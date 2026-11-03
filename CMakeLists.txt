@@ -582,6 +582,7 @@ add_library(cosmosim_physics STATIC
   src/physics/metal_cooling_table.cpp
   src/physics/thermochemistry.cpp
   src/physics/thermochemistry_operator.cpp
+  src/physics/baryonic_source_stage.cpp
   src/physics/baryonic_runtime_config.cpp
   src/physics/ism_dust_sgs.cpp
   src/physics/stellar_population.cpp
@@ -1351,6 +1352,9 @@ if(COSMOSIM_ENABLE_TESTS)
   add_executable(test_unit_config_part2_baryonic_physics tests/unit/test_config_part2_baryonic_physics.cpp)
   target_link_libraries(test_unit_config_part2_baryonic_physics PRIVATE cosmosim_all)
   add_test(NAME unit_config_part2_baryonic_physics COMMAND test_unit_config_part2_baryonic_physics)
+  add_executable(test_unit_baryonic_source_stage_rollback tests/unit/test_baryonic_source_stage_rollback.cpp)
+  target_link_libraries(test_unit_baryonic_source_stage_rollback PRIVATE cosmosim_all)
+  add_test(NAME unit_baryonic_source_stage_rollback COMMAND test_unit_baryonic_source_stage_rollback)
 
   add_executable(test_integration_gas_cell_identity_migration tests/integration/test_gas_cell_identity_migration.cpp)
   target_link_libraries(test_integration_gas_cell_identity_migration PRIVATE cosmosim_core)

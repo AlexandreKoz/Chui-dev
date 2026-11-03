@@ -52,7 +52,20 @@ struct IsmRegimeReport {
   std::vector<std::uint32_t> changed_rows;
 };
 
-// Evaluate and apply regime tags for `rows` (all rows when empty).
+// Provisional decision for one row from its step-start state (PURE).
+struct IsmRegimeDecision {
+  std::uint8_t tag = 0U;
+  double dwell_years = 0.0;
+  bool changed = false;
+  bool held_by_dwell = false;
+};
+[[nodiscard]] IsmRegimeDecision decideIsmRegime(const core::SimulationState& state, const IsmRegimeConfig& config,
+                                                const ThermochemistryUnitBridge& units,
+                                                const SourceInterval& interval, std::uint32_t row);
+
+// Evaluate and APPLY regime tags for `rows` (all rows when empty). Direct
+// utility for tests/tools; the production source stage stages decisions
+// through BaryonicSourceStage and applies them only on commit.
 IsmRegimeReport updateIsmRegimes(core::SimulationState& state, const IsmRegimeConfig& config,
                                  const ThermochemistryUnitBridge& units, const SourceInterval& interval,
                                  std::span<const std::uint32_t> rows);
@@ -137,6 +150,14 @@ struct SgsLedger {
 // Returns dissipated energy (code units) and updates e and the SGS lane.
 double advanceSgsCell(core::SimulationState& state, const CompositionLayout& layout, std::size_t row,
                       double dt_code_time, double cell_size_code, const SgsConfig& config, SgsLedger& ledger);
+
+// Pure lane-level dissipation: returns {new extensive SGS energy, dissipated}.
+struct SgsDissipation {
+  double sgs_energy = 0.0;
+  double dissipated = 0.0;
+};
+[[nodiscard]] SgsDissipation sgsDissipate(double sgs_energy, double mass, double dt_code_time,
+                                          double cell_size_code, const SgsConfig& config) noexcept;
 
 // Exact analytic SGS decay (exposed for tests).
 [[nodiscard]] double sgsSpecificEnergyAfter(double k0, double dt, double dx, double c_eps) noexcept;

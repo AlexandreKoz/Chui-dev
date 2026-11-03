@@ -78,205 +78,145 @@ ThermochemistryCellInput ThermochemistryOperator::cellInput(const core::Simulati
   return input;
 }
 
-void ThermochemistryOperator::prepare(const core::SimulationState& state, const SourceInterval& interval,
-                                      std::span<const std::uint32_t> rows) {
-  m_prepared = false;
-  m_staged.clear();
-  m_ledger = SourceLedger{};
-  m_skipped_effective = 0U;
-  m_shadow_report = ChemistryShadowReport{};
-  if (!interval.valid()) {
-    throw std::invalid_argument("thermochemistry: invalid source interval");
-  }
+ThermochemistryRowResult ThermochemistryOperator::advanceRow(const core::SimulationState& state,
+                                                             const SourceInterval& interval, std::uint32_t row,
+                                                             std::uint8_t chemistry_tag,
+                                                             ChemistryShadowReport& shadow) const {
+  ThermochemistryRowResult result;
   const auto& sidecar = state.gas_composition;
-  if (!sidecar.enabled() || !(sidecar.descriptor() == m_layout.descriptor())) {
-    throw SourceModelUnavailableError(
-        "thermochemistry requires the gas composition sidecar with layout '" + m_layout.descriptor().layout_name + "'");
+  const ThermochemistryCellInput input = cellInput(state, row, interval);
+  const bool demoted = m_hybrid_solver != nullptr && chemistry_tag == k_chemistry_tag_hybrid;
+  const ThermochemistrySolver& solver = demoted ? *m_hybrid_solver : m_solver;
+  ThermochemistryCellOutput output;
+  SourceLedger per_volume;
+  solver.advanceCell(input, interval.physical_seconds, output, per_volume);
+  if (output.status != SourceAdvanceStatus::kCompleted) {
+    result.status = output.status;
+    result.suggested_retry_seconds = output.suggested_retry_seconds;
+    result.diagnostic = "row " + std::to_string(row) + " (gas_cell_id " +
+        std::to_string(state.gas_cells.gas_cell_id[row]) + "): " + output.diagnostic;
+    return result;
   }
-  sidecar.requireAlignedWith(state.gas_cells.gas_cell_id, "ThermochemistryOperator::prepare");
-  const std::size_t row_count = rows.empty() ? state.cells.size() : rows.size();
-  m_staged.reserve(row_count);
-  double min_retry = std::numeric_limits<double>::infinity();
-  std::string first_failure;
-  std::size_t failures = 0;
-  for (std::size_t i = 0; i < row_count; ++i) {
-    const std::uint32_t row = rows.empty() ? static_cast<std::uint32_t>(i) : rows[i];
-    if (row >= state.cells.size()) throw std::out_of_range("thermochemistry: active row outside gas state");
-    if (sidecar.ism_regime_tag[row] == k_ism_regime_effective) {
-      ++m_skipped_effective;
-      continue;
-    }
-    const ThermochemistryCellInput input = cellInput(state, row, interval);
-    const bool demoted = m_hybrid_solver != nullptr &&
-        sidecar.chemistry_model_tag[row] == k_chemistry_tag_hybrid;
-    const ThermochemistrySolver& solver = demoted ? *m_hybrid_solver : m_solver;
-    ThermochemistryCellOutput output;
-    SourceLedger per_volume;
-    solver.advanceCell(input, interval.physical_seconds, output, per_volume);
-    if (output.status == SourceAdvanceStatus::kCompleted && m_reference_solver != nullptr &&
-        m_shadow_report.samples < m_config.shadow.max_cells) {
-      // Deterministic sample keyed by stable id and accepted step.
-      const std::uint64_t key = core::fnv1a64(std::to_string(state.gas_cells.gas_cell_id[row]) + ":" +
-                                              std::to_string(interval.accepted_step_index));
-      const double u01 = static_cast<double>(key >> 11U) * (1.0 / 9007199254740992.0);
-      if (u01 < m_config.shadow.sample_fraction) {
-        ThermochemistryCellOutput reference;
-        SourceLedger reference_ledger;
-        m_reference_solver->advanceCell(input, interval.physical_seconds, reference, reference_ledger);
-        if (reference.status == SourceAdvanceStatus::kCompleted) {
-          ++m_shadow_report.samples;
-          NetworkState production = output.species_cm3;
-          if (demoted) {
-            for (std::size_t sp = solver.speciesCount(); sp < m_solver.speciesCount(); ++sp) {
-              production[sp] = input.species_cm3[sp];  // frozen reservoir
-            }
+  if (m_reference_solver != nullptr && shadow.samples < m_config.shadow.max_cells) {
+    // Deterministic sample keyed by stable id and accepted step.
+    const std::uint64_t key = core::fnv1a64(std::to_string(state.gas_cells.gas_cell_id[row]) + ":" +
+                                            std::to_string(interval.accepted_step_index));
+    const double u01 = static_cast<double>(key >> 11U) * (1.0 / 9007199254740992.0);
+    if (u01 < m_config.shadow.sample_fraction) {
+      ThermochemistryCellOutput reference;
+      SourceLedger reference_ledger;
+      m_reference_solver->advanceCell(input, interval.physical_seconds, reference, reference_ledger);
+      if (reference.status == SourceAdvanceStatus::kCompleted) {
+        ++shadow.samples;
+        NetworkState production = output.species_cm3;
+        if (demoted) {
+          for (std::size_t sp = solver.speciesCount(); sp < m_solver.speciesCount(); ++sp) {
+            production[sp] = input.species_cm3[sp];  // frozen reservoir
           }
-          double species = 0.0;
-          for (std::size_t sp = 0; sp < m_solver.speciesCount(); ++sp) {
-            const double scale = std::max({std::abs(reference.species_cm3[sp]), std::abs(production[sp]),
-                                           1.0e-10 * std::max(input.species_cm3[0], 1.0e-300)});
-            species = std::max(species, std::abs(reference.species_cm3[sp] - production[sp]) / scale);
-          }
-          m_shadow_report.max_relative_species_difference =
-              std::max(m_shadow_report.max_relative_species_difference, species);
-          m_shadow_report.max_relative_electron_difference = std::max(
-              m_shadow_report.max_relative_electron_difference,
-              std::abs(reference.electron_per_hydrogen - output.electron_per_hydrogen) /
-                  std::max(reference.electron_per_hydrogen, 1.0e-12));
-          m_shadow_report.max_relative_energy_difference = std::max(
-              m_shadow_report.max_relative_energy_difference,
-              std::abs(reference.specific_internal_energy_erg_g - output.specific_internal_energy_erg_g) /
-                  reference.specific_internal_energy_erg_g);
-          const double ratio = static_cast<double>(reference_ledger.accepted_substeps + reference_ledger.rejected_substeps) /
-              std::max<double>(1.0, static_cast<double>(per_volume.accepted_substeps + per_volume.rejected_substeps));
-          m_shadow_report.mean_substep_cost_ratio +=
-              (ratio - m_shadow_report.mean_substep_cost_ratio) / static_cast<double>(m_shadow_report.samples);
         }
+        double species = 0.0;
+        for (std::size_t sp = 0; sp < m_solver.speciesCount(); ++sp) {
+          const double scale = std::max({std::abs(reference.species_cm3[sp]), std::abs(production[sp]),
+                                         1.0e-10 * std::max(input.species_cm3[0], 1.0e-300)});
+          species = std::max(species, std::abs(reference.species_cm3[sp] - production[sp]) / scale);
+        }
+        shadow.max_relative_species_difference = std::max(shadow.max_relative_species_difference, species);
+        shadow.max_relative_electron_difference = std::max(
+            shadow.max_relative_electron_difference,
+            std::abs(reference.electron_per_hydrogen - output.electron_per_hydrogen) /
+                std::max(reference.electron_per_hydrogen, 1.0e-12));
+        shadow.max_relative_energy_difference = std::max(
+            shadow.max_relative_energy_difference,
+            std::abs(reference.specific_internal_energy_erg_g - output.specific_internal_energy_erg_g) /
+                reference.specific_internal_energy_erg_g);
+        const double ratio =
+            static_cast<double>(reference_ledger.accepted_substeps + reference_ledger.rejected_substeps) /
+            std::max<double>(1.0, static_cast<double>(per_volume.accepted_substeps + per_volume.rejected_substeps));
+        shadow.mean_substep_cost_ratio += (ratio - shadow.mean_substep_cost_ratio) / static_cast<double>(shadow.samples);
       }
     }
-    if (output.status != SourceAdvanceStatus::kCompleted) {
-      ++failures;
-      if (first_failure.empty()) {
-        first_failure = "row " + std::to_string(row) + " (gas_cell_id " +
-            std::to_string(state.gas_cells.gas_cell_id[row]) + "): " + output.diagnostic;
-      }
-      min_retry = std::min(min_retry, output.suggested_retry_seconds);
+  }
+  // Volume ledger: proper cell volume = (mass / rho_code) a^3 L^3.
+  const double a = interval.evaluation_scale_factor;
+  const double volume_code = state.cells.mass_code[row] / std::max(state.gas_cells.density_code[row], 1.0e-300);
+  const double volume_cm3 = volume_code * (m_config.units.comoving ? a * a * a : 1.0) *
+      std::pow(m_config.units.length_code_to_cm, 3.0);
+  result.ledger = per_volume;
+  result.ledger.radiative_loss_erg *= volume_cm3;
+  result.ledger.heating_gain_erg *= volume_cm3;
+  result.ledger.chemical_binding_delta_erg *= volume_cm3;
+  result.ledger.floor_injection_erg *= volume_cm3;
+  result.ledger.thermal_energy_delta_erg *= volume_cm3;
+
+  ThermochemistryStagedRow& staged = result.staged;
+  staged.row = row;
+  staged.internal_energy_code = output.specific_internal_energy_erg_g /
+      (m_config.units.velocity_code_to_cm_s * m_config.units.velocity_code_to_cm_s);
+  staged.mean_molecular_weight = output.mean_molecular_weight;
+  staged.temperature_k = output.temperature_k;
+  const double mass = compositionGasMass(sidecar, row);
+  for (std::size_t s = 0; s < m_solver.speciesCount(); ++s) {
+    if (demoted && s >= solver.speciesCount()) {
+      staged.species_mass_code[s] = sidecar.value(m_layout.speciesLane(s), row);  // frozen reservoir
       continue;
     }
-    // Volume ledger: proper cell volume = (mass / rho_code) a^3 L^3.
-    const double a = interval.evaluation_scale_factor;
-    const double volume_code = state.cells.mass_code[row] / std::max(state.gas_cells.density_code[row], 1.0e-300);
-    const double volume_cm3 = volume_code * (m_config.units.comoving ? a * a * a : 1.0) *
-        std::pow(m_config.units.length_code_to_cm, 3.0);
-    SourceLedger scaled = per_volume;
-    scaled.radiative_loss_erg *= volume_cm3;
-    scaled.heating_gain_erg *= volume_cm3;
-    scaled.chemical_binding_delta_erg *= volume_cm3;
-    scaled.floor_injection_erg *= volume_cm3;
-    scaled.thermal_energy_delta_erg *= volume_cm3;
-    m_ledger += scaled;
-
-    ThermochemistryStagedRow staged;
-    staged.row = row;
-    staged.internal_energy_code = output.specific_internal_energy_erg_g /
-        (m_config.units.velocity_code_to_cm_s * m_config.units.velocity_code_to_cm_s);
-    staged.mean_molecular_weight = output.mean_molecular_weight;
-    staged.temperature_k = output.temperature_k;
-    const double mass = compositionGasMass(sidecar, row);
-    for (std::size_t s = 0; s < m_solver.speciesCount(); ++s) {
-      if (demoted && s >= solver.speciesCount()) {
-        // Frozen reservoir (C+/CO) of a demoted row: carried unchanged.
-        staged.species_mass_code[s] = sidecar.value(m_layout.speciesLane(s), row);
-        continue;
-      }
-      const double amu = chemicalSpeciesInfo(static_cast<ChemicalSpecies>(s)).mass_amu;
-      staged.species_mass_code[s] = output.species_cm3[s] * amu * k_amu_g / input.mass_density_cgs * mass;
-    }
-    if (!std::isfinite(staged.internal_energy_code) || !(staged.internal_energy_code > 0.0)) {
-      throw std::runtime_error("thermochemistry produced a non-positive internal energy");
-    }
-    m_staged.push_back(staged);
+    const double amu = chemicalSpeciesInfo(static_cast<ChemicalSpecies>(s)).mass_amu;
+    staged.species_mass_code[s] = output.species_cm3[s] * amu * k_amu_g / input.mass_density_cgs * mass;
   }
-  if (failures > 0U) {
-    m_staged.clear();
-    throw SourceIntervalIncompleteError(
-        "thermochemistry could not integrate the accepted interval in " + std::to_string(failures) +
-            " cell(s); first: " + first_failure,
-        std::isfinite(min_retry) ? min_retry : 0.0);
+  if (!std::isfinite(staged.internal_energy_code) || !(staged.internal_energy_code > 0.0)) {
+    result.status = SourceAdvanceStatus::kRejectedInvalid;
+    result.diagnostic = "thermochemistry produced a non-positive internal energy at row " + std::to_string(row);
   }
-  m_prepared = true;
+  return result;
 }
 
-ChemistryAdaptiveReport ThermochemistryOperator::selectChemistryFidelity(
-    core::SimulationState& state, const SourceInterval& interval, std::span<const std::uint32_t> rows) const {
-  ChemistryAdaptiveReport report;
-  if (!m_config.adaptive.enabled) return report;
-  auto& sidecar = state.gas_composition;
-  sidecar.requireAlignedWith(state.gas_cells.gas_cell_id, "selectChemistryFidelity");
+ChemistryFidelityDecision ThermochemistryOperator::decideChemistryFidelity(
+    const core::SimulationState& state, const SourceInterval& interval, std::uint32_t row) const {
+  const auto& sidecar = state.gas_composition;
+  ChemistryFidelityDecision decision;
+  decision.tag = sidecar.chemistry_model_tag[row];
+  decision.dwell_years = sidecar.model_dwell_years[row];
+  if (!m_config.adaptive.enabled) return decision;
   const ChemistryAdaptiveConfig& c = m_config.adaptive;
   const double h = c.hysteresis_fraction;
-  const double dt_years = interval.physical_seconds / k_seconds_per_year;
-  const std::size_t count = rows.empty() ? state.cells.size() : rows.size();
-  for (std::size_t i = 0; i < count; ++i) {
-    const std::uint32_t row = rows.empty() ? static_cast<std::uint32_t>(i) : rows[i];
-    const ThermochemistryCellInput input = cellInput(state, row, interval);
-    const double n_h = input.gas_element_mass_fraction[0] * input.mass_density_cgs /
-        (chemicalElementInfo(ChemicalElement::kH).atomic_mass_amu * k_amu_g);
-    double mu = sidecar.mean_molecular_weight[row];
-    if (!(mu > 0.0) || !std::isfinite(mu)) mu = 1.22;
-    const double t = (m_config.solver.adiabatic_index - 1.0) * mu * k_amu_g *
-        input.specific_internal_energy_erg_g / k_boltzmann_erg_per_k;
-    const double f_h2 = n_h > 0.0 ? 2.0 * input.species_cm3[static_cast<std::size_t>(ChemicalSpecies::kH2)] / n_h : 0.0;
-    const double n_c = input.species_cm3[static_cast<std::size_t>(ChemicalSpecies::kCII)] +
-        input.species_cm3[static_cast<std::size_t>(ChemicalSpecies::kCO)];
-    const double f_co = n_c > 0.0 ? input.species_cm3[static_cast<std::size_t>(ChemicalSpecies::kCO)] / n_c : 0.0;
-    const std::uint8_t current = sidecar.chemistry_model_tag[row];
-    std::uint8_t desired = current;
-    if (current == k_chemistry_tag_hybrid) {
-      const bool cold_dense = t < c.cold_temperature_k * (1.0 - h) && n_h > c.dense_n_h_cm3 * (1.0 + h);
-      if (cold_dense || f_h2 > c.molecular_fraction_threshold * (1.0 + h) ||
-          f_co > c.co_carbon_fraction_threshold * (1.0 + h)) {
-        desired = k_chemistry_tag_detailed;
-      }
+  const ThermochemistryCellInput input = cellInput(state, row, interval);
+  const double n_h = input.gas_element_mass_fraction[0] * input.mass_density_cgs /
+      (chemicalElementInfo(ChemicalElement::kH).atomic_mass_amu * k_amu_g);
+  double mu = sidecar.mean_molecular_weight[row];
+  if (!(mu > 0.0) || !std::isfinite(mu)) mu = 1.22;
+  const double t = (m_config.solver.adiabatic_index - 1.0) * mu * k_amu_g *
+      input.specific_internal_energy_erg_g / k_boltzmann_erg_per_k;
+  const double f_h2 = n_h > 0.0 ? 2.0 * input.species_cm3[static_cast<std::size_t>(ChemicalSpecies::kH2)] / n_h : 0.0;
+  const double n_c = input.species_cm3[static_cast<std::size_t>(ChemicalSpecies::kCII)] +
+      input.species_cm3[static_cast<std::size_t>(ChemicalSpecies::kCO)];
+  const double f_co = n_c > 0.0 ? input.species_cm3[static_cast<std::size_t>(ChemicalSpecies::kCO)] / n_c : 0.0;
+  const std::uint8_t current = decision.tag;
+  std::uint8_t desired = current;
+  if (current == k_chemistry_tag_hybrid) {
+    const bool cold_dense = t < c.cold_temperature_k * (1.0 - h) && n_h > c.dense_n_h_cm3 * (1.0 + h);
+    if (cold_dense || f_h2 > c.molecular_fraction_threshold * (1.0 + h) ||
+        f_co > c.co_carbon_fraction_threshold * (1.0 + h)) {
+      desired = k_chemistry_tag_detailed;
+    }
+  } else {
+    const bool clear = t > c.cold_temperature_k * (1.0 + h) && n_h < c.dense_n_h_cm3 * (1.0 - h) &&
+        f_h2 < c.molecular_fraction_threshold * (1.0 - h) && f_co < c.co_carbon_fraction_threshold * (1.0 - h);
+    if (clear) desired = k_chemistry_tag_hybrid;
+  }
+  decision.dwell_years += interval.physical_seconds / k_seconds_per_year;
+  if (desired != current) {
+    // Promotion is never delayed (the more complete model is always safe);
+    // demotion waits for the dwell time.
+    if (desired == k_chemistry_tag_hybrid && decision.dwell_years < c.minimum_dwell_years) {
+      decision.held_by_dwell = true;
     } else {
-      const bool clear = t > c.cold_temperature_k * (1.0 + h) && n_h < c.dense_n_h_cm3 * (1.0 - h) &&
-          f_h2 < c.molecular_fraction_threshold * (1.0 - h) && f_co < c.co_carbon_fraction_threshold * (1.0 - h);
-      if (clear) desired = k_chemistry_tag_hybrid;
+      decision.tag = desired;
+      decision.dwell_years = 0.0;
+      decision.promoted = desired == k_chemistry_tag_detailed;
+      decision.demoted = desired == k_chemistry_tag_hybrid;
     }
-    sidecar.model_dwell_years[row] += dt_years;
-    if (desired != current) {
-      // Promotion is never delayed (the more complete model is always safe);
-      // demotion waits for the dwell time.
-      if (desired == k_chemistry_tag_hybrid && sidecar.model_dwell_years[row] < c.minimum_dwell_years) {
-        ++report.held_by_dwell;
-      } else {
-        sidecar.chemistry_model_tag[row] = desired;
-        sidecar.model_dwell_years[row] = 0.0;
-        if (desired == k_chemistry_tag_detailed) ++report.promoted; else ++report.demoted;
-      }
-    }
-    if (sidecar.chemistry_model_tag[row] == k_chemistry_tag_detailed) ++report.detailed_cells;
-    else ++report.hybrid_cells;
   }
-  return report;
-}
-
-std::vector<std::uint32_t> ThermochemistryOperator::commit(core::SimulationState& state) {
-  if (!m_prepared) throw std::logic_error("ThermochemistryOperator::commit without successful prepare");
-  auto& sidecar = state.gas_composition;
-  std::vector<std::uint32_t> touched;
-  touched.reserve(m_staged.size());
-  for (const ThermochemistryStagedRow& staged : m_staged) {
-    state.gas_cells.internal_energy_code[staged.row] = staged.internal_energy_code;
-    sidecar.mean_molecular_weight[staged.row] = staged.mean_molecular_weight;
-    for (std::size_t s = 0; s < m_solver.speciesCount(); ++s) {
-      sidecar.setValue(m_layout.speciesLane(s), staged.row, staged.species_mass_code[s]);
-    }
-    touched.push_back(staged.row);
-  }
-  m_staged.clear();
-  m_prepared = false;
-  return touched;
+  return decision;
 }
 
 }  // namespace cosmosim::physics

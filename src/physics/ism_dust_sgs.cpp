@@ -24,6 +24,53 @@ double jeansLengthCm(double temperature_k, double mean_molecular_weight, double 
   return std::sqrt(k_pi * cs2 / (k_newton_g_cgs * rho_cgs));
 }
 
+IsmRegimeDecision decideIsmRegime(const core::SimulationState& state, const IsmRegimeConfig& config,
+                                  const ThermochemistryUnitBridge& units, const SourceInterval& interval,
+                                  std::uint32_t row) {
+  const auto& sidecar = state.gas_composition;
+  IsmRegimeDecision decision;
+  decision.tag = sidecar.ism_regime_tag[row];
+  decision.dwell_years = sidecar.ism_regime_dwell_years[row] + interval.physical_seconds / k_seconds_per_year;
+  const double a = interval.evaluation_scale_factor;
+  const double frame_density = units.comoving ? 1.0 / (a * a * a) : 1.0;
+  const double frame_length = units.comoving ? a : 1.0;
+  const double h = config.hysteresis_fraction;
+  const auto& descriptor = sidecar.descriptor();
+  const double rho_code = state.gas_cells.density_code[row];
+  const double rho_cgs = rho_code * frame_density * units.density_code_to_cgs;
+  double mass = 0.0;
+  for (std::uint32_t l = 0; l < descriptor.element_lane_count; ++l) mass += sidecar.value(descriptor.element_lane_begin + l, row);
+  for (std::uint32_t l = 0; l < descriptor.dust_lane_count; ++l) mass += sidecar.value(descriptor.dust_lane_begin + l, row);
+  const double x_h = mass > 0.0 ? sidecar.value(descriptor.element_lane_begin, row) / mass : 0.75;
+  const double n_h = x_h * rho_cgs / (chemicalElementInfo(ChemicalElement::kH).atomic_mass_amu * k_amu_g);
+  double mu = sidecar.mean_molecular_weight[row];
+  if (!(mu > 0.0) || !std::isfinite(mu)) mu = 1.22;  // neutral reference until first chemistry commit
+  const double u_cgs = state.gas_cells.internal_energy_code[row] * units.velocity_code_to_cm_s * units.velocity_code_to_cm_s;
+  const double t_k = (config.adiabatic_index - 1.0) * mu * k_amu_g * u_cgs / k_boltzmann_erg_per_k;
+  const double volume_code = state.cells.mass_code[row] / std::max(rho_code, 1.0e-300);
+  const double dx_cm = std::cbrt(std::max(volume_code, 0.0)) * frame_length * units.length_code_to_cm;
+  const double lambda = jeansLengthCm(t_k, mu, rho_cgs, config.adiabatic_index);
+  const double required = config.jeans_resolution_cells * dx_cm;
+  std::uint8_t desired = decision.tag;
+  if (decision.tag == core::k_gas_ism_regime_effective) {
+    if (lambda > required * (1.0 + h) || n_h < config.effective_threshold_n_h_cm3 * (1.0 - h)) {
+      desired = core::k_gas_ism_regime_resolved;
+    }
+  } else if (lambda < required * (1.0 - h) && n_h >= config.effective_threshold_n_h_cm3 * (1.0 + h)) {
+    desired = core::k_gas_ism_regime_effective;
+  }
+  if (desired != decision.tag) {
+    if (decision.dwell_years < config.minimum_dwell_years) {
+      decision.held_by_dwell = true;
+    } else {
+      decision.tag = desired;
+      decision.dwell_years = 0.0;
+      decision.changed = true;
+    }
+  }
+  return decision;
+}
+
 IsmRegimeReport updateIsmRegimes(core::SimulationState& state, const IsmRegimeConfig& config,
                                  const ThermochemistryUnitBridge& units, const SourceInterval& interval,
                                  std::span<const std::uint32_t> rows) {
@@ -33,52 +80,23 @@ IsmRegimeReport updateIsmRegimes(core::SimulationState& state, const IsmRegimeCo
     throw std::runtime_error("ISM regime manager requires the gas composition sidecar");
   }
   sidecar.requireAlignedWith(state.gas_cells.gas_cell_id, "updateIsmRegimes");
-  const double a = interval.evaluation_scale_factor;
-  const double frame_density = units.comoving ? 1.0 / (a * a * a) : 1.0;
-  const double frame_length = units.comoving ? a : 1.0;
-  const double dt_years = interval.physical_seconds / k_seconds_per_year;
-  const double h = config.hysteresis_fraction;
   const std::size_t count = rows.empty() ? state.cells.size() : rows.size();
-  const auto& descriptor = sidecar.descriptor();
+  // Decide for all rows from the unmodified state first, then apply.
+  std::vector<std::pair<std::uint32_t, IsmRegimeDecision>> decisions;
+  decisions.reserve(count);
   for (std::size_t i = 0; i < count; ++i) {
     const std::uint32_t row = rows.empty() ? static_cast<std::uint32_t>(i) : rows[i];
-    const double rho_code = state.gas_cells.density_code[row];
-    const double rho_cgs = rho_code * frame_density * units.density_code_to_cgs;
-    double mass = 0.0;
-    for (std::uint32_t l = 0; l < descriptor.element_lane_count; ++l) mass += sidecar.value(descriptor.element_lane_begin + l, row);
-    for (std::uint32_t l = 0; l < descriptor.dust_lane_count; ++l) mass += sidecar.value(descriptor.dust_lane_begin + l, row);
-    const double x_h = mass > 0.0 ? sidecar.value(descriptor.element_lane_begin, row) / mass : 0.75;
-    const double n_h = x_h * rho_cgs / (chemicalElementInfo(ChemicalElement::kH).atomic_mass_amu * k_amu_g);
-    double mu = sidecar.mean_molecular_weight[row];
-    if (!(mu > 0.0) || !std::isfinite(mu)) mu = 1.22;  // neutral reference until first chemistry commit
-    const double u_cgs = state.gas_cells.internal_energy_code[row] * units.velocity_code_to_cm_s * units.velocity_code_to_cm_s;
-    const double t_k = (config.adiabatic_index - 1.0) * mu * k_amu_g * u_cgs / k_boltzmann_erg_per_k;
-    const double volume_code = state.cells.mass_code[row] / std::max(rho_code, 1.0e-300);
-    const double dx_cm = std::cbrt(std::max(volume_code, 0.0)) * frame_length * units.length_code_to_cm;
-    const double lambda = jeansLengthCm(t_k, mu, rho_cgs, config.adiabatic_index);
-    const double required = config.jeans_resolution_cells * dx_cm;
-    const std::uint8_t current = sidecar.ism_regime_tag[row];
-    std::uint8_t desired = current;
-    if (current == core::k_gas_ism_regime_effective) {
-      if (lambda > required * (1.0 + h) || n_h < config.effective_threshold_n_h_cm3 * (1.0 - h)) {
-        desired = core::k_gas_ism_regime_resolved;
-      }
-    } else if (lambda < required * (1.0 - h) && n_h >= config.effective_threshold_n_h_cm3 * (1.0 + h)) {
-      desired = core::k_gas_ism_regime_effective;
+    decisions.emplace_back(row, decideIsmRegime(state, config, units, interval, row));
+  }
+  for (const auto& [row, d] : decisions) {
+    sidecar.ism_regime_tag[row] = d.tag;
+    sidecar.ism_regime_dwell_years[row] = d.dwell_years;
+    if (d.held_by_dwell) ++report.held_by_dwell;
+    if (d.changed) {
+      report.changed_rows.push_back(row);
+      if (d.tag == core::k_gas_ism_regime_effective) ++report.to_effective; else ++report.to_resolved;
     }
-    sidecar.ism_regime_dwell_years[row] += dt_years;
-    if (desired != current) {
-      if (sidecar.ism_regime_dwell_years[row] < config.minimum_dwell_years) {
-        ++report.held_by_dwell;
-      } else {
-        sidecar.ism_regime_tag[row] = desired;
-        sidecar.ism_regime_dwell_years[row] = 0.0;
-        report.changed_rows.push_back(row);
-        if (desired == core::k_gas_ism_regime_effective) ++report.to_effective; else ++report.to_resolved;
-      }
-    }
-    if (sidecar.ism_regime_tag[row] == core::k_gas_ism_regime_effective) ++report.effective_cells;
-    else ++report.resolved_cells;
+    if (d.tag == core::k_gas_ism_regime_effective) ++report.effective_cells; else ++report.resolved_cells;
   }
   return report;
 }
@@ -218,6 +236,18 @@ double sgsSpecificEnergyAfter(double k0, double dt, double dx, double c_eps) noe
   if (!(k0 > 0.0) || !(dt > 0.0) || !(dx > 0.0)) return std::max(k0, 0.0);
   const double denom = 1.0 + c_eps * std::sqrt(k0) * dt / (2.0 * dx);
   return k0 / (denom * denom);
+}
+
+SgsDissipation sgsDissipate(double sgs_energy, double mass, double dt_code_time, double cell_size_code,
+                            const SgsConfig& config) noexcept {
+  SgsDissipation out;
+  out.sgs_energy = std::max(sgs_energy, 0.0);
+  if (!(mass > 0.0)) return out;
+  const double k0 = out.sgs_energy / mass;
+  const double k1 = sgsSpecificEnergyAfter(k0, dt_code_time, cell_size_code, config.dissipation_coefficient);
+  out.sgs_energy = mass * k1;
+  out.dissipated = mass * (k0 - k1);
+  return out;
 }
 
 double advanceSgsCell(core::SimulationState& state, const CompositionLayout& layout, std::size_t row,

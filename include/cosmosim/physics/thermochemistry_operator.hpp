@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <memory>
 #include <span>
+#include <string>
 #include <vector>
 
 #include "cosmosim/core/gas_composition_sidecar.hpp"
@@ -104,41 +105,52 @@ struct ThermochemistryStagedRow {
   NetworkState species_mass_code{};  // species lane masses (network backends)
 };
 
+// Result of advancing one row (pure: no state mutation).
+struct ThermochemistryRowResult {
+  SourceAdvanceStatus status = SourceAdvanceStatus::kCompleted;
+  std::string diagnostic;
+  double suggested_retry_seconds = 0.0;
+  ThermochemistryStagedRow staged{};
+  SourceLedger ledger{};  // volume-integrated [erg]
+};
+
+// Provisional chemistry-fidelity decision of one row (pure).
+struct ChemistryFidelityDecision {
+  std::uint8_t tag = k_chemistry_tag_detailed;
+  double dwell_years = 0.0;
+  bool promoted = false;
+  bool demoted = false;
+  bool held_by_dwell = false;
+};
+
 // ---------------------------------------------------------------------------
-// One owner for thermochemistry in the SourceRuntime (CHUI Part 2). When a
-// Part 2 backend is selected, the hydro in-solver CoolingHeatingSource is NOT
+// Thermochemistry kernels for the SourceRuntime (CHUI Part 2). When a Part 2
+// backend is selected, the hydro in-solver CoolingHeatingSource is NOT
 // registered, so cooling is advanced exactly once per accepted interval.
-// prepare(): reads canonical state (e, rho, composition), integrates every
-//   resolved-regime row over the physical interval, stages the results; any
-//   row that cannot complete => SourceIntervalIncompleteError (whole stage
-//   rejected; nothing staged is committed). Effective-regime rows are skipped
-//   entirely (the effective multiphase closure owns their thermal state — the
-//   no-double-cooling rule).
-// commit(): writes e, species lanes and the mu cache for staged rows, then
-//   returns the touched rows for the thermodynamic refresh (F4 contract).
+// All member functions are PURE with respect to SimulationState: the
+// transactional owner (BaryonicSourceStage) stages every result and writes
+// state only after the collective accept (local source-stage atomicity).
+// Effective-regime rows are never passed here by the stage (the effective
+// multiphase closure owns their thermal state — no double cooling).
 // ---------------------------------------------------------------------------
 class ThermochemistryOperator {
  public:
   ThermochemistryOperator(ThermochemistryOperatorConfig config, CompositionLayout layout);
 
-  [[nodiscard]] static std::uint64_t stagingBytes(std::size_t rows) noexcept {
-    return static_cast<std::uint64_t>(rows) * sizeof(ThermochemistryStagedRow);
-  }
+  // Advance one row with the given (possibly provisional) fidelity tag.
+  [[nodiscard]] ThermochemistryRowResult advanceRow(const core::SimulationState& state,
+                                                    const SourceInterval& interval, std::uint32_t row,
+                                                    std::uint8_t chemistry_tag,
+                                                    ChemistryShadowReport& shadow) const;
+  // Local fidelity decision from the row's step-start state (no-op decision
+  // returning the current tag unless adaptive.enabled).
+  [[nodiscard]] ChemistryFidelityDecision decideChemistryFidelity(const core::SimulationState& state,
+                                                                  const SourceInterval& interval,
+                                                                  std::uint32_t row) const;
 
-  // rows empty => all gas rows.
-  void prepare(const core::SimulationState& state, const SourceInterval& interval,
-               std::span<const std::uint32_t> rows);
-  std::vector<std::uint32_t> commit(core::SimulationState& state);
-
-  // Local fidelity selection at the synchronization point (no-op unless
-  // adaptive.enabled). Mutates only chemistry_model_tag / model_dwell_years.
-  ChemistryAdaptiveReport selectChemistryFidelity(core::SimulationState& state, const SourceInterval& interval,
-                                                  std::span<const std::uint32_t> rows) const;
-
-  [[nodiscard]] const SourceLedger& ledger() const noexcept { return m_ledger; }
-  [[nodiscard]] const ChemistryShadowReport& shadowReport() const noexcept { return m_shadow_report; }
   [[nodiscard]] const ThermochemistrySolver& solver() const noexcept { return m_solver; }
-  [[nodiscard]] std::uint64_t skippedEffectiveRows() const noexcept { return m_skipped_effective; }
+  [[nodiscard]] const CompositionLayout& layout() const noexcept { return m_layout; }
+  [[nodiscard]] const ThermochemistryOperatorConfig& config() const noexcept { return m_config; }
 
   // Build the solver input of one row (also used by the shadow sampler).
   [[nodiscard]] ThermochemistryCellInput cellInput(const core::SimulationState& state, std::uint32_t row,
@@ -150,11 +162,6 @@ class ThermochemistryOperator {
   ThermochemistrySolver m_solver;
   std::unique_ptr<ThermochemistrySolver> m_hybrid_solver;     // adaptive demoted rows
   std::unique_ptr<ThermochemistrySolver> m_reference_solver;  // shadow reference
-  ChemistryShadowReport m_shadow_report{};
-  std::vector<ThermochemistryStagedRow> m_staged;
-  SourceLedger m_ledger;
-  std::uint64_t m_skipped_effective = 0U;
-  bool m_prepared = false;
 };
 
 }  // namespace cosmosim::physics
