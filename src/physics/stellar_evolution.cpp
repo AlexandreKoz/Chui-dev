@@ -615,6 +615,7 @@ StellarEvolutionRuntimeView StellarEvolutionBookkeeper::makeRuntimeView(
           state.star_particles.stellar_feedback_energy_channel_cumulative_erg[1],
           state.star_particles.stellar_feedback_energy_channel_cumulative_erg[2]},
       .particle_mass_code = state.particles.mass_code,
+      .birth_tick = state.star_particles.birth_tick,
   };
 }
 
@@ -654,7 +655,11 @@ StellarEvolutionStepReport StellarEvolutionBookkeeper::evaluateElapsedYearsFromV
     if (!(birth_mass > k_mass_floor) || !(current_mass >= 0.0)) continue;
 
     const double age_begin = std::max(view.stellar_age_years_last[star_index], 0.0);
-    const double age_end = age_begin + elapsed_years;
+    const double star_elapsed = stellarElapsedYearsInInterval(
+        star_index < view.birth_tick.size() ? view.birth_tick[star_index] : 0U, view.newborn_birth_tick,
+        elapsed_years);
+    if (!(star_elapsed > 0.0)) continue;  // F5
+    const double age_end = age_begin + star_elapsed;
     StellarEvolutionIntervalBudget interval = m_table.integrateInterval(
         age_begin,
         age_end,
@@ -700,12 +705,21 @@ StellarEvolutionStepReport StellarEvolutionBookkeeper::evaluateElapsedYearsFromV
   return report;
 }
 
+double stellarElapsedYearsInInterval(std::uint64_t birth_tick, std::uint64_t newborn_birth_tick,
+                                     double interval_years) noexcept {
+  if (newborn_birth_tick != std::numeric_limits<std::uint64_t>::max() && birth_tick == newborn_birth_tick) {
+    return 0.0;  // born at t_end of this interval (F5)
+  }
+  return std::max(interval_years, 0.0);
+}
+
 StellarEvolutionStepCounters StellarEvolutionBookkeeper::evaluateElapsedYearsGoverned(
     const core::SimulationState& state,
     std::span<const std::uint32_t> active_star_indices,
     double elapsed_years,
     core::MemoryGovernor* governor,
-    StellarEvolutionBatchWorkspace& workspace) const {
+    StellarEvolutionBatchWorkspace& workspace,
+    std::uint64_t newborn_birth_tick) const {
   // Physical owner: SourceRuntime's workspace.budgets owns the bytes.
   // Capacity admitted via governor BEFORE growth; retained capacity()
   // reconciled so the buffer is reused next batch. Growth occurs only after
@@ -776,7 +790,13 @@ StellarEvolutionStepCounters StellarEvolutionBookkeeper::evaluateElapsedYearsGov
     const double current_mass = view.particle_mass_code[particle_index];
     if (!(birth_mass > k_mass_floor) || !(current_mass >= 0.0)) continue;
     const double age_begin = std::max(view.stellar_age_years_last[star_index], 0.0);
-    const double age_end = age_begin + elapsed_years;
+    const double star_elapsed = stellarElapsedYearsInInterval(
+        star_index < view.birth_tick.size() ? view.birth_tick[star_index] : 0U, newborn_birth_tick, elapsed_years);
+    if (!(star_elapsed > 0.0)) {
+      ++counters.scanned_newborn_stars;
+      continue;  // F5: zero age in the interval that created it
+    }
+    const double age_end = age_begin + star_elapsed;
     StellarEvolutionIntervalBudget interval = m_table.integrateInterval(
         age_begin, age_end, birth_mass,
         view.birth_metallicity_mass_fraction[star_index]);

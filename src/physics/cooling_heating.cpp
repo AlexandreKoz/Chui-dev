@@ -1,10 +1,13 @@
 #include "cosmosim/physics/cooling_heating.hpp"
 
+#include "cosmosim/physics/source_interval.hpp"
+
 #include <algorithm>
 #include <cmath>
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
+#include <string>
 
 namespace cosmosim::physics {
 namespace {
@@ -229,51 +232,111 @@ CoolingIntegrationResult CoolingSourceIntegrator::integrateSpecificInternalEnerg
     double dt_code,
     const CoolingRateQuery& query,
     const CoolingRateProvider& rate_provider) const {
-  if (dt_code <= 0.0) {
-    throw std::invalid_argument("CoolingSourceIntegrator: dt_code must be > 0");
+  if (dt_code <= 0.0 || !std::isfinite(dt_code)) {
+    throw std::invalid_argument("CoolingSourceIntegrator: dt_code must be finite and > 0");
   }
+  // CHUI Part 2 audit F2 repair. The former explicit loop exited after
+  // max_subcycles with time still remaining and the caller accepted the
+  // partial result. The interval is now integrated with an implicit
+  // (backward-Euler) scalar step, Newton-solved, with step-doubling local
+  // error control and Richardson correction; max_subcycles bounds the number
+  // of step ATTEMPTS. The result is complete only when the long-double clock
+  // closes the requested interval exactly; otherwise `completed` is false,
+  // the energy returned is the UNCHANGED input energy and the caller must
+  // reject the stage (CoolingHeatingSource throws SourceIntervalIncompleteError).
+  const CoolingModelConfig& config = rate_provider.config();
+  const double rho = std::max(mass_density_physical_cgs, 1.0e-40);
+  const auto rate = [&](double energy) {
+    CoolingRateQuery local_query = query;
+    local_query.temperature_k = std::max(energy * config.temperature_per_internal_energy_k,
+                                         config.temperature_floor_k);
+    const CoolingRateResult rates = rate_provider.lookupRates(local_query);
+    return (rates.heating_rate_erg_cm3_s - rates.cooling_rate_erg_cm3_s) / rho *
+        m_specific_energy_rate_cgs_to_code;
+  };
+  const double energy_begin = std::max(specific_internal_energy_code, m_energy_floor_code);
+  // Implicit step e = e0 + h f(e): damped Newton, numerical derivative.
+  const auto implicit_step = [&](double e0, double h, double& e) -> bool {
+    e = e0;
+    for (int iteration = 0; iteration < 30; ++iteration) {
+      const double f = rate(e);
+      const double delta = 1.0e-7 * std::max(e, m_energy_floor_code);
+      const double dfde = (rate(e + delta) - f) / delta;
+      const double g = e - e0 - h * f;
+      const double dg = 1.0 - h * dfde;
+      if (!std::isfinite(f) || !std::isfinite(dg)) return false;
+      double step = (dg != 0.0) ? -g / dg : -g;
+      // Keep the iterate above the physical floor (damping, not clipping of
+      // the converged answer).
+      if (e + step < m_energy_floor_code) step = 0.5 * (m_energy_floor_code - e) + 0.5 * step * 0.5;
+      e = std::max(e + step, m_energy_floor_code);
+      if (std::abs(step) <= 1.0e-12 * std::max(e, m_energy_floor_code)) return true;
+    }
+    return false;
+  };
 
   CoolingIntegrationResult result;
-  double energy = std::max(specific_internal_energy_code, m_energy_floor_code);
-  double t_remaining = dt_code;
-  const CoolingModelConfig& config = rate_provider.config();
-
-  for (int subcycle = 0; subcycle < config.max_subcycles && t_remaining > 0.0; ++subcycle) {
-    CoolingRateQuery local_query = query;
-    local_query.temperature_k = std::max(
-        energy * config.temperature_per_internal_energy_k,
-        config.temperature_floor_k);
-
-    const CoolingRateResult rates = rate_provider.lookupRates(local_query);
-    const double volumetric_net_rate = rates.heating_rate_erg_cm3_s - rates.cooling_rate_erg_cm3_s;
-    const double de_dt =
-        volumetric_net_rate / std::max(mass_density_physical_cgs, 1.0e-40) *
-        m_specific_energy_rate_cgs_to_code;
-
-    const double cooling_time = std::max(energy, m_energy_floor_code) / std::max(std::abs(de_dt), 1.0e-30);
-    const double stable_dt = std::max(
-        config.max_fractional_energy_change_per_substep * cooling_time,
-        1.0e-14 * dt_code);
-    const double dt_sub = std::min(t_remaining, stable_dt);
-
-    energy = std::max(energy + de_dt * dt_sub, m_energy_floor_code);
-    t_remaining -= dt_sub;
-    result.diagnostics.subcycles_used = subcycle + 1;
+  result.requested_dt_code = dt_code;
+  const double rtol = std::min(config.max_fractional_energy_change_per_substep, 0.1) * 1.0e-2;
+  const double f0 = rate(energy_begin);
+  double h = std::abs(f0) > 0.0
+      ? std::min(dt_code, config.max_fractional_energy_change_per_substep * energy_begin / std::abs(f0))
+      : dt_code;
+  const double h_min = 1.0e-14 * dt_code;
+  long double t_done = 0.0L;
+  const long double t_request = static_cast<long double>(dt_code);
+  double energy = energy_begin;
+  int attempts = 0;
+  while (!physics::sourceIntervalClosed(t_done, t_request)) {
+    if (attempts >= config.max_subcycles) {
+      result.completed = false;
+      result.diagnostics.hit_subcycle_limit = true;
+      result.diagnostics.subcycles_used = attempts;
+      result.completed_dt_code = static_cast<double>(t_done);
+      result.specific_internal_energy_code = specific_internal_energy_code;  // unchanged
+      result.diagnostics.suggested_next_dt_code = std::max(static_cast<double>(t_done), h_min);
+      return result;
+    }
+    ++attempts;
+    const double remaining = static_cast<double>(t_request - t_done);
+    bool final_step = false;
+    if (h >= remaining * (1.0 - 1.0e-12)) { h = remaining; final_step = true; }
+    double e_full = 0.0, e_half = 0.0, e_half2 = 0.0;
+    if (!implicit_step(energy, h, e_full) || !implicit_step(energy, 0.5 * h, e_half) ||
+        !implicit_step(e_half, 0.5 * h, e_half2)) {
+      ++result.diagnostics.rejected_attempts;
+      h *= 0.25;
+      if (h < h_min) { attempts = config.max_subcycles; }
+      continue;
+    }
+    const double err = std::abs(e_full - e_half2) /
+        (rtol * std::max(e_half2, energy) + 1.0e-6 * m_energy_floor_code);
+    if (err > 1.0) {
+      ++result.diagnostics.rejected_attempts;
+      h *= std::max(0.2, 0.9 / std::sqrt(err));
+      if (h < h_min) { attempts = config.max_subcycles; }
+      continue;
+    }
+    result.diagnostics.max_error_estimate = std::max(result.diagnostics.max_error_estimate, err);
+    const double richardson = 2.0 * e_half2 - e_full;
+    double e_new = richardson > m_energy_floor_code ? richardson : e_half2;
+    if (e_new <= m_energy_floor_code) {
+      // Physical floor reached by a converged step: counted, not hidden.
+      e_new = m_energy_floor_code;
+      ++result.diagnostics.floor_activations;
+    }
+    energy = e_new;
+    ++result.diagnostics.accepted_substeps;
+    t_done = final_step ? t_request : t_done + static_cast<long double>(h);
+    h *= std::min(4.0, 0.9 / std::sqrt(std::max(err, 1.0e-10)));
   }
-
-  result.diagnostics.hit_subcycle_limit = (t_remaining > 1.0e-14 * dt_code);
-
-  CoolingRateQuery final_query = query;
-  final_query.temperature_k = std::max(
-      energy * config.temperature_per_internal_energy_k,
-      config.temperature_floor_k);
-  const CoolingRateResult final_rates = rate_provider.lookupRates(final_query);
-  const double final_de_dt =
-      (final_rates.heating_rate_erg_cm3_s - final_rates.cooling_rate_erg_cm3_s) /
-      std::max(mass_density_physical_cgs, 1.0e-40) *
-      m_specific_energy_rate_cgs_to_code;
+  result.completed = true;
+  result.completed_dt_code = dt_code;
+  result.diagnostics.subcycles_used = attempts;
+  result.diagnostics.hit_subcycle_limit = false;
+  const double final_rate = rate(energy);
   result.diagnostics.suggested_next_dt_code = config.max_fractional_energy_change_per_substep *
-      std::max(energy, m_energy_floor_code) / std::max(std::abs(final_de_dt), 1.0e-30);
+      std::max(energy, m_energy_floor_code) / std::max(std::abs(final_rate), 1.0e-30);
   result.specific_internal_energy_code = energy;
   return result;
 }
@@ -346,6 +409,17 @@ hydro::HydroConservedState CoolingHeatingSource::sourceForCell(
       context.update.dt_code,
       query,
       m_rate_provider);
+  if (!integrated.completed) {
+    // Audit F2: never accept a partial interval. The hydro stage converts
+    // this into a StageTransaction rejection (kNumericalRetry) and nothing
+    // is committed.
+    throw SourceIntervalIncompleteError(
+        "cooling source could not integrate the accepted interval at solver row " +
+            std::to_string(cell_index) + " (completed " + std::to_string(integrated.completed_dt_code) +
+            " of " + std::to_string(context.update.dt_code) + " code time after " +
+            std::to_string(integrated.diagnostics.subcycles_used) + " step attempts)",
+        integrated.diagnostics.suggested_next_dt_code);
+  }
 
   hydro::HydroConservedState source{};
   source.total_energy_density_comoving =

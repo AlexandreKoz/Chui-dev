@@ -785,3 +785,49 @@ A complete performance-oriented profile that combines these keys with the
 audited TreePM settings is
 `configs/performance/dmo_128_pm256_performance_unqualified.param.txt`; it is
 explicitly marked as requiring scientific qualification.
+
+## CHUI Part 2 baryonic physics keys (2026-11-03; source only, NOT RUN)
+
+All keys live in `[physics]`. Defaults reproduce the Part 1 behaviour
+(legacy cooling, total-metal tracking, legacy stellar table and deposition).
+Pre-Part-2 checkpoints resume only with every key below at its default.
+Handoff: `docs/repair/chui_part2_thermochemistry_stellar_physics_20261103.md`.
+
+| Key | Values / default | Meaning |
+|---|---|---|
+| `thermochemistry_backend` | `legacy_cooling` \| `analytic_reference` \| `equilibrium_primordial` \| `fixed_hybrid` \| `fixed_detailed` | Part 2 backends run in the source stage and require `metal_species_mode = core_elements` and `enable_cooling = true`. |
+| `metal_species_mode` | `total_only` \| `core_elements` | `core_elements` enables the 11-element composition sidecar (only with a Part 2 backend). |
+| `uv_background_model` | adds `treecool_table` | Part 2 backends accept only `none` or `treecool_table` (`hm12`/`fg20` are legacy analytic proxies). |
+| `uv_background_table_path`, `uv_background_table_sha256` | "" | TREECOOL file and optional expected SHA-256. |
+| `thermochemistry_relative_tolerance` | 1e-4, (0, 0.1) | stiff-solver relative tolerance |
+| `thermochemistry_abundance_absolute_tolerance` | 1e-12, (0, 1e-4] | per-H-nucleus abundance atol |
+| `thermochemistry_max_substeps`, `thermochemistry_max_newton_iterations` | 4096, 12 | step-attempt and Newton budgets; exhaustion rejects the stage (F2) |
+| `thermochemistry_analytic_relaxation_time_years`, `thermochemistry_analytic_equilibrium_temperature_k` | 1e6, 1e4 | REFERENCE backend only |
+| `isrf_g0_habing` | 0 | FUV field for H₂/CO photodissociation and photoelectric heating |
+| `chemistry_shielding_length_max_pc` | 100 | cap on the Jeans shielding length |
+| `metal_cooling_mode` | `none` \| `fine_structure_cold` \| `element_table` \| `element_table_and_fine_structure` | network backends only; table modes need `metal_cooling_table_path` |
+| `metal_cooling_table_path`, `metal_cooling_table_sha256`, `metal_cooling_table_range` (`reject` \| `clamp_density_redshift`), `metal_cooling_switch_temperature_k` (1e4) | | element-resolved table (`chui_metal_cooling_table_v1`) |
+| `chemistry_primordial_helium_mass_fraction` | 0.2449 | initialization policy |
+| `chemistry_metallicity_scaled_dust_proxy` | false | D/D_MW = Z/Z_sun when no live dust lanes |
+| `dust_model` | `none` \| `two_reservoir_v1` | live silicate + carbon dust (network backends) |
+| `dust_accretion_timescale_ref_years`, `dust_sputtering_timescale_ref_years`, `dust_sn_swept_mass_msun`, `dust_sn_destruction_efficiency`, `dust_agb_condensation_efficiency`, `dust_cc_condensation_efficiency` | 2e7, 1.7e8, 6800, 0.3, 0.2, 0.1 | uncalibrated research defaults |
+| `ism_regime_model` | `legacy` \| `effective_or_resolved` | required with Part 2 + effective SF |
+| `ism_jeans_resolution_cells`, `ism_regime_hysteresis_fraction`, `ism_regime_min_dwell_years` | 4, 0.2, 1e6 | regime criterion |
+| `sgs_turbulence_model` | `none` \| `budgeted_v1` | research closure |
+| `sgs_dissipation_coefficient`, `sgs_eddy_viscosity_coefficient`, `sgs_feedback_energy_fraction` | 1.58, 0.05, 0 | |
+| `chemistry_adaptive_selection` | `off` \| `local_v1` | requires `fixed_detailed` |
+| `chemistry_adaptive_hysteresis_fraction`, `chemistry_adaptive_min_dwell_years`, `chemistry_adaptive_cold_temperature_k`, `chemistry_adaptive_dense_nh_cm3` | 0.3, 1e6, 3e3, 1 | |
+| `chemistry_shadow_sample_fraction`, `chemistry_shadow_max_cells` | 0, 0 | bounded shadow reference sampling |
+| `stellar_population_model` | `legacy_table` \| `chabrier_reference_v1` \| `chabrier_yield_table_v1` | Part 2 SSP; table mode needs `ssp_yield_table_path` |
+| `ssp_yield_table_path`, `ssp_yield_table_sha256` | "" | `chui_ssp_yield_table_v1` |
+| `ssp_imf_mass_min_msun`, `ssp_imf_mass_max_msun`, `ssp_cc_mass_min_msun`, `ssp_cc_mass_max_msun` | 0.1, 100, 8, 40 | |
+| `ssp_snia_per_msun`, `ssp_snia_delay_min_years`, `ssp_snia_delay_max_years`, `ssp_energy_per_sn_erg` | 1.3e-3, 4e7, 1.37e10, 1e51 | |
+| `ssp_reference_net_metal_yield` | 0 | REFERENCE yields only |
+| `ssp_stochastic_sn_events` | true | discrete events vs expectation |
+| `ssp_clustered_associations` | false | NOT implemented; `true` is refused |
+| `thermochemistry_allow_unqualified_rates` | false | required for `equilibrium_primordial`/`fixed_hybrid`/`fixed_detailed` (rates UNQUALIFIED, see `docs/chemistry_rate_provenance.md`) |
+| `fb_supernova_model` | `legacy` \| `mechanical_resolved_unresolved` | required by Part 2 populations when feedback is on |
+| `fb_presn_wind_momentum_lsun_per_c` | 0 | EXPERIMENTAL pre-SN momentum closure |
+
+Additional rule: `enable_metal_diffusion = true` is refused with a Part 2
+backend (element-resolved diffusion not implemented).

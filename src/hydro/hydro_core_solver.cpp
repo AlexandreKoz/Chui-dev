@@ -190,7 +190,7 @@ void validateActiveSet(const HydroActiveSetView& active_set, const HydroConserve
   const HydroConservedState cell = conserved.loadCell(cell_index);
   HydroPrimitiveState primitive = HydroCoreSolver::primitiveFromConserved(cell, adiabatic_index);
   (void)selectDualEnergyThermalState(conserved, cell_index, cell, dual_energy, adiabatic_index, primitive);
-  if (source_context.thermodynamic_closure != nullptr) {
+  if (source_context.thermodynamic_closure != nullptr && effectiveClosureAllowed(source_context, cell_index)) {
     const HydroThermodynamicClosureResult closure =
         source_context.thermodynamic_closure->evaluate(
             cell_index,
@@ -1504,6 +1504,12 @@ void HydroCoreSolver::advancePatchActiveSetBatchedWithScratch(
           : k_invalid_touched_slot;
       if (neighbor_slot != k_invalid_touched_slot) {
         scratch.cell_delta[neighbor_slot] += face_delta;
+      }
+      if (source_context.face_mass_flux_sink != nullptr) {
+        // face_delta is a density change (dt/(aV) A F); times V = mass moved.
+        source_context.face_mass_flux_sink->recordFaceMassTransfer(
+            face_index, face.owner_cell, neighbor_target,
+            face_delta.mass_density_comoving * geometry.cell_volume_comoving);
       }
       if (use_dual_energy) {
         // Upwinded advective flux of rho*e and the face normal velocity for

@@ -3299,6 +3299,72 @@ std::string restartPayloadIntegrityHashHex(
   return hexU64(restartPayloadIntegrityHash(payload, governor));
 }
 
+
+namespace {
+// CHUI Part 2: true when every Part 2 physics key holds its default value
+// (the only configuration a pre-Part-2 checkpoint can be migrated into).
+[[nodiscard]] bool part2PhysicsKeysAtDefaults(const core::PhysicsConfig& physics) {
+  const core::PhysicsConfig defaults{};
+  return physics.thermochemistry_backend == defaults.thermochemistry_backend &&
+      physics.metal_cooling_mode == defaults.metal_cooling_mode &&
+      physics.metal_cooling_table_range == defaults.metal_cooling_table_range &&
+      physics.dust_model == defaults.dust_model &&
+      physics.ism_regime_model == defaults.ism_regime_model &&
+      physics.sgs_turbulence_model == defaults.sgs_turbulence_model &&
+      physics.chemistry_adaptive_selection == defaults.chemistry_adaptive_selection &&
+      physics.stellar_population_model == defaults.stellar_population_model &&
+      physics.fb_supernova_model == defaults.fb_supernova_model &&
+      physics.thermochemistry_relative_tolerance == defaults.thermochemistry_relative_tolerance &&
+      physics.thermochemistry_abundance_absolute_tolerance == defaults.thermochemistry_abundance_absolute_tolerance &&
+      physics.thermochemistry_analytic_relaxation_time_years == defaults.thermochemistry_analytic_relaxation_time_years &&
+      physics.thermochemistry_analytic_equilibrium_temperature_k == defaults.thermochemistry_analytic_equilibrium_temperature_k &&
+      physics.isrf_g0_habing == defaults.isrf_g0_habing &&
+      physics.chemistry_shielding_length_max_pc == defaults.chemistry_shielding_length_max_pc &&
+      physics.metal_cooling_switch_temperature_k == defaults.metal_cooling_switch_temperature_k &&
+      physics.chemistry_primordial_helium_mass_fraction == defaults.chemistry_primordial_helium_mass_fraction &&
+      physics.dust_accretion_timescale_ref_years == defaults.dust_accretion_timescale_ref_years &&
+      physics.dust_sputtering_timescale_ref_years == defaults.dust_sputtering_timescale_ref_years &&
+      physics.dust_sn_swept_mass_msun == defaults.dust_sn_swept_mass_msun &&
+      physics.dust_sn_destruction_efficiency == defaults.dust_sn_destruction_efficiency &&
+      physics.dust_agb_condensation_efficiency == defaults.dust_agb_condensation_efficiency &&
+      physics.dust_cc_condensation_efficiency == defaults.dust_cc_condensation_efficiency &&
+      physics.ism_jeans_resolution_cells == defaults.ism_jeans_resolution_cells &&
+      physics.ism_regime_hysteresis_fraction == defaults.ism_regime_hysteresis_fraction &&
+      physics.ism_regime_min_dwell_years == defaults.ism_regime_min_dwell_years &&
+      physics.sgs_dissipation_coefficient == defaults.sgs_dissipation_coefficient &&
+      physics.sgs_eddy_viscosity_coefficient == defaults.sgs_eddy_viscosity_coefficient &&
+      physics.sgs_feedback_energy_fraction == defaults.sgs_feedback_energy_fraction &&
+      physics.chemistry_adaptive_hysteresis_fraction == defaults.chemistry_adaptive_hysteresis_fraction &&
+      physics.chemistry_adaptive_min_dwell_years == defaults.chemistry_adaptive_min_dwell_years &&
+      physics.chemistry_adaptive_cold_temperature_k == defaults.chemistry_adaptive_cold_temperature_k &&
+      physics.chemistry_adaptive_dense_nh_cm3 == defaults.chemistry_adaptive_dense_nh_cm3 &&
+      physics.chemistry_shadow_sample_fraction == defaults.chemistry_shadow_sample_fraction &&
+      physics.ssp_imf_mass_min_msun == defaults.ssp_imf_mass_min_msun &&
+      physics.ssp_imf_mass_max_msun == defaults.ssp_imf_mass_max_msun &&
+      physics.ssp_cc_mass_min_msun == defaults.ssp_cc_mass_min_msun &&
+      physics.ssp_cc_mass_max_msun == defaults.ssp_cc_mass_max_msun &&
+      physics.ssp_snia_per_msun == defaults.ssp_snia_per_msun &&
+      physics.ssp_snia_delay_min_years == defaults.ssp_snia_delay_min_years &&
+      physics.ssp_snia_delay_max_years == defaults.ssp_snia_delay_max_years &&
+      physics.ssp_energy_per_sn_erg == defaults.ssp_energy_per_sn_erg &&
+      physics.ssp_reference_net_metal_yield == defaults.ssp_reference_net_metal_yield &&
+      physics.fb_presn_wind_momentum_lsun_per_c == defaults.fb_presn_wind_momentum_lsun_per_c &&
+      physics.thermochemistry_max_substeps == defaults.thermochemistry_max_substeps &&
+      physics.thermochemistry_max_newton_iterations == defaults.thermochemistry_max_newton_iterations &&
+      physics.chemistry_shadow_max_cells == defaults.chemistry_shadow_max_cells &&
+      physics.uv_background_table_path == defaults.uv_background_table_path &&
+      physics.uv_background_table_sha256 == defaults.uv_background_table_sha256 &&
+      physics.metal_cooling_table_path == defaults.metal_cooling_table_path &&
+      physics.metal_cooling_table_sha256 == defaults.metal_cooling_table_sha256 &&
+      physics.ssp_yield_table_path == defaults.ssp_yield_table_path &&
+      physics.ssp_yield_table_sha256 == defaults.ssp_yield_table_sha256 &&
+      physics.chemistry_metallicity_scaled_dust_proxy == defaults.chemistry_metallicity_scaled_dust_proxy &&
+      physics.thermochemistry_allow_unqualified_rates == defaults.thermochemistry_allow_unqualified_rates &&
+      physics.ssp_stochastic_sn_events == defaults.ssp_stochastic_sn_events &&
+      physics.ssp_clustered_associations == defaults.ssp_clustered_associations;
+}
+}  // namespace
+
 std::string restartConfigurationCompatibilityRecord(
     const RestartReadResult& restart, const core::FrozenConfig& current) {
   const auto fail = [](std::string_view detail) -> void {
@@ -3358,6 +3424,8 @@ std::string restartConfigurationCompatibilityRecord(
       current.config.parallel.node_memory_admission != core::NodeMemoryAdmissionMode::kOff ||
       current.config.parallel.node_memory_budget_bytes != 0U ||
       current.config.parallel.node_memory_reserve_bytes != 0U ||
+      // CHUI Part 2 keys must hold their (physics-disabled) defaults.
+      !part2PhysicsKeysAtDefaults(current.config.physics) ||
       current.config.schema_version != 1 ||
       current.provenance.config_hash_hex != core::stableConfigHashHex(current.normalized_text)) {
     fail("new options must retain legacy defaults and global KDK must remain selected");
@@ -3403,6 +3471,69 @@ std::string restartConfigurationCompatibilityRecord(
       projected.erase(position + 1U, line_end - position);
     }
   };
+  // CHUI Part 2 (20261103) added the baryonic-physics key group below; all
+  // were verified above to hold their defaults (no Part 2 physics active).
+  if (projected.find("\nthermochemistry_backend = ") != std::string::npos &&
+      restart.normalized_config_text.find("\nthermochemistry_backend = ") == std::string::npos) {
+    removeKeyLines({
+        "thermochemistry_backend",
+        "metal_cooling_mode",
+        "metal_cooling_table_range",
+        "dust_model",
+        "ism_regime_model",
+        "sgs_turbulence_model",
+        "chemistry_adaptive_selection",
+        "stellar_population_model",
+        "fb_supernova_model",
+        "thermochemistry_relative_tolerance",
+        "thermochemistry_abundance_absolute_tolerance",
+        "thermochemistry_analytic_relaxation_time_years",
+        "thermochemistry_analytic_equilibrium_temperature_k",
+        "isrf_g0_habing",
+        "chemistry_shielding_length_max_pc",
+        "metal_cooling_switch_temperature_k",
+        "chemistry_primordial_helium_mass_fraction",
+        "dust_accretion_timescale_ref_years",
+        "dust_sputtering_timescale_ref_years",
+        "dust_sn_swept_mass_msun",
+        "dust_sn_destruction_efficiency",
+        "dust_agb_condensation_efficiency",
+        "dust_cc_condensation_efficiency",
+        "ism_jeans_resolution_cells",
+        "ism_regime_hysteresis_fraction",
+        "ism_regime_min_dwell_years",
+        "sgs_dissipation_coefficient",
+        "sgs_eddy_viscosity_coefficient",
+        "sgs_feedback_energy_fraction",
+        "chemistry_adaptive_hysteresis_fraction",
+        "chemistry_adaptive_min_dwell_years",
+        "chemistry_adaptive_cold_temperature_k",
+        "chemistry_adaptive_dense_nh_cm3",
+        "chemistry_shadow_sample_fraction",
+        "ssp_imf_mass_min_msun",
+        "ssp_imf_mass_max_msun",
+        "ssp_cc_mass_min_msun",
+        "ssp_cc_mass_max_msun",
+        "ssp_snia_per_msun",
+        "ssp_snia_delay_min_years",
+        "ssp_snia_delay_max_years",
+        "ssp_energy_per_sn_erg",
+        "ssp_reference_net_metal_yield",
+        "fb_presn_wind_momentum_lsun_per_c",
+        "thermochemistry_max_substeps",
+        "thermochemistry_max_newton_iterations",
+        "chemistry_shadow_max_cells",
+        "uv_background_table_path",
+        "uv_background_table_sha256",
+        "metal_cooling_table_path",
+        "metal_cooling_table_sha256",
+        "ssp_yield_table_path",
+        "ssp_yield_table_sha256",
+        "chemistry_metallicity_scaled_dust_proxy",
+        "thermochemistry_allow_unqualified_rates",
+        "ssp_stochastic_sn_events",
+        "ssp_clustered_associations"});
+  }
   if (projected.find("\nhydro_reconstruction = ") != std::string::npos &&
       restart.normalized_config_text.find("\nhydro_reconstruction = ") == std::string::npos) {
     removeKeyLines({"hydro_reconstruction", "hydro_slope_limiter", "hydro_integration_scheme",

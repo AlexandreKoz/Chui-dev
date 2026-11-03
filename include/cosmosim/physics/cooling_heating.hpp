@@ -76,13 +76,25 @@ class CoolingRateProvider {
 };
 
 struct CoolingIntegrationDiagnostics {
+  // Step attempts (accepted + rejected); bounded by max_subcycles.
   int subcycles_used = 0;
   double suggested_next_dt_code = 0.0;
+  // True iff the attempt budget ran out before the interval closed (F2).
   bool hit_subcycle_limit = false;
+  int accepted_substeps = 0;
+  int rejected_attempts = 0;
+  int floor_activations = 0;
+  double max_error_estimate = 0.0;
 };
 
+// CHUI Part 2 (audit F2): `completed` is true only when the whole requested
+// interval was integrated. An incomplete result returns the UNCHANGED input
+// energy and must be rejected by the caller.
 struct CoolingIntegrationResult {
   double specific_internal_energy_code = 0.0;
+  bool completed = false;
+  double requested_dt_code = 0.0;
+  double completed_dt_code = 0.0;
   CoolingIntegrationDiagnostics diagnostics;
 };
 

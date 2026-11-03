@@ -3,6 +3,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <span>
 #include <string>
 #include <vector>
@@ -136,6 +137,8 @@ struct StellarEvolutionStarBudget {
 struct StellarEvolutionStepCounters {
   std::uint64_t scanned_stars = 0;
   std::uint64_t evolved_stars = 0;
+  // Stars skipped because they were born at the end of this interval (F5).
+  std::uint64_t scanned_newborn_stars = 0;
   double returned_mass_code = 0.0;
   double returned_metals_code = 0.0;
   double newly_synthesized_metals_code = 0.0;
@@ -176,7 +179,20 @@ struct StellarEvolutionRuntimeView {
   std::array<std::span<double>, k_stellar_yield_channel_count> returned_metals_channel_cumulative_code;
   std::array<std::span<double>, k_stellar_yield_channel_count> feedback_energy_channel_cumulative_erg;
   std::span<double> particle_mass_code;
+  // CHUI Part 2 audit F5: birth chronology. Stars are created by the source
+  // stage at the END of the accepted interval [t_begin, t_end] (t_birth =
+  // t_end). A star whose birth_tick equals newborn_birth_tick was born at
+  // t_end of the interval being evolved and therefore has ZERO elapsed age
+  // in it: no mass return, yields, winds or SN energy for time before birth.
+  // UINT64_MAX disables the rule (legacy diagnostic callers).
+  std::span<const std::uint64_t> birth_tick;
+  std::uint64_t newborn_birth_tick = std::numeric_limits<std::uint64_t>::max();
 };
+
+// Elapsed stellar age (years) of one star inside an accepted interval of
+// interval_years, given its birth tick (F5 chronology rule above).
+[[nodiscard]] double stellarElapsedYearsInInterval(std::uint64_t birth_tick, std::uint64_t newborn_birth_tick,
+                                                   double interval_years) noexcept;
 
 class StellarEvolutionBookkeeper {
  public:
@@ -207,12 +223,16 @@ class StellarEvolutionBookkeeper {
   // detailed budgets remain available in workspace.budgets for event
   // construction within the same admitted capacity; no hidden heap vector is
   // grown. Diagnostic callers may keep using evaluateElapsedYears.
+  // newborn_birth_tick: F5 chronology (stars with that birth tick were born
+  // at the end of this interval and are not evolved). Production passes the
+  // current step's birth tick; UINT64_MAX keeps the legacy behaviour.
   [[nodiscard]] StellarEvolutionStepCounters evaluateElapsedYearsGoverned(
       const core::SimulationState& state,
       std::span<const std::uint32_t> active_star_indices,
       double elapsed_years,
       core::MemoryGovernor* governor,
-      StellarEvolutionBatchWorkspace& workspace) const;
+      StellarEvolutionBatchWorkspace& workspace,
+      std::uint64_t newborn_birth_tick = std::numeric_limits<std::uint64_t>::max()) const;
   void commitBudgets(
       core::SimulationState& state,
       const StellarEvolutionStepReport& report) const;

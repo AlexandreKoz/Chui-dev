@@ -222,6 +222,9 @@ void appendGasFields(WireWriter& out, const core::GasCellMigrationFields& fields
   out.f64(fields.metal_mass_code);
   out.f64(fields.temperature_code);
   out.f64(fields.sound_speed_code);
+  // CHUI Part 2 (particle wire v3 / AMR patch wire v4): composition payload.
+  out.u32(static_cast<std::uint32_t>(fields.composition_payload.size()));
+  for (const double value : fields.composition_payload) out.f64(value);
 }
 
 core::GasCellMigrationFields readGasFields(WireReader& in) {
@@ -248,6 +251,15 @@ core::GasCellMigrationFields readGasFields(WireReader& in) {
   fields.metal_mass_code = in.f64("gas_metal_mass_code");
   fields.temperature_code = in.f64("gas_temperature_code");
   fields.sound_speed_code = in.f64("gas_sound_speed_code");
+  const std::uint32_t composition_width = in.u32("gas_composition_payload_width");
+  // Bounded: the packed width is lanes + metadata of one manifest (< 4096).
+  if (composition_width > 4096U) {
+    throw std::runtime_error("gas composition payload width exceeds the wire bound");
+  }
+  fields.composition_payload.resize(composition_width);
+  for (std::uint32_t i = 0; i < composition_width; ++i) {
+    fields.composition_payload[i] = in.f64("gas_composition_payload_value");
+  }
   return fields;
 }
 

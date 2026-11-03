@@ -1,4 +1,5 @@
 #include "cosmosim/workflows/output_restart_runtime.hpp"
+#include "cosmosim/physics/baryon_composition.hpp"
 #include "cosmosim/workflows/runtime_services.hpp"
 #include "cosmosim/workflows/runtime_console_reporter.hpp"
 #include "cosmosim/workflows/analysis_runtime.hpp"
@@ -1411,6 +1412,13 @@ void OutputRestartRuntime::execute(OutputRestartStageView& view) {
   const bool checkpoint_now = m_pending_output.checkpoint_due && checkpoint_pm_aligned;
   if (m_pending_output.checkpoint_due && !checkpoint_now) {
     m_profiler.counters().addCount("io.restart.deferred_for_pm_cadence");
+  }
+  if (checkpoint_now) {
+    // CHUI Part 2: serialize the gas composition sidecar into its module
+    // block right before the checkpoint, so the restart payload (and its
+    // integrity digest) carries it. Only a serialized image; the sidecar
+    // stays the single live authority.
+    physics::packGasCompositionIntoModuleSidecar(context.state);
   }
   const bool output_flushed = maybeWriteOutputs(
       m_frozen_config,

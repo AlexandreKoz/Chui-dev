@@ -27,6 +27,9 @@
 #include "cosmosim/core/profiling.hpp"
 #include "cosmosim/core/units.hpp"
 #include "cosmosim/physics/cooling_heating.hpp"
+#include "cosmosim/physics/baryon_composition.hpp"
+#include "cosmosim/physics/baryonic_runtime_config.hpp"
+#include "cosmosim/physics/composition_transport.hpp"
 #include "cosmosim/physics/effective_multiphase_ism.hpp"
 #include "cosmosim/hydro/gas_thermodynamic_refresh.hpp"
 #include "cosmosim/hydro/hydro_boundary_conditions.hpp"
@@ -142,14 +145,27 @@ class SimulationStateHydroSourcePropertyProvider final
       const core::SimulationState& state,
       const core::UnitSystem& units,
       double density_floor_code,
-      double density_frame_factor)
+      double density_frame_factor,
+      std::span<const std::uint32_t> dense_row_by_geometry_row)
       : m_state(state),
         m_units(units),
         m_density_floor_code(density_floor_code),
-        m_density_frame_factor(density_frame_factor) {}
+        m_density_frame_factor(density_frame_factor),
+        m_dense_row_by_geometry_row(dense_row_by_geometry_row) {}
 
+  // HydroCoreSolver passes SOLVER GEOMETRY rows. CHUI Part 2 audit repair
+  // (supplementary risk "cooling geometry row permutation"): the previous
+  // provider indexed SimulationState dense rows with the geometry row, so any
+  // layout whose geometry order differed from dense storage order cooled each
+  // cell with another cell's density/temperature/metallicity. The geometry
+  // row is now translated through the authoritative layout map.
   [[nodiscard]] hydro::HydroCellSourceProperties sourcePropertiesForCell(
-      std::size_t cell_index) const override {
+      std::size_t geometry_row) const override {
+    if (geometry_row >= m_dense_row_by_geometry_row.size()) {
+      throw std::out_of_range(
+          "SimulationStateHydroSourcePropertyProvider geometry row is outside the Cartesian layout map");
+    }
+    const std::size_t cell_index = m_dense_row_by_geometry_row[geometry_row];
     if (cell_index >= m_state.cells.size() || cell_index >= m_state.gas_cells.size()) {
       throw std::out_of_range(
           "SimulationStateHydroSourcePropertyProvider cell index is outside gas state");
@@ -180,6 +196,7 @@ class SimulationStateHydroSourcePropertyProvider final
   const core::UnitSystem& m_units;
   double m_density_floor_code = 0.0;
   double m_density_frame_factor = 1.0;
+  std::span<const std::uint32_t> m_dense_row_by_geometry_row;
 };
 [[nodiscard]] internal::CartesianGasCellRowLayout requireCartesianGasCellRowLayout(
     const core::SimulationState& state,
@@ -475,7 +492,11 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
         m_solver(k_gamma_adiabatic, hydroNumericsPolicyFromConfig(config)),
         m_reconstruction(makeConfiguredReconstruction(config, {0.0, 0.0, 0.0})),
         m_riemann_solver(hydro::makeHydroRiemannSolver(hydroRiemannSolverKindFromConfig(config))) {
-    if (m_config.physics.enable_cooling) {
+    // CHUI Part 2: one owner per physical source. A Part 2 thermochemistry
+    // backend is advanced by the SourceRuntime thermochemistry stage; the
+    // legacy in-solver cooling source is then NOT registered (no double
+    // cooling). legacy_cooling keeps the (F2-repaired) in-solver path.
+    if (m_config.physics.enable_cooling && !physics::part2ThermochemistrySelected(m_config.physics)) {
       constexpr double k_mean_molecular_weight_ionized = 0.59;
       constexpr double k_proton_mass_kg = 1.67262192369e-27;
       constexpr double k_boltzmann_j_per_k = 1.380649e-23;
@@ -713,6 +734,8 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
       return m_mpi_context.allreduceSumUint64(local_has_hydro_cells);
     };
     m_current_world_rank = static_cast<std::uint32_t>(std::max(m_mpi_context.worldRank(), 0));
+    // CHUI Part 2: composition must exist before the first transport.
+    (void)physics::ensureGasCompositionInitialized(context.state, m_config.physics);
     m_last_ghost_refresh = internal::refreshParticleGhostsForSolver(
         context, m_mpi_context, "hydro.godunov", &m_ghost_cache_lifecycle);
     // sent_bytes/received_bytes are traffic counters, not resident-memory
@@ -894,7 +917,8 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
         context.state,
         m_units,
         m_config.numerics.hydro_density_floor_code,
-        density_frame_factor);
+        density_frame_factor,
+        m_dense_row_by_geometry_row);
     hydro::HydroSourceContext source_context{
         .update = update,
         .gravity_accel_x_peculiar = {},
@@ -922,19 +946,48 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
     }
     const hydro::HydroActiveBatchPolicy active_batch_policy = selectHydroActiveBatchPolicy();
     auto active_batch_reservation = reserveHydroActiveBatch(active_batch_policy);
-    m_solver.advancePatchActiveSetBatchedWithScratch(
-        m_conserved,
-        m_geometry,
-        active_view,
-        update,
-        *m_reconstruction,
-        *m_riemann_solver,
-        sources,
-        source_context,
-        m_scratch,
-        nullptr,
-        active_batch_policy,
-        &m_last_hydro_profile);
+    // CHUI Part 2: composition lanes are advected with the final hydro mass
+    // flux (physics::CompositionFluxAccumulator). Deltas are staged and
+    // committed inside the same StageTransaction as the hydro state.
+    std::unique_ptr<physics::CompositionFluxAccumulator> composition_flux;
+    core::MemoryReservation composition_transport_reservation;
+    if (context.state.gas_composition.enabled()) {
+      composition_flux = std::make_unique<physics::CompositionFluxAccumulator>(context.state);
+      if (m_memory_governor != nullptr) {
+        composition_transport_reservation = m_memory_governor->reserve(
+            core::MemoryClass::kPhaseResident,
+            physics::CompositionFluxAccumulator::deltaBufferBytes(
+                context.state.gas_composition.laneCount(), context.state.cells.size()),
+            "hydro.composition_transport.delta_buffer");
+      }
+      source_context.face_mass_flux_sink = composition_flux.get();
+      composition_flux->beginAdvance(m_geometry, m_dense_row_by_geometry_row, {});
+    }
+    // Audit F2: a source that cannot integrate the full accepted interval
+    // throws StageNumericalRetryRequest from inside the solver. The solver
+    // only writes the staging copy m_conserved, so the failure is converted
+    // into a transaction rejection below; SimulationState stays untouched.
+    std::string source_retry_failure;
+    try {
+      m_solver.advancePatchActiveSetBatchedWithScratch(
+          m_conserved,
+          m_geometry,
+          active_view,
+          update,
+          *m_reconstruction,
+          *m_riemann_solver,
+          sources,
+          source_context,
+          m_scratch,
+          nullptr,
+          active_batch_policy,
+          &m_last_hydro_profile);
+    } catch (const core::StageNumericalRetryRequest& retry) {
+      source_retry_failure = retry.what();
+    }
+    if (composition_flux != nullptr) {
+      composition_flux->endAdvance();
+    }
     if (context.profiler_session != nullptr) {
       const hydro::HydroConservationReport& conservation = m_last_hydro_profile.conservation;
       context.profiler_session->recordEvent(core::RuntimeEvent{
@@ -1060,8 +1113,25 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
       hydro_transaction.adoptReservation(std::move(*active_batch_reservation));
       active_batch_reservation.reset();
     }
+    if (composition_transport_reservation.pending()) {
+      hydro_transaction.adoptReservation(std::move(composition_transport_reservation));
+    }
     std::string staged_failure;
-    const bool staged_admissible = stagedConservedStateIsAdmissible(staged_failure);
+    bool staged_admissible = source_retry_failure.empty() &&
+        stagedConservedStateIsAdmissible(staged_failure);
+    if (!source_retry_failure.empty()) {
+      staged_failure = "hydro source interval incomplete: " + source_retry_failure;
+    }
+    if (staged_admissible && composition_flux != nullptr) {
+      // Composition deltas use the step-start sidecar and need the
+      // post-hydro mass only for reconciliation inside commit().
+      try {
+        composition_flux->prepare(context.state);
+      } catch (const std::exception& error) {
+        staged_admissible = false;
+        staged_failure = std::string("composition transport: ") + error.what();
+      }
+    }
     if (!hydro_transaction.validate(
             staged_admissible, core::StageRejectionKind::kNumericalRetry, staged_failure)) {
       throw core::StageTransactionRejected(
@@ -1118,8 +1188,17 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
           primitive.specific_internal_energy_code;
       context.state.gas_cells.sound_speed_code[cell_index] =
           std::sqrt(std::max(primitive.signal_speed_squared_code, 0.0));
+      double temperature_factor = m_temperature_k_per_internal_energy_code;
+      if (context.state.gas_composition.enabled()) {
+        // CHUI Part 2: composition-dependent mu (amu) from thermochemistry.
+        const double mu_amu = context.state.gas_composition.mean_molecular_weight[cell_index];
+        if (std::isfinite(mu_amu) && mu_amu > 0.0) {
+          temperature_factor *= mu_amu * (1.66053906660e-24 / 1.67262192369e-24) /
+              hydro::k_part1_reference_mean_molecular_weight;
+        }
+      }
       context.state.gas_cells.temperature_code[cell_index] =
-          m_temperature_k_per_internal_energy_code * primitive.specific_internal_energy_code;
+          temperature_factor * primitive.specific_internal_energy_code;
       context.state.cells.mass_code[cell_index] = primitive.rho_comoving * m_geometry.cell_volume_comoving;
       context.state.gas_cells.metal_mass_code[cell_index] =
           std::clamp(primitive.metallicity_mass_fraction, 0.0, 1.0) *
@@ -1127,6 +1206,12 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
       context.state.gas_cells.velocity_x_peculiar[cell_index] = primitive.vel_x_peculiar;
       context.state.gas_cells.velocity_y_peculiar[cell_index] = primitive.vel_y_peculiar;
       context.state.gas_cells.velocity_z_peculiar[cell_index] = primitive.vel_z_peculiar;
+    }
+    if (composition_flux != nullptr) {
+      m_last_composition_transport = composition_flux->commit(context.state);
+      // Z is a derived mirror of element (+dust) inventory when composition
+      // is authoritative: the hydro passive metal lane is overwritten.
+      (void)physics::synchronizeMetalMirrorFromComposition(context.state, std::span<const std::uint32_t>{});
     }
     });
 
@@ -1777,7 +1862,7 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
             : 1.0;
     const double physical_density_cgs_per_density_code =
         m_units.densityCodeToCgs(density_frame_factor);
-    const hydro::HydroSourceContext source_context{
+    hydro::HydroSourceContext source_context{
         .update = update,
         .gravity_accel_x_peculiar = {},
         .gravity_accel_y_peculiar = {},
@@ -1836,6 +1921,24 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
     std::size_t remote_flux_register_count = 0;
     std::size_t inbound_flux_register_count = 0;
     parallel::DirectedAmrExchangeDiagnostics directed_amr_diagnostics{};
+    // CHUI Part 2 composition transport on the production AMR path. The
+    // distributed path would need remote composition ghosts and composition
+    // reflux payloads, which are Part 3 deliverables: refuse collectively
+    // BEFORE any patch advances instead of silently dropping species.
+    std::unique_ptr<physics::CompositionFluxAccumulator> composition_flux;
+    {
+      const std::uint64_t composition_ranks = m_mpi_context.allreduceSumUint64(
+          context.state.gas_composition.enabled() ? 1ULL : 0ULL);
+      if (composition_ranks > 0U && m_mpi_context.isEnabled() && m_mpi_context.worldSize() > 1) {
+        throw std::runtime_error(
+            "distributed production AMR hydro with an enabled CHUI composition sidecar is not supported "
+            "until Part 3 adds remote composition ghosts and composition reflux payloads (fail closed)");
+      }
+      if (context.state.gas_composition.enabled()) {
+        composition_flux = std::make_unique<physics::CompositionFluxAccumulator>(context.state);
+        source_context.face_mass_flux_sink = composition_flux.get();
+      }
+    }
     if (m_mpi_context.isEnabled() && m_mpi_context.worldSize() > 1) {
       const auto local_patch_records =
           internal::buildMigrationAmrPatchPayloadRecords(
@@ -2277,6 +2380,14 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
           amr_options);
     }
     m_last_amr_hydro_diagnostics = amr_diagnostics;
+    if (composition_flux != nullptr) {
+      // AMR is not transactional yet (Part 3): patches already scattered, so
+      // the composition update is prepared (may throw = hard stage failure)
+      // and committed immediately after the hydro sweep.
+      composition_flux->prepare(context.state);
+      m_last_composition_transport = composition_flux->commit(context.state);
+      (void)physics::synchronizeMetalMirrorFromComposition(context.state, std::span<const std::uint32_t>{});
+    }
     m_communication_high_water_bytes = std::max(
         m_communication_high_water_bytes,
         directed_amr_diagnostics.communication_workspace_high_water_bytes);
@@ -2653,6 +2764,7 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
   std::unique_ptr<hydro::HydroReconstruction> m_reconstruction;
   std::unique_ptr<hydro::HydroRiemannSolver> m_riemann_solver;
   std::unique_ptr<physics::CoolingHeatingSource> m_cooling_source;
+  physics::CompositionTransportCommitReport m_last_composition_transport{};
   std::unique_ptr<physics::EffectiveIsmThermodynamicClosure> m_effective_ism_closure;
   std::unique_ptr<physics::EffectiveIsmEnergyRelaxationSource> m_effective_ism_energy_source;
   hydro::HydroConservedStateSoa m_conserved;

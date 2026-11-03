@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "cosmosim/core/checked_arithmetic.hpp"
+#include "cosmosim/core/gas_composition_sidecar.hpp"
 #include "cosmosim/core/particle_species.hpp"
 #include "cosmosim/core/soa_storage.hpp"
 
@@ -679,6 +680,10 @@ struct GasCellMigrationFields {
   double metal_mass_code = 0.0;
   double temperature_code = 0.0;
   double sound_speed_code = 0.0;
+  // CHUI Part 2: packed composition row (GasCompositionSidecar::packRow);
+  // empty when composition is disabled, so legacy/DMO records allocate
+  // nothing. The width is validated against the receiving layout.
+  std::vector<double> composition_payload;
 };
 
 struct GasCellMigrationRecord {
@@ -929,6 +934,10 @@ class SimulationState {
   TracerParticleSidecar tracers;
   StateMetadata metadata;
   ModuleSidecarRegistry sidecars;
+  // CHUI Part 2 optional element/species/dust/SGS composition, row-aligned
+  // with gas rows and identity-mirrored by gas_cell_id (zero allocation when
+  // disabled). See gas_composition_sidecar.hpp.
+  GasCompositionSidecar gas_composition;
 
   void resizeParticles(std::size_t count);
   void resizeCells(std::size_t count);

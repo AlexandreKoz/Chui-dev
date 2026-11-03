@@ -209,39 +209,77 @@ void EffectiveMultiphaseEosTable::computeSignalSpeedDerivative() {
 }
 
 EffectiveMultiphaseEosLookup EffectiveMultiphaseEosTable::lookup(double density_phys_code) const {
+  // CHUI Part 2 audit repair (supplementary risk "EOS table edges"):
+  //  * u_eff is interpolated linearly in ln(rho) inside the table, and the
+  //    signal speed is the EXACT derivative of the same interpolant,
+  //      c^2 = dP/drho = (gamma - 1) (u + du/dln rho),
+  //    instead of an independently interpolated finite-difference node value
+  //    (which was inconsistent with the reconstructed pressure);
+  //  * above the tabulated density the former code CLAMPED u to the last node
+  //    (a silent P ~ rho extrapolation with a mismatched sound speed). It now
+  //    continues the last segment's power law u ~ rho^s, s = max(0, slope),
+  //    flags `extrapolated`, and keeps P and c^2 consistent and positive;
+  //  * below the threshold the closure does not apply (unchanged), and the
+  //    threshold node equals the isothermal anchor (continuity, unchanged).
   EffectiveMultiphaseEosLookup result;
   if (!std::isfinite(density_phys_code) || density_phys_code < m_threshold_density_phys_code) {
     return result;
   }
   result.above_threshold = true;
-  const double ratio = std::clamp(
-      density_phys_code / m_threshold_density_phys_code, 1.0, m_config.max_density_ratio);
-  const double position = std::log(ratio) / std::log(m_config.max_density_ratio) *
-      static_cast<double>(m_entries.size() - 1U);
-  const std::size_t left = std::min<std::size_t>(
-      static_cast<std::size_t>(std::floor(position)), m_entries.size() - 1U);
-  const std::size_t right = std::min(left + 1U, m_entries.size() - 1U);
-  const double fraction = std::clamp(position - static_cast<double>(left), 0.0, 1.0);
-  const auto lerp = [&](double a, double b) { return a + fraction * (b - a); };
+  const double gm1 = m_config.adiabatic_index - 1.0;
+  const double ratio = density_phys_code / m_threshold_density_phys_code;
+  const double log_max = std::log(m_config.max_density_ratio);
+  const std::size_t last = m_entries.size() - 1U;
+  const double node_step = log_max / static_cast<double>(last);
+  const double position = std::log(ratio) / node_step;
+  std::size_t left = 0U;
+  double fraction = 0.0;
+  if (ratio >= m_config.max_density_ratio) {
+    left = last - 1U;
+    fraction = position - static_cast<double>(left);  // > 1: extrapolation along the last segment
+    result.extrapolated = ratio > m_config.max_density_ratio;
+  } else {
+    left = std::min<std::size_t>(static_cast<std::size_t>(std::floor(position)), last - 1U);
+    fraction = std::clamp(position - static_cast<double>(left), 0.0, 1.0);
+  }
+  const std::size_t right = left + 1U;
   const EffectiveMultiphaseEosEntry& a = m_entries[left];
   const EffectiveMultiphaseEosEntry& b = m_entries[right];
+  const auto lerp = [&](double x, double y) { return x + std::clamp(fraction, 0.0, 1.0) * (y - x); };
+  double u = 0.0;
+  double du_dlnrho = 0.0;
+  if (!result.extrapolated) {
+    u = a.specific_internal_energy_eff_code +
+        fraction * (b.specific_internal_energy_eff_code - a.specific_internal_energy_eff_code);
+    du_dlnrho = (b.specific_internal_energy_eff_code - a.specific_internal_energy_eff_code) / node_step;
+  } else {
+    const double slope = std::max(0.0,
+        std::log(std::max(b.specific_internal_energy_eff_code, k_small) /
+                 std::max(a.specific_internal_energy_eff_code, k_small)) / node_step);
+    u = b.specific_internal_energy_eff_code * std::pow(ratio / m_config.max_density_ratio, slope);
+    du_dlnrho = slope * u;
+  }
+  double c_squared = gm1 * (u + du_dlnrho);
+  if (!std::isfinite(c_squared) || c_squared <= 0.0) {
+    c_squared = m_config.adiabatic_index * gm1 * u;  // positive fallback (decreasing u segment)
+  }
   result.entry = EffectiveMultiphaseEosEntry{
       .density_phys_code = density_phys_code,
       .density_ratio = ratio,
-      .cold_mass_fraction = std::clamp(lerp(a.cold_mass_fraction, b.cold_mass_fraction), 0.0, 1.0),
-      .specific_internal_energy_hot_code = lerp(a.specific_internal_energy_hot_code, b.specific_internal_energy_hot_code),
-      .specific_internal_energy_eff_code = lerp(a.specific_internal_energy_eff_code, b.specific_internal_energy_eff_code),
-      .pressure_phys_code = lerp(a.pressure_phys_code, b.pressure_phys_code),
-      .signal_speed_squared_code = std::max(lerp(a.signal_speed_squared_code, b.signal_speed_squared_code), k_small),
-      .star_formation_timescale_code = lerp(a.star_formation_timescale_code, b.star_formation_timescale_code),
-      .cooling_timescale_code = lerp(a.cooling_timescale_code, b.cooling_timescale_code),
+      .cold_mass_fraction = std::clamp(result.extrapolated ? b.cold_mass_fraction
+                                                           : lerp(a.cold_mass_fraction, b.cold_mass_fraction),
+                                       0.0, 1.0),
+      .specific_internal_energy_hot_code = result.extrapolated ? b.specific_internal_energy_hot_code
+          : lerp(a.specific_internal_energy_hot_code, b.specific_internal_energy_hot_code),
+      .specific_internal_energy_eff_code = u,
+      .pressure_phys_code = gm1 * density_phys_code * u,
+      .signal_speed_squared_code = std::max(c_squared, k_small),
+      .star_formation_timescale_code = m_config.t_star_at_threshold_code / std::sqrt(ratio),
+      .cooling_timescale_code = result.extrapolated ? b.cooling_timescale_code
+          : lerp(a.cooling_timescale_code, b.cooling_timescale_code),
       .valid = a.valid && b.valid,
   };
-  // Pressure is reconstructed at the requested density using interpolated u,
-  // avoiding a density mismatch between table nodes.
-  result.entry.pressure_phys_code = (m_config.adiabatic_index - 1.0) *
-      density_phys_code * result.entry.specific_internal_energy_eff_code;
-  result.valid = result.entry.valid && result.entry.specific_internal_energy_eff_code > 0.0 &&
+  result.valid = result.entry.valid && std::isfinite(u) && u > 0.0 &&
       result.entry.signal_speed_squared_code > 0.0;
   return result;
 }
@@ -349,12 +387,24 @@ hydro::HydroConservedState EffectiveIsmEnergyRelaxationSource::sourceForCell(
     const hydro::HydroPrimitiveState& primitive,
     const hydro::HydroSourceContext& context) const {
   hydro::HydroConservedState source;
+  if (!hydro::effectiveClosureAllowed(context, cell_index)) {
+    return source;  // resolved regime owns this cell (CHUI Part 2 regime gate)
+  }
   const hydro::HydroThermodynamicClosureResult closure = m_closure.evaluate(
       cell_index,
       conserved,
       primitive,
       context.update.scale_factor,
       context.redshift);
+  // CHUI Part 2 audit repair (supplementary risk "relaxation + cooling
+  // double count"): the relaxation acts ONLY on cells the closure places in
+  // the effective regime. Gas hot above the EOS (closure.uses_effective_ism
+  // false) is resolved gas whose thermal evolution belongs to the ordinary
+  // cooling source; the former finite-timescale branch also relaxed it
+  // downward, so both the cooling source and this source removed its energy.
+  if (!closure.uses_effective_ism) {
+    return source;
+  }
   const double target_u = closure.target_specific_internal_energy_code;
   const double actual_u = primitive.specific_internal_energy_code;
   if (!std::isfinite(target_u) || target_u <= 0.0 || !std::isfinite(actual_u) || actual_u <= 0.0 ||

@@ -100,6 +100,9 @@ void SimulationState::resizeCells(std::size_t count) {
   (void)checkedLocalCount(count, kMaxLocalCellCount, "gas-cell", "SimulationState::resizeCells");
   cells.resize(count);
   gas_cells.resize(count);
+  // Composition rows follow gas rows; callers that resize must re-establish
+  // gas_cell_id mirrors (requireAlignedWith() refuses stale rows).
+  gas_composition.resizeRows(count);
   gas_cell_identity.clear();
   bumpCellIndexGeneration();
 }

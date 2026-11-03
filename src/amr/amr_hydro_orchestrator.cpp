@@ -786,6 +786,16 @@ void commitProductionAmrCandidate(
   static_assert(std::is_nothrow_move_assignable_v<core::PatchSoa>);
   static_assert(std::is_nothrow_move_assignable_v<core::GasCellIdentityMap>);
 
+  if (state.gas_composition.enabled()) {
+    // CHUI Part 2 fail-closed boundary: the conservative composition
+    // prolongation/restriction kernels exist (physics::prolongComposition /
+    // physics::restrictComposition) but regrid row construction does not yet
+    // carry them; wiring them into runtime refinement is Part 3 (audit F6).
+    // Refuse before any mutation instead of erasing species/dust lanes.
+    throw std::runtime_error(
+        "production AMR regrid with an enabled gas composition sidecar is not supported until Part 3 "
+        "wires conservative composition prolongation/restriction into regrid; refusing before mutation");
+  }
   admission.reservation.commit();
   state.cells = std::move(candidate.cells);
   state.gas_cells = std::move(candidate.gas_cells);
@@ -2499,7 +2509,8 @@ struct AmrSynchronizedSweepWorkspace {
         .metallicity_mass_fraction = metallicity,
         .temperature_k = temperature,
         .thermodynamic_closure = global_source_context.thermodynamic_closure,
-        .redshift = global_source_context.redshift};
+        .redshift = global_source_context.redshift,
+        .face_mass_flux_sink = global_source_context.face_mass_flux_sink};
 
     const auto widths = cellWidths(patch_geometry.patch);
     // Audit F1 follow-up: predictor Courant factors are dt/(a dx), matching
@@ -2530,6 +2541,30 @@ struct AmrSynchronizedSweepWorkspace {
     auto& scratch = sweep_workspace.scratch;
     const std::uint64_t scratch_capacity_before = scratch.ownedCapacityBytes();
     hydro::HydroProfileEvent profile;
+    // CHUI Part 2 composition transport: resolve this patch's real rows and
+    // ghost sources into stable local identities for the face mass sink.
+    std::vector<std::uint32_t> composition_dense_rows;
+    std::vector<std::uint64_t> composition_ghost_origins;
+    if (global_source_context.face_mass_flux_sink != nullptr) {
+      composition_dense_rows.resize(patch_geometry.geometry.cellCount(), core::kInvalidGasCellRow);
+      for (const AmrHydroCellDescriptor& cell : patch_geometry.real_cells) {
+        if (cell.patch_local_cell < composition_dense_rows.size()) {
+          composition_dense_rows[cell.patch_local_cell] = cell.local_cell_row;
+        }
+      }
+      composition_ghost_origins.assign(patch_geometry.geometry.ghost_cells.size(), 0U);
+      for (const AmrHydroGhostDescriptor& ghost : patch_geometry.ghosts) {
+        if (ghost.ghost_slot < composition_ghost_origins.size()) {
+          composition_ghost_origins[ghost.ghost_slot] = ghost.source_gas_cell_id;
+        }
+      }
+      global_source_context.face_mass_flux_sink->beginAdvance(
+          patch_geometry.geometry, composition_dense_rows, composition_ghost_origins);
+    }
+    struct CompositionSinkScope {
+      hydro::HydroFaceMassFluxSink* sink;
+      ~CompositionSinkScope() { if (sink != nullptr) sink->endAdvance(); }
+    } composition_sink_scope{global_source_context.face_mass_flux_sink};
     solver.advancePatchActiveSetBatchedWithScratch(
         conserved_state,
         patch_geometry.geometry,

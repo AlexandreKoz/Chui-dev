@@ -1,6 +1,10 @@
 #include "cosmosim/physics/star_formation.hpp"
 
+#include "cosmosim/physics/baryon_composition.hpp"
+#include "cosmosim/physics/stellar_population.hpp"
+
 #include <algorithm>
+#include <optional>
 #include <array>
 #include <cmath>
 #include <cstddef>
@@ -1112,6 +1116,17 @@ StarFormationStepReport StarFormationModel::applyFromInputs(
   state.resizeParticles(old_particle_count + total_new_particles);
   state.star_particles.resize(old_star_count + total_new_particles);
 
+  // CHUI Part 2: element-resolved birth composition. Stars are a material
+  // reservoir: the removed fraction of every gas element, dust solid and SGS
+  // energy lane leaves the cell (exact proportional removal) and the star
+  // records its birth element mixture in chui_stellar_population_v1.
+  const bool composition = state.gas_composition.enabled();
+  std::optional<CompositionLayout> composition_layout;
+  std::optional<StellarPopulationStore> population;
+  if (composition) {
+    composition_layout = CompositionLayout::fromDescriptor(state.gas_composition.descriptor());
+    population.emplace(state);
+  }
   std::size_t append_offset = 0U;
   for (const StarBirthPlan& plan : plans) {
     const double removal_fraction = plan.total_spawn_mass_code /
@@ -1124,6 +1139,18 @@ StarFormationStepReport StarFormationModel::applyFromInputs(
     state.gas_cells.pressure_code[plan.local_cell_row] = plan.parent_pressure_code * remaining_fraction;
     state.gas_cells.metal_mass_code[plan.local_cell_row] =
         std::max(0.0, plan.parent_metal_mass_code - removed_metal_mass);
+    std::array<double, k_chemical_element_count> birth_x{};
+    if (composition) {
+      const auto removed = removeGasFractionFromComposition(
+          state.gas_composition, *composition_layout, plan.local_cell_row, std::clamp(removal_fraction, 0.0, 1.0));
+      double removed_total = 0.0;
+      for (const double m : removed) removed_total += m;
+      for (std::size_t e = 0; e < k_chemical_element_count; ++e) {
+        birth_x[e] = removed_total > 0.0 ? removed[e] / removed_total : 0.0;
+      }
+      const std::uint32_t row = plan.local_cell_row;
+      (void)synchronizeMetalMirrorFromComposition(state, std::span<const std::uint32_t>(&row, 1U));
+    }
     // velocity, temperature, sound speed, and specific internal energy remain unchanged
     // under proportional removal. Conserved momentum/energy are therefore reduced by
     // exactly the mass-proportional ledgers below when hydro rebuilds its conserved view.
@@ -1179,6 +1206,12 @@ StarFormationStepReport StarFormationModel::applyFromInputs(
         state.star_particles.stellar_returned_metals_channel_cumulative_code[channel][star_index] = 0.0;
         state.star_particles.stellar_feedback_energy_channel_cumulative_erg[channel][star_index] = 0.0;
       }
+      if (population.has_value()) {
+        // Birth epoch: the end of the accepted interval (t_birth = t_end;
+        // F5 chronology). Event stream keyed by the immutable birth key.
+        population->put(new_particle_ids[append_offset],
+                        makeStellarPopulationRecord(birth_x, m_birth_time_code, new_birth_keys[append_offset]));
+      }
       report.birth_keys.push_back(new_birth_keys[append_offset]);
       ++append_offset;
     }
@@ -1232,6 +1265,7 @@ StarFormationStepReport StarFormationModel::applyFromInputs(
   state.species.count_by_species[static_cast<std::size_t>(core::ParticleSpecies::kStar)] +=
       report.counters.spawned_particles;
   state.rebuildSpeciesIndex();
+  if (population.has_value()) population->store(state);
   StarFormationCounters cumulative = cumulativeCountersFromState(state);
   accumulateStarFormationCounters(cumulative, report.counters);
   state.sidecars.upsert(buildMetadataSidecar(
