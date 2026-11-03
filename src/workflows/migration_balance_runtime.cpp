@@ -328,6 +328,11 @@ void rebuildLocalGasStateFromParticleIds(
     rebuilt_patches.owning_rank[patch_index] = metadata.owning_rank;
   }
 
+  if (state.gas_composition.enabled()) {
+    throw std::runtime_error(
+        "rebuildLocalGasStateFromParticleIds (legacy particle-bound gas import) cannot carry the CHUI "
+        "gas composition sidecar; use gas-cell-ID migration (commitGasCellMigration/commitAmrPatchMigration)");
+  }
   state.cells = std::move(rebuilt_cells);
   state.gas_cells = std::move(rebuilt_gas);
   state.patches = std::move(rebuilt_patches);

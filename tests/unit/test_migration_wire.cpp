@@ -48,7 +48,7 @@ void testDarkMatterWireIsConditionalAndExplicit() {
 
   // Wire version and particle ID are little-endian field encodings, not native
   // struct bytes/padding.
-  assert(encoded[0] == 2U && encoded[1] == 0U && encoded[2] == 0U && encoded[3] == 0U);
+  assert(encoded[0] == 3U && encoded[1] == 0U && encoded[2] == 0U && encoded[3] == 0U);
   assert(encoded[4] == 0x08U);
   assert(encoded[11] == 0x01U);
 

@@ -494,6 +494,7 @@ add_library(cosmosim_core STATIC
   src/core/units.cpp
   src/core/simulation_state.cpp
   src/core/simulation_state_structures.cpp
+  src/core/gas_composition_sidecar.cpp
   src/core/simulation_state_ownership.cpp
   src/core/simulation_state_species.cpp
   src/core/simulation_state_metadata.cpp
@@ -573,7 +574,9 @@ add_library(cosmosim_physics STATIC
   src/physics/stellar_evolution.cpp
   src/physics/stellar_feedback.cpp
   src/physics/metal_diffusion.cpp
-  src/physics/tracer_support.cpp)
+  src/physics/tracer_support.cpp
+  src/physics/baryon_composition.cpp
+  src/physics/source_interval.cpp)
 add_library(cosmosim_io STATIC
   src/io/internal/io_contract.cpp
   src/io/transactional_file.cpp
@@ -1314,6 +1317,12 @@ if(COSMOSIM_ENABLE_TESTS)
   target_link_libraries(test_unit_migration_wire PRIVATE cosmosim_workflows)
   add_test(NAME unit_migration_wire COMMAND test_unit_migration_wire)
   cosmosim_mark_runtime_truth_test(unit_migration_wire migration memory)
+
+  # CHUI Part 2 composition substrate (NOT RUN — USER-RESERVED).
+  add_executable(test_unit_gas_composition_substrate tests/unit/test_gas_composition_substrate.cpp)
+  target_include_directories(test_unit_gas_composition_substrate PRIVATE ${PROJECT_SOURCE_DIR}/src)
+  target_link_libraries(test_unit_gas_composition_substrate PRIVATE cosmosim_workflows)
+  add_test(NAME unit_gas_composition_substrate COMMAND test_unit_gas_composition_substrate)
 
   add_executable(test_integration_gas_cell_identity_migration tests/integration/test_gas_cell_identity_migration.cpp)
   target_link_libraries(test_integration_gas_cell_identity_migration PRIVATE cosmosim_core)

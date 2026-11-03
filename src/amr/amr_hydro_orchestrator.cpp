@@ -786,6 +786,16 @@ void commitProductionAmrCandidate(
   static_assert(std::is_nothrow_move_assignable_v<core::PatchSoa>);
   static_assert(std::is_nothrow_move_assignable_v<core::GasCellIdentityMap>);
 
+  if (state.gas_composition.enabled()) {
+    // CHUI Part 2 fail-closed boundary: the conservative composition
+    // prolongation/restriction kernels exist (physics::prolongComposition /
+    // physics::restrictComposition) but regrid row construction does not yet
+    // carry them; wiring them into runtime refinement is Part 3 (audit F6).
+    // Refuse before any mutation instead of erasing species/dust lanes.
+    throw std::runtime_error(
+        "production AMR regrid with an enabled gas composition sidecar is not supported until Part 3 "
+        "wires conservative composition prolongation/restriction into regrid; refusing before mutation");
+  }
   admission.reservation.commit();
   state.cells = std::move(candidate.cells);
   state.gas_cells = std::move(candidate.gas_cells);

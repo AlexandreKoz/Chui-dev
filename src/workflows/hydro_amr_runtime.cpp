@@ -142,14 +142,27 @@ class SimulationStateHydroSourcePropertyProvider final
       const core::SimulationState& state,
       const core::UnitSystem& units,
       double density_floor_code,
-      double density_frame_factor)
+      double density_frame_factor,
+      std::span<const std::uint32_t> dense_row_by_geometry_row)
       : m_state(state),
         m_units(units),
         m_density_floor_code(density_floor_code),
-        m_density_frame_factor(density_frame_factor) {}
+        m_density_frame_factor(density_frame_factor),
+        m_dense_row_by_geometry_row(dense_row_by_geometry_row) {}
 
+  // HydroCoreSolver passes SOLVER GEOMETRY rows. CHUI Part 2 audit repair
+  // (supplementary risk "cooling geometry row permutation"): the previous
+  // provider indexed SimulationState dense rows with the geometry row, so any
+  // layout whose geometry order differed from dense storage order cooled each
+  // cell with another cell's density/temperature/metallicity. The geometry
+  // row is now translated through the authoritative layout map.
   [[nodiscard]] hydro::HydroCellSourceProperties sourcePropertiesForCell(
-      std::size_t cell_index) const override {
+      std::size_t geometry_row) const override {
+    if (geometry_row >= m_dense_row_by_geometry_row.size()) {
+      throw std::out_of_range(
+          "SimulationStateHydroSourcePropertyProvider geometry row is outside the Cartesian layout map");
+    }
+    const std::size_t cell_index = m_dense_row_by_geometry_row[geometry_row];
     if (cell_index >= m_state.cells.size() || cell_index >= m_state.gas_cells.size()) {
       throw std::out_of_range(
           "SimulationStateHydroSourcePropertyProvider cell index is outside gas state");
@@ -180,6 +193,7 @@ class SimulationStateHydroSourcePropertyProvider final
   const core::UnitSystem& m_units;
   double m_density_floor_code = 0.0;
   double m_density_frame_factor = 1.0;
+  std::span<const std::uint32_t> m_dense_row_by_geometry_row;
 };
 [[nodiscard]] internal::CartesianGasCellRowLayout requireCartesianGasCellRowLayout(
     const core::SimulationState& state,
@@ -894,7 +908,8 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
         context.state,
         m_units,
         m_config.numerics.hydro_density_floor_code,
-        density_frame_factor);
+        density_frame_factor,
+        m_dense_row_by_geometry_row);
     hydro::HydroSourceContext source_context{
         .update = update,
         .gravity_accel_x_peculiar = {},

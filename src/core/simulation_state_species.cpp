@@ -252,6 +252,14 @@ void requireValidAmrPatchMigrationFields(const AmrPatchMigrationFields& fields, 
   fields.metal_mass_code = state.gas_cells.metal_mass_code[row];
   fields.temperature_code = state.gas_cells.temperature_code[row];
   fields.sound_speed_code = state.gas_cells.sound_speed_code[row];
+  if (state.gas_composition.enabled()) {
+    // CHUI Part 2: composition travels with the cell by stable identity.
+    if (state.gas_composition.gas_cell_id[row] != fields.gas_cell_id) {
+      throw std::runtime_error(std::string(caller) +
+          ": composition sidecar row is not aligned with the gas-cell identity map");
+    }
+    fields.composition_payload = state.gas_composition.packRow(row);
+  }
   requireValidGasCellMigrationFields(fields, caller);
   return fields;
 }
@@ -260,8 +268,10 @@ void writeGasCellFieldsToRow(
     const GasCellMigrationFields& fields,
     std::uint32_t row,
     CellSoa& cells,
-    GasCellSidecar& gas_cells) {
+    GasCellSidecar& gas_cells,
+    GasCompositionSidecar& composition) {
   requireValidGasCellMigrationFields(fields, "writeGasCellFieldsToRow");
+  composition.unpackRow(row, fields.composition_payload, fields.gas_cell_id);
   cells.center_x_comoving[row] = fields.center_x_comoving;
   cells.center_y_comoving[row] = fields.center_y_comoving;
   cells.center_z_comoving[row] = fields.center_z_comoving;
@@ -1155,6 +1165,8 @@ void SimulationState::commitParticleMigration(const ParticleMigrationCommit& com
 
   CellSoa rebuilt_cells;
   GasCellSidecar rebuilt_gas_cells;
+  // Composition rows are rebuilt alongside gas rows (identity-carried payload).
+  GasCompositionSidecar rebuilt_composition = gas_composition.emptyLike(0U);
   std::vector<std::uint32_t> old_cell_to_new(cells.size(), kInvalidGasCellRow);
   const bool rebuild_gas_state =
       !commit.preserve_gas_cell_state && (state_has_gas_state || has_inbound_gas_cell_fields);
@@ -1202,8 +1214,9 @@ void SimulationState::commitParticleMigration(const ParticleMigrationCommit& com
 
     rebuilt_cells.resize(final_gas_fields.size());
     rebuilt_gas_cells.resize(final_gas_fields.size());
+    rebuilt_composition = gas_composition.emptyLike(final_gas_fields.size());
     for (std::uint32_t row = 0; row < final_gas_fields.size(); ++row) {
-      writeGasCellFieldsToRow(final_gas_fields[row], row, rebuilt_cells, rebuilt_gas_cells);
+      writeGasCellFieldsToRow(final_gas_fields[row], row, rebuilt_cells, rebuilt_gas_cells, rebuilt_composition);
     }
   }
 
@@ -1561,6 +1574,7 @@ void SimulationState::commitParticleMigration(const ParticleMigrationCommit& com
   if (rebuild_gas_state) {
     cells = std::move(rebuilt_cells);
     gas_cells = std::move(rebuilt_gas_cells);
+    gas_composition = std::move(rebuilt_composition);
     replaceGasCellIdentityRecords(gasIdentityRecordsFromSidecars(cells, gas_cells, patches));
   }
   star_particles = std::move(rebuilt_star);
@@ -1661,6 +1675,7 @@ void SimulationState::commitGasCellMigration(const GasCellMigrationCommit& commi
   GasCellSidecar rebuilt_gas_cells;
   rebuilt_cells.resize(final_count);
   rebuilt_gas_cells.resize(final_count);
+  GasCompositionSidecar rebuilt_composition = gas_composition.emptyLike(final_count);
 
   std::size_t write_row = 0U;
   for (std::uint32_t row = 0; row < cells.size(); ++row) {
@@ -1675,7 +1690,7 @@ void SimulationState::commitGasCellMigration(const GasCellMigrationCommit& commi
     if (!final_gas_cell_ids.insert(fields.gas_cell_id).second) {
       throw std::invalid_argument("commitGasCellMigration: duplicate kept gas_cell_id");
     }
-    writeGasCellFieldsToRow(fields, destination_row, rebuilt_cells, rebuilt_gas_cells);
+    writeGasCellFieldsToRow(fields, destination_row, rebuilt_cells, rebuilt_gas_cells, rebuilt_composition);
     ++write_row;
   }
   for (const GasCellMigrationRecord& inbound : commit.inbound_records) {
@@ -1690,7 +1705,7 @@ void SimulationState::commitGasCellMigration(const GasCellMigrationCommit& commi
     if (!final_gas_cell_ids.insert(fields.gas_cell_id).second) {
       throw std::invalid_argument("commitGasCellMigration: inbound gas_cell_id duplicates local gas-cell state");
     }
-    writeGasCellFieldsToRow(fields, destination_row, rebuilt_cells, rebuilt_gas_cells);
+    writeGasCellFieldsToRow(fields, destination_row, rebuilt_cells, rebuilt_gas_cells, rebuilt_composition);
     ++write_row;
   }
   if (write_row != final_count) {
@@ -1729,6 +1744,7 @@ void SimulationState::commitGasCellMigration(const GasCellMigrationCommit& commi
 
   cells = std::move(rebuilt_cells);
   gas_cells = std::move(rebuilt_gas_cells);
+  gas_composition = std::move(rebuilt_composition);
   black_holes.host_cell_index = std::move(rebuilt_black_hole_hosts);
   tracers.host_cell_index = std::move(rebuilt_tracer_hosts);
   gas_cell_identity = std::move(rebuilt_identity);
@@ -1997,6 +2013,7 @@ void SimulationState::commitAmrPatchMigration(const AmrPatchMigrationCommit& com
   rebuilt_patches.resize(final_patches.size());
   rebuilt_cells.resize(total_cell_count);
   rebuilt_gas_cells.resize(total_cell_count);
+  GasCompositionSidecar rebuilt_composition = gas_composition.emptyLike(total_cell_count);
 
   std::uint32_t write_cell = 0;
   for (std::size_t patch_row = 0; patch_row < final_patches.size(); ++patch_row) {
@@ -2012,7 +2029,7 @@ void SimulationState::commitAmrPatchMigration(const AmrPatchMigrationCommit& com
       if (!final_gas_cell_ids.insert(fields.gas_cell_id).second) {
         throw std::invalid_argument("commitAmrPatchMigration: duplicate final gas_cell_id");
       }
-      writeGasCellFieldsToRow(fields, write_cell, rebuilt_cells, rebuilt_gas_cells);
+      writeGasCellFieldsToRow(fields, write_cell, rebuilt_cells, rebuilt_gas_cells, rebuilt_composition);
       ++write_cell;
     }
   }
@@ -2181,6 +2198,7 @@ void SimulationState::commitAmrPatchMigration(const AmrPatchMigrationCommit& com
   patches = std::move(rebuilt_patches);
   cells = std::move(rebuilt_cells);
   gas_cells = std::move(rebuilt_gas_cells);
+  gas_composition = std::move(rebuilt_composition);
   black_holes.host_cell_index = std::move(rebuilt_black_hole_hosts);
   tracers.host_cell_index = std::move(rebuilt_tracer_hosts);
   gas_cell_identity = std::move(rebuilt_identity);
