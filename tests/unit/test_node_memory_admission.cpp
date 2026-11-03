@@ -150,6 +150,40 @@ void testGovernorLifecycleOverflowAndOwnerTelemetry() {
   big.release();
 }
 
+// shared_pool: two co-located "ranks" (governors) share one node pool.
+// Uneven use is admitted, the node-wide sum is bounded, releases return
+// capacity, baseline reconciliation records resident memory truthfully, and
+// detach/destruction return every held byte.
+void testNodeSharedPoolBoundsTheSumNotTheShare() {
+  co::ProcessLocalNodeMemoryPool pool(1000U);
+  {
+    co::MemoryGovernor heavy;
+    co::MemoryGovernor light;
+    heavy.attachNodePool(&pool);
+    light.attachNodePool(&pool);
+    auto big = heavy.reserve(co::MemoryClass::kScratchArena, 800U, "rank0.amr");  // > equal share
+    auto small = light.reserve(co::MemoryClass::kScratchArena, 150U, "rank1.hydro");
+    CHUI_REQUIRE(pool.usedBytes() == 950U);
+    CHUI_REQUIRE(throws<co::MemoryAdmissionError>(
+        [&] { (void)light.reserve(co::MemoryClass::kScratchArena, 100U, "rank1.hydro"); }));
+    CHUI_REQUIRE(pool.usedBytes() == 950U);  // refusal holds nothing
+    big.release();
+    CHUI_REQUIRE(pool.usedBytes() == 150U);
+    auto now_fits = light.reserve(co::MemoryClass::kScratchArena, 100U, "rank1.hydro");
+    CHUI_REQUIRE(pool.usedBytes() == 250U);
+    light.setBaselineOwnedBytes(900U);  // resident memory is recorded even above capacity
+    CHUI_REQUIRE(pool.usedBytes() == 1150U);
+    CHUI_REQUIRE(throws<co::MemoryAdmissionError>(
+        [&] { (void)heavy.reserve(co::MemoryClass::kScratchArena, 1U, "rank0.amr"); }));
+    light.setBaselineOwnedBytes(0U);
+    CHUI_REQUIRE(pool.usedBytes() == 250U);
+    now_fits.release();
+    small.release();
+    CHUI_REQUIRE(pool.usedBytes() == 0U);
+  }
+  CHUI_REQUIRE(pool.usedBytes() == 0U);
+}
+
 void testOwnerTableIsBounded() {
   co::MemoryGovernor governor;
   for (std::size_t i = 0; i < 2U * co::k_memory_owner_telemetry_slots; ++i) {
@@ -172,5 +206,6 @@ int main() {
   testInvalidInputsRefused();
   testGovernorLifecycleOverflowAndOwnerTelemetry();
   testOwnerTableIsBounded();
+  testNodeSharedPoolBoundsTheSumNotTheShare();
   return 0;
 }

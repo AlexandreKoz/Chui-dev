@@ -1,6 +1,8 @@
 #pragma once
 
+#include <atomic>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -92,5 +94,69 @@ struct NodeMemoryAdmissionResult {
 // consumes the whole node limit, std::runtime_error when no node limit is
 // known, and std::overflow_error never (all arithmetic is checked/divisive).
 [[nodiscard]] NodeMemoryAdmissionResult computeNodeMemoryAdmission(const NodeMemoryAdmissionInput& input);
+
+// Node-wide shared accounting pool (parallel.node_memory_admission =
+// shared_pool). Every MemoryGovernor of a node attached to the same pool
+// acquires each admitted byte from one shared counter whose capacity is the
+// node usable budget, so the SUM over co-located ranks never exceeds it while
+// ranks with heavier workloads may use more than an equal share.
+//
+// Concurrency: tryAcquire/release are lock-free compare-and-swap operations
+// on one 64-bit counter (no MPI call, no collective, no waiting), so they
+// cannot deadlock and are safe from any thread. They run only at
+// reservation boundaries (never inside per-cell/per-face loops).
+// Determinism: admission depends on the timing of other ranks' reservations,
+// so a refusal under contention is NOT reproducible run-to-run; use
+// shared_equal for bitwise-reproducible admission. Refusals are explicit
+// MemoryAdmissionError diagnostics naming the pool state.
+class NodeMemoryPool {
+ public:
+  virtual ~NodeMemoryPool() = default;
+  [[nodiscard]] virtual bool tryAcquire(std::uint64_t bytes) noexcept = 0;
+  // Record bytes that already exist (baseline reconciliation of memory that
+  // is resident regardless of admission). May push usage above capacity, in
+  // which case every later tryAcquire on the node fails until releases bring
+  // it back; that is the truthful state, not an error to hide.
+  virtual void forceAcquire(std::uint64_t bytes) noexcept = 0;
+  virtual void release(std::uint64_t bytes) noexcept = 0;
+  [[nodiscard]] virtual std::uint64_t capacityBytes() const noexcept = 0;
+  [[nodiscard]] virtual std::uint64_t usedBytes() const noexcept = 0;
+};
+
+// Pool over a caller-provided, 8-byte aligned counter. The counter may live
+// in process memory (serial runs, tests) or in an MPI-3 node-shared window
+// (parallel::MpiSharedNodeMemoryPool). std::atomic_ref requires lock-free
+// 64-bit atomics for cross-process correctness; this is enforced at compile
+// time.
+class AtomicCounterNodeMemoryPool final : public NodeMemoryPool {
+ public:
+  AtomicCounterNodeMemoryPool(std::uint64_t* counter, std::uint64_t capacity_bytes);
+  [[nodiscard]] bool tryAcquire(std::uint64_t bytes) noexcept override;
+  void forceAcquire(std::uint64_t bytes) noexcept override;
+  void release(std::uint64_t bytes) noexcept override;
+  [[nodiscard]] std::uint64_t capacityBytes() const noexcept override;
+  [[nodiscard]] std::uint64_t usedBytes() const noexcept override;
+
+ private:
+  std::uint64_t* m_counter = nullptr;
+  std::uint64_t m_capacity_bytes = 0U;
+};
+
+// Single-process pool owning its counter (serial / non-MPI builds, tests).
+class ProcessLocalNodeMemoryPool final : public NodeMemoryPool {
+ public:
+  explicit ProcessLocalNodeMemoryPool(std::uint64_t capacity_bytes);
+  ProcessLocalNodeMemoryPool(const ProcessLocalNodeMemoryPool&) = delete;
+  ProcessLocalNodeMemoryPool& operator=(const ProcessLocalNodeMemoryPool&) = delete;
+  [[nodiscard]] bool tryAcquire(std::uint64_t bytes) noexcept override;
+  void forceAcquire(std::uint64_t bytes) noexcept override;
+  void release(std::uint64_t bytes) noexcept override;
+  [[nodiscard]] std::uint64_t capacityBytes() const noexcept override;
+  [[nodiscard]] std::uint64_t usedBytes() const noexcept override;
+
+ private:
+  alignas(8) std::uint64_t m_counter = 0U;
+  AtomicCounterNodeMemoryPool m_pool;
+};
 
 }  // namespace cosmosim::core

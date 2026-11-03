@@ -61,6 +61,16 @@ struct ProductionAmrHydroOptions {
   // AMR ghost shells are Part 3 scope.
   hydro::HydroReconstructionScheme reconstruction_scheme = hydro::HydroReconstructionScheme::kPiecewiseLinear;
   hydro::HydroSlopeLimiter slope_limiter = hydro::HydroSlopeLimiter::kMonotonizedCentral;
+  // Periodic box extent in the patch coordinate frame (comoving), required
+  // when physical_boundary_kind == kPeriodic. A patch face on the box boundary
+  // is supported when the patch spans the box along that axis (in-patch
+  // periodic wrap); periodic neighbours in OTHER patches across the wrap are
+  // refused (std::runtime_error) until periodic-aware patch topology lands
+  // (Part 3) instead of silently closing the box.
+  std::array<double, 3> periodic_box_extent_comoving{0.0, 0.0, 0.0};
+  // T[K] per code specific internal energy for the temperature cache. Zero
+  // keeps the legacy copy (temperature_code = internal_energy_code).
+  double temperature_k_per_internal_energy_code = 0.0;
 };
 
 // Complete physical workspace for immutable step-start ghost snapshots.

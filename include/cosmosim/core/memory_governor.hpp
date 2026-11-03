@@ -11,6 +11,8 @@
 
 namespace cosmosim::core {
 
+class NodeMemoryPool;
+
 // A requested allocation would exceed the configured hard ceiling.
 // Only this rejection, not allocation failure or invalid scientific state,
 // may be interpreted as a reason to defer best-effort optional work.
@@ -204,6 +206,8 @@ class MemoryReservation final {
 class MemoryGovernor final {
  public:
   explicit MemoryGovernor(MemoryGovernorPolicy policy = {});
+  // Returns any bytes still held in an attached node pool.
+  ~MemoryGovernor();
 
   MemoryGovernor(const MemoryGovernor&) = delete;
   MemoryGovernor& operator=(const MemoryGovernor&) = delete;
@@ -226,6 +230,17 @@ class MemoryGovernor final {
   // returned vector; never call from a hot path).
   [[nodiscard]] std::vector<MemoryOwnerTelemetry> ownerTelemetry() const;
 
+  // Attach a node-shared accounting pool (shared_pool admission). From then
+  // on every governed byte of this rank (baseline + external/overlap reserves
+  // + reservations) is also held in the pool, so co-located ranks can never
+  // jointly exceed the pool capacity. Attaching acquires the currently
+  // accounted bytes and throws MemoryAdmissionError if the pool cannot hold
+  // them. The pool must outlive the governor or be detached first; detach
+  // returns every held byte. Not thread-safe against concurrent attach.
+  void attachNodePool(NodeMemoryPool* pool);
+  void detachNodePool() noexcept;
+  [[nodiscard]] std::uint64_t nodePoolHeldBytes() const;
+
  private:
   friend class MemoryReservation;
 
@@ -240,6 +255,8 @@ class MemoryGovernor final {
 
   [[nodiscard]] std::uint16_t ownerSlotLocked(std::string_view owner) noexcept;
   void releaseOwnerBytesLocked(std::uint16_t owner_slot, std::uint64_t bytes) noexcept;
+  void releaseNodePoolBytesLocked(std::uint64_t bytes) noexcept;
+  void adjustNodePoolForBaselineLocked(std::uint64_t old_baseline, std::uint64_t new_baseline) noexcept;
   void commitReservation(MemoryClass memory_class, std::uint64_t bytes);
   void releasePendingReservation(
       MemoryClass memory_class, std::uint64_t bytes, std::uint16_t owner_slot) noexcept;
@@ -272,6 +289,8 @@ class MemoryGovernor final {
   std::array<std::uint64_t, static_cast<std::size_t>(MemoryClass::kCount)>
       m_reserved_by_class{};
   std::array<OwnerSlot, k_memory_owner_telemetry_slots> m_owner_slots{};
+  NodeMemoryPool* m_node_pool = nullptr;
+  std::uint64_t m_node_pool_held_bytes = 0U;
 };
 
 }  // namespace cosmosim::core

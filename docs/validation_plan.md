@@ -825,6 +825,11 @@ Additional campaign checks to run on top of the unit tests:
 7. Mode smoke for `cosmo_cube`, `zoom_in`, `isolated_galaxy`,
    `isolated_cluster` with defaults (behavior must match pre-Part-1 apart from
    the documented F1/F3/periodic-face fixes).
-8. Memory: run with `node_memory_admission = shared_equal` and 1, 2, 4 ranks per
-   node; confirm `memory.node_admission` shares and that refusals are reported,
-   not crashes.
+8. Memory: run with `node_memory_admission = shared_equal` and `shared_pool`
+   and 1, 2, 4 ranks per node; confirm `memory.node_admission` shares, that the
+   node pool bounds the sum, and that refusals are reported, not crashes.
+9. Periodic AMR: `cosmo_cube` with a box-spanning root patch, uniform-velocity
+   metal contact crossing the box boundary for one box crossing (exact
+   translation check, global mass/momentum/energy/metal conservation); confirm
+   that a decomposed non-spanning root grid stops with the documented refusal.
+10. `unit_amr_periodic_boundary` (new).

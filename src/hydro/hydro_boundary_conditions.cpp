@@ -195,6 +195,132 @@ void validateGhostMetadata(const HydroPatchGeometry& geometry, const HydroGhostC
 
 }  // namespace
 
+namespace {
+
+// Slot of the boundary ghost adjacent to `row` on `side` of `axis`, using the
+// deterministic append order shared by appendCartesianBoundaryGhostFaces and
+// the AMR geometry builder (x: k,j ; y: k,i ; z: j,i ; lower then upper).
+// The candidate is verified against the ghost metadata; any mismatch (e.g. a
+// geometry without the standard ghost shell) yields "unavailable".
+[[nodiscard]] std::size_t standardBoundaryGhostRow(
+    const HydroPatchGeometry& geometry, std::size_t row, HydroFaceAxis axis, HydroFaceSide side) {
+  const std::size_t nx = geometry.nx;
+  const std::size_t ny = geometry.ny;
+  const std::size_t nz = geometry.nz;
+  const std::size_t x_ghosts = 2U * ny * nz;
+  const std::size_t y_ghosts = 2U * nx * nz;
+  const std::size_t z_ghosts = 2U * nx * ny;
+  if (geometry.ghost_cells.size() < x_ghosts + y_ghosts + z_ghosts) {
+    return k_invalid_cell_index;
+  }
+  const auto [i, j, k] = geometry.cellIjk(row);
+  const std::size_t side_offset = side == HydroFaceSide::kLower ? 0U : 1U;
+  std::size_t slot = 0U;
+  switch (axis) {
+    case HydroFaceAxis::kX:
+      if ((side == HydroFaceSide::kLower && i != 0U) || (side == HydroFaceSide::kUpper && i + 1U != nx)) {
+        return k_invalid_cell_index;
+      }
+      slot = 2U * (k * ny + j) + side_offset;
+      break;
+    case HydroFaceAxis::kY:
+      if ((side == HydroFaceSide::kLower && j != 0U) || (side == HydroFaceSide::kUpper && j + 1U != ny)) {
+        return k_invalid_cell_index;
+      }
+      slot = x_ghosts + 2U * (k * nx + i) + side_offset;
+      break;
+    case HydroFaceAxis::kZ:
+      if ((side == HydroFaceSide::kLower && k != 0U) || (side == HydroFaceSide::kUpper && k + 1U != nz)) {
+        return k_invalid_cell_index;
+      }
+      slot = x_ghosts + y_ghosts + 2U * (j * nx + i) + side_offset;
+      break;
+  }
+  const HydroGhostCell& ghost = geometry.ghost_cells[slot];
+  if (ghost.owner_real_cell != row || ghost.axis != axis || ghost.side != side ||
+      ghost.ghost_cell != geometry.cellCount() + slot) {
+    return k_invalid_cell_index;
+  }
+  return ghost.ghost_cell;
+}
+
+[[nodiscard]] int axisDelta(HydroFaceAxis axis, int dir, int component) {
+  const int axis_index = axis == HydroFaceAxis::kX ? 0 : (axis == HydroFaceAxis::kY ? 1 : 2);
+  return axis_index == component ? dir : 0;
+}
+
+// One step from `cell` along `axis` in direction dir (+1/-1). Real cells move
+// inside the patch, then onto the adjacent boundary ghost. A periodic ghost
+// resolves to its wrapped real source cell (same data, no dependence on ghost
+// fill). Moving past a non-periodic ghost is unavailable (single ghost layer).
+[[nodiscard]] std::size_t stencilStep(
+    const HydroPatchGeometry& geometry, std::size_t cell, HydroFaceAxis axis, int dir) {
+  const std::size_t real_cells = geometry.cellCount();
+  if (cell == k_invalid_cell_index) {
+    return k_invalid_cell_index;
+  }
+  if (cell < real_cells) {
+    const std::size_t inside = geometry.neighborCell(
+        cell, axisDelta(axis, dir, 0), axisDelta(axis, dir, 1), axisDelta(axis, dir, 2));
+    if (inside != k_invalid_cell_index) {
+      return inside;
+    }
+    const std::size_t ghost_row = standardBoundaryGhostRow(
+        geometry, cell, axis, dir > 0 ? HydroFaceSide::kUpper : HydroFaceSide::kLower);
+    if (ghost_row == k_invalid_cell_index) {
+      return k_invalid_cell_index;
+    }
+    const HydroGhostCell& ghost = geometry.ghost_cells[ghost_row - real_cells];
+    if (ghost.boundary_kind == HydroBoundaryKind::kPeriodic && ghost.source_real_cell < real_cells) {
+      return ghost.source_real_cell;
+    }
+    return ghost_row;
+  }
+  const std::size_t slot = cell - real_cells;
+  if (slot >= geometry.ghost_cells.size()) {
+    return k_invalid_cell_index;
+  }
+  const HydroGhostCell& ghost = geometry.ghost_cells[slot];
+  if (ghost.axis != axis) {
+    return k_invalid_cell_index;
+  }
+  const bool moving_away = (ghost.side == HydroFaceSide::kUpper) == (dir > 0);
+  if (!moving_away) {
+    return ghost.owner_real_cell;
+  }
+  if (ghost.boundary_kind == HydroBoundaryKind::kPeriodic && ghost.source_real_cell < real_cells) {
+    return stencilStep(geometry, ghost.source_real_cell, axis, dir);
+  }
+  return k_invalid_cell_index;
+}
+
+}  // namespace
+
+std::size_t completeReconstructionStencils(HydroPatchGeometry& geometry) {
+  const std::size_t real_cell_count = geometry.cellCount();
+  std::size_t filled = 0U;
+  for (HydroFace& face : geometry.faces) {
+    if (face.owner_cell >= real_cell_count) {
+      throw std::invalid_argument("stencil completion requires real face owners");
+    }
+    if (face.neighbor_cell == k_invalid_cell_index) {
+      continue;
+    }
+    const int along_normal = normalSignAlongAxis(face) > 0.0 ? 1 : -1;
+    const auto fill = [&](std::size_t& slot, std::size_t value) {
+      if (slot == k_invalid_cell_index && value != k_invalid_cell_index) {
+        slot = value;
+        ++filled;
+      }
+    };
+    fill(face.owner_minus_cell, stencilStep(geometry, face.owner_cell, face.axis, -along_normal));
+    fill(face.owner_minus2_cell, stencilStep(geometry, face.owner_minus_cell, face.axis, -along_normal));
+    fill(face.neighbor_plus_cell, stencilStep(geometry, face.neighbor_cell, face.axis, along_normal));
+    fill(face.neighbor_plus2_cell, stencilStep(geometry, face.neighbor_plus_cell, face.axis, along_normal));
+  }
+  return filled;
+}
+
 std::size_t completePeriodicReconstructionStencils(HydroPatchGeometry& geometry) {
   const std::size_t real_cell_count = geometry.cellCount();
   for (const HydroGhostCell& ghost : geometry.ghost_cells) {
@@ -246,6 +372,26 @@ void appendCartesianBoundaryGhostFaces(
   appendAxisBoundaryGhosts(geometry, boundary_kind, HydroFaceAxis::kX);
   appendAxisBoundaryGhosts(geometry, boundary_kind, HydroFaceAxis::kY);
   appendAxisBoundaryGhosts(geometry, boundary_kind, HydroFaceAxis::kZ);
+}
+
+void fillHydroBoundaryGhostAuxiliaryInternalEnergy(
+    HydroConservedStateSoa& conserved,
+    const HydroPatchGeometry& geometry) {
+  if (!conserved.auxiliaryInternalEnergyEnabled()) {
+    return;
+  }
+  if (conserved.size() < geometry.totalCellStorageCount()) {
+    throw std::invalid_argument("Hydro conserved state does not include storage for boundary ghosts");
+  }
+  std::span<double> auxiliary = conserved.auxiliaryInternalEnergyDensityComoving();
+  for (const HydroGhostCell& ghost : geometry.ghost_cells) {
+    validateGhostMetadata(geometry, ghost);
+    if (ghost.mutation_rights == HydroGhostMutationRights::kReadOnlyImported ||
+        ghost.boundary_kind == HydroBoundaryKind::kImportedMpi) {
+      continue;
+    }
+    auxiliary[ghost.ghost_cell] = auxiliary[ghost.source_real_cell];
+  }
 }
 
 void fillHydroBoundaryGhostCells(

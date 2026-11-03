@@ -238,10 +238,12 @@ Einstein-de Sitter (`omega_matter=1`, `omega_lambda=0`) is accepted.
   - `hydro_riemann_solver` (`hllc` | `hlle`, default `hllc`). HLLC falls back to
     HLLE (Einfeldt bounds) for degenerate/inadmissible star states.
   - `hydro_dual_energy` (`off` | `thermal_fraction`, default `off`) and
-    `hydro_dual_energy_eta` (double in (0, 1), default `1.0e-3`). See the
-    dual-energy section of `docs/hydro_numerics.md`; enabling it trades exact
-    total-energy conservation for thermal accuracy in cold high-Mach flows, and
-    the change is measured in `dual_energy_sync_delta`.
+    `hydro_dual_energy_eta` (double in (0, 1), default `1.0e-3`). With
+    `thermal_fraction`, cells whose conservative thermal energy is below
+    `eta` of the total energy take their thermal state from an auxiliary
+    internal-energy lane initialized from the canonical `e`; the solver never
+    overwrites `E`, and the resulting non-conservative thermal correction is
+    ledgered in `dual_energy_sync_delta` (`docs/hydro_numerics.md` section 7).
   - Validation is fail-closed: unknown enum spellings and eta outside (0, 1)
     are rejected. All six keys appear in the normalized dump, so enabling them
     changes the normalized-config hash (reproducibility: intended).
@@ -515,7 +517,10 @@ GPU execution contract:
 - `gravity_memory_budget_bytes` (default `0`, meaning unlimited): backward-compatible gravity-only preflight ceiling. CHUI-owned PM/FFT `PlanResources` arrays are now explicit known memory; only genuinely library-owned FFTW/CUDA plan/runtime allocations remain external.
 - `process_memory_budget_bytes` (default `0`, meaning no total-process ceiling): authoritative composed per-rank process ceiling when set. The existing DMO preflight combines live canonical state, retained scheduler state, gravity/tree staging, PM fields, explicit FFT plan arrays, bounded PM/Tree communication, configured output/restart overlap, external reserves, and the process safety margin before large gravity staging allocations. M1B also constructs the process `MemoryGovernor` from this same ceiling for reserve-before-allocate runtime admission; zero remains unlimited while accounting/high-water stays active. This does not silently change the legacy gravity-only key and no second memory-budget configuration surface exists.
 - Node-aware admission (CHUI Part 1; `docs/memory_governance.md`):
-  - `node_memory_admission` (`off` | `shared_equal`, default `off`). `off`
+  - `node_memory_admission` (`off` | `shared_equal` | `shared_pool`, default
+    `off`). `shared_pool` uses the same node limit/reserve but a node-shared
+    accounting counter (ranks may use unequal amounts; the node-wide sum is
+    bounded; admission under contention is not run-to-run reproducible). `off`
     preserves the historical per-process semantics exactly
     (`process_memory_budget_bytes = 0` stays unlimited). `shared_equal` derives
     the node limit as the minimum of `node_memory_budget_bytes` (if non-zero),

@@ -8,7 +8,9 @@ F1 (Hancock predictor sign and `1/a`), F3 (HLL passive lanes), F4
 volume) are repaired in source; PPM, CTU, HLLE selection, optional dual
 energy, node-aware memory admission, bounded owner telemetry and a stage
 transaction substrate are added; fixed-grid periodic boxes no longer apply
-boundary fluxes twice. F2/F5 (Part 2) and F6 (Part 3) remain open. Default
+boundary fluxes twice; AMR periodic box faces no longer act as zero-flux
+walls (cross-patch periodic topology is refused). F2/F5 (Part 2) and F6
+(Part 3) remain open. Default
 configuration keeps the historical method selection, but results change
 through the bug fixes. See the
 [Part 1 record](docs/repair/chui_part1_foundation_hydro_20261103.md) and

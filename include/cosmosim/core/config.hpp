@@ -63,8 +63,13 @@ enum class NodeMemoryAdmissionMode {
   kOff,
   // Determine a node limit (explicit node budget, cgroup/job limit, physical
   // RAM; minimum of the known values), subtract the node reserve once and
-  // give each co-located rank an equal share.
+  // give each co-located rank an equal share. Deterministic admission.
   kSharedEqual,
+  // Same node limit and single reserve, but one node-shared accounting pool
+  // (MPI-3 shared window, lock-free counter): ranks may use unequal amounts,
+  // the node-wide sum is bounded. Admission under contention is not
+  // run-to-run reproducible.
+  kSharedPool,
 };
 
 enum class TreePmAssignmentScheme {

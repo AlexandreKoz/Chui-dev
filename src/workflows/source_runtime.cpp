@@ -1165,6 +1165,7 @@ class SourceRuntimeImpl final : public SourceRuntime {
         context.state.black_holes.size() > 0U;
     const std::uint64_t gravity_source_mutation_rank_count =
         m_mpi_context.allreduceSumUint64(local_has_mutable_gravity_sources ? 1ULL : 0ULL);
+    bool star_formation_mutated_gas = false;
     if (m_star_formation.config().enabled) {
       constexpr std::size_t k_star_formation_cell_batch_max = 4096U;
       const bool all_cells_active =
@@ -1262,6 +1263,12 @@ class SourceRuntimeImpl final : public SourceRuntime {
       const std::size_t particle_count_before_birth =
           context.state.particles.size();
       std::uint64_t local_spawned_particles = 0U;
+      // Star formation removes gas mass/density from its host cells.
+      const auto mark_star_formation_gas_mutation = [&]() {
+        if (local_spawned_particles > 0U) {
+          star_formation_mutated_gas = true;
+        }
+      };
       for (std::uint64_t batch_round = 0U;
            batch_round < global_batch_count; ++batch_round) {
         const std::size_t batch_begin = batch_round < local_batch_count
@@ -1378,6 +1385,7 @@ class SourceRuntimeImpl final : public SourceRuntime {
               context.state.particle_sidecar.particle_id.end());
         }
       }
+      mark_star_formation_gas_mutation();
       if (local_spawned_particles > 0U &&
           context.particle_scheduler != nullptr) {
         const std::uint64_t current_tick =
@@ -1432,6 +1440,30 @@ class SourceRuntimeImpl final : public SourceRuntime {
             0U,
             current_tick + 1U);
       }
+    }
+    if (star_formation_mutated_gas || black_hole_report.counters.gas_mass_removed_code > 0.0) {
+      // Audit F4 (density-changing sources): star formation and BH accretion
+      // change gas density, which changes the effective-EOS pressure and
+      // signal speed (and the ideal-gas pressure cache). These models do not
+      // expose touched-cell lists, so refresh every local gas cell once
+      // (O(N_gas), only on steps where they removed gas). Temperature is
+      // derived with the runtime-wide factor.
+      context.state.notifyGasThermodynamicMutation();
+      std::unique_ptr<physics::EffectiveIsmThermodynamicClosure> closure;
+      if (m_effective_eos_table != nullptr) {
+        closure = std::make_unique<physics::EffectiveIsmThermodynamicClosure>(m_effective_eos_table);
+      }
+      (void)hydro::refreshAllGasThermodynamics(
+          context.state,
+          hydro::GasThermodynamicRefreshPolicy{
+              .adiabatic_index = 5.0 / 3.0,
+              .density_floor_code = m_hydro_density_floor_code,
+              .pressure_floor_code = m_hydro_pressure_floor_code,
+              .scale_factor = source_evaluation_scale_factor,
+              .redshift = std::max(0.0, 1.0 / source_evaluation_scale_factor - 1.0),
+              .closure = closure.get(),
+              .temperature_k_per_internal_energy_code =
+                  hydro::temperatureKelvinPerInternalEnergyCode(5.0 / 3.0, m_units.velocity_si_per_code)});
     }
     if (gravity_source_mutation_rank_count > 0U) {
       // Source models can change gas/star/BH gravitating mass and membership.
@@ -1850,7 +1882,9 @@ class SourceRuntimeImpl final : public SourceRuntime {
               .pressure_floor_code = m_hydro_pressure_floor_code,
               .scale_factor = source_evaluation_scale_factor,
               .redshift = std::max(0.0, 1.0 / source_evaluation_scale_factor - 1.0),
-              .closure = closure.get()});
+              .closure = closure.get(),
+              .temperature_k_per_internal_energy_code =
+                  hydro::temperatureKelvinPerInternalEnergyCode(5.0 / 3.0, m_units.velocity_si_per_code)});
       m_last_thermodynamic_refresh = refresh_report;
       if (context.profiler_session != nullptr) {
         context.profiler_session->recordEvent(core::RuntimeEvent{

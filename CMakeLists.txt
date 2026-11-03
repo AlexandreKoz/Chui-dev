@@ -611,7 +611,8 @@ add_library(cosmosim_parallel STATIC
   src/parallel/distributed_memory_tree_pm.cpp
   src/parallel/distributed_memory_amr.cpp
   src/parallel/distributed_memory_hydro.cpp
-  src/parallel/distributed_memory_device.cpp)
+  src/parallel/distributed_memory_device.cpp
+  src/parallel/node_memory_pool.cpp)
 target_link_libraries(cosmosim_gravity PUBLIC cosmosim_parallel)
 target_link_libraries(cosmosim_analysis PUBLIC cosmosim_parallel)
 
@@ -1125,7 +1126,8 @@ if(COSMOSIM_ENABLE_TESTS)
       effective_ism_energy_ledger
       node_memory_admission
       stage_transaction
-      config_hydro_numerics)
+      config_hydro_numerics
+      amr_periodic_boundary)
     add_executable(test_unit_${chui_part1_test} tests/unit/test_${chui_part1_test}.cpp)
     target_link_libraries(test_unit_${chui_part1_test} PRIVATE cosmosim_all)
     add_test(NAME unit_${chui_part1_test} COMMAND test_unit_${chui_part1_test})

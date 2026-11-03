@@ -1,4 +1,5 @@
 #include "cosmosim/core/memory_governor.hpp"
+#include "cosmosim/core/node_memory_admission.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -374,6 +375,10 @@ MemoryGovernor::MemoryGovernor(MemoryGovernorPolicy policy)
   updatePeakAccountedLocked();
 }
 
+MemoryGovernor::~MemoryGovernor() {
+  detachNodePool();
+}
+
 MemoryReservation MemoryGovernor::reserve(
     MemoryClass memory_class,
     std::uint64_t requested_bytes,
@@ -449,6 +454,23 @@ MemoryReservation MemoryGovernor::reserve(
         "hard_limit_would_be_exceeded"));
   }
 
+  if (m_node_pool != nullptr && !m_node_pool->tryAcquire(requested_bytes)) {
+    ++m_rejection_count;
+    ++m_owner_slots[ownerSlotLocked(owner)].rejection_count;
+    MemoryGovernorSnapshot current;
+    current.hard_limit_bytes = m_policy.hard_limit_bytes;
+    current.committed_bytes = m_committed_bytes;
+    current.reserved_bytes = m_reserved_bytes;
+    current.accounted_bytes = current_raw;
+    current.headroom_bytes = headroomBytesLocked(current_raw);
+    current.rejection_count = m_rejection_count;
+    current.pressure = MemoryPressure::kTrip;
+    throw MemoryAdmissionError(rejectionDiagnostic(
+        memory_class, owner, requested_bytes, current,
+        "node_pool_exhausted used=" + std::to_string(m_node_pool->usedBytes()) +
+            " capacity=" + std::to_string(m_node_pool->capacityBytes())));
+  }
+  m_node_pool_held_bytes += m_node_pool != nullptr ? requested_bytes : 0U;
   const std::size_t class_index = memoryClassIndex(memory_class);
   m_reserved_bytes = checkedMemoryBytesAdd(
       m_reserved_bytes, requested_bytes, "MemoryGovernor.reserve reserved total");
@@ -493,6 +515,49 @@ std::uint16_t MemoryGovernor::ownerSlotLocked(std::string_view owner) noexcept {
   return static_cast<std::uint16_t>(k_other_slot);
 }
 
+void MemoryGovernor::attachNodePool(NodeMemoryPool* pool) {
+  std::lock_guard lock(m_mutex);
+  if (m_node_pool != nullptr) {
+    throw std::logic_error("MemoryGovernor already has a node pool attached");
+  }
+  if (pool == nullptr) {
+    return;
+  }
+  const std::uint64_t accounted = rawAccountedBytesLocked();
+  if (!pool->tryAcquire(accounted)) {
+    ++m_rejection_count;
+    throw MemoryAdmissionError(
+        "memory node pool cannot hold this rank's accounted bytes at attach: accounted=" +
+        std::to_string(accounted) + " used=" + std::to_string(pool->usedBytes()) +
+        " capacity=" + std::to_string(pool->capacityBytes()));
+  }
+  m_node_pool = pool;
+  m_node_pool_held_bytes = accounted;
+}
+
+void MemoryGovernor::detachNodePool() noexcept {
+  std::lock_guard lock(m_mutex);
+  if (m_node_pool != nullptr) {
+    m_node_pool->release(m_node_pool_held_bytes);
+  }
+  m_node_pool = nullptr;
+  m_node_pool_held_bytes = 0U;
+}
+
+std::uint64_t MemoryGovernor::nodePoolHeldBytes() const {
+  std::lock_guard lock(m_mutex);
+  return m_node_pool_held_bytes;
+}
+
+void MemoryGovernor::releaseNodePoolBytesLocked(std::uint64_t bytes) noexcept {
+  if (m_node_pool == nullptr || bytes == 0U) {
+    return;
+  }
+  const std::uint64_t released = std::min(bytes, m_node_pool_held_bytes);
+  m_node_pool->release(released);
+  m_node_pool_held_bytes -= released;
+}
+
 void MemoryGovernor::releaseOwnerBytesLocked(std::uint16_t owner_slot, std::uint64_t bytes) noexcept {
   if (owner_slot >= m_owner_slots.size()) {
     return;
@@ -533,8 +598,25 @@ void MemoryGovernor::setBaselineOwnedBytes(std::uint64_t baseline_owned_bytes) {
       prospective, m_committed_bytes, "MemoryGovernor baseline committed bytes");
   prospective = checkedMemoryBytesAdd(
       prospective, m_reserved_bytes, "MemoryGovernor baseline reserved bytes");
+  adjustNodePoolForBaselineLocked(m_baseline_owned_bytes, baseline_owned_bytes);
   m_baseline_owned_bytes = baseline_owned_bytes;
   m_peak_accounted_bytes = std::max(m_peak_accounted_bytes, prospective);
+}
+
+void MemoryGovernor::adjustNodePoolForBaselineLocked(
+    std::uint64_t old_baseline, std::uint64_t new_baseline) noexcept {
+  if (m_node_pool == nullptr) {
+    return;
+  }
+  if (new_baseline > old_baseline) {
+    // Baseline is already-resident memory: record it truthfully.
+    const std::uint64_t delta = new_baseline - old_baseline;
+    m_node_pool->forceAcquire(delta);
+    m_node_pool_held_bytes = m_node_pool_held_bytes > std::numeric_limits<std::uint64_t>::max() - delta
+        ? std::numeric_limits<std::uint64_t>::max() : m_node_pool_held_bytes + delta;
+  } else {
+    releaseNodePoolBytesLocked(old_baseline - new_baseline);
+  }
 }
 
 MemoryGovernorSnapshot MemoryGovernor::snapshot() const {
@@ -588,6 +670,7 @@ void MemoryGovernor::releasePendingReservation(
     std::uint16_t owner_slot) noexcept {
   std::lock_guard lock(m_mutex);
   releaseOwnerBytesLocked(owner_slot, bytes);
+  releaseNodePoolBytesLocked(bytes);
   const std::size_t class_index = memoryClassIndex(memory_class);
   if (m_reserved_bytes < bytes || m_reserved_by_class[class_index] < bytes) {
     std::terminate();
@@ -602,6 +685,7 @@ void MemoryGovernor::releaseCommittedReservation(
     std::uint16_t owner_slot) noexcept {
   std::lock_guard lock(m_mutex);
   releaseOwnerBytesLocked(owner_slot, bytes);
+  releaseNodePoolBytesLocked(bytes);
   const std::size_t class_index = memoryClassIndex(memory_class);
   if (m_committed_bytes < bytes || m_committed_by_class[class_index] < bytes) {
     std::terminate();
@@ -639,6 +723,8 @@ void MemoryGovernor::reconcileBaselineAndReleaseCommittedReservation(
 
   m_committed_bytes = remaining_committed;
   m_committed_by_class[class_index] -= bytes;
+  releaseNodePoolBytesLocked(bytes);
+  adjustNodePoolForBaselineLocked(m_baseline_owned_bytes, baseline_owned_bytes);
   m_baseline_owned_bytes = baseline_owned_bytes;
   releaseOwnerBytesLocked(owner_slot, bytes);
   m_peak_accounted_bytes = std::max(m_peak_accounted_bytes, prospective);

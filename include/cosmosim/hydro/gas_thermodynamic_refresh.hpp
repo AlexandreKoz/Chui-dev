@@ -33,10 +33,24 @@ namespace cosmosim::hydro {
 // so this refresh cannot create or destroy mass or energy. Floor activations
 // are counted.
 //
-// Temperature. temperature_code is rescaled by u_new / u_before for each
-// touched cell (preserving that cell's existing mean-molecular-weight
-// calibration). Cells without a positive previous u or temperature keep
-// their temperature and are counted in temperature_unscaled_cells.
+// Temperature. With temperature_k_per_internal_energy_code > 0 the cache is
+// set to T = factor * u (the runtime-wide convention, see
+// temperatureKelvinPerInternalEnergyCode). With factor 0 (legacy/focused
+// callers) it is rescaled by u_new / u_before; cells without a positive
+// previous u or temperature then keep their value and are counted in
+// temperature_unscaled_cells.
+//
+// Units. density_code is the comoving mass density and u a specific energy
+// in code units; P and c_s are produced in the same comoving code frame the
+// hydro solver uses, and the closure receives the evaluation-epoch scale
+// factor so it can form physical densities.
+
+// T[K] per code specific internal energy for fully ionized primordial gas
+// (mu = 0.59), T = (gamma-1) mu m_p u / k_B with u in (code velocity)^2.
+// Matches CoolingModelConfig::temperature_per_internal_energy_k.
+[[nodiscard]] double temperatureKelvinPerInternalEnergyCode(
+    double adiabatic_index, double velocity_si_per_code);
+
 struct GasThermodynamicRefreshPolicy {
   double adiabatic_index = 5.0 / 3.0;
   double density_floor_code = 0.0;
@@ -45,6 +59,7 @@ struct GasThermodynamicRefreshPolicy {
   double scale_factor = 1.0;
   double redshift = 0.0;
   const HydroThermodynamicClosure* closure = nullptr;
+  double temperature_k_per_internal_energy_code = 0.0;
 };
 
 struct GasThermodynamicTouch {

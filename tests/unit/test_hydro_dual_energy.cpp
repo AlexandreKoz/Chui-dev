@@ -1,30 +1,30 @@
-// Dual-energy (auxiliary internal energy + total-energy sync) tests.
+// Dual-energy formalism tests (auxiliary internal-energy lane, no E overwrite).
 // STATUS: written as source only, NOT RUN by the authoring agent (user-reserved).
 //
-// Problem 1: a cold contact advected at high Mach (rho varies, u = 10,
-// P = 1e-4 uniform, K/(rho e) ~ 3e5, thermal fraction 3e-6 < eta). The
-// exact solution keeps P uniform. The auxiliary internal-energy update
-// advects rho e with the upwinded mass flux (F_rho e_upwind = u P/(gamma-1),
-// uniform) and has zero pdV work for uniform u, so after the E sync P is
-// exact to round-off; the switch must fire.
-// Problem 2: Galilean-boosted smooth sound wave (U0 = 1e4, du = 1e-2,
-// P = 1): the auxiliary pressure must stay within 1e-3 of the rest-frame
-// pressure after one step (the physical change is ~1e-6).
+// Policy under test (docs/hydro_numerics.md section 7): the conservative
+// update owns rho, rho u, E, rho Z; the thermal energy handed to the
+// canonical state is E - K when E - K >= eta E, otherwise the auxiliary
+// rho e evolved by the non-conservative internal-energy equation from the
+// canonical e (never from E - K). E is not modified by the solver; the
+// thermal correction is ledgered in dual_energy_sync_delta.
 //
 // Invariants:
-//  * relative pressure error < 1e-8 (problem 1) and < 1e-3 (problem 2);
-//  * the switch fired (dual_energy_sync_count > 0) and the measured total
-//    energy change is reported in dual_energy_sync_delta, so the conservation
-//    residual (which excludes it) stays at round-off;
-//  * dual energy requires the planned workspace lane (fail-closed contract).
-//
-// Evidence limit (documented in docs/hydro_numerics.md): a one-step unit
-// test cannot demonstrate the multi-step high-Mach benefit; that is a
-// human-run validation target. The synchronized scheme also cannot recover
-// thermal energy below ulp(E) (K/(rho e) >~ 1e13), which would require a
-// persistent entropy lane.
+//  1. Cold contact at K/(rho e) ~ 3e13 (beyond what E can represent): the
+//     auxiliary pressure stays uniform to < 1e-9 relative, the conservative
+//     E - K is wrong by > 1e-6 relative, E is bitwise the conservative value,
+//     and the ledger equals sum (aux - (E-K)) V.
+//  2. Warm flow (thermal fraction >> eta): the auxiliary branch is never used
+//     and the ledger is exactly zero (dual energy does not perturb
+//     conservation where it is not needed).
+//  3. Shock heating: two cold streams (Mach ~1e4) collide; shocked cells are
+//     heated through E (selection falls back to E - K, auxiliary lane resynced),
+//     so the peak pressure approaches the Rankine-Hugoniot value instead of
+//     staying cold.
+//  4. Contract: dual energy requires the planned workspace and the auxiliary
+//     lane; invalid eta is rejected.
 #include <cmath>
 #include <cstddef>
+#include <limits>
 #include <stdexcept>
 #include <vector>
 
@@ -42,100 +42,177 @@ namespace hy = cosmosim::hydro;
 constexpr double k_gamma = 5.0 / 3.0;
 constexpr std::size_t k_n = 16U;
 
-struct Result {
-  double max_relative_pressure_error = 0.0;
-  hy::HydroProfileEvent profile;
+hy::HydroNumericsPolicy dualOn() {
+  hy::HydroNumericsPolicy policy;
+  policy.dual_energy.mode = hy::HydroDualEnergyMode::kThermalFraction;
+  policy.dual_energy.thermal_fraction_switch = 1.0e-3;
+  return policy;
+}
+
+struct Box {
+  hy::HydroPatchGeometry geometry;
+  hy::HydroConservedStateSoa conserved;
+  std::vector<std::size_t> active_cells;
+  std::vector<std::size_t> active_faces;
 };
 
-Result runCold(const hy::HydroNumericsPolicy& numerics, double velocity, double pressure,
-               double density_amplitude, double velocity_amplitude) {
-  hy::HydroPatchGeometry geometry = hy::makeCartesianPatchGeometry(hy::HydroCartesianPatchSpec{
+// Periodic 1D box; density/velocity profiles given per cell, uniform P.
+template <class TDensity, class TVelocity>
+Box makeBox(bool dual, double pressure, TDensity density, TVelocity velocity,
+            hy::HydroBoundaryKind boundary = hy::HydroBoundaryKind::kPeriodic) {
+  Box box;
+  box.geometry = hy::makeCartesianPatchGeometry(hy::HydroCartesianPatchSpec{
       .nx = k_n, .ny = 1, .nz = 1,
       .cell_width_x_comoving = 1.0, .cell_width_y_comoving = 1.0, .cell_width_z_comoving = 1.0});
-  hy::appendCartesianBoundaryGhostFaces(geometry, hy::HydroBoundaryKind::kPeriodic);
-  (void)hy::completePeriodicReconstructionStencils(geometry);
-  hy::HydroConservedStateSoa conserved(geometry.totalCellStorageCount());
+  hy::appendCartesianBoundaryGhostFaces(box.geometry, boundary);
+  (void)hy::completeReconstructionStencils(box.geometry);
+  box.conserved.resize(box.geometry.totalCellStorageCount());
+  box.conserved.enableAuxiliaryInternalEnergy(dual);
   for (std::size_t i = 0; i < k_n; ++i) {
     hy::HydroPrimitiveState primitive;
-    const double phase = 2.0 * 3.141592653589793 * static_cast<double>(i) / k_n;
-    primitive.rho_comoving = 1.0 + density_amplitude * std::sin(phase);
-    primitive.vel_x_peculiar = velocity + velocity_amplitude * std::sin(phase);
+    primitive.rho_comoving = density(i);
+    primitive.vel_x_peculiar = velocity(i);
     primitive.pressure_comoving = pressure;
-    conserved.storeCell(i, hy::HydroCoreSolver::conservedFromPrimitive(primitive, k_gamma));
-  }
-  hy::fillHydroBoundaryGhostCells(conserved, geometry, k_gamma);
-  std::vector<std::size_t> active_cells;
-  for (std::size_t i = 0; i < k_n; ++i) active_cells.push_back(i);
-  std::vector<std::size_t> active_faces;
-  for (std::size_t face = 0; face < geometry.faces.size(); ++face) {
-    const hy::HydroFace& f = geometry.faces[face];
-    if (f.ghost_cell_slot != hy::k_invalid_ghost_cell_slot &&
-        geometry.ghost_cells[f.ghost_cell_slot].side == hy::HydroFaceSide::kLower) {
-      continue;
+    box.conserved.storeCell(i, hy::HydroCoreSolver::conservedFromPrimitive(primitive, k_gamma));
+    if (dual) {
+      // Canonical specific internal energy e = P/((gamma-1) rho): rho e exact.
+      box.conserved.auxiliaryInternalEnergyDensityComoving()[i] = pressure / (k_gamma - 1.0);
     }
-    active_faces.push_back(face);
   }
-  // Courant number u dt/dx = 0.4.
-  const double dt = 0.4 / velocity;
+  for (std::size_t i = 0; i < k_n; ++i) box.active_cells.push_back(i);
+  for (std::size_t face = 0; face < box.geometry.faces.size(); ++face) {
+    const hy::HydroFace& f = box.geometry.faces[face];
+    if (boundary == hy::HydroBoundaryKind::kPeriodic && f.ghost_cell_slot != hy::k_invalid_ghost_cell_slot &&
+        box.geometry.ghost_cells[f.ghost_cell_slot].side == hy::HydroFaceSide::kLower) {
+      continue;  // periodic box face evaluated once
+    }
+    box.active_faces.push_back(face);
+  }
+  return box;
+}
+
+hy::HydroProfileEvent step(Box& box, const hy::HydroCoreSolver& solver, double dt) {
+  hy::fillHydroBoundaryGhostCells(box.conserved, box.geometry, k_gamma);
+  hy::fillHydroBoundaryGhostAuxiliaryInternalEnergy(box.conserved, box.geometry);
   const hy::HydroUpdateContext update{.dt_code = dt, .scale_factor = 1.0};
   const hy::HydroSourceContext source_context{.update = update};
   const auto courant = hy::hydroTransportCourantFactors(dt, 1.0, 1.0, 1.0, 1.0);
   const hy::MusclHancockReconstruction plm(hy::HydroReconstructionPolicy{
       .dt_over_dx_code = courant[0], .dt_over_cell_width_code = courant,
       .rho_floor = 1.0e-30, .pressure_floor = 1.0e-30, .adiabatic_index = k_gamma});
-  const hy::HydroCoreSolver solver(k_gamma, numerics);
   hy::HllcRiemannSolver riemann;
   hy::HydroScratchBuffers scratch;
-  Result result;
+  hy::HydroProfileEvent profile;
   solver.advancePatchActiveSetWithScratch(
-      conserved, geometry,
-      hy::HydroActiveSetView{.active_cells = active_cells, .active_faces = active_faces},
-      update, plm, riemann, {}, source_context, scratch, nullptr, &result.profile);
+      box.conserved, box.geometry,
+      hy::HydroActiveSetView{.active_cells = box.active_cells, .active_faces = box.active_faces},
+      update, plm, riemann, {}, source_context, scratch, nullptr, &profile);
+  return profile;
+}
+
+double thermalConservative(const hy::HydroConservedState& cell) {
+  return cell.total_energy_density_comoving -
+      0.5 * cell.momentum_density_x_comoving * cell.momentum_density_x_comoving / cell.mass_density_comoving;
+}
+
+void testColdContactBeyondTotalEnergyPrecision() {
+  constexpr double pressure = 1.0e-8;
+  constexpr double velocity = 1.0e3;  // K ~ 5e5, rho e ~ 1.5e-8
+  const auto density = [](std::size_t i) {
+    return 1.0 + 0.5 * std::sin(2.0 * 3.141592653589793 * static_cast<double>(i) / k_n);
+  };
+  const auto uniform_velocity = [](std::size_t) { return velocity; };
+  const double dt = 0.4 / velocity;
+
+  Box with_aux = makeBox(true, pressure, density, uniform_velocity);
+  const hy::HydroProfileEvent profile = step(with_aux, hy::HydroCoreSolver(k_gamma, dualOn()), dt);
+  Box without_aux = makeBox(false, pressure, density, uniform_velocity);
+  (void)step(without_aux, hy::HydroCoreSolver(k_gamma), dt);
+
+  double aux_error = 0.0;
+  double conservative_error = 0.0;
+  double ledger = 0.0;
   for (std::size_t i = 0; i < k_n; ++i) {
-    const hy::HydroConservedState cell = conserved.loadCell(i);
-    const double kinetic = 0.5 * cell.momentum_density_x_comoving * cell.momentum_density_x_comoving /
-        cell.mass_density_comoving;
-    const double cell_pressure = (k_gamma - 1.0) * (cell.total_energy_density_comoving - kinetic);
-    result.max_relative_pressure_error = std::max(
-        result.max_relative_pressure_error, std::abs(cell_pressure - pressure) / pressure);
+    const double rho_e_aux = with_aux.conserved.auxiliaryInternalEnergyDensityComoving()[i];
+    aux_error = std::max(aux_error, std::abs((k_gamma - 1.0) * rho_e_aux - pressure) / pressure);
+    const hy::HydroConservedState cons_cell = without_aux.conserved.loadCell(i);
+    conservative_error = std::max(
+        conservative_error, std::abs((k_gamma - 1.0) * thermalConservative(cons_cell) - pressure) / pressure);
+    ledger += rho_e_aux - thermalConservative(with_aux.conserved.loadCell(i));
   }
-  return result;
+  CHUI_REQUIRE(aux_error < 1.0e-9);
+  CHUI_REQUIRE(conservative_error > 1.0e-6);
+  CHUI_REQUIRE(profile.dual_energy_auxiliary_cells == k_n);
+  CHUI_REQUIRE(profile.dual_energy_unknown_auxiliary_cells == 0U);
+  // The ledger is measured against the pre-floor conservative thermal energy:
+  // sum (aux - (E_final - K)) + floor_delta = sum (aux - (E_pre - K)).
+  // Tolerance: a few ulp of E ~ 5e5 per cell.
+  ledger += profile.conservation.floor_delta.total_energy;
+  CHUI_REQUIRE(std::abs(profile.conservation.dual_energy_sync_delta.total_energy - ledger) < 1.0e-8);
+  CHUI_REQUIRE(std::abs(profile.conservation.residual.mass) < 1.0e-12);
 }
 
-void testHighMachContactKeepsThermalPressure() {
-  hy::HydroNumericsPolicy on;
-  on.dual_energy.mode = hy::HydroDualEnergyMode::kThermalFraction;
-  on.dual_energy.thermal_fraction_switch = 1.0e-3;
-  const Result with_aux = runCold(on, 10.0, 1.0e-4, 0.5, 0.0);
-  CHUI_REQUIRE(with_aux.max_relative_pressure_error < 1.0e-8);
-  CHUI_REQUIRE(with_aux.profile.conservation.dual_energy_sync_count > 0U);
-  CHUI_REQUIRE(with_aux.profile.dual_energy_auxiliary_cells > 0U);
-  // Mass and momentum are untouched by the sync; the residual excludes the
-  // separately reported sync delta.
-  CHUI_REQUIRE(std::abs(with_aux.profile.conservation.residual.mass) < 1.0e-12);
-  CHUI_REQUIRE(std::abs(with_aux.profile.conservation.residual.total_energy) <
-               1.0e-9 * std::abs(with_aux.profile.conservation.before.total_energy));
+void testWarmFlowIsUntouched() {
+  const auto density = [](std::size_t i) { return 1.0 + 0.1 * static_cast<double>(i % 3U); };
+  const auto velocity = [](std::size_t) { return 0.3; };
+  Box box = makeBox(true, 1.0, density, velocity);
+  const hy::HydroProfileEvent profile = step(box, hy::HydroCoreSolver(k_gamma, dualOn()), 0.2);
+  CHUI_REQUIRE(profile.dual_energy_auxiliary_cells == 0U);
+  CHUI_REQUIRE(profile.conservation.dual_energy_sync_count == 0U);
+  CHUI_REQUIRE(profile.conservation.dual_energy_sync_delta.total_energy == 0.0);
+  for (std::size_t i = 0; i < k_n; ++i) {
+    // Auxiliary lane resynchronized to the conservative thermal energy.
+    const double thermal = thermalConservative(box.conserved.loadCell(i));
+    CHUI_REQUIRE(std::abs(box.conserved.auxiliaryInternalEnergyDensityComoving()[i] - thermal) <=
+                 1.0e-14 * std::abs(thermal));
+  }
 }
 
-void testBoostedSmoothWaveThermalPressure() {
-  hy::HydroNumericsPolicy on;
-  on.dual_energy.mode = hy::HydroDualEnergyMode::kThermalFraction;
-  const Result boosted = runCold(on, 1.0e4, 1.0, 0.0, 1.0e-2);
-  CHUI_REQUIRE(boosted.max_relative_pressure_error < 1.0e-3);
-  CHUI_REQUIRE(boosted.profile.conservation.dual_energy_sync_count > 0U);
+void testShockHeatingIsCapturedThroughTotalEnergy() {
+  constexpr double pressure = 1.0e-6;
+  constexpr double stream_speed = 10.0;  // Mach ~ 1e4 relative to c ~ 1.3e-3
+  const auto density = [](std::size_t) { return 1.0; };
+  // Converging streams: +u for i < n/2, -u for i >= n/2; open (inflow-
+  // continuing) boundaries so no vacuum forms at the box edges.
+  const auto velocity = [](std::size_t i) { return i < k_n / 2U ? stream_speed : -stream_speed; };
+  Box box = makeBox(true, pressure, density, velocity, hy::HydroBoundaryKind::kOpen);
+  const hy::HydroCoreSolver solver(k_gamma, dualOn());
+  const double dt = 0.2 / stream_speed;
+  for (int s = 0; s < 10; ++s) {
+    (void)step(box, solver, dt);
+  }
+  double peak_pressure = 0.0;
+  for (std::size_t i = 0; i < k_n; ++i) {
+    peak_pressure = std::max(peak_pressure,
+        (k_gamma - 1.0) * box.conserved.auxiliaryInternalEnergyDensityComoving()[i]);
+  }
+  // Strong-shock post-shock pressure ~ (gamma+1)/2 rho u^2 ~ 133 (stationary
+  // wall frame); require that the selected thermal state is heated by many
+  // orders of magnitude rather than staying at 1e-6.
+  CHUI_REQUIRE(peak_pressure > 10.0);
+  for (std::size_t i = 0; i < k_n; ++i) {
+    CHUI_REQUIRE(std::isfinite(box.conserved.auxiliaryInternalEnergyDensityComoving()[i]));
+    CHUI_REQUIRE(box.conserved.auxiliaryInternalEnergyDensityComoving()[i] > 0.0);
+  }
 }
 
-void testDualEnergyRequiresPlannedWorkspace() {
-  hy::HydroNumericsPolicy on;
-  on.dual_energy.mode = hy::HydroDualEnergyMode::kThermalFraction;
-  const hy::HydroCoreSolver solver(k_gamma, on);
+void testContracts() {
+  const hy::HydroCoreSolver solver(k_gamma, dualOn());
   const hy::HydroActiveBatchPolicy planned = solver.requiredWorkspaceFeatures(hy::HydroActiveBatchPolicy{});
   CHUI_REQUIRE(planned.dual_energy_workspace);
   CHUI_REQUIRE(!planned.ctu_transverse_workspace);
-  // Invalid switch values are rejected at construction.
+  // Missing auxiliary lane is refused (fail closed, no silent E - K).
+  Box box = makeBox(false, 1.0, [](std::size_t) { return 1.0; }, [](std::size_t) { return 0.0; });
+  bool refused = false;
+  try {
+    (void)step(box, solver, 0.1);
+  } catch (const std::invalid_argument&) {
+    refused = true;
+  }
+  CHUI_REQUIRE(refused);
   bool rejected = false;
   try {
-    hy::HydroNumericsPolicy bad = on;
+    hy::HydroNumericsPolicy bad = dualOn();
     bad.dual_energy.thermal_fraction_switch = 1.5;
     const hy::HydroCoreSolver invalid(k_gamma, bad);
     (void)invalid;
@@ -148,8 +225,9 @@ void testDualEnergyRequiresPlannedWorkspace() {
 }  // namespace
 
 int main() {
-  testHighMachContactKeepsThermalPressure();
-  testBoostedSmoothWaveThermalPressure();
-  testDualEnergyRequiresPlannedWorkspace();
+  testColdContactBeyondTotalEnergyPrecision();
+  testWarmFlowIsUntouched();
+  testShockHeatingIsCapturedThroughTotalEnergy();
+  testContracts();
   return 0;
 }

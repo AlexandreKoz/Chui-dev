@@ -91,6 +91,19 @@ class HydroConservedStateSoa {
   [[nodiscard]] std::span<double> metalMassDensityComoving();
   [[nodiscard]] std::span<const double> metalMassDensityComoving() const;
 
+  // Optional dual-energy lane: auxiliary internal-energy density rho*e
+  // (comoving). It is NOT a conserved flux lane: HydroCoreSolver evolves it
+  // with the non-conservative internal-energy equation and writes the
+  // selected thermal energy back into it. Callers initialize it from the
+  // canonical specific internal energy (GasCellSidecar::internal_energy_code)
+  // before an advance; NaN marks "unknown" (the solver then falls back to
+  // E - K for that row and counts the fallback). Enabling/resizing fills new
+  // rows with NaN; disabling releases the lane.
+  void enableAuxiliaryInternalEnergy(bool enabled);
+  [[nodiscard]] bool auxiliaryInternalEnergyEnabled() const noexcept;
+  [[nodiscard]] std::span<double> auxiliaryInternalEnergyDensityComoving();
+  [[nodiscard]] std::span<const double> auxiliaryInternalEnergyDensityComoving() const;
+
  private:
   std::vector<double> m_mass_density_comoving;
   std::vector<double> m_momentum_density_x_comoving;
@@ -98,6 +111,8 @@ class HydroConservedStateSoa {
   std::vector<double> m_momentum_density_z_comoving;
   std::vector<double> m_total_energy_density_comoving;
   std::vector<double> m_metal_mass_density_comoving;
+  std::vector<double> m_auxiliary_internal_energy_density_comoving;
+  bool m_auxiliary_internal_energy_enabled = false;
 };
 
 class HydroPrimitiveCacheSoa {
@@ -366,10 +381,13 @@ struct HydroConservationReport {
   HydroConservationTotals flux_delta;
   HydroConservationTotals source_delta;
   HydroConservationTotals floor_delta;
-  // Total-energy change made when the dual-energy switch replaced the
-  // total-energy-derived thermal energy by the auxiliary internal energy
-  // (E <- K + rho e_aux). This is the measured, non-conservative part of the
-  // dual-energy formalism and is excluded from `residual`.
+  // Dual energy: volume-integrated thermal correction
+  // sum (rho e_selected - (E - K)) V over cells where the auxiliary internal
+  // energy (or the thermal floor) replaced the conservative thermal energy.
+  // E itself is not modified by the solver; this correction enters the
+  // canonical state when the runtime stores e from the auxiliary lane. It is
+  // the complete non-conservative energy ledger of the formalism (only the
+  // total_energy/internal_energy entries are non-zero).
   HydroConservationTotals dual_energy_sync_delta;
   HydroConservationTotals residual;
   std::uint64_t cell_count = 0;
@@ -415,6 +433,11 @@ struct HydroProfileEvent {
   std::uint64_t ctu_transverse_inadmissible_states = 0;
   // Cells whose final thermal energy came from the auxiliary update.
   std::uint64_t dual_energy_auxiliary_cells = 0;
+  // Cells whose auxiliary lane was NaN/non-positive at step start (e.g.
+  // imported ghosts or an uninitialized lane): E - K was used as (rho e)^n.
+  std::uint64_t dual_energy_unknown_auxiliary_cells = 0;
+  // Cells where neither E - K nor the auxiliary value was positive.
+  std::uint64_t dual_energy_floor_cells = 0;
   double reconstruct_ms = 0.0;
   double riemann_ms = 0.0;
   double accumulate_ms = 0.0;
@@ -455,8 +478,10 @@ enum class HydroIntegrationScheme : std::uint8_t {
 
 enum class HydroDualEnergyMode : std::uint8_t {
   kOff = 0,
-  // Bryan et al. (1995)/Enzo-style switch with a step-local auxiliary
-  // internal energy and total-energy synchronization (see HydroCoreSolver).
+  // Bryan et al. (1995)/Enzo-style switch: an auxiliary internal-energy lane
+  // (HydroConservedStateSoa, initialized from the canonical specific internal
+  // energy) supplies the thermal state where E - K < eta E; E is never
+  // overwritten by the solver (see HydroCoreSolver).
   kThermalFraction = 1,
 };
 

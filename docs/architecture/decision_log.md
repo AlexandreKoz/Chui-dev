@@ -1131,3 +1131,22 @@ Source implementation; NOT compiled, NOT run (user-reserved validation).
   previously the boundary flux was applied twice.
 * The effective-ISM sidecar ledger becomes an integrated energy
   (`energy_ledger_version=2`); legacy density sums are discarded on restart.
+
+## CHUI Part 1 corrective pass — 20261103
+
+Source only; NOT compiled or run.
+
+* Thermal authority is the canonical specific internal energy in both hydro
+  paths; AMR no longer treats the pressure cache as authority.
+* Dual energy redesigned: auxiliary internal-energy lane initialized from the
+  canonical `e`, Bryan-type selection, no total-energy overwrite inside the
+  solver, complete ledger of the thermal correction; the earlier step-local
+  "reset E" variant is removed.
+* Reconstruction stencils are completed through the existing ghost shell for
+  all boundary kinds (no second ghost-exchange system).
+* AMR periodic physical boundaries wrap in-patch; cross-patch periodic
+  topology is refused (Part 3) rather than producing zero-flux box faces.
+* Node-shared accounting pool (MPI-3 shared window + lock-free counter)
+  attached to each rank's existing `MemoryGovernor`; no new allocator, no
+  collective in the reservation path. `core` defines the pool interface; the
+  MPI backend lives in `parallel`.

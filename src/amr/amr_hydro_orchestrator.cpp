@@ -1,4 +1,5 @@
 #include "cosmosim/amr/amr_hydro_orchestrator.hpp"
+#include "cosmosim/hydro/hydro_boundary_conditions.hpp"
 
 #include "cosmosim/amr/amr_patch_indexing.hpp"
 #include "amr/internal/amr_retained_state_admission.hpp"
@@ -241,6 +242,42 @@ constexpr double k_geometry_tol = 1.0e-10;
   return true;
 }
 
+// Periodic AMR topology guard (box convention [0, L) per axis, the same as
+// core::canonicalPeriodicPosition and the TreePM domain). For every box-boundary side classified as
+// physical, the patch must span the whole box along that axis (in-patch wrap
+// handled by the geometry builder). A face that touches another patch only
+// through the periodic wrap would need wrapped ghost sampling, wrapped
+// coarse/fine flux registers and wrapped distributed exchange, which are not
+// implemented; refusing is the only correct option (the previous behavior
+// turned such faces into zero-flux walls).
+void validatePeriodicAmrPatchTopology(
+    const PatchDescriptor& patch,
+    std::span<const PatchDescriptor> patches,
+    const std::array<double, 3>& box_extent) {
+  (void)patches;  // reserved for wrapped-neighbour detection (Part 3)
+  for (int axis = 0; axis < 3; ++axis) {
+    const double length = box_extent[static_cast<std::size_t>(axis)];
+    if (!(length > 0.0) || !std::isfinite(length)) {
+      throw std::invalid_argument(
+          "periodic AMR hydro requires ProductionAmrHydroOptions::periodic_box_extent_comoving > 0");
+    }
+    const double lower = patch.origin_comov[static_cast<std::size_t>(axis)];
+    const double upper = lower + patch.extent_comov[static_cast<std::size_t>(axis)];
+    const double tolerance = k_geometry_tol * std::max(1.0, length);
+    const bool spans = std::abs(patch.extent_comov[static_cast<std::size_t>(axis)] - length) <= tolerance;
+    const bool on_lower = std::abs(lower) <= tolerance;
+    const bool on_upper = std::abs(upper - length) <= tolerance;
+    if (spans || (!on_lower && !on_upper)) {
+      continue;
+    }
+    throw std::runtime_error(
+        "periodic AMR hydro: patch " + std::to_string(patch.patch_id) +
+        " touches the periodic box boundary on axis " + std::to_string(axis) +
+        " without spanning the box; cross-patch periodic ghost/reflux topology is not implemented "
+        "(refusing instead of closing the box). Use a root patch that spans the periodic axis.");
+  }
+}
+
 [[nodiscard]] AmrHydroBoundaryClass boundaryClassForSide(
     const PatchDescriptor& target,
     std::span<const PatchDescriptor> patches,
@@ -291,12 +328,15 @@ constexpr double k_geometry_tol = 1.0e-10;
   const double internal_energy_floor = pressure_floor > 0.0
       ? pressure_floor / ((adiabatic_index - 1.0) * std::max(rho, 1.0e-30))
       : 0.0;
-  const double internal_energy = std::max(
-      state.gas_cells.internal_energy_code[row], internal_energy_floor);
-  const double pressure = std::max({
-      state.gas_cells.pressure_code[row],
-      (adiabatic_index - 1.0) * rho * internal_energy,
-      pressure_floor});
+  // Canonical thermal authority: specific internal energy. The pressure
+  // cache is used only when e was never set (legacy/test states); taking
+  // max(P_cache, (gamma-1) rho e) silently injected energy whenever the cache
+  // was stale or held an effective-EOS pressure.
+  const double canonical_e = state.gas_cells.internal_energy_code[row];
+  const double internal_energy = std::max(canonical_e, internal_energy_floor);
+  const double pressure = canonical_e > 0.0
+      ? std::max((adiabatic_index - 1.0) * rho * internal_energy, pressure_floor)
+      : std::max(state.gas_cells.pressure_code[row], pressure_floor);
   return hydro::HydroPrimitiveState{
       .rho_comoving = rho,
       .vel_x_peculiar = state.gas_cells.velocity_x_peculiar[row],
@@ -979,7 +1019,8 @@ void scatterAmrHydroConservedStateWithIndex(
     const AmrHydroPatchGeometry& patch_geometry,
     const hydro::HydroConservedStateSoa& conserved,
     double adiabatic_index,
-    const AmrParentMirrorIndex& parent_index) {
+    const AmrParentMirrorIndex& parent_index,
+    double temperature_k_per_internal_energy_code = 0.0) {
   state.requireGasCellIdentityMapFresh(
       patch_geometry.source_gas_cell_identity_generation,
       "scatterAmrHydroConservedState");
@@ -995,7 +1036,14 @@ void scatterAmrHydroConservedStateWithIndex(
     const hydro::HydroPrimitiveState primitive =
         hydro::HydroCoreSolver::primitiveFromConserved(conserved.loadCell(patch_cell), adiabatic_index);
     const double rho = std::max(primitive.rho_comoving, 1.0e-14);
-    const double pressure = std::max(primitive.pressure_comoving, 1.0e-14);
+    double pressure = std::max(primitive.pressure_comoving, 1.0e-14);
+    if (conserved.auxiliaryInternalEnergyEnabled()) {
+      // Dual energy: store the solver-selected thermal energy.
+      const double rho_e = conserved.auxiliaryInternalEnergyDensityComoving()[patch_cell];
+      if (std::isfinite(rho_e) && rho_e > 0.0) {
+        pressure = std::max((adiabatic_index - 1.0) * rho_e, 1.0e-14);
+      }
+    }
     state.gas_cells.density_code[*row] = rho;
     state.gas_cells.pressure_code[*row] = pressure;
     state.gas_cells.internal_energy_code[*row] = pressure / ((adiabatic_index - 1.0) * rho);
@@ -1003,7 +1051,9 @@ void scatterAmrHydroConservedStateWithIndex(
     state.gas_cells.velocity_y_peculiar[*row] = primitive.vel_y_peculiar;
     state.gas_cells.velocity_z_peculiar[*row] = primitive.vel_z_peculiar;
     state.gas_cells.sound_speed_code[*row] = std::sqrt(std::max(0.0, adiabatic_index * pressure / rho));
-    state.gas_cells.temperature_code[*row] = state.gas_cells.internal_energy_code[*row];
+    state.gas_cells.temperature_code[*row] = temperature_k_per_internal_energy_code > 0.0
+        ? temperature_k_per_internal_energy_code * state.gas_cells.internal_energy_code[*row]
+        : state.gas_cells.internal_energy_code[*row];
     state.cells.mass_code[*row] = rho * patch_geometry.geometry.cell_volume_comoving;
     state.gas_cells.metal_mass_code[*row] =
         std::clamp(primitive.metallicity_mass_fraction, 0.0, 1.0) * state.cells.mass_code[*row];
@@ -1781,7 +1831,8 @@ struct AmrSynchronizedSweepWorkspace {
       return static_cast<std::uint64_t>(core::checkedSizeMultiply(
           count, width, "AMR synchronized sweep workspace"));
     };
-    std::uint64_t bound = bytes(max_total, 13U * sizeof(double));
+    const bool dual_energy = options.active_batch_policy.dual_energy_workspace;
+    std::uint64_t bound = bytes(max_total, (dual_energy ? 14U : 13U) * sizeof(double));
     bound = core::checkedMemoryBytesAdd(bound,
         bytes(max_real, sizeof(std::size_t)), "AMR active cells");
     bound = core::checkedMemoryBytesAdd(bound,
@@ -1793,6 +1844,7 @@ struct AmrSynchronizedSweepWorkspace {
       reservation = options.regrid_memory_governor->reserve(
           core::MemoryClass::kPhaseResident, bound, "amr.synchronized_sweep.workspace");
     }
+    conserved.enableAuxiliaryInternalEnergy(dual_energy);
     conserved.resize(max_total);
     for (auto& field : source_fields) {
       field.reserve(max_total);
@@ -1912,6 +1964,9 @@ struct AmrSynchronizedSweepWorkspace {
     row_scratch_reservation.commit();
   }
   for (const PatchDescriptor& patch : descriptors) {
+    if (options.physical_boundary_kind == hydro::HydroBoundaryKind::kPeriodic) {
+      validatePeriodicAmrPatchTopology(patch, all_descriptors, options.periodic_box_extent_comoving);
+    }
     AmrHydroGeometryOptions geometry_options;
     geometry_options.physical_boundary_kind = options.physical_boundary_kind;
     geometry_options.boundary_classes = {
@@ -2256,6 +2311,21 @@ struct AmrSynchronizedSweepWorkspace {
           patch_geometry.geometry.ghost_cells[ghost_slot].ghost_cell,
           prepared_ghost_states[prepared_begin + ghost_slot]);
     }
+    if (conserved_state.auxiliaryInternalEnergyEnabled()) {
+      // Dual energy: auxiliary thermal lane from the canonical e of real
+      // cells; physical ghosts copy their source; same-level / coarse-fine
+      // ghosts keep NaN and fall back to E - K (counted by the solver).
+      std::span<double> auxiliary = conserved_state.auxiliaryInternalEnergyDensityComoving();
+      std::fill(auxiliary.begin(), auxiliary.end(), std::numeric_limits<double>::quiet_NaN());
+      for (std::size_t patch_cell = 0; patch_cell < patch_geometry.real_cells.size(); ++patch_cell) {
+        const std::uint32_t row = patch_geometry.real_cells[patch_cell].local_cell_row;
+        const double canonical_e = state.gas_cells.internal_energy_code[row];
+        if (canonical_e > 0.0) {
+          auxiliary[patch_cell] = conserved_state.loadCell(patch_cell).mass_density_comoving * canonical_e;
+        }
+      }
+      hydro::fillHydroBoundaryGhostAuxiliaryInternalEnergy(conserved_state, patch_geometry.geometry);
+    }
     // buildAmrHydroPatchGeometry emits real cells in increasing patch-local
     // order. This checked invariant permits allocation-free membership queries
     // without reordering the active set passed to the numerical solver.
@@ -2269,8 +2339,21 @@ struct AmrSynchronizedSweepWorkspace {
     active_faces.clear();
     for (std::size_t face_index = 0; face_index < patch_geometry.geometry.faces.size(); ++face_index) {
       const hydro::HydroFace& face = patch_geometry.geometry.faces[face_index];
+      std::size_t neighbor_for_activity = face.neighbor_cell;
+      if (face.ghost_cell_slot != hydro::k_invalid_ghost_cell_slot) {
+        const hydro::HydroGhostCell& ghost = patch_geometry.geometry.ghost_cells[face.ghost_cell_slot];
+        if (ghost.boundary_kind == hydro::HydroBoundaryKind::kPeriodic) {
+          // In-patch periodic wrap: the lower and upper ghost faces describe
+          // the same physical box face. Evaluate it once (upper copy) and
+          // let the wrapped source cell drive activity.
+          if (ghost.side == hydro::HydroFaceSide::kLower) {
+            continue;
+          }
+          neighbor_for_activity = ghost.source_real_cell;
+        }
+      }
       if (patchCellActive(face.owner_cell) ||
-          (face.neighbor_cell < patch_geometry.geometry.cellCount() && patchCellActive(face.neighbor_cell))) {
+          (neighbor_for_activity < patch_geometry.geometry.cellCount() && patchCellActive(neighbor_for_activity))) {
         active_faces.push_back(face_index);
       }
     }
@@ -2401,7 +2484,7 @@ struct AmrSynchronizedSweepWorkspace {
     }
     scatterAmrHydroConservedStateWithIndex(
         state, patch_geometry, conserved_state, options.adiabatic_index,
-        parent_mirror_index);
+        parent_mirror_index, options.temperature_k_per_internal_energy_code);
     diagnostics.advanced_patch_count += 1U;
     diagnostics.riemann_solve_count += profile.riemann_solve_count;
     diagnostics.positivity_fallback_count += profile.positivity_fallback_count;

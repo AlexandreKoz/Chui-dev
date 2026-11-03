@@ -57,6 +57,11 @@ bool rejects(const std::string& text) {
 
 void testFailClosedValidation() {
   CHUI_REQUIRE(rejects("[mode]\nmode = zoom_in\n[numerics]\nhydro_reconstruction = weno5\n"));
+  CHUI_REQUIRE(rejects("[mode]\nmode = zoom_in\n[parallel]\nnode_memory_admission = dynamic\n"));
+  const auto pool = co::loadFrozenConfigFromString(
+      "[mode]\nmode = zoom_in\n[parallel]\nnode_memory_admission = shared_pool\n", "node_pool_mode");
+  CHUI_REQUIRE(pool.config.parallel.node_memory_admission == co::NodeMemoryAdmissionMode::kSharedPool);
+  CHUI_REQUIRE(pool.normalized_text.find("node_memory_admission = shared_pool") != std::string::npos);
   CHUI_REQUIRE(rejects("[mode]\nmode = zoom_in\n[numerics]\nhydro_integration_scheme = rk3\n"));
   CHUI_REQUIRE(rejects("[mode]\nmode = zoom_in\n[numerics]\nhydro_riemann_solver = roe\n"));
   CHUI_REQUIRE(rejects("[mode]\nmode = zoom_in\n[numerics]\nhydro_dual_energy_eta = 1.5\n"));

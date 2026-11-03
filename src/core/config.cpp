@@ -706,8 +706,9 @@ parseInitialConditionMissingFieldPolicy(
   const std::string lower = toLower(trim(value));
   if (lower == "off") return NodeMemoryAdmissionMode::kOff;
   if (lower == "shared_equal") return NodeMemoryAdmissionMode::kSharedEqual;
+  if (lower == "shared_pool") return NodeMemoryAdmissionMode::kSharedPool;
   throw ConfigError("key 'parallel.node_memory_admission': invalid value '" + value +
-                    "' (expected off or shared_equal)");
+                    "' (expected off, shared_equal or shared_pool)");
 }
 
 [[nodiscard]] TreePmAssignmentScheme parseTreePmAssignmentScheme(const std::string& value) {
@@ -1717,7 +1718,7 @@ void validateConfig(const SimulationConfig& config) {
         "parallel.node_memory_budget_bytes/node_memory_reserve_bytes require "
         "parallel.node_memory_admission = shared_equal; refusing to silently ignore a node budget");
   }
-  if (config.parallel.node_memory_admission == NodeMemoryAdmissionMode::kSharedEqual &&
+  if (config.parallel.node_memory_admission != NodeMemoryAdmissionMode::kOff &&
       config.parallel.node_memory_budget_bytes != 0U &&
       config.parallel.node_memory_reserve_bytes >= config.parallel.node_memory_budget_bytes) {
     throw ConfigError("parallel.node_memory_reserve_bytes must be smaller than parallel.node_memory_budget_bytes");
@@ -4367,6 +4368,7 @@ std::string nodeMemoryAdmissionModeToString(NodeMemoryAdmissionMode mode) {
   switch (mode) {
     case NodeMemoryAdmissionMode::kOff: return "off";
     case NodeMemoryAdmissionMode::kSharedEqual: return "shared_equal";
+    case NodeMemoryAdmissionMode::kSharedPool: return "shared_pool";
   }
   throw ConfigError("unhandled NodeMemoryAdmissionMode enum value during serialization");
 }

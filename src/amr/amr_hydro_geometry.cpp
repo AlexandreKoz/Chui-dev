@@ -1,4 +1,5 @@
 #include "cosmosim/amr/amr_hydro_geometry.hpp"
+#include "cosmosim/hydro/hydro_boundary_conditions.hpp"
 
 #include "cosmosim/amr/amr_patch_indexing.hpp"
 #include "cosmosim/core/memory_governor.hpp"
@@ -111,6 +112,23 @@ void setNormal(hydro::HydroFace& face, hydro::HydroFaceAxis axis, hydro::HydroFa
   return kLowerX;
 }
 
+[[nodiscard]] std::size_t wrappedPeriodicSource(
+    const hydro::HydroPatchGeometry& geometry,
+    hydro::HydroFaceAxis axis,
+    hydro::HydroFaceSide side,
+    std::size_t a,
+    std::size_t b) {
+  switch (axis) {
+    case hydro::HydroFaceAxis::kX:
+      return geometry.linearCellIndex(side == hydro::HydroFaceSide::kLower ? geometry.nx - 1U : 0U, a, b);
+    case hydro::HydroFaceAxis::kY:
+      return geometry.linearCellIndex(a, side == hydro::HydroFaceSide::kLower ? geometry.ny - 1U : 0U, b);
+    case hydro::HydroFaceAxis::kZ:
+      return geometry.linearCellIndex(a, b, side == hydro::HydroFaceSide::kLower ? geometry.nz - 1U : 0U);
+  }
+  return hydro::k_invalid_cell_index;
+}
+
 [[nodiscard]] std::uint64_t sourceGasCellIdForGhost(
     const AmrHydroPatchGeometry& patch_geometry,
     hydro::HydroFaceAxis axis,
@@ -161,9 +179,20 @@ void appendBoundaryGhost(
   const std::uint64_t source_gas_cell_id =
       sourceGasCellIdForGhost(patch_geometry, axis, side, a, b, boundary_class);
 
+  // Periodic physical boundary: the ghost is the wrapped cell of the SAME
+  // patch (valid only when the patch spans the periodic box along this axis;
+  // the orchestrator refuses other periodic topologies). Its flux is
+  // deposited on that wrapped cell by HydroCoreSolver, so mass, momentum,
+  // energy and metals cross the box boundary. Before this repair the source
+  // was the owner itself, which made every periodic box face a zero-flux wall.
+  const bool periodic_wrap = boundary_class == AmrHydroBoundaryClass::kPhysical &&
+      options.physical_boundary_kind == hydro::HydroBoundaryKind::kPeriodic;
+  const std::size_t wrapped_source = periodic_wrap
+      ? wrappedPeriodicSource(geometry, axis, side, a, b)
+      : owner;
   geometry.ghost_cells.push_back(hydro::HydroGhostCell{
       .owner_real_cell = owner,
-      .source_real_cell = owner,
+      .source_real_cell = wrapped_source,
       .ghost_cell = ghost_cell,
       .ghost_slot = ghost_slot,
       .boundary_kind = hydroBoundaryKindForBoundary(boundary_class, options.physical_boundary_kind),
@@ -479,6 +508,10 @@ AmrHydroPatchGeometry buildAmrHydroPatchGeometry(
   appendAxisBoundaryGhosts(result, options, hydro::HydroFaceAxis::kX);
   appendAxisBoundaryGhosts(result, options, hydro::HydroFaceAxis::kY);
   appendAxisBoundaryGhosts(result, options, hydro::HydroFaceAxis::kZ);
+  // Reconstruction stencils through the one-layer ghost shell (PLM full
+  // order at patch boundaries except the ghost side of boundary faces; PPM
+  // full order except the last two layers); periodic wraps stay in-patch.
+  (void)hydro::completeReconstructionStencils(result.geometry);
 
   result.faces.reserve(result.geometry.faces.size());
   for (std::size_t face_index = 0; face_index < result.geometry.faces.size(); ++face_index) {
@@ -602,6 +635,10 @@ AmrHydroPatchGeometry buildRemoteAmrHydroPatchGeometry(
   appendAxisBoundaryGhosts(result, options, hydro::HydroFaceAxis::kX);
   appendAxisBoundaryGhosts(result, options, hydro::HydroFaceAxis::kY);
   appendAxisBoundaryGhosts(result, options, hydro::HydroFaceAxis::kZ);
+  // Reconstruction stencils through the one-layer ghost shell (PLM full
+  // order at patch boundaries except the ghost side of boundary faces; PPM
+  // full order except the last two layers); periodic wraps stay in-patch.
+  (void)hydro::completeReconstructionStencils(result.geometry);
   result.faces.reserve(result.geometry.faces.size());
   for (std::size_t face_index = 0; face_index < result.geometry.faces.size(); ++face_index) {
     result.faces.push_back(makeFaceDescriptor(result, face_index));
@@ -620,12 +657,21 @@ void loadAmrHydroConservedStateInto(
   conserved.resize(patch_geometry.geometry.totalCellStorageCount());
   for (std::size_t patch_cell = 0; patch_cell < patch_geometry.real_cells.size(); ++patch_cell) {
     const std::uint32_t row = patch_geometry.real_cells[patch_cell].local_cell_row;
+    // Thermal authority is the canonical specific internal energy (same
+    // contract as the fixed-grid path and the refresh helper). The derived
+    // pressure cache is only a legacy fallback for states that never set e;
+    // using it as authority would mis-build E for effective-EOS cells.
+    const double rho = positiveDensityForCell(state, row);
+    const double canonical_e = state.gas_cells.internal_energy_code.at(row);
+    const double pressure = canonical_e > 0.0
+        ? std::max((adiabatic_index - 1.0) * rho * canonical_e, 1.0e-14)
+        : std::max(state.gas_cells.pressure_code.at(row), 1.0e-14);
     const hydro::HydroPrimitiveState primitive{
-        .rho_comoving = positiveDensityForCell(state, row),
+        .rho_comoving = rho,
         .vel_x_peculiar = state.gas_cells.velocity_x_peculiar.at(row),
         .vel_y_peculiar = state.gas_cells.velocity_y_peculiar.at(row),
         .vel_z_peculiar = state.gas_cells.velocity_z_peculiar.at(row),
-        .pressure_comoving = std::max(state.gas_cells.pressure_code.at(row), 1.0e-14),
+        .pressure_comoving = pressure,
         .metallicity_mass_fraction = std::clamp(
             state.gas_cells.metal_mass_code.at(row) /
                 std::max(state.cells.mass_code.at(row), 1.0e-30),

@@ -6,7 +6,10 @@ thermodynamic refresh before CFL), F7 (ISM ledger volume), periodic fixed-grid
 double boundary flux. Open: F2 cooling interval acceptance (Part 2), F5
 newborn stellar age (Part 2), F6 automatic distributed AMR hierarchy (Part 3),
 multi-layer AMR ghosts for full-order PPM/CTU at patch boundaries (Part 3),
-persistent entropy lane if validation item 3 shows it is needed. See the
+cross-patch periodic AMR topology (now refused instead of zero-flux box
+faces; Part 3), transactional AMR sweep (Part 3). Corrective pass also fixed
+AMR periodic zero-flux faces, AMR pressure-cache thermal authority and the AMR
+temperature cache, and redesigned dual energy (no E overwrite). See the
 [Part 1 record](repair/chui_part1_foundation_hydro_20261103.md).
 
 

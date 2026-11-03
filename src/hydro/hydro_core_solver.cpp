@@ -142,69 +142,54 @@ void validateActiveSet(const HydroActiveSetView& active_set, const HydroConserve
   }
 }
 
-void fillPrimitiveCache(
+// Thermal-state selection of the dual-energy formalism for one cell
+// (Bryan et al. 1995). Returns true when the auxiliary internal energy was
+// used. The conservative thermal energy E - K is authoritative unless it is
+// non-positive or a fraction smaller than eta of E, where its cancellation
+// error dominates; then rho e_aux supplies e, P = (gamma-1) rho e and c^2.
+[[nodiscard]] bool selectDualEnergyThermalState(
     const HydroConservedStateSoa& conserved,
-    const HydroActiveSetView& active_set,
-    const HydroPatchGeometry& geometry,
+    std::size_t cell_index,
+    const HydroConservedState& cell,
+    const HydroDualEnergyPolicy& dual_energy,
     double adiabatic_index,
-    const HydroSourceContext& source_context,
-    HydroPrimitiveCacheSoa& primitive_cache) {
-  if (primitive_cache.size() != conserved.size()) {
-    primitive_cache.resize(conserved.size());
+    HydroPrimitiveState& primitive) {
+  if (dual_energy.mode == HydroDualEnergyMode::kOff || !conserved.auxiliaryInternalEnergyEnabled()) {
+    return false;
   }
-
-  const auto closedPrimitive = [&](std::size_t cell_index) {
-    const HydroConservedState cell = conserved.loadCell(cell_index);
-    HydroPrimitiveState primitive = HydroCoreSolver::primitiveFromConserved(cell, adiabatic_index);
-    if (source_context.thermodynamic_closure != nullptr) {
-      const HydroThermodynamicClosureResult closure =
-          source_context.thermodynamic_closure->evaluate(
-              cell_index, cell, primitive, source_context.update.scale_factor, source_context.redshift);
-      if (closure.valid && closure.pressure_comoving > 0.0 &&
-          closure.signal_speed_squared_code > 0.0) {
-        primitive.pressure_comoving = closure.pressure_comoving;
-        primitive.signal_speed_squared_code = closure.signal_speed_squared_code;
-        primitive.uses_effective_ism = closure.uses_effective_ism;
-      }
-    }
-    return primitive;
-  };
-
-  for (std::size_t cell_index : active_set.active_cells) {
-    primitive_cache.storeCell(
-        cell_index,
-        closedPrimitive(cell_index));
+  const std::span<const double> auxiliary = conserved.auxiliaryInternalEnergyDensityComoving();
+  if (cell_index >= auxiliary.size()) {
+    return false;
   }
-  for (std::size_t face_index : active_set.active_faces) {
-    const HydroFace& face = geometry.faces[face_index];
-    primitive_cache.storeCell(
-        face.owner_cell,
-        closedPrimitive(face.owner_cell));
-    if (face.neighbor_cell != k_invalid_cell_index) {
-      primitive_cache.storeCell(
-          face.neighbor_cell,
-          closedPrimitive(face.neighbor_cell));
-    }
-    if (face.owner_minus_cell != k_invalid_cell_index) {
-      primitive_cache.storeCell(
-          face.owner_minus_cell,
-          closedPrimitive(face.owner_minus_cell));
-    }
-    if (face.neighbor_plus_cell != k_invalid_cell_index) {
-      primitive_cache.storeCell(
-          face.neighbor_plus_cell,
-          closedPrimitive(face.neighbor_plus_cell));
-    }
+  const double rho_e_aux = auxiliary[cell_index];
+  if (!std::isfinite(rho_e_aux) || !(rho_e_aux > 0.0)) {
+    return false;
   }
+  const double rho = std::max(cell.mass_density_comoving, k_small);
+  const double kinetic = 0.5 *
+      (cell.momentum_density_x_comoving * cell.momentum_density_x_comoving +
+       cell.momentum_density_y_comoving * cell.momentum_density_y_comoving +
+       cell.momentum_density_z_comoving * cell.momentum_density_z_comoving) / rho;
+  const double thermal_conservative = cell.total_energy_density_comoving - kinetic;
+  if (thermal_conservative > 0.0 &&
+      thermal_conservative >= dual_energy.thermal_fraction_switch * cell.total_energy_density_comoving) {
+    return false;
+  }
+  primitive.specific_internal_energy_code = rho_e_aux / rho;
+  primitive.pressure_comoving = (adiabatic_index - 1.0) * rho_e_aux;
+  primitive.signal_speed_squared_code = adiabatic_index * primitive.pressure_comoving / rho;
+  return true;
 }
 
 [[nodiscard]] HydroPrimitiveState closedPrimitiveForCell(
     const HydroConservedStateSoa& conserved,
     std::size_t cell_index,
     double adiabatic_index,
-    const HydroSourceContext& source_context) {
+    const HydroSourceContext& source_context,
+    const HydroDualEnergyPolicy& dual_energy) {
   const HydroConservedState cell = conserved.loadCell(cell_index);
   HydroPrimitiveState primitive = HydroCoreSolver::primitiveFromConserved(cell, adiabatic_index);
+  (void)selectDualEnergyThermalState(conserved, cell_index, cell, dual_energy, adiabatic_index, primitive);
   if (source_context.thermodynamic_closure != nullptr) {
     const HydroThermodynamicClosureResult closure =
         source_context.thermodynamic_closure->evaluate(
@@ -221,6 +206,38 @@ void fillPrimitiveCache(
     }
   }
   return primitive;
+}
+
+void fillPrimitiveCache(
+    const HydroConservedStateSoa& conserved,
+    const HydroActiveSetView& active_set,
+    const HydroPatchGeometry& geometry,
+    double adiabatic_index,
+    const HydroSourceContext& source_context,
+    const HydroDualEnergyPolicy& dual_energy,
+    HydroPrimitiveCacheSoa& primitive_cache) {
+  if (primitive_cache.size() != conserved.size()) {
+    primitive_cache.resize(conserved.size());
+  }
+  const auto store = [&](std::size_t cell_index) {
+    if (cell_index != k_invalid_cell_index) {
+      primitive_cache.storeCell(
+          cell_index,
+          closedPrimitiveForCell(conserved, cell_index, adiabatic_index, source_context, dual_energy));
+    }
+  };
+  for (std::size_t cell_index : active_set.active_cells) {
+    store(cell_index);
+  }
+  for (std::size_t face_index : active_set.active_faces) {
+    const HydroFace& face = geometry.faces[face_index];
+    store(face.owner_cell);
+    store(face.neighbor_cell);
+    store(face.owner_minus_cell);
+    store(face.neighbor_plus_cell);
+    store(face.owner_minus2_cell);
+    store(face.neighbor_plus2_cell);
+  }
 }
 
 [[nodiscard]] std::size_t hydroFaceBatchLimit(
@@ -416,6 +433,10 @@ HydroConservedStateSoa::HydroConservedStateSoa(std::size_t cell_count)
       m_metal_mass_density_comoving(cell_count, 0.0) {}
 
 void HydroConservedStateSoa::resize(std::size_t cell_count) {
+  if (m_auxiliary_internal_energy_enabled) {
+    m_auxiliary_internal_energy_density_comoving.resize(
+        cell_count, std::numeric_limits<double>::quiet_NaN());
+  }
   m_mass_density_comoving.resize(cell_count, 0.0);
   m_momentum_density_x_comoving.resize(cell_count, 0.0);
   m_momentum_density_y_comoving.resize(cell_count, 0.0);
@@ -427,7 +448,7 @@ void HydroConservedStateSoa::resize(std::size_t cell_count) {
 std::size_t HydroConservedStateSoa::size() const { return m_mass_density_comoving.size(); }
 
 std::uint64_t HydroConservedStateSoa::currentSizeBytes() const {
-  constexpr std::uint64_t k_lane_count = 6U;
+  const std::uint64_t k_lane_count = m_auxiliary_internal_energy_enabled ? 7U : 6U;
   constexpr std::uint64_t k_lane_bytes = sizeof(double);
   const std::uint64_t cell_count = static_cast<std::uint64_t>(size());
   if (cell_count > std::numeric_limits<std::uint64_t>::max() / k_lane_count / k_lane_bytes) {
@@ -451,7 +472,31 @@ std::uint64_t HydroConservedStateSoa::ownedCapacityBytes() const {
   add(m_momentum_density_z_comoving);
   add(m_total_energy_density_comoving);
   add(m_metal_mass_density_comoving);
+  add(m_auxiliary_internal_energy_density_comoving);
   return total;
+}
+
+void HydroConservedStateSoa::enableAuxiliaryInternalEnergy(bool enabled) {
+  m_auxiliary_internal_energy_enabled = enabled;
+  if (enabled) {
+    m_auxiliary_internal_energy_density_comoving.assign(
+        size(), std::numeric_limits<double>::quiet_NaN());
+  } else {
+    m_auxiliary_internal_energy_density_comoving.clear();
+    m_auxiliary_internal_energy_density_comoving.shrink_to_fit();
+  }
+}
+
+bool HydroConservedStateSoa::auxiliaryInternalEnergyEnabled() const noexcept {
+  return m_auxiliary_internal_energy_enabled;
+}
+
+std::span<double> HydroConservedStateSoa::auxiliaryInternalEnergyDensityComoving() {
+  return m_auxiliary_internal_energy_density_comoving;
+}
+
+std::span<const double> HydroConservedStateSoa::auxiliaryInternalEnergyDensityComoving() const {
+  return m_auxiliary_internal_energy_density_comoving;
 }
 
 HydroConservedState HydroConservedStateSoa::loadCell(std::size_t cell_index) const {
@@ -1167,6 +1212,12 @@ void HydroCoreSolver::advancePatchActiveSetBatchedWithScratch(
 
   validateAdvanceInputs(conserved, geometry, update, source_context_in, m_adiabatic_index);
   validateActiveSet(active_set, conserved, geometry);
+  if (use_dual_energy && !conserved.auxiliaryInternalEnergyEnabled()) {
+    throw std::invalid_argument(
+        "dual-energy hydro advance requires the auxiliary internal-energy lane "
+        "(HydroConservedStateSoa::enableAuxiliaryInternalEnergy) initialized from the canonical "
+        "specific internal energy");
+  }
   // Source terms integrate densities over the authoritative cell volume
   // (audit F7); the copy is a handful of spans/pointers, not field data.
   HydroSourceContext source_context = source_context_in;
@@ -1223,7 +1274,8 @@ void HydroCoreSolver::advancePatchActiveSetBatchedWithScratch(
   // paths pass nullptr and construct only batch-local primitive stencils.
   if (primitive_cache != nullptr) {
     fillPrimitiveCache(
-        conserved, active_set, geometry, m_adiabatic_index, source_context, *primitive_cache);
+        conserved, active_set, geometry, m_adiabatic_index, source_context, m_numerics.dual_energy,
+        *primitive_cache);
   }
 
   const std::size_t face_batch_limit = hydroFaceBatchLimit(batch_policy, active_set.active_faces.size());
@@ -1269,7 +1321,8 @@ void HydroCoreSolver::advancePatchActiveSetBatchedWithScratch(
             conserved,
             scratch.primitive_stencil_cells[slot],
             m_adiabatic_index,
-            source_context);
+            source_context,
+            m_numerics.dual_energy);
       }
       scratch.high_water.primitive_stencil_capacity = std::max(
           scratch.high_water.primitive_stencil_capacity,
@@ -1485,13 +1538,15 @@ void HydroCoreSolver::advancePatchActiveSetBatchedWithScratch(
 
   const auto source_start = std::chrono::steady_clock::now();
   std::uint64_t dual_energy_auxiliary_cells = 0U;
+  std::uint64_t dual_energy_unknown_auxiliary_cells = 0U;
+  std::uint64_t dual_energy_floor_cells = 0U;
   for (std::size_t touched_slot = 0; touched_slot < scratch.touched_cells.size(); ++touched_slot) {
     const std::size_t cell_index = scratch.touched_cells[touched_slot];
     const HydroConservedState old_cell = conserved.loadCell(cell_index);
     HydroPrimitiveState primitive = primitive_cache != nullptr
         ? primitive_cache->loadCell(cell_index)
         : closedPrimitiveForCell(
-            conserved, cell_index, m_adiabatic_index, source_context);
+            conserved, cell_index, m_adiabatic_index, source_context, m_numerics.dual_energy);
 
     HydroConservedState source_total;
     if (std::binary_search(
@@ -1519,24 +1574,36 @@ void HydroCoreSolver::advancePatchActiveSetBatchedWithScratch(
 
     HydroConservedState updated = old_cell + flux_delta + source_delta;
 
-    // Dual-energy switch (step-local auxiliary internal energy with E sync).
-    // Auxiliary equation (comoving, flux epoch a):
-    //   (rho e)^{n+1} = (rho e)^n - dt/(aV) sum A F_rho e_upwind
-    //                   - P^n dt/(aV) sum A u_face.n + dt (S_E - u.S_m)
-    // where S_E - u.S_m is the internal-energy share of the source terms
-    // (e.g. -3 H P for homogeneous expansion, zero for gravity work).
-    // If the conservative thermal energy E-K is unreliable (E-K < eta E or
-    // non-positive) and the auxiliary value is positive, E is reset to
-    // K + (rho e)_aux. The total-energy change is recorded in
-    // dual_energy_sync_delta; the next step re-derives e from the synced E,
-    // so no separate persistent field is needed and restarts stay exact.
-    if (use_dual_energy && cell_index < real_cell_count && updated.mass_density_comoving > k_small) {
+    // Dual energy (Bryan et al. 1995 policy, no total-energy overwrite).
+    // Authority: the conservative update owns rho, rho u, E and rho Z; the
+    // thermal energy handed to the canonical state is either E - K or the
+    // auxiliary rho e_aux evolved by the non-conservative equation
+    //   (rho e)^{n+1} = (rho e)^n - dt/(aV) sum_f A F_rho e_upwind
+    //                   - P^n dt/(aV) sum_f A u_face.n + dt (S_E - u.S_m),
+    // with (rho e)^n taken from the auxiliary lane (initialized from the
+    // canonical specific internal energy, so it never suffers the E - K
+    // cancellation) and S_E - u.S_m the thermal share of the hydro sources
+    // (cooling, effective-ISM relaxation; -3 H P for expansion).
+    // Selection after the update: E - K if it is positive and >= eta E
+    // (shocks heat through E and are captured here; the auxiliary lane is
+    // resynchronized to E - K), otherwise rho e_aux if positive (cold
+    // hypersonic flow, strong rarefactions). E itself is never modified here:
+    // the difference (selected - (E - K)) V is a non-conservative thermal
+    // correction that enters the canonical state when the runtime stores e
+    // from the auxiliary lane, and it is ledgered in dual_energy_sync_delta.
+    if (use_dual_energy && cell_index < real_cell_count && updated.mass_density_comoving > k_small &&
+        conserved.auxiliaryInternalEnergyEnabled()) {
+      std::span<double> auxiliary = conserved.auxiliaryInternalEnergyDensityComoving();
       const double old_rho = std::max(old_cell.mass_density_comoving, k_small);
       const double old_kinetic = 0.5 *
           (old_cell.momentum_density_x_comoving * old_cell.momentum_density_x_comoving +
            old_cell.momentum_density_y_comoving * old_cell.momentum_density_y_comoving +
            old_cell.momentum_density_z_comoving * old_cell.momentum_density_z_comoving) / old_rho;
-      const double old_internal = std::max(old_cell.total_energy_density_comoving - old_kinetic, 0.0);
+      double old_internal = auxiliary[cell_index];
+      if (!std::isfinite(old_internal) || !(old_internal > 0.0)) {
+        old_internal = std::max(old_cell.total_energy_density_comoving - old_kinetic, 0.0);
+        ++dual_energy_unknown_auxiliary_cells;
+      }
       const double source_internal = source_total.total_energy_density_comoving -
           (primitive.vel_x_peculiar * source_total.momentum_density_x_comoving +
            primitive.vel_y_peculiar * source_total.momentum_density_y_comoving +
@@ -1551,19 +1618,25 @@ void HydroCoreSolver::advancePatchActiveSetBatchedWithScratch(
            updated.momentum_density_z_comoving * updated.momentum_density_z_comoving) /
           updated.mass_density_comoving;
       const double conservative_internal = updated.total_energy_density_comoving - new_kinetic;
-      const bool unreliable = !(conservative_internal > 0.0) ||
-          conservative_internal <
+      const bool conservative_reliable = conservative_internal > 0.0 &&
+          conservative_internal >=
               m_numerics.dual_energy.thermal_fraction_switch * updated.total_energy_density_comoving;
-      if (unreliable && std::isfinite(auxiliary_internal) && auxiliary_internal > 0.0) {
-        const HydroConservedState before_sync = updated;
-        updated.total_energy_density_comoving = new_kinetic + auxiliary_internal;
-        HydroConservedState sync_delta;
-        sync_delta.total_energy_density_comoving =
-            updated.total_energy_density_comoving - before_sync.total_energy_density_comoving;
-        conservation_report.dual_energy_sync_delta += totalsFromDelta(
-            sync_delta, before_sync, geometry.cell_volume_comoving);
-        ++conservation_report.dual_energy_sync_count;
+      double selected_internal = conservative_internal;
+      if (!conservative_reliable && std::isfinite(auxiliary_internal) && auxiliary_internal > 0.0) {
+        selected_internal = auxiliary_internal;
         ++dual_energy_auxiliary_cells;
+      } else if (!(conservative_internal > 0.0)) {
+        // Neither branch admissible: thermal floor (counted, ledgered).
+        selected_internal = k_small;
+        ++dual_energy_floor_cells;
+      }
+      auxiliary[cell_index] = selected_internal;
+      if (selected_internal != conservative_internal) {
+        HydroConservedState thermal_correction;
+        thermal_correction.total_energy_density_comoving = selected_internal - conservative_internal;
+        conservation_report.dual_energy_sync_delta += totalsFromDelta(
+            thermal_correction, updated, geometry.cell_volume_comoving);
+        ++conservation_report.dual_energy_sync_count;
       }
     }
 
@@ -1593,15 +1666,16 @@ void HydroCoreSolver::advancePatchActiveSetBatchedWithScratch(
       primitive_cache->storeCell(
           cell_index,
           closedPrimitiveForCell(
-              conserved, cell_index, m_adiabatic_index, source_context));
+              conserved, cell_index, m_adiabatic_index, source_context, m_numerics.dual_energy));
     }
   }
   const auto source_stop = std::chrono::steady_clock::now();
   const auto total_stop = std::chrono::steady_clock::now();
   conservation_report.after = conservationTotals(conserved, geometry, scratch.full_active_cells);
+  // The dual-energy thermal correction is applied to the canonical state by
+  // the runtime store, not to E here, so it is not part of this residual.
   conservation_report.residual = conservation_report.after - conservation_report.before -
-      conservation_report.flux_delta - conservation_report.source_delta - conservation_report.floor_delta -
-      conservation_report.dual_energy_sync_delta;
+      conservation_report.flux_delta - conservation_report.source_delta - conservation_report.floor_delta;
 
   scratch.high_water.touched_cell_capacity = std::max(
       scratch.high_water.touched_cell_capacity, scratch.touched_cells.capacity());
@@ -1626,6 +1700,8 @@ void HydroCoreSolver::advancePatchActiveSetBatchedWithScratch(
     profile->ctu_transverse_degraded_states += ctu_degraded;
     profile->ctu_transverse_inadmissible_states += ctu_inadmissible;
     profile->dual_energy_auxiliary_cells += dual_energy_auxiliary_cells;
+    profile->dual_energy_unknown_auxiliary_cells += dual_energy_unknown_auxiliary_cells;
+    profile->dual_energy_floor_cells += dual_energy_floor_cells;
     profile->reconstruct_ms += reconstruct_ms;
     profile->riemann_ms += riemann_ms;
     profile->accumulate_ms += accumulate_ms;

@@ -40,6 +40,7 @@
 #include "cosmosim/core/cuda_runtime.hpp"
 #include "cosmosim/core/memory_governor.hpp"
 #include "cosmosim/core/node_memory_admission.hpp"
+#include "cosmosim/parallel/node_memory_pool.hpp"
 #include "cosmosim/core/profiling.hpp"
 #include "cosmosim/core/simulation_mode.hpp"
 #include "cosmosim/core/time_integration.hpp"
@@ -390,7 +391,7 @@ ReferenceWorkflowReport ReferenceWorkflowRunner::runImpl(
   // the same rule locally, so no collective is needed and none can block.
   std::uint64_t rank_hard_limit_bytes = config.parallel.process_memory_budget_bytes;
   std::optional<core::NodeMemoryAdmissionResult> node_admission;
-  if (config.parallel.node_memory_admission == core::NodeMemoryAdmissionMode::kSharedEqual) {
+  if (config.parallel.node_memory_admission != core::NodeMemoryAdmissionMode::kOff) {
     std::exception_ptr node_admission_failure;
     try {
       node_admission = core::computeNodeMemoryAdmission(core::NodeMemoryAdmissionInput{
@@ -400,12 +401,23 @@ ReferenceWorkflowReport ReferenceWorkflowRunner::runImpl(
           .process_budget_bytes = config.parallel.process_memory_budget_bytes,
           .discovery = core::discoverNodeMemory()});
       rank_hard_limit_bytes = node_admission->rank_hard_limit_bytes;
+      if (config.parallel.node_memory_admission == core::NodeMemoryAdmissionMode::kSharedPool) {
+        // The node pool bounds the node-wide sum; a single rank may use up to
+        // the whole usable node budget (still capped by a non-zero process
+        // budget).
+        rank_hard_limit_bytes = config.parallel.process_memory_budget_bytes != 0U
+            ? std::min(config.parallel.process_memory_budget_bytes, node_admission->node_usable_bytes)
+            : node_admission->node_usable_bytes;
+      }
     } catch (...) {
       node_admission_failure = std::current_exception();
     }
     mpi_context.rethrowCollectivePreparationFailure(
         node_admission_failure, "node memory admission");
   }
+  // Declared before the governor so it outlives it (the governor returns its
+  // pool bytes on destruction).
+  std::unique_ptr<parallel::NodeSharedMemoryPool> node_memory_pool;
   core::MemoryGovernor memory_governor(core::MemoryGovernorPolicy{
       .hard_limit_bytes = rank_hard_limit_bytes,
       .external_runtime_reserve_bytes = external_runtime_reserve_bytes,
@@ -414,6 +426,20 @@ ReferenceWorkflowReport ReferenceWorkflowRunner::runImpl(
       .safety_margin_fraction =
           config.parallel.process_memory_safety_margin_fraction,
   });
+  // shared_pool: collective creation of the node-shared counter, then attach
+  // (attach failure is reported collectively so no rank proceeds alone).
+  if (config.parallel.node_memory_admission == core::NodeMemoryAdmissionMode::kSharedPool &&
+      node_admission.has_value()) {
+    node_memory_pool = std::make_unique<parallel::NodeSharedMemoryPool>(
+        mpi_context, node_admission->node_usable_bytes);
+    std::exception_ptr attach_failure;
+    try {
+      memory_governor.attachNodePool(&node_memory_pool->pool());
+    } catch (...) {
+      attach_failure = std::current_exception();
+    }
+    mpi_context.rethrowCollectivePreparationFailure(attach_failure, "node memory pool attach");
+  }
   const RuntimeServices runtime_services{
       .mpi_context = mpi_context,
       .profiler = profiler,

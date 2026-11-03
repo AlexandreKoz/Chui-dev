@@ -561,3 +561,41 @@ before each deposition batch (old + new storage coexist during growth).
 buffers (covered only by the explicit reserves), per-step reconstruction /
 Riemann solver objects (a few hundred bytes), the `ownerTelemetry()` result
 vector at diagnostic boundaries.
+
+### Node-shared accounting pool (`shared_pool`, corrective pass 20261103)
+
+`shared_equal` gives each co-located rank a fixed equal ceiling: deterministic
+and provably non-overcommitting, but it cannot let a heavy rank borrow from a
+light one. `shared_pool` keeps the same node limit and single reserve and adds
+one node-wide accounting counter:
+
+* `parallel::NodeSharedMemoryPool` allocates one 8-byte MPI-3 shared window on
+  node-local rank 0 (`MPI_Comm_split_type(MPI_COMM_TYPE_SHARED)` +
+  `MPI_Win_allocate_shared`), collectively, once, at workflow start (main
+  thread). Non-MPI builds and single-rank runs use a process-local counter.
+* `MemoryGovernor::attachNodePool()` acquires the rank's current accounted
+  bytes; afterwards every reservation acquires its bytes from the counter by
+  lock-free compare-and-swap (`std::atomic_ref<uint64_t>`, compile-time checked
+  lock-free) and every release returns them. Baseline reconciliation of
+  already-resident memory is recorded unconditionally (`forceAcquire`), so the
+  counter reflects reality even if it exceeds capacity, in which case all new
+  reservations on the node fail until memory is released.
+* Invariant: `sum over co-located ranks of governed bytes <= node_usable`
+  whenever reservations succeed; a single rank may use up to `node_usable`
+  (capped by a non-zero `process_memory_budget_bytes`).
+* No MPI call or collective per reservation (works with
+  `MPI_THREAD_FUNNELED`), no waiting, hence no deadlock; cost is one atomic CAS
+  at reservation boundaries, never in per-cell/per-face loops.
+* Failure is explicit (`MemoryAdmissionError` with `node_pool_exhausted`, used
+  and capacity bytes) but, under contention, NOT run-to-run reproducible; use
+  `shared_equal` when admission must be deterministic.
+* What is governed: everything that goes through `MemoryGovernor` (hydro batch
+  incl. CTU/dual lanes, AMR sweep workspace incl. the auxiliary lane, AMR
+  regrid transactions, feedback touch log, existing owners) plus the declared
+  external reserves. Not governed: allocations that bypass the governor and
+  library internals beyond the declared reserves. The counter is an
+  accounting limit, not OS RSS/PSS; `observeProcessMemory()` remains the
+  diagnostic for actual residency.
+* Dependency: borrowing that is coordinated with work redistribution (moving
+  load away from a rank near the node limit) belongs to the Part 3
+  distributed scheduler.

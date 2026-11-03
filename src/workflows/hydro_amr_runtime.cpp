@@ -28,6 +28,7 @@
 #include "cosmosim/core/units.hpp"
 #include "cosmosim/physics/cooling_heating.hpp"
 #include "cosmosim/physics/effective_multiphase_ism.hpp"
+#include "cosmosim/hydro/gas_thermodynamic_refresh.hpp"
 #include "cosmosim/hydro/hydro_boundary_conditions.hpp"
 #include "cosmosim/hydro/hydro_cartesian_patch.hpp"
 #include "cosmosim/hydro/hydro_reconstruction.hpp"
@@ -97,6 +98,14 @@ constexpr double k_gamma_adiabatic = 5.0 / 3.0;
   return config.numerics.hydro_riemann_solver == core::HydroRiemannSolverMode::kHlle
       ? hydro::HydroRiemannSolverKind::kHlle
       : hydro::HydroRiemannSolverKind::kHllc;
+}
+
+// Temperature cache conversion T[K] = factor * e[code], fully ionized
+// primordial gas (mu = 0.59), matching the cooling module's convention
+// (CoolingModelConfig::temperature_per_internal_energy_k). One rule for the
+// fixed-grid store, the AMR scatter/reflux and the feedback refresh.
+[[nodiscard]] double temperatureKelvinPerInternalEnergyCode(const core::UnitSystem& units) {
+  return hydro::temperatureKelvinPerInternalEnergyCode(k_gamma_adiabatic, units.velocity_si_per_code);
 }
 
 // Build the selected reconstruction for one advance. courant_factors must be
@@ -462,6 +471,7 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
         m_memory_governor(services.memory_governor),
         m_units(core::makeUnitSystem(
             config.units.length_unit, config.units.mass_unit, config.units.velocity_unit)),
+        m_temperature_k_per_internal_energy_code(temperatureKelvinPerInternalEnergyCode(m_units)),
         m_solver(k_gamma_adiabatic, hydroNumericsPolicyFromConfig(config)),
         m_reconstruction(makeConfiguredReconstruction(config, {0.0, 0.0, 0.0})),
         m_riemann_solver(hydro::makeHydroRiemannSolver(hydroRiemannSolverKindFromConfig(config))) {
@@ -765,6 +775,10 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
     verifyAcceptedHydroCfl(context, context.active_set.cell_indices);
 
     m_conserved.resize(m_geometry.totalCellStorageCount());
+    const bool dual_energy_enabled =
+        m_solver.numericsPolicy().dual_energy.mode != hydro::HydroDualEnergyMode::kOff;
+    // Re-arm (NaN) the auxiliary lane every step; rows are filled below.
+    m_conserved.enableAuxiliaryInternalEnergy(dual_energy_enabled);
     for (std::size_t cell_index = 0; cell_index < context.state.cells.size(); ++cell_index) {
       const double rho = std::max(
           context.state.gas_cells.density_code[cell_index],
@@ -808,11 +822,18 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
       m_conserved.storeCell(
           m_geometry_row_by_dense_row[cell_index],
           hydro::HydroCoreSolver::conservedFromPrimitive(primitive, k_gamma_adiabatic));
+      if (dual_energy_enabled) {
+        // Auxiliary thermal lane from the canonical specific internal energy
+        // (exact; never recovered from E - K).
+        m_conserved.auxiliaryInternalEnergyDensityComoving()[m_geometry_row_by_dense_row[cell_index]] =
+            rho * internal_energy;
+      }
     }
     m_last_remote_ghost_boundary_report = refreshRemoteHydroBoundaryGhosts(
         context,
         particle_row_by_id);
     hydro::fillHydroBoundaryGhostCells(m_conserved, m_geometry, k_gamma_adiabatic);
+    hydro::fillHydroBoundaryGhostAuxiliaryInternalEnergy(m_conserved, m_geometry);
     const std::uint32_t world_rank = static_cast<std::uint32_t>(m_mpi_context.worldRank());
     const HydroGhostConservedSnapshot ghost_conserved_snapshot = snapshotHydroGhostConservedCells(
         context.state, m_conserved, m_geometry, m_geometry_row_by_dense_row, world_rank);
@@ -1059,6 +1080,18 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
       const hydro::HydroConservedState stored_conserved = m_conserved.loadCell(geometry_row);
       hydro::HydroPrimitiveState primitive =
           hydro::HydroCoreSolver::primitiveFromConserved(stored_conserved, k_gamma_adiabatic);
+      if (m_conserved.auxiliaryInternalEnergyEnabled()) {
+        // Dual energy: the solver wrote the SELECTED thermal energy (E - K or
+        // the auxiliary value) into the lane; the non-conservative difference
+        // is ledgered in HydroConservationReport::dual_energy_sync_delta.
+        const double rho_e = m_conserved.auxiliaryInternalEnergyDensityComoving()[geometry_row];
+        if (std::isfinite(rho_e) && rho_e > 0.0) {
+          primitive.specific_internal_energy_code = rho_e / primitive.rho_comoving;
+          primitive.pressure_comoving = (k_gamma_adiabatic - 1.0) * rho_e;
+          primitive.signal_speed_squared_code =
+              k_gamma_adiabatic * primitive.pressure_comoving / primitive.rho_comoving;
+        }
+      }
       if (m_effective_ism_closure != nullptr) {
         const auto closure = m_effective_ism_closure->evaluate(
             cell_index,
@@ -1078,6 +1111,8 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
           primitive.specific_internal_energy_code;
       context.state.gas_cells.sound_speed_code[cell_index] =
           std::sqrt(std::max(primitive.signal_speed_squared_code, 0.0));
+      context.state.gas_cells.temperature_code[cell_index] =
+          m_temperature_k_per_internal_energy_code * primitive.specific_internal_energy_code;
       context.state.cells.mass_code[cell_index] = primitive.rho_comoving * m_geometry.cell_volume_comoving;
       context.state.gas_cells.metal_mass_code[cell_index] =
           std::clamp(primitive.metallicity_mass_fraction, 0.0, 1.0) *
@@ -1770,7 +1805,14 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
         .physical_density_cgs_per_density_code = physical_density_cgs_per_density_code,
         .regrid_memory_governor = m_memory_governor,
         .reconstruction_scheme = hydroReconstructionSchemeFromConfig(m_config),
-        .slope_limiter = hydroSlopeLimiterFromConfig(m_config)};
+        .slope_limiter = hydroSlopeLimiterFromConfig(m_config),
+        // Patch coordinates share the comoving coordinate frame of the
+        // configured box (same convention as the fixed-grid layout).
+        .periodic_box_extent_comoving = {
+            m_config.cosmology.box_size_x_mpc_comoving,
+            m_config.cosmology.box_size_y_mpc_comoving,
+            m_config.cosmology.box_size_z_mpc_comoving},
+        .temperature_k_per_internal_energy_code = m_temperature_k_per_internal_energy_code};
     amr::ProductionAmrHydroDiagnostics amr_diagnostics;
     std::size_t remote_patch_count = 0;
     std::size_t remote_flux_register_count = 0;
@@ -2435,11 +2477,10 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
     hydro::appendCartesianBoundaryGhostFaces(
         m_geometry,
         hydroBoundaryKindFromModePolicy(m_mode_policy.hydro_boundary));
-    if (hydroBoundaryKindFromModePolicy(m_mode_policy.hydro_boundary) == hydro::HydroBoundaryKind::kPeriodic) {
-      // Full-order periodic reconstruction stencils (PLM and PPM) across the
-      // box boundary; the wrapped cells are authoritative real rows.
-      (void)hydro::completePeriodicReconstructionStencils(m_geometry);
-    }
+    // Complete along-normal stencils through the boundary ghost shell:
+    // periodic boxes wrap to real cells (full order everywhere), open and
+    // reflective boundaries use the ghost row as the stencil cell.
+    (void)hydro::completeReconstructionStencils(m_geometry);
     // The reconstruction (and its dt/(a dx) Courant factors) is rebuilt per
     // step once the flux-update epoch is known; see the hydro callback.
   }
@@ -2619,6 +2660,7 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
   core::MemoryGovernor* m_memory_governor = nullptr;
   core::UnitSystem m_units;
   std::uint32_t m_current_world_rank = 0;
+  double m_temperature_k_per_internal_energy_code = 0.0;
   hydro::HydroCoreSolver m_solver;
   std::unique_ptr<hydro::HydroReconstruction> m_reconstruction;
   std::unique_ptr<hydro::HydroRiemannSolver> m_riemann_solver;

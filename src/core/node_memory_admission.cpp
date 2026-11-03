@@ -1,6 +1,8 @@
 #include "cosmosim/core/node_memory_admission.hpp"
 
 #include <algorithm>
+#include <atomic>
+#include <cstdint>
 #include <cctype>
 #include <charconv>
 #include <cstdlib>
@@ -267,5 +269,79 @@ NodeMemoryAdmissionResult computeNodeMemoryAdmission(const NodeMemoryAdmissionIn
   result.explanation = explanation.str();
   return result;
 }
+
+static_assert(std::atomic_ref<std::uint64_t>::is_always_lock_free,
+              "node-shared memory accounting requires lock-free 64-bit atomics");
+
+AtomicCounterNodeMemoryPool::AtomicCounterNodeMemoryPool(std::uint64_t* counter, std::uint64_t capacity_bytes)
+    : m_counter(counter), m_capacity_bytes(capacity_bytes) {
+  if (m_counter == nullptr) {
+    throw std::invalid_argument("node memory pool requires a counter");
+  }
+  if (reinterpret_cast<std::uintptr_t>(m_counter) % alignof(std::uint64_t) != 0U) {
+    throw std::invalid_argument("node memory pool counter must be 8-byte aligned");
+  }
+  if (m_capacity_bytes == 0U) {
+    throw std::invalid_argument("node memory pool requires a positive capacity");
+  }
+}
+
+bool AtomicCounterNodeMemoryPool::tryAcquire(std::uint64_t bytes) noexcept {
+  if (bytes == 0U) {
+    return true;
+  }
+  std::atomic_ref<std::uint64_t> counter(*m_counter);
+  std::uint64_t used = counter.load(std::memory_order_relaxed);
+  while (true) {
+    if (bytes > m_capacity_bytes || used > m_capacity_bytes - bytes) {
+      return false;
+    }
+    if (counter.compare_exchange_weak(used, used + bytes, std::memory_order_acq_rel,
+                                      std::memory_order_relaxed)) {
+      return true;
+    }
+  }
+}
+
+void AtomicCounterNodeMemoryPool::forceAcquire(std::uint64_t bytes) noexcept {
+  std::atomic_ref<std::uint64_t> counter(*m_counter);
+  std::uint64_t used = counter.load(std::memory_order_relaxed);
+  while (true) {
+    const std::uint64_t next = used > std::numeric_limits<std::uint64_t>::max() - bytes
+        ? std::numeric_limits<std::uint64_t>::max() : used + bytes;
+    if (counter.compare_exchange_weak(used, next, std::memory_order_acq_rel, std::memory_order_relaxed)) {
+      return;
+    }
+  }
+}
+
+void AtomicCounterNodeMemoryPool::release(std::uint64_t bytes) noexcept {
+  if (bytes == 0U) {
+    return;
+  }
+  std::atomic_ref<std::uint64_t> counter(*m_counter);
+  std::uint64_t used = counter.load(std::memory_order_relaxed);
+  while (true) {
+    const std::uint64_t next = used >= bytes ? used - bytes : 0U;
+    if (counter.compare_exchange_weak(used, next, std::memory_order_acq_rel, std::memory_order_relaxed)) {
+      return;
+    }
+  }
+}
+
+std::uint64_t AtomicCounterNodeMemoryPool::capacityBytes() const noexcept { return m_capacity_bytes; }
+
+std::uint64_t AtomicCounterNodeMemoryPool::usedBytes() const noexcept {
+  return std::atomic_ref<std::uint64_t>(*m_counter).load(std::memory_order_acquire);
+}
+
+ProcessLocalNodeMemoryPool::ProcessLocalNodeMemoryPool(std::uint64_t capacity_bytes)
+    : m_pool(&m_counter, capacity_bytes) {}
+
+bool ProcessLocalNodeMemoryPool::tryAcquire(std::uint64_t bytes) noexcept { return m_pool.tryAcquire(bytes); }
+void ProcessLocalNodeMemoryPool::forceAcquire(std::uint64_t bytes) noexcept { m_pool.forceAcquire(bytes); }
+void ProcessLocalNodeMemoryPool::release(std::uint64_t bytes) noexcept { m_pool.release(bytes); }
+std::uint64_t ProcessLocalNodeMemoryPool::capacityBytes() const noexcept { return m_pool.capacityBytes(); }
+std::uint64_t ProcessLocalNodeMemoryPool::usedBytes() const noexcept { return m_pool.usedBytes(); }
 
 }  // namespace cosmosim::core

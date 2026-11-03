@@ -123,6 +123,23 @@ void testEffectiveBranchTransition() {
   CHUI_REQUIRE(std::abs(state.gas_cells.pressure_code[0] - (k_gamma - 1.0) * 100.0) < 1.0e-12);
 }
 
+// Runtime-wide temperature convention: T = factor * u with
+// factor = (gamma-1) mu m_p / k_B * v_unit^2 (mu = 0.59). For a km/s velocity
+// unit and u = 1 (km/s)^2: T = (2/3) 0.59 1.6726e-27 1e6 / 1.3806e-23 K.
+void testTemperatureConventionFactor() {
+  const double factor = hy::temperatureKelvinPerInternalEnergyCode(k_gamma, 1.0e3);
+  const double expected = (2.0 / 3.0) * 0.59 * 1.67262192369e-27 * 1.0e6 / 1.380649e-23;
+  CHUI_REQUIRE(std::abs(factor - expected) <= 1.0e-12 * expected);
+  cosmosim::core::SimulationState state;
+  seedStaticGas(state, 1U, 3.0);
+  state.notifyGasThermodynamicMutation();
+  const std::vector<hy::GasThermodynamicTouch> touched{{.cell_row = 0U, .internal_energy_before_code = 3.0}};
+  (void)hy::refreshGasThermodynamics(
+      state, touched,
+      hy::GasThermodynamicRefreshPolicy{.adiabatic_index = k_gamma, .temperature_k_per_internal_energy_code = factor});
+  CHUI_REQUIRE(std::abs(state.gas_cells.temperature_code[0] - 3.0 * factor) <= 1.0e-12 * 3.0 * factor);
+}
+
 void testOutOfRangeRowRejectedBeforeWrites() {
   cosmosim::core::SimulationState state;
   seedStaticGas(state, 2U, 1.0);
@@ -148,6 +165,7 @@ void testOutOfRangeRowRejectedBeforeWrites() {
 int main() {
   testHeatingByHundredTightensCflByTen();
   testEffectiveBranchTransition();
+  testTemperatureConventionFactor();
   testOutOfRangeRowRejectedBeforeWrites();
   return 0;
 }

@@ -97,6 +97,34 @@ void testUnequalVolumesWeightByOwnVolume() {
                     4.0 * unit_source.ledger().net_energy_adjustment_code, 1.0e-12));
 }
 
+// Coordinate convention: the same physical cell described in an isolated
+// (a = 1) frame and in a comoving frame at a = 0.5 has rho_c = a^3 rho_phys
+// and V_c = V_phys / a^3, so rho_c V_c = m and the integrated ledger
+// m * delta_u must agree. The closure forms the physical density rho_c/a^3,
+// so the equilibrium target is the same in both descriptions.
+void testComovingAndIsolatedConventionsAgree() {
+  ph::EffectiveIsmThermodynamicClosure closure(makeTable());
+  const ColdCell physical = coldEffectiveCell(closure.table());
+  const double a = 0.5;
+  const double volume_physical = 2.0;
+  ColdCell comoving = physical;
+  comoving.primitive.rho_comoving = physical.primitive.rho_comoving * a * a * a;
+  comoving.primitive.pressure_comoving = physical.primitive.pressure_comoving * a * a * a;
+  comoving.conserved = hy::HydroCoreSolver::conservedFromPrimitive(comoving.primitive, 5.0 / 3.0);
+  ph::EffectiveIsmEnergyRelaxationSource isolated_source(closure);
+  ph::EffectiveIsmEnergyRelaxationSource comoving_source(closure);
+  hy::HydroSourceContext isolated{.update = hy::HydroUpdateContext{.dt_code = 0.25, .scale_factor = 1.0}};
+  isolated.cell_volume_comoving = volume_physical;
+  hy::HydroSourceContext cosmological{
+      .update = hy::HydroUpdateContext{.dt_code = 0.25, .scale_factor = a}, .redshift = 1.0 / a - 1.0};
+  cosmological.cell_volume_comoving = volume_physical / (a * a * a);
+  (void)isolated_source.sourceForCell(0U, physical.conserved, physical.primitive, isolated);
+  (void)comoving_source.sourceForCell(0U, comoving.conserved, comoving.primitive, cosmological);
+  CHUI_REQUIRE(isolated_source.ledger().adjusted_cell_count == 1U);
+  CHUI_REQUIRE(near(comoving_source.ledger().net_energy_adjustment_code,
+                    isolated_source.ledger().net_energy_adjustment_code, 1.0e-10));
+}
+
 void testMissingVolumeIsRefused() {
   ph::EffectiveIsmThermodynamicClosure closure(makeTable());
   const ColdCell cell = coldEffectiveCell(closure.table());
@@ -147,6 +175,7 @@ void testSolverInjectsPatchVolumeAndLedgerMatchesSourceDelta() {
 int main() {
   testParentVersusEightChildren();
   testUnequalVolumesWeightByOwnVolume();
+  testComovingAndIsolatedConventionsAgree();
   testMissingVolumeIsRefused();
   testSolverInjectsPatchVolumeAndLedgerMatchesSourceDelta();
   return 0;
