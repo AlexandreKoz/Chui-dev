@@ -88,6 +88,24 @@ struct CflTimeStepInput {
   double sound_speed_code = 0.0;
 };
 
+// Discrete stability rule of the hydro time-integration family.
+//  * kPerAxisMaximum: dt = C min_d L dx_d / (|v_d| + c). Appropriate for
+//    corner-transport-upwind (CTU) integration, whose transverse corrections
+//    make the stability region per-axis (simplified 3D variant: nu_d <= 1/2,
+//    so C = 0.4 is admissible). Historical default rule.
+//  * kDimensionSummed: dt = C / sum_{active d} (|v_d| + c) / (L dx_d), i.e.
+//    sum_d nu_d <= C. Required by the directionally UNSPLIT MUSCL-Hancock
+//    update U^{n+1} = U^n - sum_d dt/(a dx_d) (F_{d,+} - F_{d,-}): for linear
+//    advection with first-order states its amplification factor is that of
+//    unsplit donor cell, stable iff sum_d nu_d <= 1 (the Hancock half step
+//    does not enlarge the region). With C = 0.4 the 1D step is unchanged and
+//    3D diagonal flow is kept at sum nu <= 0.4 instead of up to 1.2.
+// L = a in comoving coordinates (peculiar speeds, comoving widths), 1 otherwise.
+enum class HydroCflStabilityRule : std::uint8_t {
+  kPerAxisMaximum = 0,
+  kDimensionSummed = 1,
+};
+
 struct DirectionalCflTimeStepInput {
   // Ordered x, y, z stored-coordinate widths. velocity_axis_code and
   // sound_speed_code are physical peculiar/signal speeds. For a comoving
@@ -99,7 +117,28 @@ struct DirectionalCflTimeStepInput {
   double sound_speed_code = 0.0;
   CoordinateFrame coordinate_frame = CoordinateFrame::kPhysical;
   double scale_factor = 1.0;
+  HydroCflStabilityRule stability_rule = HydroCflStabilityRule::kPerAxisMaximum;
+  // Axes along which the hydro solver actually transports (an axis whose
+  // single cell spans the whole domain carries no flux differences). An
+  // inactive axis is excluded from both rules.
+  std::array<bool, 3> active_axis{true, true, true};
 };
+
+// Active hydro axes for a cell: an axis is inactive only when one cell spans
+// the whole domain extent along it (degenerate 1D/2D setups). This criterion
+// is per cell and rank-independent, so all ranks agree.
+[[nodiscard]] std::array<bool, 3> activeHydroAxes(
+    const std::array<double, 3>& cell_width_axis_code,
+    const std::array<double, 3>& domain_extent_axis_code);
+
+// numerics.hydro_integration_scheme -> stability rule (ctu: per-axis,
+// muscl_hancock: dimension-summed). Single mapping used by TimeCoordinator
+// and the hydro accepted-step guard.
+[[nodiscard]] HydroCflStabilityRule hydroCflStabilityRuleFor(const SimulationConfig& config) noexcept;
+// Configured domain extent in the stored coordinate frame
+// (cosmology.box_size_{x,y,z}_mpc_comoving, the convention of the gravity
+// domain and the fixed-grid layout).
+[[nodiscard]] std::array<double, 3> hydroDomainExtentCode(const SimulationConfig& config) noexcept;
 
 struct HydroCflDiagnostics {
   std::uint32_t local_row = 0;
@@ -119,6 +158,7 @@ struct HydroCflDiagnostics {
   CoordinateFrame coordinate_frame = CoordinateFrame::kPhysical;
   double scale_factor = 1.0;
   std::uint8_t limiting_axis = 0;
+  HydroCflStabilityRule stability_rule = HydroCflStabilityRule::kPerAxisMaximum;
 };
 
 struct GravityTimeStepInput {

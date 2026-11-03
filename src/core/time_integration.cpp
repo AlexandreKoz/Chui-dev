@@ -3145,6 +3145,32 @@ double computeCflTimeStep(const CflTimeStepInput& input, double c_cfl) {
   return c_cfl * (input.cell_width_code / denom);
 }
 
+std::array<bool, 3> activeHydroAxes(
+    const std::array<double, 3>& cell_width_axis_code,
+    const std::array<double, 3>& domain_extent_axis_code) {
+  std::array<bool, 3> active{true, true, true};
+  for (std::size_t axis = 0; axis < 3U; ++axis) {
+    const double extent = domain_extent_axis_code[axis];
+    if (std::isfinite(extent) && extent > 0.0 &&
+        cell_width_axis_code[axis] >= extent * (1.0 - 1.0e-12)) {
+      active[axis] = false;
+    }
+  }
+  return active;
+}
+
+HydroCflStabilityRule hydroCflStabilityRuleFor(const SimulationConfig& config) noexcept {
+  return config.numerics.hydro_integration_scheme == HydroIntegrationMode::kCornerTransportUpwind
+      ? HydroCflStabilityRule::kPerAxisMaximum
+      : HydroCflStabilityRule::kDimensionSummed;
+}
+
+std::array<double, 3> hydroDomainExtentCode(const SimulationConfig& config) noexcept {
+  return {config.cosmology.box_size_x_mpc_comoving,
+          config.cosmology.box_size_y_mpc_comoving,
+          config.cosmology.box_size_z_mpc_comoving};
+}
+
 double computeDirectionalCflTimeStep(const DirectionalCflTimeStepInput& input, double c_cfl) {
   if (c_cfl <= 0.0 || !std::isfinite(c_cfl)) {
     throw std::invalid_argument("c_cfl must be finite and positive");
@@ -3160,6 +3186,7 @@ double computeDirectionalCflTimeStep(const DirectionalCflTimeStepInput& input, d
       : 1.0;
   const double sound_speed = std::max(input.sound_speed_code, 0.0);
   double dt = std::numeric_limits<double>::infinity();
+  double summed_rate = 0.0;
   for (std::size_t axis = 0; axis < input.cell_width_axis_code.size(); ++axis) {
     const double cell_width_stored = input.cell_width_axis_code[axis];
     if (cell_width_stored <= 0.0 || !std::isfinite(cell_width_stored)) {
@@ -3168,11 +3195,18 @@ double computeDirectionalCflTimeStep(const DirectionalCflTimeStepInput& input, d
     if (!std::isfinite(input.velocity_axis_code[axis])) {
       throw std::invalid_argument("velocity_axis_code entries must be finite");
     }
+    if (!input.active_axis[axis]) {
+      continue;
+    }
     const double denom = std::abs(input.velocity_axis_code[axis]) + sound_speed;
     if (denom > 0.0) {
       const double crossing_length_code = length_scale * cell_width_stored;
       dt = std::min(dt, c_cfl * crossing_length_code / denom);
+      summed_rate += denom / crossing_length_code;
     }
+  }
+  if (input.stability_rule == HydroCflStabilityRule::kDimensionSummed) {
+    return summed_rate > 0.0 ? c_cfl / summed_rate : std::numeric_limits<double>::infinity();
   }
   return dt;
 }
@@ -3210,7 +3244,11 @@ HydroCflDiagnostics makeHydroCflDiagnostics(
   const double length_scale = input.coordinate_frame == CoordinateFrame::kComoving
       ? input.scale_factor
       : 1.0;
+  diagnostics.stability_rule = input.stability_rule;
   for (std::size_t axis = 0; axis < input.cell_width_axis_code.size(); ++axis) {
+    if (!input.active_axis[axis]) {
+      continue;
+    }
     const double denom = std::abs(input.velocity_axis_code[axis]) + sound_speed;
     const double axis_dt = denom > 0.0
         ? c_cfl * length_scale * input.cell_width_axis_code[axis] / denom

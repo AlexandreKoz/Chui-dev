@@ -833,3 +833,11 @@ Additional campaign checks to run on top of the unit tests:
    translation check, global mass/momentum/energy/metal conservation); confirm
    that a decomposed non-spanning root grid stops with the documented refusal.
 10. `unit_amr_periodic_boundary` (new).
+11. Stabilization: `unit_hydro_cfl_stability_rule`, `unit_amr_reflux_thermodynamics`,
+    `integration_amr_production_hydro_integration` (refinement caches). Run a 3D
+    diagonal advection with `muscl_hancock` at the new summed CFL for >= 1000
+    steps (must stay bounded) and compare step counts with `ctu`.
+12. MPI shared pool: on an MPI build with >= 2 ranks per node, check the
+    `memory.node_admission` event (`node_pool_established`,
+    `node_pool_mpi_shared_window`, `node_pool_fallback_reason`) and a forced
+    contention test where one rank reserves most of the node budget.

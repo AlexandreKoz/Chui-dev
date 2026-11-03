@@ -1,8 +1,8 @@
 # CHUI Part 1 — foundation, hydro suite, memory admission, audit F1/F3/F4/F7
 
 Date: 2026-11-03. Base revision: `4c4a807` (the audit's pinned revision).
-Initial source pass: commit `7157116`. Corrective pass: the commit that adds
-this revision of the record.
+Initial source pass: commit `7157116`. Corrective pass: `6ca40e1`.
+Stabilization gate: the commit that adds this revision of the record.
 
 **Evidence status: SOURCE ONLY. No configure, build, compiler, test,
 benchmark, sanitizer or simulation command was executed (explicit owner
@@ -55,6 +55,25 @@ Design inputs read: `chui_final_implementation_route_consolidation_v10.md`,
 8. Documentation now states the equations actually implemented
    (`docs/hydro_numerics.md`).
 
+## 2b. Stabilization-gate changes
+
+1. **Hydro CFL rule**: MUSCL-Hancock (default) now uses the dimension-summed
+   condition `dt = 0.4 / sum_d (|v_d|+c_s)/(L dx_d)` (stable iff
+   `sum nu <= 1` for the unsplit update; the old per-axis rule allowed 1.2);
+   CTU keeps the per-axis rule. Same function for the TimeCoordinator and the
+   accepted-step guard; inactive (domain-spanning single-cell) axes excluded.
+2. **AMR thermodynamic caches**: scatter, reflux (local + remote), refine and
+   derefine writes produce closure-consistent `P`, `c_s` and `T = f e`
+   (`amr::AmrThermodynamicCachePolicy`); whole-rank post-AMR closure pass
+   removed; both loaders use canonical `e` (pressure cache only as legacy
+   fallback); star formation refresh is touched-row based; `mu` parameterized.
+3. **Shared pool**: guarantee only after world-agreed compile-time + runtime
+   checks (address-free allowlist, `MPI_WIN_UNIFIED`, alignment); otherwise
+   deterministic `shared_equal` fallback, reported.
+4. **Dual energy at AMR**: reflux keeps pre-reflux `e` where `E - K < eta E`
+   (ledgered); ghost auxiliary energy from local source cells; remote sources
+   counted as degraded.
+
 ## 3. Policies as implemented
 
 * **Dual energy:** `docs/hydro_numerics.md` section 7. Conservative state owns
@@ -95,13 +114,18 @@ table edges, relaxation + cooling partition.
 * PPM/CTU at AMR (and non-periodic fixed-grid) patch boundaries: explicit,
   counted reductions (table in `docs/hydro_numerics.md` section 3; CTU ghost
   side normal-only). Multi-layer ghost shells and corner ghosts are Part 3.
-* Periodic AMR across patches is refused; decomposed periodic `cosmo_cube` gas
+* **MANDATORY PART 3 DELIVERABLE — periodic cross-patch AMR topology.**
+  Periodic AMR across patches is refused; decomposed periodic `cosmo_cube` gas
   whose root patches do not span the box stops with an explicit error.
-* MUSCL-Hancock with the per-axis 0.4 CFL can exceed `sum nu = 1` for 3D
-  diagonal flow (pre-existing; CTU is within its bound).
+  `cosmo_cube` is a first-class mode: Part 3 must implement wrapped neighbour
+  detection, wrapped ghost sampling, wrapped coarse/fine flux registers and
+  wrapped distributed exchange across MPI ranks, then lift the refusal.
 * Dual energy: weak shocks below `eta` not heated by the auxiliary branch;
-  AMR reflux re-derives `e` through `E - K`.
-* AMR reflux/regrid write legacy `T = e` until the next scatter.
+  remote AMR ghost sources fall back to `E - K` (counted); reflux keeps the
+  pre-reflux `e` in cold cells (ledgered non-conservative correction).
+* Gravity half-kick scaling of effective-EOS caches deviates by O(H dt) for
+  one step (re-derived at the next hydro store).
+* BH accretion triggers a whole-rank refresh (no touched-cell list).
 * Not bit-reproducible with pre-Part-1 binaries (intended numerical fixes).
 
 ## 6. Migrations
@@ -127,7 +151,12 @@ cold contact beyond E precision, warm-flow no-op, shock heating, contracts),
 `unit_gas_thermodynamic_refresh` (+ temperature convention),
 `unit_effective_ism_energy_ledger` (+ comoving vs isolated),
 `unit_node_memory_admission` (+ shared pool), `unit_stage_transaction`,
-`unit_config_hydro_numerics` (+ `shared_pool`), `unit_amr_periodic_boundary`
+`unit_config_hydro_numerics` (+ `shared_pool`), `unit_hydro_cfl_stability_rule`
+(new: amplification-factor proof, anisotropic, comoving, guard),
+`unit_amr_reflux_thermodynamics` (new: closure/temperature at reflux, legacy
+path, dual-energy reflux fallback), `integration_amr_production_hydro_integration`
+(+ refinement caches), `unit_node_memory_admission` (+ serial pool),
+`unit_amr_periodic_boundary`
 (new: wrapped ghosts, boundary-crossing donor-cell step with metals and
 velocity, conservation, ghost-shell stencils), modified
 `unit_effective_multiphase_ism`; benchmark source `bench_hydro_method_matrix`.
@@ -153,7 +182,8 @@ in `docs/validation_plan.md`.
   reports mutated cells through `StellarFeedbackThermodynamicTouchSink`;
   source ledgers integrate with `HydroSourceContext::cell_volume_comoving`;
   thermal sources enter the dual-energy auxiliary update through `S_E`.
-* Part 3: multi-layer AMR ghost shells (`requiredStencilHalfWidth()` layers,
+* Part 3 (mandatory first item): periodic cross-patch AMR topology.
+* Part 3: remote auxiliary-energy ghost exchange, multi-layer AMR ghost shells (`requiredStencilHalfWidth()` layers,
   corner ghosts for CTU), wrapped periodic patch topology (ghost sampling,
   flux registers, distributed exchange), transactional AMR sweep, dimension-
-  summed CFL for MUSCL-Hancock, scheduler-coordinated memory borrowing.
+  scheduler-coordinated memory borrowing. (Dimension-summed CFL is now done.)

@@ -1127,7 +1127,9 @@ if(COSMOSIM_ENABLE_TESTS)
       node_memory_admission
       stage_transaction
       config_hydro_numerics
-      amr_periodic_boundary)
+      amr_periodic_boundary
+      hydro_cfl_stability_rule
+      amr_reflux_thermodynamics)
     add_executable(test_unit_${chui_part1_test} tests/unit/test_${chui_part1_test}.cpp)
     target_link_libraries(test_unit_${chui_part1_test} PRIVATE cosmosim_all)
     add_test(NAME unit_${chui_part1_test} COMMAND test_unit_${chui_part1_test})

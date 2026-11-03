@@ -130,12 +130,28 @@ transverse increment of a cell uses exactly the active faces, i.e. the same
 faces the final update uses. Scratch: three conserved states per touched cell,
 batch-scoped, admitted before the advance (`ctu_transverse_workspace`).
 
-**CFL caveat (pre-existing, unchanged):** the directionally unsplit
-MUSCL-Hancock family without transverse terms is linearly stable only for
-`sum_d nu_d <= 1`; the per-axis CFL coefficient 0.4 allows `sum_d nu_d` up to
-1.2 for 3D diagonal flow. CTU does not have this problem. A dimension-summed
-CFL option for MUSCL-Hancock is recommended for the Part 3 scheduler work; it
-was not changed here because it alters every run's timestep.
+**Hydro CFL rule (stabilization pass).** The gas timestep is selected by the
+rule of the configured integration family, identically in `TimeCoordinator`
+and in the accepted-step guard (`core::hydroCflStabilityRuleFor`,
+`core::computeDirectionalCflTimeStep`, `core::makeHydroCflDiagnostics`):
+
+* `muscl_hancock` (directionally unsplit, no transverse terms):
+  `dt = C / sum_{active d} (|v_d| + c_s) / (L dx_d)`, `C = 0.4`. Linear
+  analysis of the implemented update with first-order states gives the unsplit
+  donor-cell amplification factor `g = 1 - sum_d nu_d (1 - e^{-i theta_d})`,
+  which is stable iff `sum_d nu_d <= 1`; the limited, Hancock-predicted scheme
+  is used with the same bound plus margin. The previous per-axis rule admitted
+  `sum_d nu_d = 1.2` for 3D diagonal flow and is removed for this family.
+* `ctu`: `dt = C min_{active d} L dx_d / (|v_d| + c_s)`, `C = 0.4` (per-axis
+  `nu_d <= 1/2` for the simplified 3D variant).
+* `L = a` for comoving coordinates (comoving widths, peculiar speeds), `1`
+  otherwise. An axis is inactive only when one cell spans the whole configured
+  domain along it (`core::activeHydroAxes`, rank-independent), so 1D/2D setups
+  keep their 1D/2D steps (identical to before in 1D).
+* Consequence: default (`muscl_hancock`) 3D runs take steps up to 3x smaller
+  (isotropic sound-speed limited) than before; results and step counts are not
+  reproducible against earlier binaries (intended stability fix, no config key
+  restores the unsafe rule).
 
 ## 5. Riemann solvers and passive scalars (audit F3)
 
@@ -167,19 +183,31 @@ per-face heap allocation is needed and DMO/gravity paths never see the lanes.
   (effective multiphase ISM) evaluated at the flux epoch.
 * Temperature cache: `T = f e` with `f = (gamma-1) mu m_p v_unit^2 / k_B`,
   `mu = 0.59` (the cooling module's convention), applied by the fixed-grid
-  store, the AMR scatter and the source-stage refresh. **Repair:** the AMR
-  scatter wrote `T = e` (code units) and the fixed-grid store never updated `T`.
-  AMR reflux and regrid still write the legacy `T = e` for the cells they touch
-  until the next hydro scatter (documented limitation).
+  store, the AMR scatter, AMR reflux (local and remote registers), AMR
+  refine/derefine writes and the source-stage refresh. **Repair:** these paths
+  wrote `T = e` (code units) or never updated `T`. The AMR paths now go through
+  `amr::AmrThermodynamicCachePolicy` (temperature factor + active closure), so
+  effective-EOS `P`/`c_s` are also produced at the mutation itself (the former
+  whole-rank post-AMR closure pass, which read the stale pressure cache, is
+  removed). Focused callers that pass no policy keep the legacy values.
+  `mu` is a parameter of `hydro::temperatureKelvinPerInternalEnergyCode`
+  (Part 1 reference value 0.59); Part 2 supplies composition/ionization-
+  dependent `mu` through the closure interface.
+* Gravity half-kicks rescale `e`, `P`, `T` by the adiabatic expansion factor
+  and `c_s` by its square root: exact for the ideal closure; for effective-EOS
+  cells (whose `P`, `c_s` depend on density, not `e`) the cache deviates by
+  O(H dt) for at most one step and is re-derived at the next hydro store.
 * Floors: reconstructed-state floors (above); the conserved update applies the
   internal-energy floor `E >= K + epsilon`, measured in `floor_delta`.
 * Refresh contract: `hydro::refreshGasThermodynamics()` /
   `refreshAllGasThermodynamics()`. Any stage that mutates `rho`, `e` or
   composition outside the hydro store calls
   `SimulationState::notifyGasThermodynamicMutation()` then a refresh. Wired:
-  feedback deposition (touched-cell log, before mutation), star formation and
-  BH accretion (whole-rank refresh on steps where they removed gas, because
-  those models have no touched-cell lists). `TimeCoordinator` refuses to build
+  feedback deposition (touched-cell log, before mutation), star formation
+  (its reported host rows), BH accretion (whole-rank refresh, only on steps
+  with accretion, because the BH model exposes no touched-cell list). Both
+  hydro loaders take the canonical `e` and use the pressure cache only when
+  `e` was never set. `TimeCoordinator` refuses to build
   timestep criteria from stale caches (`std::logic_error`).
 
 ## 7. Dual energy (high-Mach thermal accuracy)
@@ -218,10 +246,20 @@ Selectable: `hydro_dual_energy = off` (reference: thermal energy is always
 * **Persistence.** No new persistent field: the canonical `e` is already
   restart truth, and the auxiliary lane is rebuilt from it each advance.
 * **Interactions.** Cooling/ISM sources enter through `S_E`; feedback and other
-  source stages mutate `e` between advances (the lane picks them up); AMR
-  reflux applies flux corrections to the stored state after the scatter and
-  re-derives `e` through `E - K` for the corrected coarse cells (cancellation
-  there is not protected: limitation).
+  source stages mutate `e` between advances (the lane picks them up).
+* **AMR reflux (explicit fallback).** Reflux corrects mass, momentum, `E` and
+  metals conservatively. If the corrected `E - K` of a coarse cell is below
+  `eta E` (or non-positive) the cell keeps its pre-reflux specific internal
+  energy instead of the cancellation-dominated `E - K`; the thermal
+  correction is ledgered in `RefluxDiagnostics::dual_energy_reflux_*` and
+  reported in the `hydro.amr_production_stage` event.
+* **AMR ghosts.** Physical ghosts copy their source; same-level and
+  coarse/fine ghosts take `rho_ghost * e_source` from the local source cell's
+  canonical `e`. Ghosts whose source is remote (or unknown) keep `E - K` and
+  are counted (`dual_energy_unresolved_ghosts`): protection is degraded at
+  those faces and this is reported, not silent. Remote auxiliary exchange is a
+  Part 3 item. Per-step AMR thermal corrections are summed in
+  `dual_energy_thermal_correction_code`.
 * **Limits.** Weak shocks whose post-shock thermal fraction stays below `eta`
   are not heated by the auxiliary branch (same as Enzo-type schemes);
   `eta = 1e-3` is the default; the pdV face velocity is first-order accurate.

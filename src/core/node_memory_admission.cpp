@@ -270,8 +270,10 @@ NodeMemoryAdmissionResult computeNodeMemoryAdmission(const NodeMemoryAdmissionIn
   return result;
 }
 
-static_assert(std::atomic_ref<std::uint64_t>::is_always_lock_free,
-              "node-shared memory accounting requires lock-free 64-bit atomics");
+// No static_assert on lock-freedom here: within one process std::atomic_ref
+// is correct either way. Cross-process use is gated at runtime by
+// parallel::NodeSharedMemoryPool (lock-free + address-free allowlist,
+// MPI_WIN_UNIFIED, alignment, world-wide agreement).
 
 AtomicCounterNodeMemoryPool::AtomicCounterNodeMemoryPool(std::uint64_t* counter, std::uint64_t capacity_bytes)
     : m_counter(counter), m_capacity_bytes(capacity_bytes) {

@@ -21,6 +21,26 @@ enum class ProductionAmrHydroSweepMode : std::uint8_t {
   kLocalSubcycling = 1,
 };
 
+// Derived thermodynamic caches written by AMR operations that mutate gas
+// (scatter after a patch advance, reflux, refine/derefine writes). With a
+// zero temperature factor and no closure the legacy behaviour is kept
+// (ideal P/c_s, temperature_code = internal_energy_code) for focused callers;
+// production passes the runtime-wide temperature factor and the active
+// effective-EOS closure so P, c_s and T are consistent with the selected
+// model immediately after the mutation (no stale cache can reach the CFL).
+struct AmrThermodynamicCachePolicy {
+  double temperature_k_per_internal_energy_code = 0.0;
+  const hydro::HydroThermodynamicClosure* closure = nullptr;
+  double scale_factor = 1.0;
+  double redshift = 0.0;
+  // Dual energy at reflux: when the corrected (E - K) is below eta E the
+  // reflux keeps the pre-reflux specific internal energy instead of the
+  // cancellation-dominated E - K, and ledgers the difference in
+  // RefluxDiagnostics::dual_energy_reflux_thermal_correction_code.
+  bool dual_energy = false;
+  double dual_energy_eta = 1.0e-3;
+};
+
 struct ProductionAmrHydroOptions {
   hydro::HydroBoundaryKind physical_boundary_kind = hydro::HydroBoundaryKind::kOpen;
   double adiabatic_index = 5.0 / 3.0;
@@ -68,9 +88,7 @@ struct ProductionAmrHydroOptions {
   // refused (std::runtime_error) until periodic-aware patch topology lands
   // (Part 3) instead of silently closing the box.
   std::array<double, 3> periodic_box_extent_comoving{0.0, 0.0, 0.0};
-  // T[K] per code specific internal energy for the temperature cache. Zero
-  // keeps the legacy copy (temperature_code = internal_energy_code).
-  double temperature_k_per_internal_energy_code = 0.0;
+  AmrThermodynamicCachePolicy thermodynamic_cache{};
 };
 
 // Complete physical workspace for immutable step-start ghost snapshots.
@@ -85,6 +103,12 @@ struct ProductionAmrHydroDiagnostics {
   std::uint64_t stencil_degradation_count = 0;
   std::uint64_t ctu_transverse_degraded_states = 0;
   std::uint64_t dual_energy_auxiliary_cells = 0;
+  // Ghost rows whose auxiliary energy could not be resolved from a local
+  // source cell (remote sources): dual-energy protection degraded there.
+  std::uint64_t dual_energy_unresolved_ghosts = 0;
+  // Sum over patches of HydroConservationReport::dual_energy_sync_delta
+  // (non-conservative thermal correction applied by the scatter).
+  double dual_energy_thermal_correction_code = 0.0;
   std::size_t patch_count = 0;
   std::size_t advanced_patch_count = 0;
   std::size_t active_cell_count = 0;
@@ -175,7 +199,8 @@ void scatterAmrHydroConservedState(
     core::SimulationState& state,
     std::span<const FluxRegisterEntry> entries,
     std::span<const PatchDescriptor> all_patches,
-    double adiabatic_index);
+    double adiabatic_index,
+    const AmrThermodynamicCachePolicy& thermodynamic_cache = {});
 
 [[nodiscard]] std::size_t mergeFluxRegistersIntoPendingStore(
     core::SimulationState& state,
@@ -185,7 +210,8 @@ void scatterAmrHydroConservedState(
 [[nodiscard]] RefluxDiagnostics applyCompletePendingFluxRegistersToSimulationState(
     core::SimulationState& state,
     std::span<const PatchDescriptor> all_patches,
-    double adiabatic_index);
+    double adiabatic_index,
+    const AmrThermodynamicCachePolicy& thermodynamic_cache = {});
 
 // Gate-2 active-level row storage contract. coarse_rows and fine_rows coexist,
 // so admission must include BOTH physical capacities. The workspace owns both

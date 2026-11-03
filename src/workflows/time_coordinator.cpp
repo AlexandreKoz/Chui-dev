@@ -696,15 +696,20 @@ enum class SchedulerElementFamily {
       const double vx = view.gas_cells.velocity_x_peculiar[cell_index];
       const double vy = view.gas_cells.velocity_y_peculiar[cell_index];
       const double vz = view.gas_cells.velocity_z_peculiar[cell_index];
+      const std::array<double, 3> cell_widths{
+          view.gas_cells.cell_width_x_code[cell_index],
+          view.gas_cells.cell_width_y_code[cell_index],
+          view.gas_cells.cell_width_z_code[cell_index]};
+      // Same rule as the accepted-step guard in HydroAmrRuntime
+      // (core::hydroCflStabilityRuleFor / activeHydroAxes).
       const core::DirectionalCflTimeStepInput hydro_cfl_input{
-          .cell_width_axis_code = {
-              view.gas_cells.cell_width_x_code[cell_index],
-              view.gas_cells.cell_width_y_code[cell_index],
-              view.gas_cells.cell_width_z_code[cell_index]},
+          .cell_width_axis_code = cell_widths,
           .velocity_axis_code = {vx, vy, vz},
           .sound_speed_code = std::max(view.gas_cells.sound_speed_code[cell_index], 0.0),
           .coordinate_frame = config.units.coordinate_frame,
           .scale_factor = gravity_scale_factor,
+          .stability_rule = core::hydroCflStabilityRuleFor(config),
+          .active_axis = core::activeHydroAxes(cell_widths, core::hydroDomainExtentCode(config)),
       };
       const double cfl_dt =
           core::computeDirectionalCflTimeStep(hydro_cfl_input, 0.4);

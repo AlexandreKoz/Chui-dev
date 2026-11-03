@@ -45,11 +45,17 @@ namespace cosmosim::hydro {
 // hydro solver uses, and the closure receives the evaluation-epoch scale
 // factor so it can form physical densities.
 
-// T[K] per code specific internal energy for fully ionized primordial gas
-// (mu = 0.59), T = (gamma-1) mu m_p u / k_B with u in (code velocity)^2.
-// Matches CoolingModelConfig::temperature_per_internal_energy_k.
+// T[K] per code specific internal energy, T = (gamma-1) mu m_p u / k_B with
+// u in (code velocity)^2. Part 1 reference: fixed mu = 0.59 (fully ionized
+// primordial gas), matching CoolingModelConfig::temperature_per_internal_energy_k.
+// mu is a parameter, not a physical constant of the interface: Part 2 will
+// supply a composition/ionization-dependent mu through the thermodynamic
+// closure; callers must not assume 0.59 elsewhere.
+inline constexpr double k_part1_reference_mean_molecular_weight = 0.59;
 [[nodiscard]] double temperatureKelvinPerInternalEnergyCode(
-    double adiabatic_index, double velocity_si_per_code);
+    double adiabatic_index,
+    double velocity_si_per_code,
+    double mean_molecular_weight = k_part1_reference_mean_molecular_weight);
 
 struct GasThermodynamicRefreshPolicy {
   double adiabatic_index = 5.0 / 3.0;
@@ -88,6 +94,16 @@ struct GasThermodynamicRefreshReport {
 GasThermodynamicRefreshReport refreshGasThermodynamics(
     core::SimulationState& state,
     std::span<const GasThermodynamicTouch> touched_cells,
+    const GasThermodynamicRefreshPolicy& policy);
+
+// Per-cell refresh used inside operations that already own the mutation
+// (AMR scatter, reflux, regrid writes): recomputes P and c_s through the
+// closure and, when temperature_k_per_internal_energy_code > 0, T = f u.
+// Does NOT touch the state epochs (the caller's operation is atomic with its
+// own refresh). Returns true when the effective-EOS branch was used.
+bool refreshGasThermodynamicCell(
+    core::SimulationState& state,
+    std::size_t row,
     const GasThermodynamicRefreshPolicy& policy);
 
 // Refresh every gas cell (used after bulk mutations such as regrid). The

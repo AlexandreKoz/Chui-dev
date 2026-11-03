@@ -95,14 +95,15 @@ void accumulate(GasThermodynamicRefreshReport& report, const RefreshedCell& cell
 
 }  // namespace
 
-double temperatureKelvinPerInternalEnergyCode(double adiabatic_index, double velocity_si_per_code) {
-  constexpr double k_mean_molecular_weight_ionized = 0.59;
+double temperatureKelvinPerInternalEnergyCode(
+    double adiabatic_index, double velocity_si_per_code, double mean_molecular_weight) {
   constexpr double k_proton_mass_kg = 1.67262192369e-27;
   constexpr double k_boltzmann_j_per_k = 1.380649e-23;
-  if (!(adiabatic_index > 1.0) || !(velocity_si_per_code > 0.0)) {
-    throw std::invalid_argument("temperature conversion requires gamma > 1 and a positive velocity unit");
+  if (!(adiabatic_index > 1.0) || !(velocity_si_per_code > 0.0) || !(mean_molecular_weight > 0.0)) {
+    throw std::invalid_argument(
+        "temperature conversion requires gamma > 1, a positive velocity unit and mu > 0");
   }
-  return (adiabatic_index - 1.0) * k_mean_molecular_weight_ionized * k_proton_mass_kg /
+  return (adiabatic_index - 1.0) * mean_molecular_weight * k_proton_mass_kg /
       k_boltzmann_j_per_k * velocity_si_per_code * velocity_si_per_code;
 }
 
@@ -136,6 +137,24 @@ GasThermodynamicRefreshReport refreshGasThermodynamics(
   }
   state.markGasThermodynamicsRefreshed();
   return report;
+}
+
+bool refreshGasThermodynamicCell(
+    core::SimulationState& state,
+    std::size_t row,
+    const GasThermodynamicRefreshPolicy& policy) {
+  if (row >= state.gas_cells.size()) {
+    throw std::out_of_range("gas thermodynamic cell refresh row is outside GasCellSidecar");
+  }
+  const RefreshedCell cell = evaluateCell(state, row, policy);
+  auto& gas = state.gas_cells;
+  gas.pressure_code[row] = cell.pressure;
+  gas.sound_speed_code[row] = cell.sound_speed;
+  if (policy.temperature_k_per_internal_energy_code > 0.0) {
+    gas.temperature_code[row] =
+        policy.temperature_k_per_internal_energy_code * std::max(gas.internal_energy_code[row], 0.0);
+  }
+  return cell.effective;
 }
 
 GasThermodynamicRefreshReport refreshAllGasThermodynamics(

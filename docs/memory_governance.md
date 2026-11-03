@@ -599,3 +599,49 @@ one node-wide accounting counter:
 * Dependency: borrowing that is coordinated with work redistribution (moving
   load away from a rank near the node limit) belongs to the Part 3
   distributed scheduler.
+
+### Shared-pool guarantee conditions and fallback (stabilization pass)
+
+`std::atomic_ref<uint64_t>::is_always_lock_free` alone does NOT prove that
+atomics on memory mapped into several processes are atomic across those
+processes: the C++ standard only *recommends* that lock-free atomics be
+address-free. The node-wide sum guarantee of `shared_pool` is therefore
+claimed only when all of the following hold, and the decision is agreed by
+`MPI_Allreduce(MIN)` over the world at construction (all ranks use the pool or
+none does):
+
+1. Toolchain/ISA allowlist: GCC/Clang on x86-64, AArch64 or POWER64, where
+   64-bit lock-free atomics compile to address-free hardware instructions
+   (`lock cmpxchg`, LSE/LL-SC, `ldarx/stdcx`) on cache-coherent memory, and
+   `std::atomic_ref<uint64_t>::is_always_lock_free`.
+2. `MPI_WIN_MODEL == MPI_WIN_UNIFIED` for the shared window (direct load/store
+   is coherent with the window's public copy).
+3. The counter from `MPI_Win_shared_query` is 8-byte aligned.
+4. Initialization: node rank 0 stores 0 (release), then `MPI_Win_sync` and a
+   node barrier before any rank reserves. Updates are acquire-release CAS loops;
+   no rank ever waits on another.
+
+If any condition fails anywhere, the window is freed, `established()` is false,
+every rank keeps the deterministic `shared_equal` ceiling, and the
+`memory.node_admission` event reports `node_pool_established = false` with the
+reason. Single-process runs use a process-local counter (always correct).
+
+Unequal ranks: the pool only bounds the sum; a rank may hold up to the usable
+node budget (capped by a non-zero process budget). A refused reservation
+acquires nothing (no rollback needed); releases and governor destruction
+return exactly the bytes held. Teardown: governors are destroyed before the
+pool; the pool's `MPI_Win_free` is collective and is skipped during exception
+unwinding so a failing rank cannot hang (MPI_Finalize/Abort reclaims it).
+Baseline reconciliation records resident memory even above capacity, which
+then refuses new reservations node-wide until releases happen (truthful
+accounting, not hidden overcommit).
+
+Precise guarantee now provided:
+* `off`: per-rank `process_memory_budget_bytes` (0 = unlimited), as before.
+* `shared_equal`: for every node, sum over co-located ranks of governed bytes
+  `<= node_limit - node_reserve`, deterministic.
+* `shared_pool` with `established()`: the same node-wide bound, with
+  unequal per-rank use; non-deterministic admission order under contention.
+* `shared_pool` without `established()`: exactly the `shared_equal` guarantee.
+All of these bound GOVERNED accounting (CHUI allocations that go through the
+governor plus declared external reserves), not OS RSS/PSS.

@@ -19,6 +19,8 @@
 
 #include "cosmosim/core/memory_governor.hpp"
 #include "cosmosim/core/node_memory_admission.hpp"
+#include "cosmosim/parallel/distributed_memory.hpp"
+#include "cosmosim/parallel/node_memory_pool.hpp"
 #include "../support/test_require.hpp"
 
 namespace {
@@ -184,6 +186,21 @@ void testNodeSharedPoolBoundsTheSumNotTheShare() {
   CHUI_REQUIRE(pool.usedBytes() == 0U);
 }
 
+// Single-process execution: the node pool is a process-local counter and the
+// node-wide guarantee is trivially established; no MPI symbol is touched.
+// (Multi-rank establishment / fallback requires an MPI run: user-reserved.)
+void testSerialNodePoolIsEstablishedWithoutMpi() {
+  const cosmosim::parallel::MpiContext serial(false, 1, 0);
+  cosmosim::parallel::NodeSharedMemoryPool pool(serial, 1000U);
+  CHUI_REQUIRE(pool.established());
+  CHUI_REQUIRE(!pool.usesMpiSharedWindow());
+  CHUI_REQUIRE(pool.fallbackReason().empty());
+  CHUI_REQUIRE(pool.pool().tryAcquire(600U));
+  CHUI_REQUIRE(!pool.pool().tryAcquire(600U));
+  pool.pool().release(600U);
+  CHUI_REQUIRE(pool.pool().usedBytes() == 0U);
+}
+
 void testOwnerTableIsBounded() {
   co::MemoryGovernor governor;
   for (std::size_t i = 0; i < 2U * co::k_memory_owner_telemetry_slots; ++i) {
@@ -207,5 +224,6 @@ int main() {
   testGovernorLifecycleOverflowAndOwnerTelemetry();
   testOwnerTableIsBounded();
   testNodeSharedPoolBoundsTheSumNotTheShare();
+  testSerialNodePoolIsEstablishedWithoutMpi();
   return 0;
 }

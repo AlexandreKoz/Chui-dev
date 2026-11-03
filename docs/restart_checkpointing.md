@@ -654,3 +654,14 @@ schema version changes. Reproducibility impact: a resumed run continues with
 the corrected numerics (F1 predictor sign and `1/a`, F3 passive lanes,
 periodic box faces evaluated once), so it is not bit-identical to a
 continuation under the pre-Part-1 binary.
+
+## CHUI Part 1 stabilization: hydro timestep rule (20261103)
+
+The gas CFL candidate now follows the stability rule of the integration
+family: dimension-summed for `muscl_hancock` (default), per-axis for `ctu`
+(`docs/hydro_numerics.md` section 4). Resuming any checkpoint with the default
+method yields smaller multi-dimensional timesteps than the binary that wrote
+it; no schema or config migration is involved, and the old per-axis rule
+cannot be selected for MUSCL-Hancock because it is linearly unstable for
+diagonal 3D flow. Reproducibility against pre-stabilization runs is not
+bitwise.

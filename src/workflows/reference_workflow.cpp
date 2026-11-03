@@ -401,14 +401,7 @@ ReferenceWorkflowReport ReferenceWorkflowRunner::runImpl(
           .process_budget_bytes = config.parallel.process_memory_budget_bytes,
           .discovery = core::discoverNodeMemory()});
       rank_hard_limit_bytes = node_admission->rank_hard_limit_bytes;
-      if (config.parallel.node_memory_admission == core::NodeMemoryAdmissionMode::kSharedPool) {
-        // The node pool bounds the node-wide sum; a single rank may use up to
-        // the whole usable node budget (still capped by a non-zero process
-        // budget).
-        rank_hard_limit_bytes = config.parallel.process_memory_budget_bytes != 0U
-            ? std::min(config.parallel.process_memory_budget_bytes, node_admission->node_usable_bytes)
-            : node_admission->node_usable_bytes;
-      }
+
     } catch (...) {
       node_admission_failure = std::current_exception();
     }
@@ -416,8 +409,26 @@ ReferenceWorkflowReport ReferenceWorkflowRunner::runImpl(
         node_admission_failure, "node memory admission");
   }
   // Declared before the governor so it outlives it (the governor returns its
-  // pool bytes on destruction).
+  // pool bytes on destruction). shared_pool: the collective pool construction
+  // happens BEFORE the governor so the rank ceiling can depend on whether the
+  // node-wide guarantee was established. If it was not (see
+  // parallel::NodeSharedMemoryPool), every rank keeps the deterministic
+  // shared_equal ceiling computed above and the fallback is reported.
   std::unique_ptr<parallel::NodeSharedMemoryPool> node_memory_pool;
+  bool node_pool_established = false;
+  if (config.parallel.node_memory_admission == core::NodeMemoryAdmissionMode::kSharedPool &&
+      node_admission.has_value()) {
+    node_memory_pool = std::make_unique<parallel::NodeSharedMemoryPool>(
+        mpi_context, node_admission->node_usable_bytes);
+    node_pool_established = node_memory_pool->established();
+    if (node_pool_established) {
+      // The pool bounds the node-wide sum; one rank may use up to the whole
+      // usable node budget (still capped by a non-zero process budget).
+      rank_hard_limit_bytes = config.parallel.process_memory_budget_bytes != 0U
+          ? std::min(config.parallel.process_memory_budget_bytes, node_admission->node_usable_bytes)
+          : node_admission->node_usable_bytes;
+    }
+  }
   core::MemoryGovernor memory_governor(core::MemoryGovernorPolicy{
       .hard_limit_bytes = rank_hard_limit_bytes,
       .external_runtime_reserve_bytes = external_runtime_reserve_bytes,
@@ -428,17 +439,16 @@ ReferenceWorkflowReport ReferenceWorkflowRunner::runImpl(
   });
   // shared_pool: collective creation of the node-shared counter, then attach
   // (attach failure is reported collectively so no rank proceeds alone).
-  if (config.parallel.node_memory_admission == core::NodeMemoryAdmissionMode::kSharedPool &&
-      node_admission.has_value()) {
-    node_memory_pool = std::make_unique<parallel::NodeSharedMemoryPool>(
-        mpi_context, node_admission->node_usable_bytes);
-    std::exception_ptr attach_failure;
-    try {
-      memory_governor.attachNodePool(&node_memory_pool->pool());
-    } catch (...) {
-      attach_failure = std::current_exception();
+  if (node_pool_established) {
+    {
+      std::exception_ptr attach_failure;
+      try {
+        memory_governor.attachNodePool(&node_memory_pool->pool());
+      } catch (...) {
+        attach_failure = std::current_exception();
+      }
+      mpi_context.rethrowCollectivePreparationFailure(attach_failure, "node memory pool attach");
     }
-    mpi_context.rethrowCollectivePreparationFailure(attach_failure, "node memory pool attach");
   }
   const RuntimeServices runtime_services{
       .mpi_context = mpi_context,
@@ -465,7 +475,14 @@ ReferenceWorkflowReport ReferenceWorkflowRunner::runImpl(
                     {"ranks_on_node", std::to_string(node_admission->ranks_on_node)},
                     {"rank_share_bytes", std::to_string(node_admission->rank_share_bytes)},
                     {"rank_hard_limit_bytes", std::to_string(node_admission->rank_hard_limit_bytes)},
-                    {"process_budget_binding", node_admission->process_budget_was_binding ? "true" : "false"}},
+                    {"process_budget_binding", node_admission->process_budget_was_binding ? "true" : "false"},
+                    {"mode", core::nodeMemoryAdmissionModeToString(config.parallel.node_memory_admission)},
+                    {"node_pool_established", node_pool_established ? "true" : "false"},
+                    {"node_pool_mpi_shared_window",
+                     node_memory_pool != nullptr && node_memory_pool->usesMpiSharedWindow() ? "true" : "false"},
+                    {"node_pool_fallback_reason",
+                     node_memory_pool != nullptr ? node_memory_pool->fallbackReason() : std::string()},
+                    {"effective_rank_hard_limit_bytes", std::to_string(rank_hard_limit_bytes)}},
     });
   }
   const core::OpenMpRuntimeInfo omp_runtime = core::openMpRuntimeInfo();

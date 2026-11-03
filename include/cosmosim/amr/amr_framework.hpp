@@ -213,6 +213,12 @@ struct RefluxDiagnostics {
   double corrected_metal_mass_code = 0.0;
   double corrected_energy_code = 0.0;
   double corrected_internal_energy_code = 0.0;
+  // Dual energy: corrected cells whose post-reflux thermal fraction was below
+  // eta kept their pre-reflux specific internal energy; the resulting
+  // non-conservative thermal correction sum (rho e_kept - (E - K)) V is
+  // ledgered here (code energy).
+  std::size_t dual_energy_reflux_cells = 0;
+  double dual_energy_reflux_thermal_correction_code = 0.0;
 };
 
 class RefluxSynchronizer {

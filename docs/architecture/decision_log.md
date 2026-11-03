@@ -1150,3 +1150,23 @@ Source only; NOT compiled or run.
   attached to each rank's existing `MemoryGovernor`; no new allocator, no
   collective in the reservation path. `core` defines the pool interface; the
   MPI backend lives in `parallel`.
+
+## CHUI Part 1 stabilization gate — 20261103
+
+Source only; NOT compiled or run.
+
+* Hydro CFL rule is selected by the integration family (dimension-summed for
+  MUSCL-Hancock, per-axis for CTU) through one core mapping used by both the
+  TimeCoordinator candidate and the accepted-step guard.
+* AMR mutations (scatter, reflux, regrid) write derived thermodynamic caches
+  through `amr::AmrThermodynamicCachePolicy` (closure + temperature factor);
+  the whole-rank post-AMR closure pass is removed. `mu` is an interface
+  parameter (Part 1 reference 0.59).
+* `shared_pool` claims its node-wide guarantee only after compile-time and
+  runtime conditions are agreed world-wide; otherwise all ranks fall back to
+  `shared_equal`. The core no longer static-asserts lock-freedom.
+* Dual energy: explicit reflux fallback (keep pre-reflux e when E-K is
+  unreliable, ledgered) and ghost auxiliary fill from local sources; remote
+  sources counted.
+* Periodic cross-patch AMR topology remains refused (mandatory Part 3
+  deliverable).

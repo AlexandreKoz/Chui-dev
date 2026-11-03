@@ -1166,6 +1166,8 @@ class SourceRuntimeImpl final : public SourceRuntime {
     const std::uint64_t gravity_source_mutation_rank_count =
         m_mpi_context.allreduceSumUint64(local_has_mutable_gravity_sources ? 1ULL : 0ULL);
     bool star_formation_mutated_gas = false;
+    std::vector<hydro::GasThermodynamicTouch> star_formation_touches;
+    std::vector<std::uint32_t> star_formation_touched_rows;
     if (m_star_formation.config().enabled) {
       constexpr std::size_t k_star_formation_cell_batch_max = 4096U;
       const bool all_cells_active =
@@ -1357,6 +1359,12 @@ class SourceRuntimeImpl final : public SourceRuntime {
               "source runtime star-formation batch spawn count overflows uint64");
         }
         local_spawned_particles += batch_report.counters.spawned_particles;
+        // Host rows whose gas mass/density the batch reduced (F4 refresh).
+        // Bounded by the number of births, which is itself admitted above.
+        star_formation_touched_rows.insert(
+            star_formation_touched_rows.end(),
+            batch_report.spawned_from_cells.begin(),
+            batch_report.spawned_from_cells.end());
       }
 
       if (local_spawned_particles > 0U) {
@@ -1444,26 +1452,40 @@ class SourceRuntimeImpl final : public SourceRuntime {
     if (star_formation_mutated_gas || black_hole_report.counters.gas_mass_removed_code > 0.0) {
       // Audit F4 (density-changing sources): star formation and BH accretion
       // change gas density, which changes the effective-EOS pressure and
-      // signal speed (and the ideal-gas pressure cache). These models do not
-      // expose touched-cell lists, so refresh every local gas cell once
-      // (O(N_gas), only on steps where they removed gas). Temperature is
-      // derived with the runtime-wide factor.
+      // signal speed (and the ideal-gas pressure cache). Star formation
+      // reports its host rows, so only those are refreshed; the BH model does
+      // not expose its accretion cells, so a BH gas removal refreshes the
+      // whole rank (O(N_gas), only on steps with accretion).
       context.state.notifyGasThermodynamicMutation();
       std::unique_ptr<physics::EffectiveIsmThermodynamicClosure> closure;
       if (m_effective_eos_table != nullptr) {
         closure = std::make_unique<physics::EffectiveIsmThermodynamicClosure>(m_effective_eos_table);
       }
-      (void)hydro::refreshAllGasThermodynamics(
-          context.state,
-          hydro::GasThermodynamicRefreshPolicy{
-              .adiabatic_index = 5.0 / 3.0,
-              .density_floor_code = m_hydro_density_floor_code,
-              .pressure_floor_code = m_hydro_pressure_floor_code,
-              .scale_factor = source_evaluation_scale_factor,
-              .redshift = std::max(0.0, 1.0 / source_evaluation_scale_factor - 1.0),
-              .closure = closure.get(),
-              .temperature_k_per_internal_energy_code =
-                  hydro::temperatureKelvinPerInternalEnergyCode(5.0 / 3.0, m_units.velocity_si_per_code)});
+      const hydro::GasThermodynamicRefreshPolicy policy{
+          .adiabatic_index = 5.0 / 3.0,
+          .density_floor_code = m_hydro_density_floor_code,
+          .pressure_floor_code = m_hydro_pressure_floor_code,
+          .scale_factor = source_evaluation_scale_factor,
+          .redshift = std::max(0.0, 1.0 / source_evaluation_scale_factor - 1.0),
+          .closure = closure.get(),
+          .temperature_k_per_internal_energy_code =
+              hydro::temperatureKelvinPerInternalEnergyCode(5.0 / 3.0, m_units.velocity_si_per_code)};
+      if (black_hole_report.counters.gas_mass_removed_code > 0.0) {
+        (void)hydro::refreshAllGasThermodynamics(context.state, policy);
+      } else {
+        std::sort(star_formation_touched_rows.begin(), star_formation_touched_rows.end());
+        star_formation_touched_rows.erase(
+            std::unique(star_formation_touched_rows.begin(), star_formation_touched_rows.end()),
+            star_formation_touched_rows.end());
+        star_formation_touches.reserve(star_formation_touched_rows.size());
+        for (const std::uint32_t row : star_formation_touched_rows) {
+          // Star formation does not change specific internal energy.
+          star_formation_touches.push_back(hydro::GasThermodynamicTouch{
+              .cell_row = row,
+              .internal_energy_before_code = context.state.gas_cells.internal_energy_code[row]});
+        }
+        (void)hydro::refreshGasThermodynamics(context.state, star_formation_touches, policy);
+      }
     }
     if (gravity_source_mutation_rank_count > 0U) {
       // Source models can change gas/star/BH gravitating mass and membership.

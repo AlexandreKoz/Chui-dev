@@ -787,13 +787,20 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
           ? m_config.numerics.hydro_pressure_floor_code /
                 ((k_gamma_adiabatic - 1.0) * std::max(rho, 1.0e-30))
           : 0.0;
+      // Canonical thermal authority is e; the derived pressure cache must not
+      // raise the thermal state (it may be stale or hold an effective-EOS
+      // pressure, which the closure re-derives inside the solver). States that
+      // never set e (legacy initial conditions) fall back to the cache.
+      const double canonical_e = context.state.gas_cells.internal_energy_code[cell_index];
       const double internal_energy = std::max(
-          context.state.gas_cells.internal_energy_code[cell_index],
+          canonical_e > 0.0
+              ? canonical_e
+              : context.state.gas_cells.pressure_code[cell_index] /
+                    ((k_gamma_adiabatic - 1.0) * std::max(rho, 1.0e-30)),
           internal_energy_floor);
-      const double pressure = std::max({
-          context.state.gas_cells.pressure_code[cell_index],
+      const double pressure = std::max(
           (k_gamma_adiabatic - 1.0) * rho * internal_energy,
-          m_config.numerics.hydro_pressure_floor_code});
+          m_config.numerics.hydro_pressure_floor_code);
       const double sound_speed_squared_floor = m_config.numerics.hydro_pressure_floor_code > 0.0
           ? k_gamma_adiabatic * m_config.numerics.hydro_pressure_floor_code /
                 std::max(rho, 1.0e-30)
@@ -1131,6 +1138,17 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
   }
 
  private:
+  [[nodiscard]] amr::AmrThermodynamicCachePolicy amrThermodynamicCachePolicy(
+      double scale_factor, double redshift) const {
+    return amr::AmrThermodynamicCachePolicy{
+        .temperature_k_per_internal_energy_code = m_temperature_k_per_internal_energy_code,
+        .closure = m_effective_ism_closure.get(),
+        .scale_factor = scale_factor,
+        .redshift = redshift,
+        .dual_energy = m_solver.numericsPolicy().dual_energy.mode != hydro::HydroDualEnergyMode::kOff,
+        .dual_energy_eta = m_solver.numericsPolicy().dual_energy.thermal_fraction_switch};
+  }
+
   // Validation predicate of the fixed-grid hydro transaction: every staged
   // real-cell conserved lane is finite, mass is positive and the thermal
   // energy E - |p|^2/(2 rho) is non-negative. O(N_cells) streaming check over
@@ -1812,7 +1830,7 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
             m_config.cosmology.box_size_x_mpc_comoving,
             m_config.cosmology.box_size_y_mpc_comoving,
             m_config.cosmology.box_size_z_mpc_comoving},
-        .temperature_k_per_internal_energy_code = m_temperature_k_per_internal_energy_code};
+        .thermodynamic_cache = amrThermodynamicCachePolicy(update.scale_factor, source_context.redshift)};
     amr::ProductionAmrHydroDiagnostics amr_diagnostics;
     std::size_t remote_patch_count = 0;
     std::size_t remote_flux_register_count = 0;
@@ -2228,7 +2246,8 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
       if (!inbound_entries.empty()) {
         const auto local_descriptors = amr::buildProductionAmrPatchDescriptors(context.state);
         const amr::RefluxDiagnostics remote_reflux = amr::applyFluxRegistersToSimulationState(
-            context.state, inbound_entries, local_descriptors, k_gamma_adiabatic);
+            context.state, inbound_entries, local_descriptors, k_gamma_adiabatic,
+            amrThermodynamicCachePolicy(update.scale_factor, source_context.redshift));
         amr_diagnostics.reflux.complete_register_count += remote_reflux.complete_register_count;
         amr_diagnostics.reflux.skipped_incomplete_register_count += remote_reflux.skipped_incomplete_register_count;
         amr_diagnostics.reflux.skipped_area_mismatch_count += remote_reflux.skipped_area_mismatch_count;
@@ -2242,6 +2261,9 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
         amr_diagnostics.reflux.corrected_metal_mass_code += remote_reflux.corrected_metal_mass_code;
         amr_diagnostics.reflux.corrected_energy_code += remote_reflux.corrected_energy_code;
         amr_diagnostics.reflux.corrected_internal_energy_code += remote_reflux.corrected_internal_energy_code;
+        amr_diagnostics.reflux.dual_energy_reflux_cells += remote_reflux.dual_energy_reflux_cells;
+        amr_diagnostics.reflux.dual_energy_reflux_thermal_correction_code +=
+            remote_reflux.dual_energy_reflux_thermal_correction_code;
       }
     } else {
       amr_diagnostics = amr::advanceProductionAmrHydro(
@@ -2259,55 +2281,11 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
         m_communication_high_water_bytes,
         directed_amr_diagnostics.communication_workspace_high_water_bytes);
 
-    if (m_effective_ism_closure != nullptr) {
-      const double redshift = source_context.redshift;
-      for (std::size_t row = 0; row < context.state.cells.size(); ++row) {
-        const double rho = std::max(
-            context.state.gas_cells.density_code[row],
-            m_config.numerics.hydro_density_floor_code);
-        const double internal_energy_floor = m_config.numerics.hydro_pressure_floor_code > 0.0
-            ? m_config.numerics.hydro_pressure_floor_code /
-                  ((k_gamma_adiabatic - 1.0) * std::max(rho, 1.0e-30))
-            : 0.0;
-        const double internal_energy = std::max(
-            context.state.gas_cells.internal_energy_code[row],
-            internal_energy_floor);
-        const double pressure = std::max({
-            context.state.gas_cells.pressure_code[row],
-            (k_gamma_adiabatic - 1.0) * rho * internal_energy,
-            m_config.numerics.hydro_pressure_floor_code});
-        const double sound_speed_squared_floor = m_config.numerics.hydro_pressure_floor_code > 0.0
-            ? k_gamma_adiabatic * m_config.numerics.hydro_pressure_floor_code /
-                  std::max(rho, 1.0e-30)
-            : 0.0;
-        hydro::HydroPrimitiveState primitive{
-            .rho_comoving = rho,
-            .vel_x_peculiar = context.state.gas_cells.velocity_x_peculiar[row],
-            .vel_y_peculiar = context.state.gas_cells.velocity_y_peculiar[row],
-            .vel_z_peculiar = context.state.gas_cells.velocity_z_peculiar[row],
-            .pressure_comoving = pressure,
-            .specific_internal_energy_code = internal_energy,
-            .signal_speed_squared_code = std::max(
-                context.state.gas_cells.sound_speed_code[row] *
-                    context.state.gas_cells.sound_speed_code[row],
-                sound_speed_squared_floor),
-            .uses_effective_ism = false,
-            .metallicity_mass_fraction = context.state.cells.mass_code[row] > 0.0
-                ? std::clamp(context.state.gas_cells.metal_mass_code[row] /
-                    context.state.cells.mass_code[row], 0.0, 1.0)
-                : 0.0,
-        };
-        const hydro::HydroConservedState conserved =
-            hydro::HydroCoreSolver::conservedFromPrimitive(primitive, k_gamma_adiabatic);
-        const auto closure = m_effective_ism_closure->evaluate(
-            row, conserved, primitive, update.scale_factor, redshift);
-        if (closure.valid && closure.pressure_comoving > 0.0) {
-          context.state.gas_cells.pressure_code[row] = closure.pressure_comoving;
-          context.state.gas_cells.sound_speed_code[row] =
-              std::sqrt(std::max(closure.signal_speed_squared_code, 0.0));
-        }
-      }
-    }
+    // Effective-EOS pressure / signal speed and the temperature cache are
+    // written by the AMR scatter and reflux themselves (amr_thermodynamic_cache
+    // policy), for exactly the rows they mutate; the former whole-rank
+    // closure pass here (which also read the stale pressure cache through a
+    // max()) is no longer needed.
     internal::synchronizeParentParticleCompatibilityMirrors(
         context.state,
         m_current_world_rank,
@@ -2329,6 +2307,12 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
                       {"stencil_degradation_count", std::to_string(amr_diagnostics.stencil_degradation_count)},
                       {"ctu_transverse_degraded_states", std::to_string(amr_diagnostics.ctu_transverse_degraded_states)},
                       {"dual_energy_auxiliary_cells", std::to_string(amr_diagnostics.dual_energy_auxiliary_cells)},
+                      {"dual_energy_unresolved_ghosts", std::to_string(amr_diagnostics.dual_energy_unresolved_ghosts)},
+                      {"dual_energy_thermal_correction_code",
+                       std::to_string(amr_diagnostics.dual_energy_thermal_correction_code)},
+                      {"dual_energy_reflux_cells", std::to_string(amr_diagnostics.reflux.dual_energy_reflux_cells)},
+                      {"dual_energy_reflux_thermal_correction_code",
+                       std::to_string(amr_diagnostics.reflux.dual_energy_reflux_thermal_correction_code)},
                       {"active_cell_count", std::to_string(amr_diagnostics.active_cell_count)},
                       {"active_face_count", std::to_string(amr_diagnostics.active_face_count)},
                       {"flux_register_entry_count", std::to_string(amr_diagnostics.flux_register_entry_count)},
@@ -2573,6 +2557,10 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
         .sound_speed_code = std::max(state.gas_cells.sound_speed_code[cell_index], 0.0),
         .coordinate_frame = m_config.units.coordinate_frame,
         .scale_factor = cfl_scale_factor,
+        .stability_rule = core::hydroCflStabilityRuleFor(m_config),
+        .active_axis = core::activeHydroAxes(
+            {m_geometry.cell_width_x_comoving, m_geometry.cell_width_y_comoving, m_geometry.cell_width_z_comoving},
+            core::hydroDomainExtentCode(m_config)),
     };
     const auto patch_identity = patchIdentityForCellRow(state, cell_index);
     return core::makeHydroCflDiagnostics(
