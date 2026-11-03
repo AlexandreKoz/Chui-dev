@@ -118,9 +118,11 @@ void testHydroClosureAndEnergyLedger() {
   assert(result.signal_speed_squared_code > 0.0);
 
   cosmosim::physics::EffectiveIsmEnergyRelaxationSource source(closure);
-  const cosmosim::hydro::HydroSourceContext context{
+  cosmosim::hydro::HydroSourceContext context{
       .update = cosmosim::hydro::HydroUpdateContext{.dt_code = 0.25, .scale_factor = 1.0},
       .redshift = 0.0};
+  // Audit F7 contract: the ledger integrates over the authoritative volume.
+  context.cell_volume_comoving = 1.0;
   const auto delta = source.sourceForCell(0U, conserved, primitive, context);
   assert(delta.total_energy_density_comoving > 0.0);
   const auto ledger = source.ledger();

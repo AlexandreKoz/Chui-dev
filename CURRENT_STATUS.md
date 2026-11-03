@@ -1,5 +1,21 @@
 # Current repository status
 
+## CHUI Part 1 foundation + hydro suite — 2026-11-03
+
+**IMPLEMENTED IN SOURCE — NOT COMPILED, NOT TESTED (user-reserved).** Audit
+F1 (Hancock predictor sign and `1/a`), F3 (HLL passive lanes), F4
+(post-feedback thermodynamic refresh before CFL) and F7 (effective-ISM ledger
+volume) are repaired in source; PPM, CTU, HLLE selection, optional dual
+energy, node-aware memory admission, bounded owner telemetry and a stage
+transaction substrate are added; fixed-grid periodic boxes no longer apply
+boundary fluxes twice; AMR periodic box faces no longer act as zero-flux
+walls (cross-patch periodic topology is refused). F2/F5 (Part 2) and F6
+(Part 3) remain open. Default
+configuration keeps the historical method selection, but results change
+through the bug fixes. See the
+[Part 1 record](docs/repair/chui_part1_foundation_hydro_20261103.md) and
+[`docs/hydro_numerics.md`](docs/hydro_numerics.md).
+
 ## Attempt 1 TreePM recovery — 2026-10-12
 
 **IMPLEMENTED IN SOURCE — NOT VALIDATED.** The confirmed drift velocity

@@ -506,3 +506,142 @@ just as the communication arena has its own owner. No per-particle storage is
 added by this optimization; existing optional hierarchical split-force lanes
 remain governed by their existing transactions. This does not certify a large
 DMO simulation's whole-process fit.
+
+## Node-aware admission, owner telemetry and stage transactions (CHUI Part 1, 20261103)
+
+Status: source only, NOT RUN.
+
+**Rank vs node.** `MemoryGovernor` remains the single rank-local authority.
+`core::computeNodeMemoryAdmission()` (`include/cosmosim/core/node_memory_admission.hpp`)
+derives its hard limit when `parallel.node_memory_admission = shared_equal`:
+
+    node_limit  = min(node_memory_budget_bytes [if set], cgroup v2/v1 limit,
+                      SLURM_MEM_PER_NODE, physical RAM)
+    node_usable = node_limit - node_memory_reserve_bytes      (once)
+    rank_share  = floor(node_usable / ranks_on_node)           (MPI_COMM_TYPE_SHARED size)
+    hard_limit  = min(rank_share, process_memory_budget_bytes if non-zero)
+
+`sum(hard_limit) <= node_usable` for every co-located rank set, independent of
+how unevenly ranks allocate, so no node-level shared counter or MPI window is
+required. Rank-local external reserves (`process_*_unknown_reserve_bytes`) stay
+inside each rank's share: nothing is subtracted twice. Discovery is
+best-effort and never throws; if no limit is known the admission refuses and
+asks for an explicit node budget. Assumptions: a discovered cgroup/scheduler
+limit is shared by all co-located ranks (conservative for per-task cgroups);
+physical RAM is optimistic on shared nodes. The 36/42 GiB numbers of the
+historical 48 GiB workstation are only an illustrative profile; the rule is
+size-independent (unit tests use synthetic 8/16/48/128 GiB nodes). Serial and
+non-MPI builds use `ranks_on_node = 1` and never call MPI. The selection is
+reported in the `memory.node_admission` profiler event.
+
+**Owner telemetry.** `MemoryGovernor::ownerTelemetry()` returns, per owner label
+(first 63 labels, then `<other>`), live bytes, peak live bytes, reservation and
+rejection counts. The table is fixed-size; reservation never allocates for it.
+Accounting remains an estimate of CHUI-owned allocations, not OS residency
+(`observeProcessMemory()` stays diagnostic evidence).
+
+**Batch-scoped hydro scratch.** CTU (`3 x HydroConservedState` per touched
+cell) and dual-energy (`2 x double` per touched cell) lanes are planned by
+`HydroScratchBuffers::workspaceBytes/prepareForActiveSet` when the batch policy
+requests them (`HydroCoreSolver::requiredWorkspaceFeatures`), are sized by the
+active patch/batch, and are never persistent all-mesh copies. The batched
+solver refuses an unplanned lane rather than growing after admission. PPM
+stages up to six primitive stencil cells per face (was four).
+
+**Stage transactions.** `core::StageTransaction` admits all transient bytes
+before work (refusal is recorded, not thrown, so every rank still votes),
+classifies preparation failures (numerical retry / model downgrade / resource /
+invalid state), performs exactly one collective vote, commits pending
+reservations before the authoritative mutation, and releases everything exactly
+once on every path. Wired today around the fixed-grid hydro commit (staged
+conserved state -> `SimulationState`). Feedback touch-log capacity is admitted
+before each deposition batch (old + new storage coexist during growth).
+
+**Known ungoverned allocations (unchanged by Part 1):** FFTW/MPI/HDF5 internal
+buffers (covered only by the explicit reserves), per-step reconstruction /
+Riemann solver objects (a few hundred bytes), the `ownerTelemetry()` result
+vector at diagnostic boundaries.
+
+### Node-shared accounting pool (`shared_pool`, corrective pass 20261103)
+
+`shared_equal` gives each co-located rank a fixed equal ceiling: deterministic
+and provably non-overcommitting, but it cannot let a heavy rank borrow from a
+light one. `shared_pool` keeps the same node limit and single reserve and adds
+one node-wide accounting counter:
+
+* `parallel::NodeSharedMemoryPool` allocates one 8-byte MPI-3 shared window on
+  node-local rank 0 (`MPI_Comm_split_type(MPI_COMM_TYPE_SHARED)` +
+  `MPI_Win_allocate_shared`), collectively, once, at workflow start (main
+  thread). Non-MPI builds and single-rank runs use a process-local counter.
+* `MemoryGovernor::attachNodePool()` acquires the rank's current accounted
+  bytes; afterwards every reservation acquires its bytes from the counter by
+  lock-free compare-and-swap (`std::atomic_ref<uint64_t>`, compile-time checked
+  lock-free) and every release returns them. Baseline reconciliation of
+  already-resident memory is recorded unconditionally (`forceAcquire`), so the
+  counter reflects reality even if it exceeds capacity, in which case all new
+  reservations on the node fail until memory is released.
+* Invariant: `sum over co-located ranks of governed bytes <= node_usable`
+  whenever reservations succeed; a single rank may use up to `node_usable`
+  (capped by a non-zero `process_memory_budget_bytes`).
+* No MPI call or collective per reservation (works with
+  `MPI_THREAD_FUNNELED`), no waiting, hence no deadlock; cost is one atomic CAS
+  at reservation boundaries, never in per-cell/per-face loops.
+* Failure is explicit (`MemoryAdmissionError` with `node_pool_exhausted`, used
+  and capacity bytes) but, under contention, NOT run-to-run reproducible; use
+  `shared_equal` when admission must be deterministic.
+* What is governed: everything that goes through `MemoryGovernor` (hydro batch
+  incl. CTU/dual lanes, AMR sweep workspace incl. the auxiliary lane, AMR
+  regrid transactions, feedback touch log, existing owners) plus the declared
+  external reserves. Not governed: allocations that bypass the governor and
+  library internals beyond the declared reserves. The counter is an
+  accounting limit, not OS RSS/PSS; `observeProcessMemory()` remains the
+  diagnostic for actual residency.
+* Dependency: borrowing that is coordinated with work redistribution (moving
+  load away from a rank near the node limit) belongs to the Part 3
+  distributed scheduler.
+
+### Shared-pool guarantee conditions and fallback (stabilization pass)
+
+`std::atomic_ref<uint64_t>::is_always_lock_free` alone does NOT prove that
+atomics on memory mapped into several processes are atomic across those
+processes: the C++ standard only *recommends* that lock-free atomics be
+address-free. The node-wide sum guarantee of `shared_pool` is therefore
+claimed only when all of the following hold, and the decision is agreed by
+`MPI_Allreduce(MIN)` over the world at construction (all ranks use the pool or
+none does):
+
+1. Toolchain/ISA allowlist: GCC/Clang on x86-64, AArch64 or POWER64, where
+   64-bit lock-free atomics compile to address-free hardware instructions
+   (`lock cmpxchg`, LSE/LL-SC, `ldarx/stdcx`) on cache-coherent memory, and
+   `std::atomic_ref<uint64_t>::is_always_lock_free`.
+2. `MPI_WIN_MODEL == MPI_WIN_UNIFIED` for the shared window (direct load/store
+   is coherent with the window's public copy).
+3. The counter from `MPI_Win_shared_query` is 8-byte aligned.
+4. Initialization: node rank 0 stores 0 (release), then `MPI_Win_sync` and a
+   node barrier before any rank reserves. Updates are acquire-release CAS loops;
+   no rank ever waits on another.
+
+If any condition fails anywhere, the window is freed, `established()` is false,
+every rank keeps the deterministic `shared_equal` ceiling, and the
+`memory.node_admission` event reports `node_pool_established = false` with the
+reason. Single-process runs use a process-local counter (always correct).
+
+Unequal ranks: the pool only bounds the sum; a rank may hold up to the usable
+node budget (capped by a non-zero process budget). A refused reservation
+acquires nothing (no rollback needed); releases and governor destruction
+return exactly the bytes held. Teardown: governors are destroyed before the
+pool; the pool's `MPI_Win_free` is collective and is skipped during exception
+unwinding so a failing rank cannot hang (MPI_Finalize/Abort reclaims it).
+Baseline reconciliation records resident memory even above capacity, which
+then refuses new reservations node-wide until releases happen (truthful
+accounting, not hidden overcommit).
+
+Precise guarantee now provided:
+* `off`: per-rank `process_memory_budget_bytes` (0 = unlimited), as before.
+* `shared_equal`: for every node, sum over co-located ranks of governed bytes
+  `<= node_limit - node_reserve`, deterministic.
+* `shared_pool` with `established()`: the same node-wide bound, with
+  unequal per-rank use; non-deterministic admission order under contention.
+* `shared_pool` without `established()`: exactly the `shared_equal` guarantee.
+All of these bound GOVERNED accounting (CHUI allocations that go through the
+governor plus declared external reserves), not OS RSS/PSS.

@@ -3348,6 +3348,16 @@ std::string restartConfigurationCompatibilityRecord(
       current.config.numerics.treepm_tree_max_leaf_size != 16 ||
       current.config.numerics.treepm_gaussian_pair_lookup_enabled ||
       !current.config.numerics.treepm_full_mac_diagnostics || current.config.numerics.hierarchical_max_rung != 0 ||
+      // CHUI Part 1 keys must hold their historical-equivalent defaults.
+      current.config.numerics.hydro_reconstruction != core::HydroReconstructionMode::kPiecewiseLinear ||
+      current.config.numerics.hydro_slope_limiter != core::HydroSlopeLimiterMode::kMonotonizedCentral ||
+      current.config.numerics.hydro_integration_scheme != core::HydroIntegrationMode::kMusclHancock ||
+      current.config.numerics.hydro_riemann_solver != core::HydroRiemannSolverMode::kHllc ||
+      current.config.numerics.hydro_dual_energy != core::HydroDualEnergyConfigMode::kOff ||
+      current.config.numerics.hydro_dual_energy_eta != 1.0e-3 ||
+      current.config.parallel.node_memory_admission != core::NodeMemoryAdmissionMode::kOff ||
+      current.config.parallel.node_memory_budget_bytes != 0U ||
+      current.config.parallel.node_memory_reserve_bytes != 0U ||
       current.config.schema_version != 1 ||
       current.provenance.config_hash_hex != core::stableConfigHashHex(current.normalized_text)) {
     fail("new options must retain legacy defaults and global KDK must remain selected");
@@ -3376,14 +3386,40 @@ std::string restartConfigurationCompatibilityRecord(
       projected.erase(position, line.size());
     }
   };
+  // CHUI Part 1 (20261103) added nine keys whose defaults reproduce the
+  // historical hydro method and per-process memory semantics. Their current
+  // values were verified above to be those defaults, so remove each complete
+  // "key = value" line exactly once (value text comes from the same
+  // normalizer, avoiding a second formatting rule). Every predecessor
+  // checkpoint lacks this group.
+  const auto removeKeyLines = [&](std::initializer_list<std::string_view> keys) {
+    for (const auto key : keys) {
+      const std::string prefix = "\n" + std::string(key) + " = ";
+      const auto position = projected.find(prefix);
+      if (position == std::string::npos || projected.find(prefix, position + prefix.size()) != std::string::npos)
+        fail("current normalized Part 1 default representation is not the supported revision");
+      const auto line_end = projected.find('\n', position + 1U);
+      if (line_end == std::string::npos) fail("unterminated Part 1 normalized default line");
+      projected.erase(position + 1U, line_end - position);
+    }
+  };
+  if (projected.find("\nhydro_reconstruction = ") != std::string::npos &&
+      restart.normalized_config_text.find("\nhydro_reconstruction = ") == std::string::npos) {
+    removeKeyLines({"hydro_reconstruction", "hydro_slope_limiter", "hydro_integration_scheme",
+        "hydro_riemann_solver", "hydro_dual_energy", "hydro_dual_energy_eta",
+        "node_memory_admission", "node_memory_budget_bytes", "node_memory_reserve_bytes"});
+  }
+  const std::string after_part1_projection = projected;
   // Support exact predecessor groups, not arbitrary missing keys.
-  removeDefaults({"treepm_radial_coefficients_enabled = false\n", "treepm_full_residual_lookup_enabled = false\n", "treepm_leaf_simd_enabled = false\n",
-      "treepm_residual_block_size = 64\n", "treepm_tree_max_leaf_size = 16\n"});
+  if (projected != restart.normalized_config_text) {
+    removeDefaults({"treepm_radial_coefficients_enabled = false\n", "treepm_full_residual_lookup_enabled = false\n", "treepm_leaf_simd_enabled = false\n",
+        "treepm_residual_block_size = 64\n", "treepm_tree_max_leaf_size = 16\n"});
+  }
   if (projected != restart.normalized_config_text) {
     removeDefaults({"treepm_gaussian_pair_lookup_enabled = false\n", "treepm_full_mac_diagnostics = true\n"});
   }
   if (projected != restart.normalized_config_text) {
-    projected = current.normalized_text;
+    projected = after_part1_projection;
     removeDefaults({"treepm_gaussian_pair_lookup_enabled = false\n", "treepm_full_mac_diagnostics = true\n"});
   }
   if (projected != restart.normalized_config_text) fail("scientific/settings equivalence not established by exact legacy projection");

@@ -1,5 +1,12 @@
 # Repair state recap (post-repair audit snapshot)
 
+20261103 CHUI Part 1 (foundation + hydro suite): audit F1, F3, F4, F7 repaired
+in source; PPM, CTU, HLLE selection, dual energy, thermodynamic refresh
+contract, node-aware admission, owner telemetry and stage transactions added.
+**IMPLEMENTED IN SOURCE — NOT COMPILED, NOT TESTED** (user-reserved).
+F2, F5, F6 remain open and owned by Parts 2/3. See the
+[Part 1 record](repair/chui_part1_foundation_hydro_20261103.md).
+
 20261012 regression closure: short-range fixture dispatch, valid typed config
 controls, field-specific negative checks, experiment deck invariants, PM owned
 allocation expectations and the stale hierarchical admission diagnostic are

@@ -309,6 +309,28 @@ std::uint64_t SimulationState::gravitySourceGeneration() const noexcept {
   return m_gravity_source_generation;
 }
 
+std::uint64_t SimulationState::gasThermodynamicMutationEpoch() const noexcept {
+  return m_gas_thermodynamic_mutation_epoch;
+}
+
+std::uint64_t SimulationState::gasThermodynamicRefreshEpoch() const noexcept {
+  return m_gas_thermodynamic_refresh_epoch;
+}
+
+void SimulationState::notifyGasThermodynamicMutation() noexcept {
+  if (m_gas_thermodynamic_mutation_epoch != std::numeric_limits<std::uint64_t>::max()) {
+    ++m_gas_thermodynamic_mutation_epoch;
+  }
+}
+
+void SimulationState::markGasThermodynamicsRefreshed() noexcept {
+  m_gas_thermodynamic_refresh_epoch = m_gas_thermodynamic_mutation_epoch;
+}
+
+bool SimulationState::gasThermodynamicCachesFresh() const noexcept {
+  return m_gas_thermodynamic_refresh_epoch == m_gas_thermodynamic_mutation_epoch;
+}
+
 void SimulationState::bumpGravitySourceGeneration() noexcept {
   if (m_gravity_source_generation != std::numeric_limits<std::uint64_t>::max()) {
     ++m_gravity_source_generation;

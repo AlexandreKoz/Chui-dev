@@ -465,3 +465,11 @@ The array layout and schema version are unchanged. Added summary fields are `ret
 counts from the event array. Existing event records remain readable; ordinary
 profiler JSON stays version 1. These source changes require consumer/fixture
 qualification; no output or restart tests were executed in P6.
+
+## Effective-ISM sidecar ledger units (CHUI Part 1, audit F7)
+
+The `effective_multiphase_ism` module sidecar now records integrated code
+energies (`energy_ledger_version=2`, `energy_ledger_units=integrated_code_energy`).
+No HDF5 group or dataset name changes; the snapshot/restart schema versions are
+unchanged. Legacy (version-less) ledgers are discarded on restart, see
+`docs/restart_checkpointing.md`.

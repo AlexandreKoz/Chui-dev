@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <span>
+#include <string_view>
 #include <vector>
 
 #include "cosmosim/hydro/hydro_reconstruction.hpp"
@@ -90,6 +91,19 @@ class HydroConservedStateSoa {
   [[nodiscard]] std::span<double> metalMassDensityComoving();
   [[nodiscard]] std::span<const double> metalMassDensityComoving() const;
 
+  // Optional dual-energy lane: auxiliary internal-energy density rho*e
+  // (comoving). It is NOT a conserved flux lane: HydroCoreSolver evolves it
+  // with the non-conservative internal-energy equation and writes the
+  // selected thermal energy back into it. Callers initialize it from the
+  // canonical specific internal energy (GasCellSidecar::internal_energy_code)
+  // before an advance; NaN marks "unknown" (the solver then falls back to
+  // E - K for that row and counts the fallback). Enabling/resizing fills new
+  // rows with NaN; disabling releases the lane.
+  void enableAuxiliaryInternalEnergy(bool enabled);
+  [[nodiscard]] bool auxiliaryInternalEnergyEnabled() const noexcept;
+  [[nodiscard]] std::span<double> auxiliaryInternalEnergyDensityComoving();
+  [[nodiscard]] std::span<const double> auxiliaryInternalEnergyDensityComoving() const;
+
  private:
   std::vector<double> m_mass_density_comoving;
   std::vector<double> m_momentum_density_x_comoving;
@@ -97,6 +111,8 @@ class HydroConservedStateSoa {
   std::vector<double> m_momentum_density_z_comoving;
   std::vector<double> m_total_energy_density_comoving;
   std::vector<double> m_metal_mass_density_comoving;
+  std::vector<double> m_auxiliary_internal_energy_density_comoving;
+  bool m_auxiliary_internal_energy_enabled = false;
 };
 
 class HydroPrimitiveCacheSoa {
@@ -183,6 +199,15 @@ struct HydroGhostCell {
   std::uint64_t decomposition_epoch = 0;
 };
 
+// One Cartesian face. Reconstruction stencil cells are ordered ALONG THE
+// FACE NORMAL n (owner -> neighbor is +n):
+//   owner_minus2_cell -> owner_minus_cell -> owner_cell | face |
+//   neighbor_cell -> neighbor_plus_cell -> neighbor_plus2_cell
+// k_invalid_cell_index marks an unavailable stencil cell. Interior faces of
+// makeCartesianPatchGeometry have n = +axis; physical-boundary ghost faces on
+// the lower side have n = -axis and no stencil beyond owner/neighbor.
+// owner_minus2_cell / neighbor_plus2_cell are consumed only by PPM; they are
+// appended after `axis` so existing designated initializers stay valid.
 struct HydroFace {
   std::size_t owner_cell = k_invalid_cell_index;
   std::size_t neighbor_cell = k_invalid_cell_index;
@@ -194,6 +219,8 @@ struct HydroFace {
   double normal_y = 0.0;
   double normal_z = 0.0;
   HydroFaceAxis axis = HydroFaceAxis::kX;
+  std::size_t owner_minus2_cell = k_invalid_cell_index;
+  std::size_t neighbor_plus2_cell = k_invalid_cell_index;
 };
 
 struct HydroPatchGeometry {
@@ -316,6 +343,12 @@ struct HydroSourceContext {
   const HydroCellSourcePropertyProvider* source_property_provider = nullptr;
   const HydroThermodynamicClosure* thermodynamic_closure = nullptr;
   double redshift = 0.0;
+  // Authoritative comoving volume of the cells being advanced (uniform per
+  // Cartesian patch). HydroCoreSolver overwrites this with
+  // HydroPatchGeometry::cell_volume_comoving before invoking source terms, so
+  // source ledgers can integrate energy densities into energies (audit F7).
+  // Direct callers of HydroSourceTerm::sourceForCell must set it explicitly.
+  double cell_volume_comoving = 0.0;
 };
 
 // Volume-integrated conserved diagnostics over a selected set of real cells.
@@ -348,9 +381,18 @@ struct HydroConservationReport {
   HydroConservationTotals flux_delta;
   HydroConservationTotals source_delta;
   HydroConservationTotals floor_delta;
+  // Dual energy: volume-integrated thermal correction
+  // sum (rho e_selected - (E - K)) V over cells where the auxiliary internal
+  // energy (or the thermal floor) replaced the conservative thermal energy.
+  // E itself is not modified by the solver; this correction enters the
+  // canonical state when the runtime stores e from the auxiliary lane. It is
+  // the complete non-conservative energy ledger of the formalism (only the
+  // total_energy/internal_energy entries are non-zero).
+  HydroConservationTotals dual_energy_sync_delta;
   HydroConservationTotals residual;
   std::uint64_t cell_count = 0;
   std::uint64_t internal_energy_floor_count = 0;
+  std::uint64_t dual_energy_sync_count = 0;
 };
 
 class HydroSourceTerm {
@@ -379,6 +421,23 @@ struct HydroProfileEvent {
   std::uint64_t limiter_clip_count = 0;
   std::uint64_t positivity_fallback_count = 0;
   std::uint64_t riemann_fallback_count = 0;
+  // Total Riemann evaluations (MUSCL-Hancock: 1 per face; CTU: 2 per face).
+  std::uint64_t riemann_solve_count = 0;
+  std::uint64_t stencil_degradation_count = 0;
+  // CTU transverse-correction outcome per face side.
+  std::uint64_t ctu_transverse_corrected_states = 0;
+  // Side state whose cell had no transverse information (non-periodic
+  // ghost / imported MPI ghost): normal-only predictor used.
+  std::uint64_t ctu_transverse_degraded_states = 0;
+  // Corrected state was inadmissible; normal-only predictor used.
+  std::uint64_t ctu_transverse_inadmissible_states = 0;
+  // Cells whose final thermal energy came from the auxiliary update.
+  std::uint64_t dual_energy_auxiliary_cells = 0;
+  // Cells whose auxiliary lane was NaN/non-positive at step start (e.g.
+  // imported ghosts or an uninitialized lane): E - K was used as (rho e)^n.
+  std::uint64_t dual_energy_unknown_auxiliary_cells = 0;
+  // Cells where neither E - K nor the auxiliary value was positive.
+  std::uint64_t dual_energy_floor_cells = 0;
   double reconstruct_ms = 0.0;
   double riemann_ms = 0.0;
   double accumulate_ms = 0.0;
@@ -394,7 +453,54 @@ struct HydroActiveBatchPolicy {
   // flux deltas are accumulated against the common step-start state before
   // any authoritative cell is committed.
   std::size_t max_active_cells = 0;
+  // Optional sparse per-touched-cell lanes that must be admitted before the
+  // advance. Set them from HydroCoreSolver::requiredWorkspaceFeatures() so
+  // workspaceBytes/prepareForActiveSet reserve them up front; the batched
+  // solver refuses to grow unplanned lanes.
+  bool ctu_transverse_workspace = false;
+  bool dual_energy_workspace = false;
 };
+
+// Time-integration family (orthogonal to reconstruction and Riemann solver).
+enum class HydroIntegrationScheme : std::uint8_t {
+  // Directionally unsplit MUSCL-Hancock: one Riemann solve per face using
+  // the normal-only Hancock predictor of the selected reconstruction.
+  kMusclHancock = 0,
+  // Corner-transport-upwind (Colella 1990), simplified 3D variant: pass 1
+  // solves every face with the normal-predicted states; per-cell transverse
+  // conservative increments are accumulated from those fluxes; pass 2 adds
+  // half of the transverse increments (all axes except the face axis) to each
+  // face state and re-solves. Two Riemann solves per face (6 per cell in 3D,
+  // 4 in 2D). Stability: Courant <= 1 in 2D; <= 1/2 in 3D for this variant
+  // (no corner-coupled 12-solve terms of Saltzman 1994).
+  kCornerTransportUpwind = 1,
+};
+
+enum class HydroDualEnergyMode : std::uint8_t {
+  kOff = 0,
+  // Bryan et al. (1995)/Enzo-style switch: an auxiliary internal-energy lane
+  // (HydroConservedStateSoa, initialized from the canonical specific internal
+  // energy) supplies the thermal state where E - K < eta E; E is never
+  // overwritten by the solver (see HydroCoreSolver).
+  kThermalFraction = 1,
+};
+
+struct HydroDualEnergyPolicy {
+  HydroDualEnergyMode mode = HydroDualEnergyMode::kOff;
+  // eta: use the auxiliary internal energy when (E - K) < eta * E after the
+  // conservative update, or when E - K is non-positive.
+  double thermal_fraction_switch = 1.0e-3;
+};
+
+struct HydroNumericsPolicy {
+  HydroIntegrationScheme integration_scheme = HydroIntegrationScheme::kMusclHancock;
+  HydroDualEnergyPolicy dual_energy{};
+};
+
+[[nodiscard]] std::string_view hydroIntegrationSchemeToString(HydroIntegrationScheme scheme);
+[[nodiscard]] HydroIntegrationScheme hydroIntegrationSchemeFromString(std::string_view name);
+[[nodiscard]] std::string_view hydroDualEnergyModeToString(HydroDualEnergyMode mode);
+[[nodiscard]] HydroDualEnergyMode hydroDualEnergyModeFromString(std::string_view name);
 
 struct HydroScratchHighWater {
   std::size_t active_cell_batch_capacity = 0;
@@ -416,6 +522,15 @@ struct HydroScratchBuffers {
   std::vector<HydroPrimitiveState> primitive_stencil_states;
   std::vector<std::size_t> full_active_cells;
   std::vector<std::size_t> full_active_faces;
+  // CTU only: per touched cell, the conservative increment produced by the
+  // pass-1 fluxes of the faces normal to x, y and z (same ordering as
+  // touched_cells). Transient, batch-scoped, never restart truth.
+  std::vector<std::array<HydroConservedState, 3>> ctu_transverse_delta;
+  // Dual energy only: per touched cell, the advective internal-energy flux
+  // divergence and the face-velocity divergence (both already multiplied by
+  // dt/(a V) and the face area), consumed by the auxiliary update.
+  std::vector<double> aux_internal_energy_advection;
+  std::vector<double> aux_velocity_divergence;
   HydroScratchHighWater high_water{};
 
   // Admit and physically prepare every vector used by the sparse solver before
@@ -433,11 +548,22 @@ struct HydroScratchBuffers {
   [[nodiscard]] std::uint64_t ownedCapacityBytes() const;
 };
 
+// Conservative finite-volume update (comoving form). With rho the comoving
+// mass density, u the peculiar velocity, x comoving and a the scale factor at
+// the flux epoch (HydroUpdateContext::scale_factor, normally the interval
+// midpoint),
+//   U_i^{n+1} = U_i^n - dt/(a V_i) sum_faces A_f F_f(W_L, W_R) + dt S_i
+// with the Hancock/CTU predictors using the same dt/(a dx) factor
+// (hydroTransportCourantFactors). Non-expanding runs use a = 1.
 class HydroCoreSolver {
  public:
-  explicit HydroCoreSolver(double adiabatic_index);
+  explicit HydroCoreSolver(double adiabatic_index, HydroNumericsPolicy numerics = {});
 
   [[nodiscard]] double adiabaticIndex() const;
+  [[nodiscard]] const HydroNumericsPolicy& numericsPolicy() const noexcept;
+  // Batch policy with the optional workspace lanes this solver needs.
+  [[nodiscard]] HydroActiveBatchPolicy requiredWorkspaceFeatures(
+      HydroActiveBatchPolicy batch_policy) const noexcept;
 
   [[nodiscard]] static HydroConservedState conservedFromPrimitive(
       const HydroPrimitiveState& primitive,
@@ -519,6 +645,7 @@ class HydroCoreSolver {
 
  private:
   double m_adiabatic_index = 5.0 / 3.0;
+  HydroNumericsPolicy m_numerics{};
 };
 
 }  // namespace cosmosim::hydro

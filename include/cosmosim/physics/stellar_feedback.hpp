@@ -83,6 +83,16 @@ class StellarFeedbackCellVolumeProvider {
   [[nodiscard]] virtual double cellVolumeCode(std::uint32_t cell_index) const = 0;
 };
 
+// Receives every gas cell whose mass, density, metals or internal energy is
+// about to be changed by feedback deposition (audit F4). Implementations must
+// not throw from capacity growth they did not admit beforehand; the source
+// runtime's implementation reserves through the MemoryGovernor.
+class StellarFeedbackThermodynamicTouchSink {
+ public:
+  virtual ~StellarFeedbackThermodynamicTouchSink() = default;
+  virtual void recordGasCellMutation(std::uint32_t cell_index, double internal_energy_before_code) = 0;
+};
+
 struct StellarFeedbackDepositionView {
   std::span<double> cell_mass_code;
   std::span<double> gas_density_code;
@@ -93,6 +103,8 @@ struct StellarFeedbackDepositionView {
   // Optional phase-local provider used by AMR workflows to derive exact cell
   // geometry without retaining a full-population volume vector.
   const StellarFeedbackCellVolumeProvider* cell_volume_provider = nullptr;
+  // Optional (audit F4): notified before each gas-cell thermodynamic mutation.
+  StellarFeedbackThermodynamicTouchSink* thermodynamic_touch_sink = nullptr;
 };
 
 struct StellarFeedbackEvent {

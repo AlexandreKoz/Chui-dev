@@ -1099,3 +1099,74 @@ migration require closed all-active coarse endpoints. Gas/source multirate laws
 and lazy prediction need a separate scientifically specified extension. Core's
 preparation callback accepts generic exception/string_view data; workflow supplies
 its existing collective failure coordinator. No dependency-boundary exception.
+
+## CHUI Part 1 foundation, hydro method suite and audit F1/F3/F4/F7 — 20261103
+
+Source implementation; NOT compiled, NOT run (user-reserved validation).
+
+* Hydro numerics are three orthogonal selections resolved once per advance:
+  reconstruction (PCM/PLM/PPM, `hydro_reconstruction.hpp`), integration family
+  (MUSCL-Hancock/CTU, `HydroNumericsPolicy` owned by `HydroCoreSolver`) and
+  Riemann solver (HLLC/HLLE, `makeHydroRiemannSolver`). Exactly one Hancock
+  half step per face state; CTU adds transverse conservative increments. The
+  core-owned config enums are mapped in workflows so `core` does not include
+  `hydro` (no dependency exception).
+* `HydroFace` gains `owner_minus2_cell`/`neighbor_plus2_cell` (appended, default
+  invalid) and a documented along-normal stencil order. Additive public change;
+  existing designated initializers remain valid.
+* Dual energy is step-local with total-energy synchronization; no persistent
+  auxiliary lane and no restart schema change. The measured non-conservation is
+  reported separately from the residual.
+* Single thermodynamic refresh contract `hydro::refreshGasThermodynamics()` with
+  rank-local, non-persistent mutation/refresh epochs on `SimulationState`;
+  timestep selection fails closed on stale caches. `hydro` now depends on
+  `core::SimulationState` for this helper (core remains foundational).
+* Node-aware admission is a pure per-rank rule (equal share of the node limit
+  minus a reserve subtracted once); no collective, so it cannot deadlock.
+  Per-owner governor telemetry is a fixed 64-slot table.
+* `core::StageTransaction` (reserve/prepare/validate/commit) with one
+  collective vote per transaction through `StageCollectiveDecision`; the MPI
+  adapter lives in `workflows/internal` so `core` does not depend on `parallel`.
+* Fixed-grid periodic boxes evaluate each box face once (upper ghost copy);
+  previously the boundary flux was applied twice.
+* The effective-ISM sidecar ledger becomes an integrated energy
+  (`energy_ledger_version=2`); legacy density sums are discarded on restart.
+
+## CHUI Part 1 corrective pass — 20261103
+
+Source only; NOT compiled or run.
+
+* Thermal authority is the canonical specific internal energy in both hydro
+  paths; AMR no longer treats the pressure cache as authority.
+* Dual energy redesigned: auxiliary internal-energy lane initialized from the
+  canonical `e`, Bryan-type selection, no total-energy overwrite inside the
+  solver, complete ledger of the thermal correction; the earlier step-local
+  "reset E" variant is removed.
+* Reconstruction stencils are completed through the existing ghost shell for
+  all boundary kinds (no second ghost-exchange system).
+* AMR periodic physical boundaries wrap in-patch; cross-patch periodic
+  topology is refused (Part 3) rather than producing zero-flux box faces.
+* Node-shared accounting pool (MPI-3 shared window + lock-free counter)
+  attached to each rank's existing `MemoryGovernor`; no new allocator, no
+  collective in the reservation path. `core` defines the pool interface; the
+  MPI backend lives in `parallel`.
+
+## CHUI Part 1 stabilization gate — 20261103
+
+Source only; NOT compiled or run.
+
+* Hydro CFL rule is selected by the integration family (dimension-summed for
+  MUSCL-Hancock, per-axis for CTU) through one core mapping used by both the
+  TimeCoordinator candidate and the accepted-step guard.
+* AMR mutations (scatter, reflux, regrid) write derived thermodynamic caches
+  through `amr::AmrThermodynamicCachePolicy` (closure + temperature factor);
+  the whole-rank post-AMR closure pass is removed. `mu` is an interface
+  parameter (Part 1 reference 0.59).
+* `shared_pool` claims its node-wide guarantee only after compile-time and
+  runtime conditions are agreed world-wide; otherwise all ranks fall back to
+  `shared_equal`. The core no longer static-asserts lock-freedom.
+* Dual energy: explicit reflux fallback (keep pre-reflux e when E-K is
+  unreliable, ledgered) and ghost auxiliary fill from local sources; remote
+  sources counted.
+* Periodic cross-patch AMR topology remains refused (mandatory Part 3
+  deliverable).

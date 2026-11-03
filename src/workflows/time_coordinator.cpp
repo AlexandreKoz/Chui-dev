@@ -325,6 +325,16 @@ struct LocalGasCellCflMetadata {
     double scale_factor,
     AdaptiveTimeStepCriteriaStorage& storage) {
   state.requireGasCellIdentityMapCoversDenseRows("adaptive time-bin view construction");
+  // Audit F4: the gas CFL candidate reads GasCellSidecar::sound_speed_code.
+  // A source stage that changed density/internal energy must have run the
+  // thermodynamic refresh contract before the next timestep is selected.
+  if (!state.gasThermodynamicCachesFresh()) {
+    throw std::logic_error(
+        "timestep selection refused stale gas thermodynamic caches: a source stage mutated gas "
+        "thermodynamics without hydro::refreshGasThermodynamics() (mutation epoch " +
+        std::to_string(state.gasThermodynamicMutationEpoch()) + ", refresh epoch " +
+        std::to_string(state.gasThermodynamicRefreshEpoch()) + ")");
+  }
   const auto particle_row_by_id = internal::buildParticleRowById(state);
   constexpr std::uint32_t k_no_parent_particle = std::numeric_limits<std::uint32_t>::max();
   storage.gas_particle_index_by_cell.clear();
@@ -686,15 +696,20 @@ enum class SchedulerElementFamily {
       const double vx = view.gas_cells.velocity_x_peculiar[cell_index];
       const double vy = view.gas_cells.velocity_y_peculiar[cell_index];
       const double vz = view.gas_cells.velocity_z_peculiar[cell_index];
+      const std::array<double, 3> cell_widths{
+          view.gas_cells.cell_width_x_code[cell_index],
+          view.gas_cells.cell_width_y_code[cell_index],
+          view.gas_cells.cell_width_z_code[cell_index]};
+      // Same rule as the accepted-step guard in HydroAmrRuntime
+      // (core::hydroCflStabilityRuleFor / activeHydroAxes).
       const core::DirectionalCflTimeStepInput hydro_cfl_input{
-          .cell_width_axis_code = {
-              view.gas_cells.cell_width_x_code[cell_index],
-              view.gas_cells.cell_width_y_code[cell_index],
-              view.gas_cells.cell_width_z_code[cell_index]},
+          .cell_width_axis_code = cell_widths,
           .velocity_axis_code = {vx, vy, vz},
           .sound_speed_code = std::max(view.gas_cells.sound_speed_code[cell_index], 0.0),
           .coordinate_frame = config.units.coordinate_frame,
           .scale_factor = gravity_scale_factor,
+          .stability_rule = core::hydroCflStabilityRuleFor(config),
+          .active_axis = core::activeHydroAxes(cell_widths, core::hydroDomainExtentCode(config)),
       };
       const double cfl_dt =
           core::computeDirectionalCflTimeStep(hydro_cfl_input, 0.4);

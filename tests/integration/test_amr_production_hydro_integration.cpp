@@ -576,7 +576,38 @@ void testProductionRegridReservationDoesNotScaleWithUnrelatedParticles() {
 
 }  // namespace
 
+// CHUI Part 1 stabilization (NOT RUN — USER-RESERVED): refinement writes the
+// derived thermodynamic caches of every child through the runtime-wide
+// policy: T = f e (not the legacy T = e in code units), P = (gamma-1) rho e,
+// c_s = sqrt(gamma P / rho), consistent with the canonical e of the child.
+void testRefinementWritesConsistentThermodynamicCaches() {
+  cosmosim::core::SimulationState state = makeRefineState();
+  cosmosim::core::MemoryGovernor regrid_governor;
+  const auto parent = cosmosim::amr::buildProductionAmrPatchDescriptors(state).front();
+  cosmosim::amr::ProductionAmrHydroOptions options = regridOptions(state, regrid_governor);
+  options.adiabatic_index = k_gamma;
+  constexpr double k_factor = 1234.5;  // synthetic T per code specific energy
+  options.thermodynamic_cache.temperature_k_per_internal_energy_code = k_factor;
+  const auto refine = cosmosim::amr::refineProductionPatchInSimulationState(state, parent, 400, 20000, options);
+  assert(refine.refined_patch_count == 1U);
+  std::size_t child_rows = 0;
+  for (std::size_t row = 0; row < state.gas_cells.size(); ++row) {
+    if (state.gas_cells.gas_cell_id[row] < 20000U) {
+      continue;  // only rows written by the refinement (child ids start at 20000)
+    }
+    ++child_rows;
+    const double rho = state.gas_cells.density_code[row];
+    const double e = state.gas_cells.internal_energy_code[row];
+    assert(std::abs(state.gas_cells.temperature_code[row] - k_factor * e) <= 1.0e-12 * k_factor * e);
+    assert(std::abs(state.gas_cells.pressure_code[row] - (k_gamma - 1.0) * rho * e) <= 1.0e-12 * rho * e);
+    assert(std::abs(state.gas_cells.sound_speed_code[row] -
+                    std::sqrt(k_gamma * (k_gamma - 1.0) * e)) <= 1.0e-12 * std::sqrt(e));
+  }
+  assert(child_rows > 0U);
+}
+
 int main() {
+  testRefinementWritesConsistentThermodynamicCaches();
   testPreparedGhostWorkspaceAdmission();
   testProductionAmrGeometryScatterAndRefluxPath();
   testPatchLocalMappingSurvivesRowReorder();

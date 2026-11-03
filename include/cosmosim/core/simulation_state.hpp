@@ -1054,6 +1054,19 @@ class SimulationState {
   // place (star formation, black holes, tracers, gas-parent aggregation).
   [[nodiscard]] std::uint64_t particleMassGeneration() const noexcept;
   void notifyParticleMassMutation() noexcept;
+  // Gas thermodynamic cache epochs (rank-local, non-persistent; audit F4).
+  // GasCellSidecar::pressure_code / sound_speed_code / temperature_code are
+  // derived caches of (density, internal energy, composition, closure). A
+  // stage that mutates the authoritative thermodynamic inputs outside the
+  // hydro primitive store (e.g. feedback deposition) must call
+  // notifyGasThermodynamicMutation(); the single refresh contract
+  // hydro::refreshGasThermodynamics() calls markGasThermodynamicsRefreshed().
+  // Timestep selection refuses to read stale caches.
+  [[nodiscard]] std::uint64_t gasThermodynamicMutationEpoch() const noexcept;
+  [[nodiscard]] std::uint64_t gasThermodynamicRefreshEpoch() const noexcept;
+  void notifyGasThermodynamicMutation() noexcept;
+  void markGasThermodynamicsRefreshed() noexcept;
+  [[nodiscard]] bool gasThermodynamicCachesFresh() const noexcept;
 
  private:
   [[nodiscard]] bool validateOwnershipInvariantsImpl(
@@ -1076,6 +1089,8 @@ class SimulationState {
   std::uint64_t m_particle_identity_generation = 1;
   std::uint64_t m_cell_index_generation = 0;
   std::uint64_t m_gravity_source_generation = 1;
+  std::uint64_t m_gas_thermodynamic_mutation_epoch = 0;
+  std::uint64_t m_gas_thermodynamic_refresh_epoch = 0;
   mutable ParticleIdentityValidationCertificate m_particle_identity_validation_certificate{};
 };
 

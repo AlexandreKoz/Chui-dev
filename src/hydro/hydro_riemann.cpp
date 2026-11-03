@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <stdexcept>
+#include <string>
 
 #include "cosmosim/hydro/hydro_core_solver.hpp"
 
@@ -48,56 +50,65 @@ constexpr double k_small = 1.0e-14;
   return flux;
 }
 
+struct HllWaveSpeeds {
+  double s_left = 0.0;
+  double s_right = 0.0;
+};
+
+[[nodiscard]] double normalVelocity(const HydroPrimitiveState& state, const HydroFace& face) {
+  return dot3(state.vel_x_peculiar, state.vel_y_peculiar, state.vel_z_peculiar,
+      face.normal_x, face.normal_y, face.normal_z);
+}
+
+// Einfeldt (1988) bounds combined with the Davis direct estimates. The
+// averaged signal speed uses only rho, u_n and c^2, so it is valid for the
+// effective-ISM closure as well as for an ideal gas.
+[[nodiscard]] HllWaveSpeeds einfeldtWaveSpeeds(
+    const HydroPrimitiveState& left_state,
+    const HydroPrimitiveState& right_state,
+    const HydroFace& face,
+    double adiabatic_index) {
+  const double u_left = normalVelocity(left_state, face);
+  const double u_right = normalVelocity(right_state, face);
+  const double c_left = soundSpeed(left_state, adiabatic_index);
+  const double c_right = soundSpeed(right_state, adiabatic_index);
+  const double sqrt_rho_left = std::sqrt(std::max(left_state.rho_comoving, k_small));
+  const double sqrt_rho_right = std::sqrt(std::max(right_state.rho_comoving, k_small));
+  const double weight_sum = sqrt_rho_left + sqrt_rho_right;
+  const double u_average = (sqrt_rho_left * u_left + sqrt_rho_right * u_right) / weight_sum;
+  const double eta2 = 0.5 * sqrt_rho_left * sqrt_rho_right / (weight_sum * weight_sum);
+  const double du = u_right - u_left;
+  const double d_squared =
+      (sqrt_rho_left * c_left * c_left + sqrt_rho_right * c_right * c_right) / weight_sum +
+      eta2 * du * du;
+  const double d = std::sqrt(std::max(d_squared, k_small));
+  return HllWaveSpeeds{
+      .s_left = std::min({u_left - c_left, u_right - c_right, u_average - d}),
+      .s_right = std::max({u_left + c_left, u_right + c_right, u_average + d})};
+}
+
+// Lane-generic HLL flux. All conserved lanes, including passive scalars,
+// pass through the same formula (audit F3 repair).
 [[nodiscard]] HydroConservedState hllFlux(
     const HydroPrimitiveState& left_state,
     const HydroPrimitiveState& right_state,
     const HydroFace& face,
     double adiabatic_index) {
-  const HydroConservedState u_left = HydroCoreSolver::conservedFromPrimitive(left_state, adiabatic_index);
-  const HydroConservedState u_right = HydroCoreSolver::conservedFromPrimitive(right_state, adiabatic_index);
-
+  const HllWaveSpeeds speeds = einfeldtWaveSpeeds(left_state, right_state, face, adiabatic_index);
   const HydroConservedState f_left = eulerPhysicalFlux(left_state, face, adiabatic_index);
-  const HydroConservedState f_right = eulerPhysicalFlux(right_state, face, adiabatic_index);
-
-  const double vel_n_left = dot3(left_state.vel_x_peculiar, left_state.vel_y_peculiar, left_state.vel_z_peculiar, face.normal_x, face.normal_y, face.normal_z);
-  const double vel_n_right = dot3(right_state.vel_x_peculiar, right_state.vel_y_peculiar, right_state.vel_z_peculiar, face.normal_x, face.normal_y, face.normal_z);
-
-  const double c_left = soundSpeed(left_state, adiabatic_index);
-  const double c_right = soundSpeed(right_state, adiabatic_index);
-
-  const double s_left = std::min(vel_n_left - c_left, vel_n_right - c_right);
-  const double s_right = std::max(vel_n_left + c_left, vel_n_right + c_right);
-
-  if (s_left >= 0.0) {
+  if (speeds.s_left >= 0.0) {
     return f_left;
   }
-  if (s_right <= 0.0) {
+  const HydroConservedState f_right = eulerPhysicalFlux(right_state, face, adiabatic_index);
+  if (speeds.s_right <= 0.0) {
     return f_right;
   }
-
-  const double inv_speed_delta = 1.0 / std::max(s_right - s_left, k_small);
-  HydroConservedState flux;
-  flux.mass_density_comoving =
-      (s_right * f_left.mass_density_comoving - s_left * f_right.mass_density_comoving +
-       s_left * s_right * (u_right.mass_density_comoving - u_left.mass_density_comoving)) *
-      inv_speed_delta;
-  flux.momentum_density_x_comoving =
-      (s_right * f_left.momentum_density_x_comoving - s_left * f_right.momentum_density_x_comoving +
-       s_left * s_right * (u_right.momentum_density_x_comoving - u_left.momentum_density_x_comoving)) *
-      inv_speed_delta;
-  flux.momentum_density_y_comoving =
-      (s_right * f_left.momentum_density_y_comoving - s_left * f_right.momentum_density_y_comoving +
-       s_left * s_right * (u_right.momentum_density_y_comoving - u_left.momentum_density_y_comoving)) *
-      inv_speed_delta;
-  flux.momentum_density_z_comoving =
-      (s_right * f_left.momentum_density_z_comoving - s_left * f_right.momentum_density_z_comoving +
-       s_left * s_right * (u_right.momentum_density_z_comoving - u_left.momentum_density_z_comoving)) *
-      inv_speed_delta;
-  flux.total_energy_density_comoving =
-      (s_right * f_left.total_energy_density_comoving - s_left * f_right.total_energy_density_comoving +
-       s_left * s_right * (u_right.total_energy_density_comoving - u_left.total_energy_density_comoving)) *
-      inv_speed_delta;
-  return flux;
+  const HydroConservedState u_left = HydroCoreSolver::conservedFromPrimitive(left_state, adiabatic_index);
+  const HydroConservedState u_right = HydroCoreSolver::conservedFromPrimitive(right_state, adiabatic_index);
+  const double inv_speed_delta = 1.0 / std::max(speeds.s_right - speeds.s_left, k_small);
+  return inv_speed_delta *
+      (speeds.s_right * f_left - speeds.s_left * f_right +
+       (speeds.s_left * speeds.s_right) * (u_right - u_left));
 }
 
 }  // namespace
@@ -204,6 +215,36 @@ HydroConservedState HllcRiemannSolver::computeFlux(
     return f_left + s_left * (u_star_left - u_left);
   }
   return f_right + s_right * (u_star_right - u_right);
+}
+
+std::string_view hydroRiemannSolverKindToString(HydroRiemannSolverKind kind) {
+  switch (kind) {
+    case HydroRiemannSolverKind::kHllc:
+      return "hllc";
+    case HydroRiemannSolverKind::kHlle:
+      return "hlle";
+  }
+  return "unknown";
+}
+
+HydroRiemannSolverKind hydroRiemannSolverKindFromString(std::string_view name) {
+  if (name == "hllc") {
+    return HydroRiemannSolverKind::kHllc;
+  }
+  if (name == "hlle") {
+    return HydroRiemannSolverKind::kHlle;
+  }
+  throw std::invalid_argument("Unsupported hydro Riemann solver: " + std::string(name));
+}
+
+std::unique_ptr<HydroRiemannSolver> makeHydroRiemannSolver(HydroRiemannSolverKind kind) {
+  switch (kind) {
+    case HydroRiemannSolverKind::kHllc:
+      return std::make_unique<HllcRiemannSolver>();
+    case HydroRiemannSolverKind::kHlle:
+      return std::make_unique<HlleRiemannSolver>();
+  }
+  throw std::invalid_argument("unhandled HydroRiemannSolverKind");
 }
 
 std::uint64_t HllcRiemannSolver::fallbackCount() const {

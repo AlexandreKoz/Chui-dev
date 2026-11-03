@@ -660,6 +660,57 @@ parseInitialConditionMissingFieldPolicy(
   throw ConfigError("key 'numerics.hydro_solver': invalid value '" + value + "'");
 }
 
+[[nodiscard]] HydroReconstructionMode parseHydroReconstructionMode(const std::string& value) {
+  const std::string lower = toLower(trim(value));
+  if (lower == "piecewise_constant") return HydroReconstructionMode::kPiecewiseConstant;
+  if (lower == "piecewise_linear") return HydroReconstructionMode::kPiecewiseLinear;
+  if (lower == "piecewise_parabolic") return HydroReconstructionMode::kPiecewiseParabolic;
+  throw ConfigError("key 'numerics.hydro_reconstruction': invalid value '" + value +
+                    "' (expected piecewise_constant, piecewise_linear, or piecewise_parabolic)");
+}
+
+[[nodiscard]] HydroSlopeLimiterMode parseHydroSlopeLimiterMode(const std::string& value) {
+  const std::string lower = toLower(trim(value));
+  if (lower == "minmod") return HydroSlopeLimiterMode::kMinmod;
+  if (lower == "mc") return HydroSlopeLimiterMode::kMonotonizedCentral;
+  if (lower == "van_leer") return HydroSlopeLimiterMode::kVanLeer;
+  throw ConfigError("key 'numerics.hydro_slope_limiter': invalid value '" + value +
+                    "' (expected minmod, mc, or van_leer)");
+}
+
+[[nodiscard]] HydroIntegrationMode parseHydroIntegrationMode(const std::string& value) {
+  const std::string lower = toLower(trim(value));
+  if (lower == "muscl_hancock") return HydroIntegrationMode::kMusclHancock;
+  if (lower == "ctu") return HydroIntegrationMode::kCornerTransportUpwind;
+  throw ConfigError("key 'numerics.hydro_integration_scheme': invalid value '" + value +
+                    "' (expected muscl_hancock or ctu)");
+}
+
+[[nodiscard]] HydroRiemannSolverMode parseHydroRiemannSolverMode(const std::string& value) {
+  const std::string lower = toLower(trim(value));
+  if (lower == "hllc") return HydroRiemannSolverMode::kHllc;
+  if (lower == "hlle") return HydroRiemannSolverMode::kHlle;
+  throw ConfigError("key 'numerics.hydro_riemann_solver': invalid value '" + value +
+                    "' (expected hllc or hlle)");
+}
+
+[[nodiscard]] HydroDualEnergyConfigMode parseHydroDualEnergyConfigMode(const std::string& value) {
+  const std::string lower = toLower(trim(value));
+  if (lower == "off") return HydroDualEnergyConfigMode::kOff;
+  if (lower == "thermal_fraction") return HydroDualEnergyConfigMode::kThermalFraction;
+  throw ConfigError("key 'numerics.hydro_dual_energy': invalid value '" + value +
+                    "' (expected off or thermal_fraction)");
+}
+
+[[nodiscard]] NodeMemoryAdmissionMode parseNodeMemoryAdmissionMode(const std::string& value) {
+  const std::string lower = toLower(trim(value));
+  if (lower == "off") return NodeMemoryAdmissionMode::kOff;
+  if (lower == "shared_equal") return NodeMemoryAdmissionMode::kSharedEqual;
+  if (lower == "shared_pool") return NodeMemoryAdmissionMode::kSharedPool;
+  throw ConfigError("key 'parallel.node_memory_admission': invalid value '" + value +
+                    "' (expected off, shared_equal or shared_pool)");
+}
+
 [[nodiscard]] TreePmAssignmentScheme parseTreePmAssignmentScheme(const std::string& value) {
   const std::string lower = toLower(trim(value));
   if (lower == "cic") {
@@ -1271,6 +1322,12 @@ struct ConfigKeySpec {
       {"numerics.hydro_density_floor_code", "1.0e-10"},
       {"numerics.hydro_pressure_floor_code", "1.0e-10"},
       {"numerics.hydro_active_batch_max_cells", "0"},
+      {"numerics.hydro_reconstruction", "piecewise_linear"},
+      {"numerics.hydro_slope_limiter", "mc"},
+      {"numerics.hydro_integration_scheme", "muscl_hancock"},
+      {"numerics.hydro_riemann_solver", "hllc"},
+      {"numerics.hydro_dual_energy", "off"},
+      {"numerics.hydro_dual_energy_eta", "1.0e-3"},
       {"numerics.max_global_steps", "1024"},
       {"numerics.hierarchical_max_rung", "0"},
       {"numerics.hierarchical_coarse_displacement_criterion", "max_speed_mesh"},
@@ -1462,6 +1519,9 @@ struct ConfigKeySpec {
       {"parallel.process_allocator_unknown_reserve_bytes", "0"},
       {"parallel.process_output_restart_overlap_bytes", "0"},
       {"parallel.process_memory_safety_margin_fraction", "0.0"},
+      {"parallel.node_memory_admission", "off"},
+      {"parallel.node_memory_budget_bytes", "0"},
+      {"parallel.node_memory_reserve_bytes", "0"},
       {"analysis.enable_diagnostics", "true"},
       {"analysis.enable_halo_workflow", "false"},
       {"analysis.halo_on_the_fly", "false"},
@@ -1645,6 +1705,23 @@ void validateConfig(const SimulationConfig& config) {
   if (config.numerics.hydro_density_floor_code < 0.0 ||
       config.numerics.hydro_pressure_floor_code < 0.0) {
     throw ConfigError("numerics hydro floors must be finite and non-negative code-unit values");
+  }
+  if (!std::isfinite(config.numerics.hydro_dual_energy_eta) ||
+      config.numerics.hydro_dual_energy_eta <= 0.0 ||
+      config.numerics.hydro_dual_energy_eta >= 1.0) {
+    throw ConfigError("numerics.hydro_dual_energy_eta must be finite and in (0, 1)");
+  }
+  if (config.parallel.node_memory_admission == NodeMemoryAdmissionMode::kOff &&
+      (config.parallel.node_memory_budget_bytes != 0U ||
+       config.parallel.node_memory_reserve_bytes != 0U)) {
+    throw ConfigError(
+        "parallel.node_memory_budget_bytes/node_memory_reserve_bytes require "
+        "parallel.node_memory_admission = shared_equal; refusing to silently ignore a node budget");
+  }
+  if (config.parallel.node_memory_admission != NodeMemoryAdmissionMode::kOff &&
+      config.parallel.node_memory_budget_bytes != 0U &&
+      config.parallel.node_memory_reserve_bytes >= config.parallel.node_memory_budget_bytes) {
+    throw ConfigError("parallel.node_memory_reserve_bytes must be smaller than parallel.node_memory_budget_bytes");
   }
   if (config.numerics.max_global_steps <= 0) {
     throw ConfigError("numerics.max_global_steps must be > 0");
@@ -2506,6 +2583,17 @@ class NormalizedConfigStream {
   stream << "hydro_density_floor_code = " << frozen.config.numerics.hydro_density_floor_code << '\n';
   stream << "hydro_pressure_floor_code = " << frozen.config.numerics.hydro_pressure_floor_code << '\n';
   stream << "hydro_active_batch_max_cells = " << frozen.config.numerics.hydro_active_batch_max_cells << '\n';
+  stream << "hydro_reconstruction = "
+         << hydroReconstructionModeToString(frozen.config.numerics.hydro_reconstruction) << '\n';
+  stream << "hydro_slope_limiter = "
+         << hydroSlopeLimiterModeToString(frozen.config.numerics.hydro_slope_limiter) << '\n';
+  stream << "hydro_integration_scheme = "
+         << hydroIntegrationModeToString(frozen.config.numerics.hydro_integration_scheme) << '\n';
+  stream << "hydro_riemann_solver = "
+         << hydroRiemannSolverModeToString(frozen.config.numerics.hydro_riemann_solver) << '\n';
+  stream << "hydro_dual_energy = "
+         << hydroDualEnergyConfigModeToString(frozen.config.numerics.hydro_dual_energy) << '\n';
+  stream << "hydro_dual_energy_eta = " << frozen.config.numerics.hydro_dual_energy_eta << '\n';
   stream << "max_global_steps = " << frozen.config.numerics.max_global_steps << '\n';
   stream << "hierarchical_max_rung = " << frozen.config.numerics.hierarchical_max_rung << '\n';
   stream << "hierarchical_coarse_displacement_criterion = "
@@ -2809,6 +2897,12 @@ class NormalizedConfigStream {
          << frozen.config.parallel.process_output_restart_overlap_bytes << '\n';
   stream << "process_memory_safety_margin_fraction = "
          << frozen.config.parallel.process_memory_safety_margin_fraction << '\n';
+  stream << "node_memory_admission = "
+         << nodeMemoryAdmissionModeToString(frozen.config.parallel.node_memory_admission) << '\n';
+  stream << "node_memory_budget_bytes = "
+         << frozen.config.parallel.node_memory_budget_bytes << '\n';
+  stream << "node_memory_reserve_bytes = "
+         << frozen.config.parallel.node_memory_reserve_bytes << '\n';
   stream << "\n[analysis]\n";
   stream << "enable_diagnostics = " << (frozen.config.analysis.enable_diagnostics ? "true" : "false")
          << '\n';
@@ -3174,6 +3268,21 @@ class NormalizedConfigStream {
           "numerics.hydro_active_batch_max_cells",
           defaultFor("numerics.hydro_active_batch_max_cells")),
       "numerics.hydro_active_batch_max_cells");
+  frozen.config.numerics.hydro_reconstruction = parseHydroReconstructionMode(requireString(
+      entries, consumed, "numerics.hydro_reconstruction", defaultFor("numerics.hydro_reconstruction")));
+  frozen.config.numerics.hydro_slope_limiter = parseHydroSlopeLimiterMode(requireString(
+      entries, consumed, "numerics.hydro_slope_limiter", defaultFor("numerics.hydro_slope_limiter")));
+  frozen.config.numerics.hydro_integration_scheme = parseHydroIntegrationMode(requireString(
+      entries, consumed, "numerics.hydro_integration_scheme",
+      defaultFor("numerics.hydro_integration_scheme")));
+  frozen.config.numerics.hydro_riemann_solver = parseHydroRiemannSolverMode(requireString(
+      entries, consumed, "numerics.hydro_riemann_solver", defaultFor("numerics.hydro_riemann_solver")));
+  frozen.config.numerics.hydro_dual_energy = parseHydroDualEnergyConfigMode(requireString(
+      entries, consumed, "numerics.hydro_dual_energy", defaultFor("numerics.hydro_dual_energy")));
+  frozen.config.numerics.hydro_dual_energy_eta = parseFloating(
+      requireString(entries, consumed, "numerics.hydro_dual_energy_eta",
+                    defaultFor("numerics.hydro_dual_energy_eta")),
+      "numerics.hydro_dual_energy_eta");
   frozen.config.numerics.max_global_steps = parseNumber<int>(
       requireString(entries, consumed, "numerics.max_global_steps", "1024"),
       "numerics.max_global_steps");
@@ -3824,6 +3933,16 @@ class NormalizedConfigStream {
       requireString(entries, consumed, "parallel.process_memory_safety_margin_fraction",
                     defaultFor("parallel.process_memory_safety_margin_fraction")),
       "parallel.process_memory_safety_margin_fraction");
+  frozen.config.parallel.node_memory_admission = parseNodeMemoryAdmissionMode(requireString(
+      entries, consumed, "parallel.node_memory_admission", defaultFor("parallel.node_memory_admission")));
+  frozen.config.parallel.node_memory_budget_bytes = parseNumber<std::uint64_t>(
+      requireString(entries, consumed, "parallel.node_memory_budget_bytes",
+                    defaultFor("parallel.node_memory_budget_bytes")),
+      "parallel.node_memory_budget_bytes");
+  frozen.config.parallel.node_memory_reserve_bytes = parseNumber<std::uint64_t>(
+      requireString(entries, consumed, "parallel.node_memory_reserve_bytes",
+                    defaultFor("parallel.node_memory_reserve_bytes")),
+      "parallel.node_memory_reserve_bytes");
 
   frozen.config.analysis.enable_diagnostics = parseBool(
       requireString(entries, consumed, "analysis.enable_diagnostics", "true"),
@@ -4201,6 +4320,57 @@ std::string hydroSolverToString(HydroSolver solver) {
       return "godunov_fv";
   }
   throw ConfigError("unhandled HydroSolver enum value during serialization");
+}
+
+std::string hydroReconstructionModeToString(HydroReconstructionMode mode) {
+  switch (mode) {
+    case HydroReconstructionMode::kPiecewiseConstant: return "piecewise_constant";
+    case HydroReconstructionMode::kPiecewiseLinear: return "piecewise_linear";
+    case HydroReconstructionMode::kPiecewiseParabolic: return "piecewise_parabolic";
+  }
+  throw ConfigError("unhandled HydroReconstructionMode enum value during serialization");
+}
+
+std::string hydroSlopeLimiterModeToString(HydroSlopeLimiterMode mode) {
+  switch (mode) {
+    case HydroSlopeLimiterMode::kMinmod: return "minmod";
+    case HydroSlopeLimiterMode::kMonotonizedCentral: return "mc";
+    case HydroSlopeLimiterMode::kVanLeer: return "van_leer";
+  }
+  throw ConfigError("unhandled HydroSlopeLimiterMode enum value during serialization");
+}
+
+std::string hydroIntegrationModeToString(HydroIntegrationMode mode) {
+  switch (mode) {
+    case HydroIntegrationMode::kMusclHancock: return "muscl_hancock";
+    case HydroIntegrationMode::kCornerTransportUpwind: return "ctu";
+  }
+  throw ConfigError("unhandled HydroIntegrationMode enum value during serialization");
+}
+
+std::string hydroRiemannSolverModeToString(HydroRiemannSolverMode mode) {
+  switch (mode) {
+    case HydroRiemannSolverMode::kHllc: return "hllc";
+    case HydroRiemannSolverMode::kHlle: return "hlle";
+  }
+  throw ConfigError("unhandled HydroRiemannSolverMode enum value during serialization");
+}
+
+std::string hydroDualEnergyConfigModeToString(HydroDualEnergyConfigMode mode) {
+  switch (mode) {
+    case HydroDualEnergyConfigMode::kOff: return "off";
+    case HydroDualEnergyConfigMode::kThermalFraction: return "thermal_fraction";
+  }
+  throw ConfigError("unhandled HydroDualEnergyConfigMode enum value during serialization");
+}
+
+std::string nodeMemoryAdmissionModeToString(NodeMemoryAdmissionMode mode) {
+  switch (mode) {
+    case NodeMemoryAdmissionMode::kOff: return "off";
+    case NodeMemoryAdmissionMode::kSharedEqual: return "shared_equal";
+    case NodeMemoryAdmissionMode::kSharedPool: return "shared_pool";
+  }
+  throw ConfigError("unhandled NodeMemoryAdmissionMode enum value during serialization");
 }
 
 std::string coordinateFrameToString(CoordinateFrame frame) {

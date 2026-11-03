@@ -505,6 +505,8 @@ add_library(cosmosim_core STATIC
   src/core/memory_governor.cpp
   src/core/memory_accounting.cpp
   src/core/process_memory.cpp
+  src/core/node_memory_admission.cpp
+  src/core/stage_transaction.cpp
   src/core/openmp_runtime.cpp)
 
 add_executable(cosmosim_treepm_experiment_configs tools/treepm_experiment_configs.cpp)
@@ -556,7 +558,8 @@ add_library(cosmosim_hydro STATIC
   src/hydro/hydro_cartesian_patch.cpp
   src/hydro/hydro_core_solver.cpp
   src/hydro/hydro_reconstruction.cpp
-  src/hydro/hydro_riemann.cpp)
+  src/hydro/hydro_riemann.cpp
+  src/hydro/gas_thermodynamic_refresh.cpp)
 add_library(cosmosim_amr STATIC
   src/amr/amr_framework.cpp
   src/amr/amr_hydro_geometry.cpp
@@ -608,7 +611,8 @@ add_library(cosmosim_parallel STATIC
   src/parallel/distributed_memory_tree_pm.cpp
   src/parallel/distributed_memory_amr.cpp
   src/parallel/distributed_memory_hydro.cpp
-  src/parallel/distributed_memory_device.cpp)
+  src/parallel/distributed_memory_device.cpp
+  src/parallel/node_memory_pool.cpp)
 target_link_libraries(cosmosim_gravity PUBLIC cosmosim_parallel)
 target_link_libraries(cosmosim_analysis PUBLIC cosmosim_parallel)
 
@@ -1109,6 +1113,27 @@ if(COSMOSIM_ENABLE_TESTS)
   add_executable(test_unit_hydro_riemann tests/unit/test_hydro_riemann.cpp)
   target_link_libraries(test_unit_hydro_riemann PRIVATE cosmosim_all)
   add_test(NAME unit_hydro_riemann COMMAND test_unit_hydro_riemann)
+
+  # CHUI Part 1 (hydro numerics, F1/F3/F4/F7, memory, transactions).
+  # Authored without execution; first human run pending.
+  foreach(chui_part1_test
+      hydro_muscl_hancock_predictor
+      hydro_riemann_passive_scalars
+      hydro_ppm
+      hydro_ctu
+      hydro_dual_energy
+      gas_thermodynamic_refresh
+      effective_ism_energy_ledger
+      node_memory_admission
+      stage_transaction
+      config_hydro_numerics
+      amr_periodic_boundary
+      hydro_cfl_stability_rule
+      amr_reflux_thermodynamics)
+    add_executable(test_unit_${chui_part1_test} tests/unit/test_${chui_part1_test}.cpp)
+    target_link_libraries(test_unit_${chui_part1_test} PRIVATE cosmosim_all)
+    add_test(NAME unit_${chui_part1_test} COMMAND test_unit_${chui_part1_test})
+  endforeach()
 
 
   add_executable(test_unit_cooling_heating tests/unit/test_cooling_heating.cpp)
@@ -2552,6 +2577,10 @@ if(COSMOSIM_ENABLE_BENCHMARKS)
   add_executable(bench_hydro_kernels bench/hydro/bench_hydro_kernels.cpp)
   target_link_libraries(bench_hydro_kernels PRIVATE cosmosim_hydro)
   target_include_directories(bench_hydro_kernels PRIVATE ${PROJECT_SOURCE_DIR})
+
+  add_executable(bench_hydro_method_matrix bench/hydro/bench_hydro_method_matrix.cpp)
+  target_link_libraries(bench_hydro_method_matrix PRIVATE cosmosim_hydro)
+  target_include_directories(bench_hydro_method_matrix PRIVATE ${PROJECT_SOURCE_DIR})
 
   add_executable(bench_amr_regrid_kernel bench/amr/bench_amr_regrid_kernel.cpp)
   target_link_libraries(bench_amr_regrid_kernel PRIVATE cosmosim_amr)
