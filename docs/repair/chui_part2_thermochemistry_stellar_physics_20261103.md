@@ -16,6 +16,97 @@ Vocabulary: IMPLEMENTED IN SOURCE (connected production path, by inspection
 only) · REFERENCE ONLY · EXPERIMENTAL/UNQUALIFIED · BLOCKED BY DATA/TOPOLOGY ·
 NOT RUN — USER-RESERVED.
 
+
+## 0. Corrective gate (2026-11-03, after independent review of `5625b20`)
+
+**Still SOURCE ONLY — nothing compiled or run; every check NOT RUN — USER-RESERVED.**
+
+### 0.1 Class-ownership and integration defects corrected
+* `executePart2StellarPopulation()` had been inserted inside
+  `DistributedParticleIdRegistry` (it used `SourceRuntimeImpl` state and was
+  called from `SourceRuntimeImpl`). The complete implementation now lives in
+  `SourceRuntimeImpl`; state ownership, memory admission, collective ordering
+  and transaction semantics are unchanged. No globals/friends/duplicated state.
+* Static review fixes: one-cell physical dimension in the SF neighbour index
+  returned NaN (now 0, missing remote neighbours still NaN); deposited ejecta
+  mass now equals the element + dust budget and is re-capped at the star mass
+  (gas mass and composition change identically; no mass created by a
+  commit-time clamp); SSP diagnostics restored on stage rejection.
+
+### 0.2 Transactional guarantees (local source-stage atomicity)
+* New `physics::BaryonicSourceStage` (`baryonic_source_stage.{hpp,cpp}`):
+  ISM-regime decision + dwell, chemistry-fidelity decision + dwell,
+  thermochemistry, live dust and SGS dissipation are computed from the
+  step-start state by PURE kernels (`decideIsmRegime`,
+  `ThermochemistryOperator::decideChemistryFidelity/advanceRow`,
+  `advanceDustCell` on a private one-row scratch, `sgsDissipate`) and staged
+  per row (all composition lanes, e, mu, tags, dwell). SimulationState,
+  composition metadata and the published diagnostics change only in
+  `commit()` after the StageTransaction collective vote; a rejection leaves
+  them bit-identical. Staging is bounded ((lanes + 8) doubles per active row)
+  and admitted through the transaction; no full-state copy.
+* Stellar-population stage: event ordinals, star masses/ages, population
+  records and gas deltas were already staged; the mutable SSP diagnostic
+  counters are now restored on rejection.
+* NOT covered (Part 3): a rejection after earlier stages of the same step
+  (hydro, AMR sweep) committed — global distributed step rollback.
+
+### 0.3 Rate provenance
+* The primary sources could not be consulted: the session network policy
+  blocks `arxiv.org`. Therefore **no coefficient is verified**. Every reaction
+  and cooling fit carries `RateVerification::kUnverifiedTranscription`;
+  `equilibrium_primordial`, `fixed_hybrid`, `fixed_detailed` refuse to run
+  unless `physics.thermochemistry_allow_unqualified_rates = true` (config
+  validation and solver construction). Only the Compton coefficient is derived
+  from CODATA constants; `analytic_reference` uses no rate data.
+* R16 (H₂ + H → 3H) removed: the implemented form decreased with T above
+  1e4 K and vanished by 1e6 K (transcription defect); listed as omitted.
+* `docs/chemistry_rate_provenance.md`: per-rate implemented form, claimed
+  source, regime risks (e.g. R14 growth above 1e5 K, R12 clamp is an
+  implementation choice), owner verification procedure, numerical reference
+  values of the implemented formulas, missing channels and consequences.
+
+### 0.4 Stellar yields
+* No silent rebalancing: a net-yield residual above the table's declared
+  `net_yield_sum_tolerance` (default 1e-3 of the ejecta) rejects the table;
+  no renormalization of per-element ejecta; ejected mass = sum of tracked
+  element ejecta; untracked residual and negative-ejecta clamps are counted.
+* `chabrier_reference_v1` remains REFERENCE ONLY (birth-mixture return), not a
+  calibrated enrichment model.
+* SSP return is now the difference of cumulative channel returns: exactly
+  additive under step subdivision; discrete events were already subdivision-
+  and restart-invariant (cumulative-Poisson thresholds in the persistent
+  particle-indexed record).
+
+### 0.5 Options and outputs
+* `ssp_clustered_associations = true` is now refused (was a no-op).
+* **Science snapshots do NOT export composition, species, dust, SGS, ISM tags or
+  stellar population records.** Only restart checkpoints carry them (module
+  blocks). Checkpoint persistence is not science-snapshot support.
+
+### 0.6 External data requirements (nothing bundled or synthesized)
+| Data | Key | Needed for |
+|---|---|---|
+| TREECOOL UV background | `uv_background_table_path` (+ `_sha256`) | `uv_background_model = treecool_table` |
+| element-resolved metal cooling, `chui_metal_cooling_table_v1` | `metal_cooling_table_path` | `metal_cooling_mode = element_table*` |
+| SSP yields, `chui_ssp_yield_table_v1` | `ssp_yield_table_path` | `stellar_population_model = chabrier_yield_table_v1` |
+| verified rate coefficients (publications) | — | qualifying any network/equilibrium backend |
+
+### 0.7 Tests added (NOT RUN — USER-RESERVED)
+`unit_baryonic_source_stage_rollback` (failure injection, bit-identical
+preservation), `unit_star_formation_gradients` (patch boundary, periodic,
+coarse/fine, missing remote neighbour), plus updates to
+`unit_thermochemistry_backends` (unqualified-rate refusal),
+`unit_stellar_population_feedback` (exact subdivision additivity, yield table
+never rebalanced), `unit_config_part2_baryonic_physics` (opt-in and
+association refusal).
+
+### 0.8 Known compilation risks
+Large unbuilt change set: new aggregate fields / designated-initializer
+orders in tests, `std::optional`/`<string>` includes, mutable members in
+`SspModel`, the moved 250-line method, new headers in `cosmosim_physics`,
+and `src/`-relative includes in tests (`target_include_directories` added).
+
 ## 1. Production call graph (one owner per source term)
 
 ```
@@ -90,6 +181,8 @@ External data — **BLOCKED BY DATA (nothing bundled or synthesized)**:
 * UV background: TREECOOL file (`uv_background_table_path`, SHA-256 recorded).
   Without it Part 2 runs must use `uv_background_model = none`; `hm12`/`fg20`
   are legacy analytic proxies and are refused by Part 2 backends.
+* Rate coefficients: UNQUALIFIED (see §0.3); network/equilibrium backends need
+  the explicit opt-in.
 * Hot metal cooling: `chui_metal_cooling_table_v1` converted by the owner from
   a licensed element-resolved table (e.g. Wiersma et al. 2009).
 * Production SSP yields: `chui_ssp_yield_table_v1` (AGB/CC net yields vs mass
@@ -144,8 +237,8 @@ deposition: Hopkins 2018 coupling with KO15 terminal momentum, net vector
 removed mass-weighted (radial deficit ledgered), energy closure by momentum
 scaling, SGS share, dust condensation (AGB/CC efficiencies) and SN
 destruction. Pre-SN momentum is an EXPERIMENTAL user closure (default off).
-Associations (`ssp_clustered_associations`) are parsed but **not implemented**
-(no runtime effect) — named gap.
+Associations (`ssp_clustered_associations`) are not implemented and the option
+is refused by config validation.
 
 ## 9. Config / schema
 55 new `physics.*` keys (see `docs/configuration.md` §CHUI Part 2), typed,
@@ -159,23 +252,23 @@ gap). Migration wire versions bumped (particle 3, AMR patch 4).
 ## 10. Known gaps / risks (honest list)
 1. Nothing compiled; expect type/signature errors (e.g. new aggregate fields,
    `std::optional` includes, designated-initializer orders).
-2. Rate coefficients need verification against the publications.
+2. Rate coefficients are UNQUALIFIED (arxiv.org blocked during the gate); owner verification required.
 3. Element-resolved metal diffusion not implemented; metal diffusion is
    refused by config when a Part 2 backend is selected.
 4. Snapshot HDF5 export of composition/dust/species not implemented.
 5. Composition transport is first-order in concentration.
-6. Regime/fidelity tags and dwell counters are updated before the
-   thermochemistry transaction; a rejected stage leaves those decisions applied.
-7. Dust/SGS updates after the thermochemistry commit are not transactional.
-8. Association mode and benchmark matrices not implemented.
-9. SF gradient index lacks a dedicated unit test.
+6. (fixed by the gate) regime/fidelity/dwell/dust/SGS are staged and atomic.
+7. (fixed by the gate) see §0.2.
+8. Association mode refused; benchmark matrices not implemented.
+9. (fixed by the gate) dedicated SF gradient test added.
 10. Equilibrium backend is expensive (bisection × KWH iteration) — reference use.
 
 ## 11. Tests and fixtures (all NOT RUN — USER-RESERVED)
 `unit_gas_composition_substrate`, `unit_composition_transport`,
 `unit_cooling_f2_complete_interval`, `unit_thermochemistry_backends`,
 `unit_ism_dust_sgs_adaptive`, `unit_stellar_population_feedback`,
-`unit_config_part2_baryonic_physics`; updated `unit_migration_wire`.
+`unit_config_part2_baryonic_physics`, `unit_baryonic_source_stage_rollback`,
+`unit_star_formation_gradients`; updated `unit_migration_wire`.
 Fixtures: `configs/chui_part2/{cosmo_cube,zoom_in,isolated_galaxy,isolated_cluster}_part2.param.txt`.
 
 Human commands (documentation only):

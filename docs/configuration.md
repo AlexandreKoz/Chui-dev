@@ -824,7 +824,8 @@ Handoff: `docs/repair/chui_part2_thermochemistry_stellar_physics_20261103.md`.
 | `ssp_snia_per_msun`, `ssp_snia_delay_min_years`, `ssp_snia_delay_max_years`, `ssp_energy_per_sn_erg` | 1.3e-3, 4e7, 1.37e10, 1e51 | |
 | `ssp_reference_net_metal_yield` | 0 | REFERENCE yields only |
 | `ssp_stochastic_sn_events` | true | discrete events vs expectation |
-| `ssp_clustered_associations` | false | parsed, NOT implemented (no effect) |
+| `ssp_clustered_associations` | false | NOT implemented; `true` is refused |
+| `thermochemistry_allow_unqualified_rates` | false | required for `equilibrium_primordial`/`fixed_hybrid`/`fixed_detailed` (rates UNQUALIFIED, see `docs/chemistry_rate_provenance.md`) |
 | `fb_supernova_model` | `legacy` \| `mechanical_resolved_unresolved` | required by Part 2 populations when feedback is on |
 | `fb_presn_wind_momentum_lsun_per_c` | 0 | EXPERIMENTAL pre-SN momentum closure |
 

@@ -773,7 +773,7 @@ Record: `docs/repair/chui_part2_thermochemistry_stellar_physics_20261103.md`.
 | ID | Status | Remaining acceptance |
 |---|---|---|
 | CHUI-P2-BUILD | Source written, never compiled | Human build + the Part 2 unit tests listed in the record §11. |
-| CHUI-P2-RATES | Coefficients transcribed from publications | Independent check of every rate in `chemical_network.cpp` against the cited papers. |
+| CHUI-P2-RATES | UNQUALIFIED (arxiv.org blocked during the corrective gate); backends gated behind `thermochemistry_allow_unqualified_rates` | Owner verifies each rate per `docs/chemistry_rate_provenance.md`; R16 to be re-derived. |
 | CHUI-P2-DATA | BLOCKED BY DATA | Owner-supplied TREECOOL, element metal-cooling table, SSP yield table with licenses. |
 | CHUI-P2-TOPOLOGY | Fail closed | Part 3: distributed composition ghosts/reflux, regrid composition transfer, remote feedback deposition. |
-| CHUI-P2-GAPS | Open | Element-resolved diffusion, snapshot export of composition, associations, benchmarks, SF gradient test, transactional regime/dust/SGS decisions. |
+| CHUI-P2-GAPS | Open | Element-resolved diffusion (refused by config), science-snapshot export of composition/dust/species/stellar records (not implemented), benchmarks; associations refused. |

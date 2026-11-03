@@ -1861,6 +1861,13 @@ class SourceRuntimeImpl final : public SourceRuntime {
           double element_sum = 0.0;
           for (const double m : budget.ejecta_elements_code) element_sum += m;
           for (const double m : budget.ejecta_dust_code) element_sum += m;
+          if (element_sum > current_mass && element_sum > 0.0) {
+            // Never return more than the star holds (exact, all lanes scaled).
+            const double cap = current_mass / element_sum;
+            for (double& m : budget.ejecta_elements_code) m *= cap;
+            for (double& m : budget.ejecta_dust_code) m *= cap;
+            element_sum = current_mass;
+          }
           returned = element_sum;
           budget.ejecta_mass_code = element_sum;
         }
