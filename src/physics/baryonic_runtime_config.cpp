@@ -56,6 +56,9 @@ bool ensureGasCompositionInitialized(core::SimulationState& state, const core::P
   }
   const CompositionLayout layout = CompositionLayout::make(compositionLayoutRequestFromConfig(physics));
   const bool was_enabled = state.gas_composition.enabled();
+  if (!was_enabled && restoreGasCompositionFromModuleSidecar(state, layout)) {
+    return false;  // restored from a checkpoint, not initialized
+  }
   enableGasComposition(state, layout, primordialPolicyFromConfig(physics));
   return !was_enabled;
 }

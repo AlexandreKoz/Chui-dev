@@ -1,6 +1,8 @@
 #include "cosmosim/physics/baryon_composition.hpp"
 
 #include <algorithm>
+#include <cstring>
+#include <unordered_map>
 #include <cmath>
 #include <stdexcept>
 #include <string>
@@ -367,6 +369,81 @@ std::array<double, k_chemical_element_count> removeGasFractionFromComposition(
   }
   sidecar.scaleRow(row, 1.0 - removed_fraction);
   return removed;
+}
+
+namespace {
+template <class T>
+void appendPod(std::vector<std::byte>& out, const T& value) {
+  const auto* bytes = reinterpret_cast<const std::byte*>(&value);
+  out.insert(out.end(), bytes, bytes + sizeof(T));
+}
+template <class T>
+T readPod(const std::vector<std::byte>& in, std::size_t& offset) {
+  if (offset + sizeof(T) > in.size()) throw std::runtime_error("chui_gas_composition_v1 block is truncated");
+  T value;
+  std::memcpy(&value, in.data() + offset, sizeof(T));
+  offset += sizeof(T);
+  return value;
+}
+}  // namespace
+
+void packGasCompositionIntoModuleSidecar(core::SimulationState& state) {
+  const auto& sidecar = state.gas_composition;
+  if (!sidecar.enabled()) return;
+  sidecar.requireAlignedWith(state.gas_cells.gas_cell_id, "packGasCompositionIntoModuleSidecar");
+  core::ModuleSidecarBlock block;
+  block.module_name = k_gas_composition_module;
+  block.schema_version = 1U;
+  const auto& d = sidecar.descriptor();
+  appendPod(block.payload, d.layout_version);
+  appendPod(block.payload, d.layout_signature);
+  appendPod(block.payload, d.lane_count);
+  appendPod(block.payload, static_cast<std::uint64_t>(sidecar.rowCount()));
+  for (std::size_t row = 0; row < sidecar.rowCount(); ++row) {
+    appendPod(block.payload, sidecar.gas_cell_id[row]);
+    for (const double v : sidecar.packRow(row)) appendPod(block.payload, v);
+  }
+  state.sidecars.upsert(std::move(block));
+}
+
+bool restoreGasCompositionFromModuleSidecar(core::SimulationState& state, const CompositionLayout& layout) {
+  const core::ModuleSidecarBlock* block = state.sidecars.find(k_gas_composition_module);
+  if (block == nullptr) return false;
+  if (block->schema_version != 1U) throw std::runtime_error("unsupported chui_gas_composition schema version");
+  std::size_t offset = 0;
+  const auto version = readPod<std::uint32_t>(block->payload, offset);
+  const auto signature = readPod<std::uint64_t>(block->payload, offset);
+  const auto lanes = readPod<std::uint32_t>(block->payload, offset);
+  const auto rows = readPod<std::uint64_t>(block->payload, offset);
+  const auto& d = layout.descriptor();
+  if (version != d.layout_version || signature != d.layout_signature || lanes != d.lane_count) {
+    throw std::runtime_error(
+        "checkpointed gas composition layout differs from the configured layout '" + d.layout_name +
+        "'; changing the composition model on resume requires an explicit, versioned conversion");
+  }
+  if (rows != state.cells.size()) {
+    throw std::runtime_error("checkpointed gas composition row count differs from the restored gas cells");
+  }
+  core::GasCompositionSidecar restored;
+  restored.configure(d, state.cells.size());
+  std::unordered_map<std::uint64_t, std::uint32_t> row_by_id;
+  row_by_id.reserve(state.cells.size());
+  for (std::uint32_t r = 0; r < state.cells.size(); ++r) row_by_id.emplace(state.gas_cells.gas_cell_id[r], r);
+  std::vector<double> payload(restored.packedRowWidth());
+  std::vector<std::uint8_t> filled(state.cells.size(), 0U);
+  for (std::uint64_t i = 0; i < rows; ++i) {
+    const auto id = readPod<std::uint64_t>(block->payload, offset);
+    for (double& v : payload) v = readPod<double>(block->payload, offset);
+    const auto it = row_by_id.find(id);
+    if (it == row_by_id.end() || filled[it->second] != 0U) {
+      throw std::runtime_error("checkpointed gas composition row " + std::to_string(id) +
+                               " has no unique restored gas cell");
+    }
+    restored.unpackRow(it->second, payload, id);
+    filled[it->second] = 1U;
+  }
+  state.gas_composition = std::move(restored);
+  return true;
 }
 
 }  // namespace cosmosim::physics

@@ -210,4 +210,20 @@ std::array<double, k_chemical_element_count> removeGasFractionFromComposition(
     core::GasCompositionSidecar& sidecar, const CompositionLayout& layout, std::size_t row,
     double removed_fraction);
 
+// ---------------------------------------------------------------------------
+// Restart persistence (CHUI Part 2). The composition sidecar is checkpointed
+// as the run-persistent module block "chui_gas_composition_v1" (schema 1):
+//   u32 layout_version, u64 layout_signature, u32 lane_count,
+//   u64 row_count, then per row: u64 gas_cell_id, f64 x packedRowWidth().
+// The block is refreshed immediately before each restart write (it is a
+// serialized image, not a second live authority) and is covered by the
+// existing restart payload integrity digest. On resume the sidecar is
+// rebuilt by STABLE gas_cell_id (row order independent); a missing cell, a
+// layout signature mismatch or a width mismatch is refused.
+// ---------------------------------------------------------------------------
+inline constexpr const char* k_gas_composition_module = "chui_gas_composition_v1";
+void packGasCompositionIntoModuleSidecar(core::SimulationState& state);
+// Returns true when the sidecar was restored from the module block.
+bool restoreGasCompositionFromModuleSidecar(core::SimulationState& state, const CompositionLayout& layout);
+
 }  // namespace cosmosim::physics
