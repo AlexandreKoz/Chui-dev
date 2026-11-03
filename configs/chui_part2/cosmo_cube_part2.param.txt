@@ -1,0 +1,89 @@
+# CHUI Part 2 source fixture for cosmo_cube (NOT RUN — USER-RESERVED).
+# Derived from configs/cosmo_cube.param.txt; only the [physics] Part 2 keys
+# differ. UV background is 'none' because no TREECOOL table is bundled:
+# set uv_background_model = treecool_table and uv_background_table_path to a
+# licensed TREECOOL file for production runs. Element-table metal cooling and
+# production SSP yields likewise require owner-supplied data files.
+schema_version = 1
+
+[units]
+length_unit = mpc
+mass_unit = msun
+velocity_unit = km_s
+coordinate_frame = comoving
+
+[mode]
+mode = cosmo_cube
+ic_file = cosmo_cube_ics.hdf5
+ic_convention = gadget_arepo_bridge_v1
+ic_bridge_source_length_unit_to_si = 3.0856775814913673e19
+ic_bridge_source_mass_unit_to_si = 1.98847e30
+ic_bridge_source_velocity_unit_to_si = 1000
+ic_bridge_coordinate_frame = comoving
+ic_bridge_velocity_convention = gadget_arepo_stored_peculiar
+ic_bridge_length_hubble_exponent = 0
+ic_bridge_length_scale_factor_exponent = 0
+ic_bridge_mass_hubble_exponent = 0
+ic_bridge_mass_scale_factor_exponent = 0
+ic_bridge_velocity_hubble_exponent = 0
+ic_bridge_velocity_scale_factor_exponent = 0
+zoom_high_res_region = false
+hydro_boundary = periodic
+gravity_boundary = periodic
+
+[cosmology]
+omega_matter = 0.31
+omega_lambda = 0.69
+omega_baryon = 0.0486
+hubble_param = 0.677
+sigma8 = 0.81
+scalar_index_ns = 0.966
+box_size = 100 mpc
+
+[numerics]
+time_begin_code = 0.0
+time_end_code = 1.0
+max_global_steps = 2048
+hierarchical_max_rung = 0
+amr_max_level = 9
+gravity_softening = 3.0 kpc
+gravity_solver = treepm
+hydro_solver = godunov_fv
+treepm_pm_grid = 64
+treepm_asmth_cells = 1.25
+treepm_rcut_cells = 6.25
+treepm_assignment_scheme = tsc
+treepm_enable_window_deconvolution = true
+treepm_update_cadence_steps = 1
+
+[physics]
+enable_cooling = true
+enable_star_formation = true
+star_formation_model = effective_multiphase_tng_like
+enable_feedback = true
+reionization_model = hm12
+
+metal_species_mode = core_elements
+uv_background_model = none
+self_shielding_model = rahmati13_like
+chemistry_metallicity_scaled_dust_proxy = false
+thermochemistry_backend = fixed_hybrid
+metal_cooling_mode = fine_structure_cold
+dust_model = two_reservoir_v1
+ism_regime_model = effective_or_resolved
+stellar_population_model = chabrier_reference_v1
+fb_supernova_model = mechanical_resolved_unresolved
+
+[output]
+run_name = cosmo_cube_reference
+output_directory = outputs/cosmo_cube
+output_stem = snapshot
+restart_stem = restart
+snapshot_interval_steps = 64
+write_restarts = true
+
+[parallel]
+mpi_ranks_expected = 1
+omp_threads = 1
+gpu_devices = 0
+deterministic_reduction = true

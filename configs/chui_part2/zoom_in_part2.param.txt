@@ -1,0 +1,106 @@
+# CHUI Part 2 source fixture for zoom_in (NOT RUN — USER-RESERVED).
+# Derived from configs/zoom_in.param.txt; only the [physics] Part 2 keys
+# differ. UV background is 'none' because no TREECOOL table is bundled:
+# set uv_background_model = treecool_table and uv_background_table_path to a
+# licensed TREECOOL file for production runs. Element-table metal cooling and
+# production SSP yields likewise require owner-supplied data files.
+schema_version = 1
+
+[units]
+length_unit = mpc
+mass_unit = msun
+velocity_unit = km_s
+coordinate_frame = comoving
+
+[mode]
+mode = zoom_in
+ic_file = zoom_in_ics.hdf5
+ic_convention = gadget_arepo_bridge_v1
+ic_bridge_source_length_unit_to_si = 3.0856775814913673e19
+ic_bridge_source_mass_unit_to_si = 1.98847e30
+ic_bridge_source_velocity_unit_to_si = 1000
+ic_bridge_coordinate_frame = comoving
+ic_bridge_velocity_convention = gadget_arepo_stored_peculiar
+ic_bridge_length_hubble_exponent = 0
+ic_bridge_length_scale_factor_exponent = 0
+ic_bridge_mass_hubble_exponent = 0
+ic_bridge_mass_scale_factor_exponent = 0
+ic_bridge_velocity_hubble_exponent = 0
+ic_bridge_velocity_scale_factor_exponent = 0
+zoom_high_res_region = true
+zoom_region_file = zoom_lagrangian_region.hdf5
+zoom_long_range_strategy = global_coarse_plus_focused_highres_correction
+zoom_region_center_x = 25.0
+zoom_region_center_y = 25.0
+zoom_region_center_z = 25.0
+zoom_region_radius = 5.0
+zoom_focused_pm_grid_nx = 128
+zoom_focused_pm_grid_ny = 128
+zoom_focused_pm_grid_nz = 128
+zoom_contamination_radius = 7.5
+hydro_boundary = periodic
+gravity_boundary = periodic
+
+[cosmology]
+omega_matter = 0.3089
+omega_lambda = 0.6911
+omega_baryon = 0.0486
+hubble_param = 0.6774
+sigma8 = 0.8159
+scalar_index_ns = 0.9667
+box_size = 50 mpc
+
+[numerics]
+time_begin_code = 0.0
+time_end_code = 1.0
+max_global_steps = 4096
+hierarchical_max_rung = 0
+amr_max_level = 12
+gravity_softening = 0.6 kpc
+gravity_solver = treepm
+hydro_solver = godunov_fv
+treepm_pm_grid = 64
+treepm_asmth_cells = 1.25
+treepm_rcut_cells = 6.25
+treepm_assignment_scheme = cic
+treepm_enable_window_deconvolution = false
+treepm_update_cadence_steps = 1
+
+[physics]
+enable_cooling = true
+enable_star_formation = true
+star_formation_model = adaptive_bound_jeans
+enable_feedback = true
+reionization_model = hm12
+uv_background_model = none
+self_shielding_model = rahmati13_like
+cooling_model = primordial
+temperature_floor_k = 100.0
+sf_density_threshold_code = 10.0
+sf_temperature_threshold_k = 10000.0
+sf_min_converging_flow_rate_code = 0.0
+sf_epsilon_ff = 0.01
+sf_min_star_particle_mass_code = 0.1
+sf_stochastic_spawning = true
+sf_random_seed = 123456789
+
+metal_species_mode = core_elements
+chemistry_metallicity_scaled_dust_proxy = false
+thermochemistry_backend = fixed_hybrid
+metal_cooling_mode = fine_structure_cold
+stellar_population_model = chabrier_reference_v1
+fb_supernova_model = mechanical_resolved_unresolved
+
+[output]
+run_name = zoom_in_reference
+output_directory = outputs/zoom_in
+output_stem = snapshot
+restart_stem = restart
+snapshot_interval_steps = 32
+write_restarts = true
+
+[parallel]
+mpi_ranks_expected = 4
+omp_threads = 1
+gpu_devices = 0
+deterministic_reduction = true

@@ -1,0 +1,86 @@
+# CHUI Part 2 source fixture for isolated_galaxy (NOT RUN — USER-RESERVED).
+# Derived from configs/isolated_galaxy.param.txt; only the [physics] Part 2 keys
+# differ. UV background is 'none' because no TREECOOL table is bundled:
+# set uv_background_model = treecool_table and uv_background_table_path to a
+# licensed TREECOOL file for production runs. Element-table metal cooling and
+# production SSP yields likewise require owner-supplied data files.
+schema_version = 1
+
+[units]
+length_unit = kpc
+mass_unit = msun
+velocity_unit = km_s
+coordinate_frame = physical
+
+[mode]
+mode = isolated_galaxy
+ic_file = isolated_galaxy_ics.hdf5
+ic_convention = gadget_arepo_bridge_v1
+ic_bridge_source_length_unit_to_si = 3.0856775814913673e19
+ic_bridge_source_mass_unit_to_si = 1.98847e30
+ic_bridge_source_velocity_unit_to_si = 1000
+ic_bridge_coordinate_frame = comoving
+ic_bridge_velocity_convention = physical_peculiar
+ic_bridge_length_hubble_exponent = 0
+ic_bridge_length_scale_factor_exponent = 0
+ic_bridge_mass_hubble_exponent = 0
+ic_bridge_mass_scale_factor_exponent = 0
+ic_bridge_velocity_hubble_exponent = 0
+ic_bridge_velocity_scale_factor_exponent = 0
+zoom_high_res_region = false
+hydro_boundary = open
+gravity_boundary = isolated_monopole
+
+[cosmology]
+omega_matter = 0.31
+omega_lambda = 0.69
+omega_baryon = 0.0486
+hubble_param = 0.677
+sigma8 = 0.81
+scalar_index_ns = 0.966
+box_size = 400 kpc
+
+[numerics]
+time_begin_code = 0.0
+time_end_code = 1.0
+max_global_steps = 3000
+hierarchical_max_rung = 0
+amr_max_level = 11
+gravity_softening = 0.05 kpc
+treepm_pm_grid = 32
+treepm_asmth_cells = 1.25
+treepm_rcut_cells = 6.25
+treepm_assignment_scheme = cic
+treepm_enable_window_deconvolution = false
+treepm_update_cadence_steps = 1
+
+[output]
+run_name = isolated_galaxy_reference
+output_directory = outputs/isolated_galaxy
+output_stem = snapshot
+restart_stem = restart
+snapshot_interval_steps = 50
+write_restarts = true
+
+[parallel]
+mpi_ranks_expected = 1
+omp_threads = 1
+gpu_devices = 0
+deterministic_reduction = true
+
+[physics]
+metal_species_mode = core_elements
+uv_background_model = none
+self_shielding_model = rahmati13_like
+chemistry_metallicity_scaled_dust_proxy = false
+thermochemistry_backend = fixed_detailed
+metal_cooling_mode = fine_structure_cold
+isrf_g0_habing = 1.0
+dust_model = two_reservoir_v1
+sgs_turbulence_model = budgeted_v1
+sgs_feedback_energy_fraction = 0.1
+chemistry_adaptive_selection = local_v1
+chemistry_shadow_sample_fraction = 0.01
+chemistry_shadow_max_cells = 64
+stellar_population_model = chabrier_reference_v1
+fb_supernova_model = mechanical_resolved_unresolved
