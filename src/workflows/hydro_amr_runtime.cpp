@@ -956,19 +956,28 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
       source_context.face_mass_flux_sink = composition_flux.get();
       composition_flux->beginAdvance(m_geometry, m_dense_row_by_geometry_row, {});
     }
-    m_solver.advancePatchActiveSetBatchedWithScratch(
-        m_conserved,
-        m_geometry,
-        active_view,
-        update,
-        *m_reconstruction,
-        *m_riemann_solver,
-        sources,
-        source_context,
-        m_scratch,
-        nullptr,
-        active_batch_policy,
-        &m_last_hydro_profile);
+    // Audit F2: a source that cannot integrate the full accepted interval
+    // throws StageNumericalRetryRequest from inside the solver. The solver
+    // only writes the staging copy m_conserved, so the failure is converted
+    // into a transaction rejection below; SimulationState stays untouched.
+    std::string source_retry_failure;
+    try {
+      m_solver.advancePatchActiveSetBatchedWithScratch(
+          m_conserved,
+          m_geometry,
+          active_view,
+          update,
+          *m_reconstruction,
+          *m_riemann_solver,
+          sources,
+          source_context,
+          m_scratch,
+          nullptr,
+          active_batch_policy,
+          &m_last_hydro_profile);
+    } catch (const core::StageNumericalRetryRequest& retry) {
+      source_retry_failure = retry.what();
+    }
     if (composition_flux != nullptr) {
       composition_flux->endAdvance();
     }
@@ -1101,7 +1110,11 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
       hydro_transaction.adoptReservation(std::move(composition_transport_reservation));
     }
     std::string staged_failure;
-    bool staged_admissible = stagedConservedStateIsAdmissible(staged_failure);
+    bool staged_admissible = source_retry_failure.empty() &&
+        stagedConservedStateIsAdmissible(staged_failure);
+    if (!source_retry_failure.empty()) {
+      staged_failure = "hydro source interval incomplete: " + source_retry_failure;
+    }
     if (staged_admissible && composition_flux != nullptr) {
       // Composition deltas use the step-start sidecar and need the
       // post-hydro mass only for reconciliation inside commit().
@@ -1168,8 +1181,17 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
           primitive.specific_internal_energy_code;
       context.state.gas_cells.sound_speed_code[cell_index] =
           std::sqrt(std::max(primitive.signal_speed_squared_code, 0.0));
+      double temperature_factor = m_temperature_k_per_internal_energy_code;
+      if (context.state.gas_composition.enabled()) {
+        // CHUI Part 2: composition-dependent mu (amu) from thermochemistry.
+        const double mu_amu = context.state.gas_composition.mean_molecular_weight[cell_index];
+        if (std::isfinite(mu_amu) && mu_amu > 0.0) {
+          temperature_factor *= mu_amu * (1.66053906660e-24 / 1.67262192369e-24) /
+              hydro::k_part1_reference_mean_molecular_weight;
+        }
+      }
       context.state.gas_cells.temperature_code[cell_index] =
-          m_temperature_k_per_internal_energy_code * primitive.specific_internal_energy_code;
+          temperature_factor * primitive.specific_internal_energy_code;
       context.state.cells.mass_code[cell_index] = primitive.rho_comoving * m_geometry.cell_volume_comoving;
       context.state.gas_cells.metal_mass_code[cell_index] =
           std::clamp(primitive.metallicity_mass_fraction, 0.0, 1.0) *

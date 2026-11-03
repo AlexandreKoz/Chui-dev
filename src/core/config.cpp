@@ -1064,6 +1064,9 @@ parseInitialConditionMissingFieldPolicy(
   if (lower == "fg20") {
     return UvBackgroundModel::kFg20;
   }
+  if (lower == "treecool_table") {
+    return UvBackgroundModel::kTreecoolTable;
+  }
   throw ConfigError("key 'physics.uv_background_model': invalid value '" + value + "'");
 }
 
@@ -1087,6 +1090,75 @@ parseInitialConditionMissingFieldPolicy(
     return CoolingModel::kPrimordialMetalLine;
   }
   throw ConfigError("key 'physics.cooling_model': invalid value '" + value + "'");
+}
+
+[[nodiscard]] ThermochemistryBackendMode parseThermochemistryBackendMode(const std::string& value) {
+  const std::string lower = toLower(trim(value));
+  if (lower == "legacy_cooling") return ThermochemistryBackendMode::kLegacyCooling;
+  if (lower == "analytic_reference") return ThermochemistryBackendMode::kAnalyticReference;
+  if (lower == "equilibrium_primordial") return ThermochemistryBackendMode::kEquilibriumPrimordial;
+  if (lower == "fixed_hybrid") return ThermochemistryBackendMode::kFixedHybrid;
+  if (lower == "fixed_detailed") return ThermochemistryBackendMode::kFixedDetailed;
+  throw ConfigError("physics.thermochemistry_backend must be one of: legacy_cooling, analytic_reference, equilibrium_primordial, fixed_hybrid, fixed_detailed");
+}
+
+[[nodiscard]] MetalCoolingModeConfig parseMetalCoolingModeConfig(const std::string& value) {
+  const std::string lower = toLower(trim(value));
+  if (lower == "none") return MetalCoolingModeConfig::kNone;
+  if (lower == "fine_structure_cold") return MetalCoolingModeConfig::kFineStructureCold;
+  if (lower == "element_table") return MetalCoolingModeConfig::kElementTable;
+  if (lower == "element_table_and_fine_structure") return MetalCoolingModeConfig::kElementTableAndFineStructure;
+  throw ConfigError("physics.metal_cooling_mode must be one of: none, fine_structure_cold, element_table, element_table_and_fine_structure");
+}
+
+[[nodiscard]] MetalCoolingTableRangeConfig parseMetalCoolingTableRangeConfig(const std::string& value) {
+  const std::string lower = toLower(trim(value));
+  if (lower == "reject") return MetalCoolingTableRangeConfig::kReject;
+  if (lower == "clamp_density_redshift") return MetalCoolingTableRangeConfig::kClampDensityAndRedshift;
+  throw ConfigError("physics.metal_cooling_table_range must be one of: reject, clamp_density_redshift");
+}
+
+[[nodiscard]] DustModelConfig parseDustModelConfig(const std::string& value) {
+  const std::string lower = toLower(trim(value));
+  if (lower == "none") return DustModelConfig::kNone;
+  if (lower == "two_reservoir_v1") return DustModelConfig::kTwoReservoirV1;
+  throw ConfigError("physics.dust_model must be one of: none, two_reservoir_v1");
+}
+
+[[nodiscard]] IsmRegimeModelConfig parseIsmRegimeModelConfig(const std::string& value) {
+  const std::string lower = toLower(trim(value));
+  if (lower == "legacy") return IsmRegimeModelConfig::kLegacy;
+  if (lower == "effective_or_resolved") return IsmRegimeModelConfig::kEffectiveOrResolved;
+  throw ConfigError("physics.ism_regime_model must be one of: legacy, effective_or_resolved");
+}
+
+[[nodiscard]] SgsTurbulenceModelConfig parseSgsTurbulenceModelConfig(const std::string& value) {
+  const std::string lower = toLower(trim(value));
+  if (lower == "none") return SgsTurbulenceModelConfig::kNone;
+  if (lower == "budgeted_v1") return SgsTurbulenceModelConfig::kBudgetedV1;
+  throw ConfigError("physics.sgs_turbulence_model must be one of: none, budgeted_v1");
+}
+
+[[nodiscard]] ChemistryAdaptiveSelectionConfig parseChemistryAdaptiveSelectionConfig(const std::string& value) {
+  const std::string lower = toLower(trim(value));
+  if (lower == "off") return ChemistryAdaptiveSelectionConfig::kOff;
+  if (lower == "local_v1") return ChemistryAdaptiveSelectionConfig::kLocalV1;
+  throw ConfigError("physics.chemistry_adaptive_selection must be one of: off, local_v1");
+}
+
+[[nodiscard]] StellarPopulationModelConfig parseStellarPopulationModelConfig(const std::string& value) {
+  const std::string lower = toLower(trim(value));
+  if (lower == "legacy_table") return StellarPopulationModelConfig::kLegacyTable;
+  if (lower == "chabrier_reference_v1") return StellarPopulationModelConfig::kChabrierReferenceV1;
+  if (lower == "chabrier_yield_table_v1") return StellarPopulationModelConfig::kChabrierYieldTableV1;
+  throw ConfigError("physics.stellar_population_model must be one of: legacy_table, chabrier_reference_v1, chabrier_yield_table_v1");
+}
+
+[[nodiscard]] SupernovaFeedbackModelConfig parseSupernovaFeedbackModelConfig(const std::string& value) {
+  const std::string lower = toLower(trim(value));
+  if (lower == "legacy") return SupernovaFeedbackModelConfig::kLegacy;
+  if (lower == "mechanical_resolved_unresolved") return SupernovaFeedbackModelConfig::kMechanicalResolvedUnresolved;
+  throw ConfigError("physics.fb_supernova_model must be one of: legacy, mechanical_resolved_unresolved");
 }
 
 [[nodiscard]] MetalSpeciesMode parseMetalSpeciesMode(const std::string& value) {
@@ -1471,6 +1543,62 @@ struct ConfigKeySpec {
       {"physics.enable_tracers", "false"},
       {"physics.tracer_track_mass", "true"},
       {"physics.tracer_min_host_mass_code", "0.0"},
+      {"physics.thermochemistry_backend", "legacy_cooling"},
+      {"physics.metal_cooling_mode", "none"},
+      {"physics.metal_cooling_table_range", "reject"},
+      {"physics.dust_model", "none"},
+      {"physics.ism_regime_model", "legacy"},
+      {"physics.sgs_turbulence_model", "none"},
+      {"physics.chemistry_adaptive_selection", "off"},
+      {"physics.stellar_population_model", "legacy_table"},
+      {"physics.fb_supernova_model", "legacy"},
+      {"physics.thermochemistry_relative_tolerance", "1.0e-4"},
+      {"physics.thermochemistry_abundance_absolute_tolerance", "1.0e-12"},
+      {"physics.thermochemistry_analytic_relaxation_time_years", "1.0e6"},
+      {"physics.thermochemistry_analytic_equilibrium_temperature_k", "1.0e4"},
+      {"physics.isrf_g0_habing", "0.0"},
+      {"physics.chemistry_shielding_length_max_pc", "100.0"},
+      {"physics.metal_cooling_switch_temperature_k", "1.0e4"},
+      {"physics.chemistry_primordial_helium_mass_fraction", "0.2449"},
+      {"physics.dust_accretion_timescale_ref_years", "2.0e7"},
+      {"physics.dust_sputtering_timescale_ref_years", "1.7e8"},
+      {"physics.dust_sn_swept_mass_msun", "6800.0"},
+      {"physics.dust_sn_destruction_efficiency", "0.3"},
+      {"physics.dust_agb_condensation_efficiency", "0.2"},
+      {"physics.dust_cc_condensation_efficiency", "0.1"},
+      {"physics.ism_jeans_resolution_cells", "4.0"},
+      {"physics.ism_regime_hysteresis_fraction", "0.2"},
+      {"physics.ism_regime_min_dwell_years", "1.0e6"},
+      {"physics.sgs_dissipation_coefficient", "1.58"},
+      {"physics.sgs_eddy_viscosity_coefficient", "0.05"},
+      {"physics.sgs_feedback_energy_fraction", "0.0"},
+      {"physics.chemistry_adaptive_hysteresis_fraction", "0.3"},
+      {"physics.chemistry_adaptive_min_dwell_years", "1.0e6"},
+      {"physics.chemistry_adaptive_cold_temperature_k", "3.0e3"},
+      {"physics.chemistry_adaptive_dense_nh_cm3", "1.0"},
+      {"physics.chemistry_shadow_sample_fraction", "0.0"},
+      {"physics.ssp_imf_mass_min_msun", "0.1"},
+      {"physics.ssp_imf_mass_max_msun", "100.0"},
+      {"physics.ssp_cc_mass_min_msun", "8.0"},
+      {"physics.ssp_cc_mass_max_msun", "40.0"},
+      {"physics.ssp_snia_per_msun", "1.3e-3"},
+      {"physics.ssp_snia_delay_min_years", "4.0e7"},
+      {"physics.ssp_snia_delay_max_years", "1.37e10"},
+      {"physics.ssp_energy_per_sn_erg", "1.0e51"},
+      {"physics.ssp_reference_net_metal_yield", "0.0"},
+      {"physics.fb_presn_wind_momentum_lsun_per_c", "0.0"},
+      {"physics.thermochemistry_max_substeps", "4096"},
+      {"physics.thermochemistry_max_newton_iterations", "12"},
+      {"physics.chemistry_shadow_max_cells", "0"},
+      {"physics.uv_background_table_path", ""},
+      {"physics.uv_background_table_sha256", ""},
+      {"physics.metal_cooling_table_path", ""},
+      {"physics.metal_cooling_table_sha256", ""},
+      {"physics.ssp_yield_table_path", ""},
+      {"physics.ssp_yield_table_sha256", ""},
+      {"physics.chemistry_metallicity_scaled_dust_proxy", "false"},
+      {"physics.ssp_stochastic_sn_events", "true"},
+      {"physics.ssp_clustered_associations", "false"},
       {"output.run_name", "cosmosim_run"},
       {"output.output_directory", "outputs"},
       {"output.output_stem", "snapshot"},
@@ -1572,6 +1700,127 @@ struct ConfigKeySpec {
   throw ConfigError("internal config key registry missing default for key '" + key + "'");
 }
 
+// CHUI Part 2 typed validation of the baryonic-physics keys. Every rule is
+// explicit; no Part 2 model silently degrades to a cheaper one.
+void validatePart2BaryonicPhysics(const SimulationConfig& config) {
+  const PhysicsConfig& p = config.physics;
+  const bool part2 = p.thermochemistry_backend != ThermochemistryBackendMode::kLegacyCooling;
+  if (part2 != (p.metal_species_mode == MetalSpeciesMode::kCoreElements)) {
+    throw ConfigError(
+        "physics.metal_species_mode=core_elements is required by (and only valid with) a Part 2 "
+        "thermochemistry_backend (analytic_reference, equilibrium_primordial, fixed_hybrid, fixed_detailed)");
+  }
+  if (part2 && !p.enable_cooling) {
+    throw ConfigError("a Part 2 thermochemistry_backend requires physics.enable_cooling=true");
+  }
+  if (part2 && (p.uv_background_model == UvBackgroundModel::kHm12 ||
+                p.uv_background_model == UvBackgroundModel::kFg20)) {
+    throw ConfigError(
+        "physics.uv_background_model=hm12/fg20 are legacy analytic proxies; Part 2 backends require "
+        "uv_background_model=none or treecool_table with uv_background_table_path");
+  }
+  if (p.uv_background_model == UvBackgroundModel::kTreecoolTable) {
+    if (!part2) throw ConfigError("uv_background_model=treecool_table requires a Part 2 thermochemistry_backend");
+    if (p.uv_background_table_path.empty()) {
+      throw ConfigError("uv_background_model=treecool_table requires physics.uv_background_table_path");
+    }
+  }
+  if (!part2 && (p.metal_cooling_mode != MetalCoolingModeConfig::kNone ||
+                 p.dust_model != DustModelConfig::kNone ||
+                 p.ism_regime_model != IsmRegimeModelConfig::kLegacy ||
+                 p.sgs_turbulence_model != SgsTurbulenceModelConfig::kNone ||
+                 p.chemistry_adaptive_selection != ChemistryAdaptiveSelectionConfig::kOff)) {
+    throw ConfigError(
+        "metal_cooling_mode, dust_model, ism_regime_model, sgs_turbulence_model and "
+        "chemistry_adaptive_selection require a Part 2 thermochemistry_backend");
+  }
+  const bool network = p.thermochemistry_backend == ThermochemistryBackendMode::kFixedHybrid ||
+      p.thermochemistry_backend == ThermochemistryBackendMode::kFixedDetailed;
+  if ((p.metal_cooling_mode != MetalCoolingModeConfig::kNone || p.dust_model != DustModelConfig::kNone) &&
+      !network) {
+    throw ConfigError("metal_cooling_mode and dust_model require thermochemistry_backend=fixed_hybrid or fixed_detailed");
+  }
+  if ((p.metal_cooling_mode == MetalCoolingModeConfig::kElementTable ||
+       p.metal_cooling_mode == MetalCoolingModeConfig::kElementTableAndFineStructure) &&
+      p.metal_cooling_table_path.empty()) {
+    throw ConfigError("element-table metal cooling requires physics.metal_cooling_table_path (no table is bundled)");
+  }
+  if (p.chemistry_adaptive_selection == ChemistryAdaptiveSelectionConfig::kLocalV1 &&
+      p.thermochemistry_backend != ThermochemistryBackendMode::kFixedDetailed) {
+    throw ConfigError(
+        "chemistry_adaptive_selection=local_v1 needs the detailed species lanes (thermochemistry_backend=fixed_detailed)");
+  }
+  if (!(p.thermochemistry_relative_tolerance > 0.0) || p.thermochemistry_relative_tolerance >= 0.1) {
+    throw ConfigError("physics.thermochemistry_relative_tolerance must be in (0, 0.1)");
+  }
+  if (!(p.thermochemistry_abundance_absolute_tolerance > 0.0) || p.thermochemistry_abundance_absolute_tolerance > 1.0e-4) {
+    throw ConfigError("physics.thermochemistry_abundance_absolute_tolerance must be in (0, 1e-4]");
+  }
+  if (p.thermochemistry_max_substeps == 0U || p.thermochemistry_max_newton_iterations == 0U) {
+    throw ConfigError("thermochemistry_max_substeps and thermochemistry_max_newton_iterations must be > 0");
+  }
+  if (!(p.thermochemistry_analytic_relaxation_time_years > 0.0) ||
+      !(p.thermochemistry_analytic_equilibrium_temperature_k > 0.0)) {
+    throw ConfigError("analytic thermochemistry reference requires positive relaxation time and temperature");
+  }
+  if (p.isrf_g0_habing < 0.0 || !(p.chemistry_shielding_length_max_pc > 0.0) ||
+      !(p.metal_cooling_switch_temperature_k > 10.0)) {
+    throw ConfigError("isrf_g0_habing >= 0, chemistry_shielding_length_max_pc > 0, metal_cooling_switch_temperature_k > 10 required");
+  }
+  if (!(p.chemistry_primordial_helium_mass_fraction > 0.2) || p.chemistry_primordial_helium_mass_fraction > 0.3) {
+    throw ConfigError("physics.chemistry_primordial_helium_mass_fraction must be in (0.2, 0.3]");
+  }
+  for (const double v : {p.dust_accretion_timescale_ref_years, p.dust_sputtering_timescale_ref_years,
+                         p.dust_sn_swept_mass_msun}) {
+    if (!(v > 0.0)) throw ConfigError("dust timescales and SN swept mass must be > 0");
+  }
+  for (const double v : {p.dust_sn_destruction_efficiency, p.dust_agb_condensation_efficiency,
+                         p.dust_cc_condensation_efficiency, p.sgs_feedback_energy_fraction,
+                         p.chemistry_shadow_sample_fraction}) {
+    if (!(v >= 0.0) || v > 1.0) throw ConfigError("dust efficiencies, sgs_feedback_energy_fraction and chemistry_shadow_sample_fraction must be in [0, 1]");
+  }
+  if (!(p.ism_jeans_resolution_cells >= 1.0) || !(p.ism_regime_hysteresis_fraction >= 0.0) ||
+      p.ism_regime_hysteresis_fraction >= 1.0 || p.ism_regime_min_dwell_years < 0.0) {
+    throw ConfigError("ism_jeans_resolution_cells >= 1, ism_regime_hysteresis_fraction in [0,1), dwell >= 0 required");
+  }
+  if (p.ism_regime_model == IsmRegimeModelConfig::kEffectiveOrResolved &&
+      p.star_formation_model != StarFormationModelKind::kEffectiveMultiphaseTngLike) {
+    throw ConfigError(
+        "ism_regime_model=effective_or_resolved requires star_formation_model=effective_multiphase_tng_like "
+        "(the effective closure is the unresolved branch)");
+  }
+  if (!(p.sgs_dissipation_coefficient > 0.0) || !(p.sgs_eddy_viscosity_coefficient > 0.0)) {
+    throw ConfigError("SGS closure coefficients must be > 0");
+  }
+  if (!(p.chemistry_adaptive_hysteresis_fraction >= 0.0) || p.chemistry_adaptive_hysteresis_fraction >= 1.0 ||
+      p.chemistry_adaptive_min_dwell_years < 0.0 || !(p.chemistry_adaptive_cold_temperature_k > 10.0) ||
+      !(p.chemistry_adaptive_dense_nh_cm3 > 0.0)) {
+    throw ConfigError("invalid chemistry_adaptive_* parameters");
+  }
+  if (!(p.ssp_imf_mass_min_msun > 0.0) || !(p.ssp_imf_mass_max_msun > p.ssp_imf_mass_min_msun) ||
+      !(p.ssp_cc_mass_min_msun > p.ssp_imf_mass_min_msun) || !(p.ssp_cc_mass_max_msun > p.ssp_cc_mass_min_msun) ||
+      p.ssp_cc_mass_max_msun > p.ssp_imf_mass_max_msun) {
+    throw ConfigError("SSP mass limits must satisfy 0 < m_min < m_cc,min < m_cc,max <= m_max");
+  }
+  if (!(p.ssp_snia_per_msun >= 0.0) || !(p.ssp_snia_delay_min_years > 0.0) ||
+      !(p.ssp_snia_delay_max_years > p.ssp_snia_delay_min_years) || !(p.ssp_energy_per_sn_erg > 0.0) ||
+      p.ssp_reference_net_metal_yield < 0.0 || p.ssp_reference_net_metal_yield > 0.1 ||
+      p.fb_presn_wind_momentum_lsun_per_c < 0.0) {
+    throw ConfigError("invalid SSP Ia/energy/yield or pre-SN parameters");
+  }
+  if (p.stellar_population_model != StellarPopulationModelConfig::kLegacyTable && !part2) {
+    throw ConfigError("Part 2 stellar_population_model values require a Part 2 thermochemistry_backend (element composition)");
+  }
+  if (p.stellar_population_model == StellarPopulationModelConfig::kChabrierYieldTableV1 &&
+      p.ssp_yield_table_path.empty()) {
+    throw ConfigError("stellar_population_model=chabrier_yield_table_v1 requires physics.ssp_yield_table_path (no yields are bundled)");
+  }
+  if (p.fb_supernova_model == SupernovaFeedbackModelConfig::kMechanicalResolvedUnresolved &&
+      p.stellar_population_model == StellarPopulationModelConfig::kLegacyTable) {
+    throw ConfigError("fb_supernova_model=mechanical_resolved_unresolved consumes discrete SN events from a Part 2 stellar_population_model");
+  }
+}
+
 void validateConfig(const SimulationConfig& config) {
   if (config.schema_version != 1) {
     throw ConfigError("schema_version must be 1 for this build");
@@ -1667,6 +1916,41 @@ void validateConfig(const SimulationConfig& config) {
       {config.physics.bh_newton_g_si, "physics.bh_newton_g_si"},
       {config.physics.bh_speed_of_light_si, "physics.bh_speed_of_light_si"},
       {config.physics.tracer_min_host_mass_code, "physics.tracer_min_host_mass_code"},
+      {config.physics.thermochemistry_relative_tolerance, "physics.thermochemistry_relative_tolerance"},
+      {config.physics.thermochemistry_abundance_absolute_tolerance, "physics.thermochemistry_abundance_absolute_tolerance"},
+      {config.physics.thermochemistry_analytic_relaxation_time_years, "physics.thermochemistry_analytic_relaxation_time_years"},
+      {config.physics.thermochemistry_analytic_equilibrium_temperature_k, "physics.thermochemistry_analytic_equilibrium_temperature_k"},
+      {config.physics.isrf_g0_habing, "physics.isrf_g0_habing"},
+      {config.physics.chemistry_shielding_length_max_pc, "physics.chemistry_shielding_length_max_pc"},
+      {config.physics.metal_cooling_switch_temperature_k, "physics.metal_cooling_switch_temperature_k"},
+      {config.physics.chemistry_primordial_helium_mass_fraction, "physics.chemistry_primordial_helium_mass_fraction"},
+      {config.physics.dust_accretion_timescale_ref_years, "physics.dust_accretion_timescale_ref_years"},
+      {config.physics.dust_sputtering_timescale_ref_years, "physics.dust_sputtering_timescale_ref_years"},
+      {config.physics.dust_sn_swept_mass_msun, "physics.dust_sn_swept_mass_msun"},
+      {config.physics.dust_sn_destruction_efficiency, "physics.dust_sn_destruction_efficiency"},
+      {config.physics.dust_agb_condensation_efficiency, "physics.dust_agb_condensation_efficiency"},
+      {config.physics.dust_cc_condensation_efficiency, "physics.dust_cc_condensation_efficiency"},
+      {config.physics.ism_jeans_resolution_cells, "physics.ism_jeans_resolution_cells"},
+      {config.physics.ism_regime_hysteresis_fraction, "physics.ism_regime_hysteresis_fraction"},
+      {config.physics.ism_regime_min_dwell_years, "physics.ism_regime_min_dwell_years"},
+      {config.physics.sgs_dissipation_coefficient, "physics.sgs_dissipation_coefficient"},
+      {config.physics.sgs_eddy_viscosity_coefficient, "physics.sgs_eddy_viscosity_coefficient"},
+      {config.physics.sgs_feedback_energy_fraction, "physics.sgs_feedback_energy_fraction"},
+      {config.physics.chemistry_adaptive_hysteresis_fraction, "physics.chemistry_adaptive_hysteresis_fraction"},
+      {config.physics.chemistry_adaptive_min_dwell_years, "physics.chemistry_adaptive_min_dwell_years"},
+      {config.physics.chemistry_adaptive_cold_temperature_k, "physics.chemistry_adaptive_cold_temperature_k"},
+      {config.physics.chemistry_adaptive_dense_nh_cm3, "physics.chemistry_adaptive_dense_nh_cm3"},
+      {config.physics.chemistry_shadow_sample_fraction, "physics.chemistry_shadow_sample_fraction"},
+      {config.physics.ssp_imf_mass_min_msun, "physics.ssp_imf_mass_min_msun"},
+      {config.physics.ssp_imf_mass_max_msun, "physics.ssp_imf_mass_max_msun"},
+      {config.physics.ssp_cc_mass_min_msun, "physics.ssp_cc_mass_min_msun"},
+      {config.physics.ssp_cc_mass_max_msun, "physics.ssp_cc_mass_max_msun"},
+      {config.physics.ssp_snia_per_msun, "physics.ssp_snia_per_msun"},
+      {config.physics.ssp_snia_delay_min_years, "physics.ssp_snia_delay_min_years"},
+      {config.physics.ssp_snia_delay_max_years, "physics.ssp_snia_delay_max_years"},
+      {config.physics.ssp_energy_per_sn_erg, "physics.ssp_energy_per_sn_erg"},
+      {config.physics.ssp_reference_net_metal_yield, "physics.ssp_reference_net_metal_yield"},
+      {config.physics.fb_presn_wind_momentum_lsun_per_c, "physics.fb_presn_wind_momentum_lsun_per_c"},
       {config.analysis.halo_fof_linking_length_factor, "analysis.halo_fof_linking_length_factor"},
   });
 
@@ -1993,11 +2277,10 @@ void validateConfig(const SimulationConfig& config) {
         "physics.stellar_evolution_table_path is required when "
         "stellar_evolution_require_production_table=true");
   }
-  if (config.physics.metal_species_mode == MetalSpeciesMode::kCoreElements) {
-    throw ConfigError(
-        "physics.metal_species_mode=core_elements is not enabled in schema v2; "
-        "use total_only until element yield/cooling provenance is supplied");
-  }
+  // CHUI Part 2: core_elements is the element-resolved composition sidecar,
+  // available only together with a Part 2 thermochemistry backend (which owns
+  // the element/species manifest). The pairing is checked in
+  // validatePart2BaryonicPhysics().
   if (config.physics.enable_metal_diffusion) {
     if (config.physics.metal_diffusion_model == MetalDiffusionModel::kNone) {
       throw ConfigError("metal diffusion is enabled but metal_diffusion_model=none");
@@ -2046,6 +2329,7 @@ void validateConfig(const SimulationConfig& config) {
   if (config.physics.tracer_min_host_mass_code < 0.0) {
     throw ConfigError("physics.tracer_min_host_mass_code must be >= 0");
   }
+  validatePart2BaryonicPhysics(config);
   if (config.cosmology.box_size_x_mpc_comoving <= 0.0 ||
       config.cosmology.box_size_y_mpc_comoving <= 0.0 ||
       config.cosmology.box_size_z_mpc_comoving <= 0.0) {
@@ -2810,6 +3094,62 @@ class NormalizedConfigStream {
   stream << "enable_tracers = " << (frozen.config.physics.enable_tracers ? "true" : "false") << '\n';
   stream << "tracer_track_mass = " << (frozen.config.physics.tracer_track_mass ? "true" : "false") << '\n';
   stream << "tracer_min_host_mass_code = " << frozen.config.physics.tracer_min_host_mass_code << '\n';
+  stream << "thermochemistry_backend = " << thermochemistryBackendModeToString(frozen.config.physics.thermochemistry_backend) << '\n';
+  stream << "metal_cooling_mode = " << metalCoolingModeConfigToString(frozen.config.physics.metal_cooling_mode) << '\n';
+  stream << "metal_cooling_table_range = " << metalCoolingTableRangeConfigToString(frozen.config.physics.metal_cooling_table_range) << '\n';
+  stream << "dust_model = " << dustModelConfigToString(frozen.config.physics.dust_model) << '\n';
+  stream << "ism_regime_model = " << ismRegimeModelConfigToString(frozen.config.physics.ism_regime_model) << '\n';
+  stream << "sgs_turbulence_model = " << sgsTurbulenceModelConfigToString(frozen.config.physics.sgs_turbulence_model) << '\n';
+  stream << "chemistry_adaptive_selection = " << chemistryAdaptiveSelectionConfigToString(frozen.config.physics.chemistry_adaptive_selection) << '\n';
+  stream << "stellar_population_model = " << stellarPopulationModelConfigToString(frozen.config.physics.stellar_population_model) << '\n';
+  stream << "fb_supernova_model = " << supernovaFeedbackModelConfigToString(frozen.config.physics.fb_supernova_model) << '\n';
+  stream << "thermochemistry_relative_tolerance = " << frozen.config.physics.thermochemistry_relative_tolerance << '\n';
+  stream << "thermochemistry_abundance_absolute_tolerance = " << frozen.config.physics.thermochemistry_abundance_absolute_tolerance << '\n';
+  stream << "thermochemistry_analytic_relaxation_time_years = " << frozen.config.physics.thermochemistry_analytic_relaxation_time_years << '\n';
+  stream << "thermochemistry_analytic_equilibrium_temperature_k = " << frozen.config.physics.thermochemistry_analytic_equilibrium_temperature_k << '\n';
+  stream << "isrf_g0_habing = " << frozen.config.physics.isrf_g0_habing << '\n';
+  stream << "chemistry_shielding_length_max_pc = " << frozen.config.physics.chemistry_shielding_length_max_pc << '\n';
+  stream << "metal_cooling_switch_temperature_k = " << frozen.config.physics.metal_cooling_switch_temperature_k << '\n';
+  stream << "chemistry_primordial_helium_mass_fraction = " << frozen.config.physics.chemistry_primordial_helium_mass_fraction << '\n';
+  stream << "dust_accretion_timescale_ref_years = " << frozen.config.physics.dust_accretion_timescale_ref_years << '\n';
+  stream << "dust_sputtering_timescale_ref_years = " << frozen.config.physics.dust_sputtering_timescale_ref_years << '\n';
+  stream << "dust_sn_swept_mass_msun = " << frozen.config.physics.dust_sn_swept_mass_msun << '\n';
+  stream << "dust_sn_destruction_efficiency = " << frozen.config.physics.dust_sn_destruction_efficiency << '\n';
+  stream << "dust_agb_condensation_efficiency = " << frozen.config.physics.dust_agb_condensation_efficiency << '\n';
+  stream << "dust_cc_condensation_efficiency = " << frozen.config.physics.dust_cc_condensation_efficiency << '\n';
+  stream << "ism_jeans_resolution_cells = " << frozen.config.physics.ism_jeans_resolution_cells << '\n';
+  stream << "ism_regime_hysteresis_fraction = " << frozen.config.physics.ism_regime_hysteresis_fraction << '\n';
+  stream << "ism_regime_min_dwell_years = " << frozen.config.physics.ism_regime_min_dwell_years << '\n';
+  stream << "sgs_dissipation_coefficient = " << frozen.config.physics.sgs_dissipation_coefficient << '\n';
+  stream << "sgs_eddy_viscosity_coefficient = " << frozen.config.physics.sgs_eddy_viscosity_coefficient << '\n';
+  stream << "sgs_feedback_energy_fraction = " << frozen.config.physics.sgs_feedback_energy_fraction << '\n';
+  stream << "chemistry_adaptive_hysteresis_fraction = " << frozen.config.physics.chemistry_adaptive_hysteresis_fraction << '\n';
+  stream << "chemistry_adaptive_min_dwell_years = " << frozen.config.physics.chemistry_adaptive_min_dwell_years << '\n';
+  stream << "chemistry_adaptive_cold_temperature_k = " << frozen.config.physics.chemistry_adaptive_cold_temperature_k << '\n';
+  stream << "chemistry_adaptive_dense_nh_cm3 = " << frozen.config.physics.chemistry_adaptive_dense_nh_cm3 << '\n';
+  stream << "chemistry_shadow_sample_fraction = " << frozen.config.physics.chemistry_shadow_sample_fraction << '\n';
+  stream << "ssp_imf_mass_min_msun = " << frozen.config.physics.ssp_imf_mass_min_msun << '\n';
+  stream << "ssp_imf_mass_max_msun = " << frozen.config.physics.ssp_imf_mass_max_msun << '\n';
+  stream << "ssp_cc_mass_min_msun = " << frozen.config.physics.ssp_cc_mass_min_msun << '\n';
+  stream << "ssp_cc_mass_max_msun = " << frozen.config.physics.ssp_cc_mass_max_msun << '\n';
+  stream << "ssp_snia_per_msun = " << frozen.config.physics.ssp_snia_per_msun << '\n';
+  stream << "ssp_snia_delay_min_years = " << frozen.config.physics.ssp_snia_delay_min_years << '\n';
+  stream << "ssp_snia_delay_max_years = " << frozen.config.physics.ssp_snia_delay_max_years << '\n';
+  stream << "ssp_energy_per_sn_erg = " << frozen.config.physics.ssp_energy_per_sn_erg << '\n';
+  stream << "ssp_reference_net_metal_yield = " << frozen.config.physics.ssp_reference_net_metal_yield << '\n';
+  stream << "fb_presn_wind_momentum_lsun_per_c = " << frozen.config.physics.fb_presn_wind_momentum_lsun_per_c << '\n';
+  stream << "thermochemistry_max_substeps = " << frozen.config.physics.thermochemistry_max_substeps << '\n';
+  stream << "thermochemistry_max_newton_iterations = " << frozen.config.physics.thermochemistry_max_newton_iterations << '\n';
+  stream << "chemistry_shadow_max_cells = " << frozen.config.physics.chemistry_shadow_max_cells << '\n';
+  stream << "uv_background_table_path = " << frozen.config.physics.uv_background_table_path << '\n';
+  stream << "uv_background_table_sha256 = " << frozen.config.physics.uv_background_table_sha256 << '\n';
+  stream << "metal_cooling_table_path = " << frozen.config.physics.metal_cooling_table_path << '\n';
+  stream << "metal_cooling_table_sha256 = " << frozen.config.physics.metal_cooling_table_sha256 << '\n';
+  stream << "ssp_yield_table_path = " << frozen.config.physics.ssp_yield_table_path << '\n';
+  stream << "ssp_yield_table_sha256 = " << frozen.config.physics.ssp_yield_table_sha256 << '\n';
+  stream << "chemistry_metallicity_scaled_dust_proxy = " << (frozen.config.physics.chemistry_metallicity_scaled_dust_proxy ? "true" : "false") << '\n';
+  stream << "ssp_stochastic_sn_events = " << (frozen.config.physics.ssp_stochastic_sn_events ? "true" : "false") << '\n';
+  stream << "ssp_clustered_associations = " << (frozen.config.physics.ssp_clustered_associations ? "true" : "false") << '\n';
   stream << "\n[output]\n";
   stream << "run_name = " << frozen.config.output.run_name << '\n';
   stream << "output_directory = " << frozen.config.output.output_directory << '\n';
@@ -3759,6 +4099,112 @@ class NormalizedConfigStream {
   frozen.config.physics.tracer_min_host_mass_code = parseFloating(
       requireString(entries, consumed, "physics.tracer_min_host_mass_code", "0.0"),
       "physics.tracer_min_host_mass_code");
+  frozen.config.physics.thermochemistry_backend = parseThermochemistryBackendMode(
+      requireString(entries, consumed, "physics.thermochemistry_backend", "legacy_cooling"));
+  frozen.config.physics.metal_cooling_mode = parseMetalCoolingModeConfig(
+      requireString(entries, consumed, "physics.metal_cooling_mode", "none"));
+  frozen.config.physics.metal_cooling_table_range = parseMetalCoolingTableRangeConfig(
+      requireString(entries, consumed, "physics.metal_cooling_table_range", "reject"));
+  frozen.config.physics.dust_model = parseDustModelConfig(
+      requireString(entries, consumed, "physics.dust_model", "none"));
+  frozen.config.physics.ism_regime_model = parseIsmRegimeModelConfig(
+      requireString(entries, consumed, "physics.ism_regime_model", "legacy"));
+  frozen.config.physics.sgs_turbulence_model = parseSgsTurbulenceModelConfig(
+      requireString(entries, consumed, "physics.sgs_turbulence_model", "none"));
+  frozen.config.physics.chemistry_adaptive_selection = parseChemistryAdaptiveSelectionConfig(
+      requireString(entries, consumed, "physics.chemistry_adaptive_selection", "off"));
+  frozen.config.physics.stellar_population_model = parseStellarPopulationModelConfig(
+      requireString(entries, consumed, "physics.stellar_population_model", "legacy_table"));
+  frozen.config.physics.fb_supernova_model = parseSupernovaFeedbackModelConfig(
+      requireString(entries, consumed, "physics.fb_supernova_model", "legacy"));
+  frozen.config.physics.thermochemistry_relative_tolerance = parseFloating(
+      requireString(entries, consumed, "physics.thermochemistry_relative_tolerance", "1.0e-4"), "physics.thermochemistry_relative_tolerance");
+  frozen.config.physics.thermochemistry_abundance_absolute_tolerance = parseFloating(
+      requireString(entries, consumed, "physics.thermochemistry_abundance_absolute_tolerance", "1.0e-12"), "physics.thermochemistry_abundance_absolute_tolerance");
+  frozen.config.physics.thermochemistry_analytic_relaxation_time_years = parseFloating(
+      requireString(entries, consumed, "physics.thermochemistry_analytic_relaxation_time_years", "1.0e6"), "physics.thermochemistry_analytic_relaxation_time_years");
+  frozen.config.physics.thermochemistry_analytic_equilibrium_temperature_k = parseFloating(
+      requireString(entries, consumed, "physics.thermochemistry_analytic_equilibrium_temperature_k", "1.0e4"), "physics.thermochemistry_analytic_equilibrium_temperature_k");
+  frozen.config.physics.isrf_g0_habing = parseFloating(
+      requireString(entries, consumed, "physics.isrf_g0_habing", "0.0"), "physics.isrf_g0_habing");
+  frozen.config.physics.chemistry_shielding_length_max_pc = parseFloating(
+      requireString(entries, consumed, "physics.chemistry_shielding_length_max_pc", "100.0"), "physics.chemistry_shielding_length_max_pc");
+  frozen.config.physics.metal_cooling_switch_temperature_k = parseFloating(
+      requireString(entries, consumed, "physics.metal_cooling_switch_temperature_k", "1.0e4"), "physics.metal_cooling_switch_temperature_k");
+  frozen.config.physics.chemistry_primordial_helium_mass_fraction = parseFloating(
+      requireString(entries, consumed, "physics.chemistry_primordial_helium_mass_fraction", "0.2449"), "physics.chemistry_primordial_helium_mass_fraction");
+  frozen.config.physics.dust_accretion_timescale_ref_years = parseFloating(
+      requireString(entries, consumed, "physics.dust_accretion_timescale_ref_years", "2.0e7"), "physics.dust_accretion_timescale_ref_years");
+  frozen.config.physics.dust_sputtering_timescale_ref_years = parseFloating(
+      requireString(entries, consumed, "physics.dust_sputtering_timescale_ref_years", "1.7e8"), "physics.dust_sputtering_timescale_ref_years");
+  frozen.config.physics.dust_sn_swept_mass_msun = parseFloating(
+      requireString(entries, consumed, "physics.dust_sn_swept_mass_msun", "6800.0"), "physics.dust_sn_swept_mass_msun");
+  frozen.config.physics.dust_sn_destruction_efficiency = parseFloating(
+      requireString(entries, consumed, "physics.dust_sn_destruction_efficiency", "0.3"), "physics.dust_sn_destruction_efficiency");
+  frozen.config.physics.dust_agb_condensation_efficiency = parseFloating(
+      requireString(entries, consumed, "physics.dust_agb_condensation_efficiency", "0.2"), "physics.dust_agb_condensation_efficiency");
+  frozen.config.physics.dust_cc_condensation_efficiency = parseFloating(
+      requireString(entries, consumed, "physics.dust_cc_condensation_efficiency", "0.1"), "physics.dust_cc_condensation_efficiency");
+  frozen.config.physics.ism_jeans_resolution_cells = parseFloating(
+      requireString(entries, consumed, "physics.ism_jeans_resolution_cells", "4.0"), "physics.ism_jeans_resolution_cells");
+  frozen.config.physics.ism_regime_hysteresis_fraction = parseFloating(
+      requireString(entries, consumed, "physics.ism_regime_hysteresis_fraction", "0.2"), "physics.ism_regime_hysteresis_fraction");
+  frozen.config.physics.ism_regime_min_dwell_years = parseFloating(
+      requireString(entries, consumed, "physics.ism_regime_min_dwell_years", "1.0e6"), "physics.ism_regime_min_dwell_years");
+  frozen.config.physics.sgs_dissipation_coefficient = parseFloating(
+      requireString(entries, consumed, "physics.sgs_dissipation_coefficient", "1.58"), "physics.sgs_dissipation_coefficient");
+  frozen.config.physics.sgs_eddy_viscosity_coefficient = parseFloating(
+      requireString(entries, consumed, "physics.sgs_eddy_viscosity_coefficient", "0.05"), "physics.sgs_eddy_viscosity_coefficient");
+  frozen.config.physics.sgs_feedback_energy_fraction = parseFloating(
+      requireString(entries, consumed, "physics.sgs_feedback_energy_fraction", "0.0"), "physics.sgs_feedback_energy_fraction");
+  frozen.config.physics.chemistry_adaptive_hysteresis_fraction = parseFloating(
+      requireString(entries, consumed, "physics.chemistry_adaptive_hysteresis_fraction", "0.3"), "physics.chemistry_adaptive_hysteresis_fraction");
+  frozen.config.physics.chemistry_adaptive_min_dwell_years = parseFloating(
+      requireString(entries, consumed, "physics.chemistry_adaptive_min_dwell_years", "1.0e6"), "physics.chemistry_adaptive_min_dwell_years");
+  frozen.config.physics.chemistry_adaptive_cold_temperature_k = parseFloating(
+      requireString(entries, consumed, "physics.chemistry_adaptive_cold_temperature_k", "3.0e3"), "physics.chemistry_adaptive_cold_temperature_k");
+  frozen.config.physics.chemistry_adaptive_dense_nh_cm3 = parseFloating(
+      requireString(entries, consumed, "physics.chemistry_adaptive_dense_nh_cm3", "1.0"), "physics.chemistry_adaptive_dense_nh_cm3");
+  frozen.config.physics.chemistry_shadow_sample_fraction = parseFloating(
+      requireString(entries, consumed, "physics.chemistry_shadow_sample_fraction", "0.0"), "physics.chemistry_shadow_sample_fraction");
+  frozen.config.physics.ssp_imf_mass_min_msun = parseFloating(
+      requireString(entries, consumed, "physics.ssp_imf_mass_min_msun", "0.1"), "physics.ssp_imf_mass_min_msun");
+  frozen.config.physics.ssp_imf_mass_max_msun = parseFloating(
+      requireString(entries, consumed, "physics.ssp_imf_mass_max_msun", "100.0"), "physics.ssp_imf_mass_max_msun");
+  frozen.config.physics.ssp_cc_mass_min_msun = parseFloating(
+      requireString(entries, consumed, "physics.ssp_cc_mass_min_msun", "8.0"), "physics.ssp_cc_mass_min_msun");
+  frozen.config.physics.ssp_cc_mass_max_msun = parseFloating(
+      requireString(entries, consumed, "physics.ssp_cc_mass_max_msun", "40.0"), "physics.ssp_cc_mass_max_msun");
+  frozen.config.physics.ssp_snia_per_msun = parseFloating(
+      requireString(entries, consumed, "physics.ssp_snia_per_msun", "1.3e-3"), "physics.ssp_snia_per_msun");
+  frozen.config.physics.ssp_snia_delay_min_years = parseFloating(
+      requireString(entries, consumed, "physics.ssp_snia_delay_min_years", "4.0e7"), "physics.ssp_snia_delay_min_years");
+  frozen.config.physics.ssp_snia_delay_max_years = parseFloating(
+      requireString(entries, consumed, "physics.ssp_snia_delay_max_years", "1.37e10"), "physics.ssp_snia_delay_max_years");
+  frozen.config.physics.ssp_energy_per_sn_erg = parseFloating(
+      requireString(entries, consumed, "physics.ssp_energy_per_sn_erg", "1.0e51"), "physics.ssp_energy_per_sn_erg");
+  frozen.config.physics.ssp_reference_net_metal_yield = parseFloating(
+      requireString(entries, consumed, "physics.ssp_reference_net_metal_yield", "0.0"), "physics.ssp_reference_net_metal_yield");
+  frozen.config.physics.fb_presn_wind_momentum_lsun_per_c = parseFloating(
+      requireString(entries, consumed, "physics.fb_presn_wind_momentum_lsun_per_c", "0.0"), "physics.fb_presn_wind_momentum_lsun_per_c");
+  frozen.config.physics.thermochemistry_max_substeps = parseNumber<std::uint32_t>(
+      requireString(entries, consumed, "physics.thermochemistry_max_substeps", "4096"), "physics.thermochemistry_max_substeps");
+  frozen.config.physics.thermochemistry_max_newton_iterations = parseNumber<std::uint32_t>(
+      requireString(entries, consumed, "physics.thermochemistry_max_newton_iterations", "12"), "physics.thermochemistry_max_newton_iterations");
+  frozen.config.physics.chemistry_shadow_max_cells = parseNumber<std::uint32_t>(
+      requireString(entries, consumed, "physics.chemistry_shadow_max_cells", "0"), "physics.chemistry_shadow_max_cells");
+  frozen.config.physics.uv_background_table_path = requireString(entries, consumed, "physics.uv_background_table_path", "");
+  frozen.config.physics.uv_background_table_sha256 = requireString(entries, consumed, "physics.uv_background_table_sha256", "");
+  frozen.config.physics.metal_cooling_table_path = requireString(entries, consumed, "physics.metal_cooling_table_path", "");
+  frozen.config.physics.metal_cooling_table_sha256 = requireString(entries, consumed, "physics.metal_cooling_table_sha256", "");
+  frozen.config.physics.ssp_yield_table_path = requireString(entries, consumed, "physics.ssp_yield_table_path", "");
+  frozen.config.physics.ssp_yield_table_sha256 = requireString(entries, consumed, "physics.ssp_yield_table_sha256", "");
+  frozen.config.physics.chemistry_metallicity_scaled_dust_proxy = parseBool(
+      requireString(entries, consumed, "physics.chemistry_metallicity_scaled_dust_proxy", "false"), "physics.chemistry_metallicity_scaled_dust_proxy");
+  frozen.config.physics.ssp_stochastic_sn_events = parseBool(
+      requireString(entries, consumed, "physics.ssp_stochastic_sn_events", "true"), "physics.ssp_stochastic_sn_events");
+  frozen.config.physics.ssp_clustered_associations = parseBool(
+      requireString(entries, consumed, "physics.ssp_clustered_associations", "false"), "physics.ssp_clustered_associations");
 
   frozen.config.output.run_name =
       requireString(entries, consumed, "output.run_name", frozen.config.output.run_name);
@@ -4576,6 +5022,84 @@ std::string feedbackVariantToString(FeedbackVariant variant) {
 }
 
 
+std::string thermochemistryBackendModeToString(ThermochemistryBackendMode value) {
+  switch (value) {
+    case ThermochemistryBackendMode::kLegacyCooling: return "legacy_cooling";
+    case ThermochemistryBackendMode::kAnalyticReference: return "analytic_reference";
+    case ThermochemistryBackendMode::kEquilibriumPrimordial: return "equilibrium_primordial";
+    case ThermochemistryBackendMode::kFixedHybrid: return "fixed_hybrid";
+    case ThermochemistryBackendMode::kFixedDetailed: return "fixed_detailed";
+  }
+  throw ConfigError("unhandled ThermochemistryBackendMode enum value during serialization");
+}
+
+std::string metalCoolingModeConfigToString(MetalCoolingModeConfig value) {
+  switch (value) {
+    case MetalCoolingModeConfig::kNone: return "none";
+    case MetalCoolingModeConfig::kFineStructureCold: return "fine_structure_cold";
+    case MetalCoolingModeConfig::kElementTable: return "element_table";
+    case MetalCoolingModeConfig::kElementTableAndFineStructure: return "element_table_and_fine_structure";
+  }
+  throw ConfigError("unhandled MetalCoolingModeConfig enum value during serialization");
+}
+
+std::string metalCoolingTableRangeConfigToString(MetalCoolingTableRangeConfig value) {
+  switch (value) {
+    case MetalCoolingTableRangeConfig::kReject: return "reject";
+    case MetalCoolingTableRangeConfig::kClampDensityAndRedshift: return "clamp_density_redshift";
+  }
+  throw ConfigError("unhandled MetalCoolingTableRangeConfig enum value during serialization");
+}
+
+std::string dustModelConfigToString(DustModelConfig value) {
+  switch (value) {
+    case DustModelConfig::kNone: return "none";
+    case DustModelConfig::kTwoReservoirV1: return "two_reservoir_v1";
+  }
+  throw ConfigError("unhandled DustModelConfig enum value during serialization");
+}
+
+std::string ismRegimeModelConfigToString(IsmRegimeModelConfig value) {
+  switch (value) {
+    case IsmRegimeModelConfig::kLegacy: return "legacy";
+    case IsmRegimeModelConfig::kEffectiveOrResolved: return "effective_or_resolved";
+  }
+  throw ConfigError("unhandled IsmRegimeModelConfig enum value during serialization");
+}
+
+std::string sgsTurbulenceModelConfigToString(SgsTurbulenceModelConfig value) {
+  switch (value) {
+    case SgsTurbulenceModelConfig::kNone: return "none";
+    case SgsTurbulenceModelConfig::kBudgetedV1: return "budgeted_v1";
+  }
+  throw ConfigError("unhandled SgsTurbulenceModelConfig enum value during serialization");
+}
+
+std::string chemistryAdaptiveSelectionConfigToString(ChemistryAdaptiveSelectionConfig value) {
+  switch (value) {
+    case ChemistryAdaptiveSelectionConfig::kOff: return "off";
+    case ChemistryAdaptiveSelectionConfig::kLocalV1: return "local_v1";
+  }
+  throw ConfigError("unhandled ChemistryAdaptiveSelectionConfig enum value during serialization");
+}
+
+std::string stellarPopulationModelConfigToString(StellarPopulationModelConfig value) {
+  switch (value) {
+    case StellarPopulationModelConfig::kLegacyTable: return "legacy_table";
+    case StellarPopulationModelConfig::kChabrierReferenceV1: return "chabrier_reference_v1";
+    case StellarPopulationModelConfig::kChabrierYieldTableV1: return "chabrier_yield_table_v1";
+  }
+  throw ConfigError("unhandled StellarPopulationModelConfig enum value during serialization");
+}
+
+std::string supernovaFeedbackModelConfigToString(SupernovaFeedbackModelConfig value) {
+  switch (value) {
+    case SupernovaFeedbackModelConfig::kLegacy: return "legacy";
+    case SupernovaFeedbackModelConfig::kMechanicalResolvedUnresolved: return "mechanical_resolved_unresolved";
+  }
+  throw ConfigError("unhandled SupernovaFeedbackModelConfig enum value during serialization");
+}
+
 std::string uvBackgroundModelToString(UvBackgroundModel model) {
   switch (model) {
     case UvBackgroundModel::kNone:
@@ -4584,6 +5108,8 @@ std::string uvBackgroundModelToString(UvBackgroundModel model) {
       return "hm12";
     case UvBackgroundModel::kFg20:
       return "fg20";
+    case UvBackgroundModel::kTreecoolTable:
+      return "treecool_table";
   }
   throw ConfigError("unhandled UvBackgroundModel enum value during serialization");
 }

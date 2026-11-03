@@ -107,6 +107,25 @@ double temperatureKelvinPerInternalEnergyCode(
       k_boltzmann_j_per_k * velocity_si_per_code * velocity_si_per_code;
 }
 
+namespace {
+// CHUI Part 2: composition-dependent temperature. When the gas composition
+// sidecar carries a valid mean molecular weight for the row (written by the
+// thermochemistry commit, in units of the atomic mass unit), T uses that mu
+// instead of the Part 1 reference mu = 0.59; otherwise the reference factor
+// applies (plain hydro / legacy runs are unchanged).
+[[nodiscard]] double rowTemperatureFactor(const core::SimulationState& state, std::size_t row, double base) {
+  const auto& composition = state.gas_composition;
+  if (base > 0.0 && composition.enabled() && row < composition.rowCount()) {
+    const double mu_amu = composition.mean_molecular_weight[row];
+    if (std::isfinite(mu_amu) && mu_amu > 0.0) {
+      constexpr double k_amu_over_proton_mass = 1.66053906660e-24 / 1.67262192369e-24;
+      return base * mu_amu * k_amu_over_proton_mass / k_part1_reference_mean_molecular_weight;
+    }
+  }
+  return base;
+}
+}  // namespace
+
 GasThermodynamicRefreshReport refreshGasThermodynamics(
     core::SimulationState& state,
     std::span<const GasThermodynamicTouch> touched_cells,
@@ -128,7 +147,8 @@ GasThermodynamicRefreshReport refreshGasThermodynamics(
     gas.sound_speed_code[row] = cell.sound_speed;
     const double u_new = gas.internal_energy_code[row];
     if (policy.temperature_k_per_internal_energy_code > 0.0) {
-      gas.temperature_code[row] = policy.temperature_k_per_internal_energy_code * std::max(u_new, 0.0);
+      gas.temperature_code[row] =
+          rowTemperatureFactor(state, row, policy.temperature_k_per_internal_energy_code) * std::max(u_new, 0.0);
     } else if (touch.internal_energy_before_code > 0.0 && gas.temperature_code[row] > 0.0 && u_new > 0.0) {
       gas.temperature_code[row] *= u_new / touch.internal_energy_before_code;
     } else {
@@ -151,8 +171,8 @@ bool refreshGasThermodynamicCell(
   gas.pressure_code[row] = cell.pressure;
   gas.sound_speed_code[row] = cell.sound_speed;
   if (policy.temperature_k_per_internal_energy_code > 0.0) {
-    gas.temperature_code[row] =
-        policy.temperature_k_per_internal_energy_code * std::max(gas.internal_energy_code[row], 0.0);
+    gas.temperature_code[row] = rowTemperatureFactor(state, row, policy.temperature_k_per_internal_energy_code) *
+        std::max(gas.internal_energy_code[row], 0.0);
   }
   return cell.effective;
 }
@@ -169,8 +189,8 @@ GasThermodynamicRefreshReport refreshAllGasThermodynamics(
     gas.pressure_code[row] = cell.pressure;
     gas.sound_speed_code[row] = cell.sound_speed;
     if (policy.temperature_k_per_internal_energy_code > 0.0) {
-      gas.temperature_code[row] =
-          policy.temperature_k_per_internal_energy_code * std::max(gas.internal_energy_code[row], 0.0);
+      gas.temperature_code[row] = rowTemperatureFactor(state, row, policy.temperature_k_per_internal_energy_code) *
+          std::max(gas.internal_energy_code[row], 0.0);
     } else {
       ++report.temperature_unscaled_cells;
     }

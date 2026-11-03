@@ -257,8 +257,12 @@ enum class FeedbackVariant {
 
 enum class UvBackgroundModel {
   kNone,
+  // Legacy analytic proxies of an overall heating scale (pre-Part-2); refused
+  // by every Part 2 thermochemistry backend.
   kHm12,
   kFg20,
+  // Production: TREECOOL-format table at physics.uv_background_table_path.
+  kTreecoolTable,
 };
 
 enum class SelfShieldingModel {
@@ -269,6 +273,59 @@ enum class SelfShieldingModel {
 enum class CoolingModel {
   kPrimordial,
   kPrimordialMetalLine,
+};
+
+
+// CHUI Part 2 baryonic-physics selectors (see docs/configuration.md).
+enum class ThermochemistryBackendMode : std::uint8_t {
+  kLegacyCooling = 0,
+  kAnalyticReference = 1,
+  kEquilibriumPrimordial = 2,
+  kFixedHybrid = 3,
+  kFixedDetailed = 4,
+};
+
+enum class MetalCoolingModeConfig : std::uint8_t {
+  kNone = 0,
+  kFineStructureCold = 1,
+  kElementTable = 2,
+  kElementTableAndFineStructure = 3,
+};
+
+enum class MetalCoolingTableRangeConfig : std::uint8_t {
+  kReject = 0,
+  kClampDensityAndRedshift = 1,
+};
+
+enum class DustModelConfig : std::uint8_t {
+  kNone = 0,
+  kTwoReservoirV1 = 1,
+};
+
+enum class IsmRegimeModelConfig : std::uint8_t {
+  kLegacy = 0,
+  kEffectiveOrResolved = 1,
+};
+
+enum class SgsTurbulenceModelConfig : std::uint8_t {
+  kNone = 0,
+  kBudgetedV1 = 1,
+};
+
+enum class ChemistryAdaptiveSelectionConfig : std::uint8_t {
+  kOff = 0,
+  kLocalV1 = 1,
+};
+
+enum class StellarPopulationModelConfig : std::uint8_t {
+  kLegacyTable = 0,
+  kChabrierReferenceV1 = 1,
+  kChabrierYieldTableV1 = 2,
+};
+
+enum class SupernovaFeedbackModelConfig : std::uint8_t {
+  kLegacy = 0,
+  kMechanicalResolvedUnresolved = 1,
 };
 
 enum class MetalSpeciesMode {
@@ -515,6 +572,64 @@ struct PhysicsConfig {
   bool enable_tracers = false;
   bool tracer_track_mass = true;
   double tracer_min_host_mass_code = 0.0;
+
+  // ---- CHUI Part 2 baryonic physics (defaults keep Part 1 behaviour) ----
+  ThermochemistryBackendMode thermochemistry_backend = ThermochemistryBackendMode::kLegacyCooling;
+  MetalCoolingModeConfig metal_cooling_mode = MetalCoolingModeConfig::kNone;
+  MetalCoolingTableRangeConfig metal_cooling_table_range = MetalCoolingTableRangeConfig::kReject;
+  DustModelConfig dust_model = DustModelConfig::kNone;
+  IsmRegimeModelConfig ism_regime_model = IsmRegimeModelConfig::kLegacy;
+  SgsTurbulenceModelConfig sgs_turbulence_model = SgsTurbulenceModelConfig::kNone;
+  ChemistryAdaptiveSelectionConfig chemistry_adaptive_selection = ChemistryAdaptiveSelectionConfig::kOff;
+  StellarPopulationModelConfig stellar_population_model = StellarPopulationModelConfig::kLegacyTable;
+  SupernovaFeedbackModelConfig fb_supernova_model = SupernovaFeedbackModelConfig::kLegacy;
+  double thermochemistry_relative_tolerance = 1.0e-4;
+  double thermochemistry_abundance_absolute_tolerance = 1.0e-12;
+  double thermochemistry_analytic_relaxation_time_years = 1.0e6;
+  double thermochemistry_analytic_equilibrium_temperature_k = 1.0e4;
+  double isrf_g0_habing = 0.0;
+  double chemistry_shielding_length_max_pc = 100.0;
+  double metal_cooling_switch_temperature_k = 1.0e4;
+  double chemistry_primordial_helium_mass_fraction = 0.2449;
+  double dust_accretion_timescale_ref_years = 2.0e7;
+  double dust_sputtering_timescale_ref_years = 1.7e8;
+  double dust_sn_swept_mass_msun = 6800.0;
+  double dust_sn_destruction_efficiency = 0.3;
+  double dust_agb_condensation_efficiency = 0.2;
+  double dust_cc_condensation_efficiency = 0.1;
+  double ism_jeans_resolution_cells = 4.0;
+  double ism_regime_hysteresis_fraction = 0.2;
+  double ism_regime_min_dwell_years = 1.0e6;
+  double sgs_dissipation_coefficient = 1.58;
+  double sgs_eddy_viscosity_coefficient = 0.05;
+  double sgs_feedback_energy_fraction = 0.0;
+  double chemistry_adaptive_hysteresis_fraction = 0.3;
+  double chemistry_adaptive_min_dwell_years = 1.0e6;
+  double chemistry_adaptive_cold_temperature_k = 3.0e3;
+  double chemistry_adaptive_dense_nh_cm3 = 1.0;
+  double chemistry_shadow_sample_fraction = 0.0;
+  double ssp_imf_mass_min_msun = 0.1;
+  double ssp_imf_mass_max_msun = 100.0;
+  double ssp_cc_mass_min_msun = 8.0;
+  double ssp_cc_mass_max_msun = 40.0;
+  double ssp_snia_per_msun = 1.3e-3;
+  double ssp_snia_delay_min_years = 4.0e7;
+  double ssp_snia_delay_max_years = 1.37e10;
+  double ssp_energy_per_sn_erg = 1.0e51;
+  double ssp_reference_net_metal_yield = 0.0;
+  double fb_presn_wind_momentum_lsun_per_c = 0.0;
+  std::uint32_t thermochemistry_max_substeps = 4096U;
+  std::uint32_t thermochemistry_max_newton_iterations = 12U;
+  std::uint32_t chemistry_shadow_max_cells = 0U;
+  std::string uv_background_table_path = "";
+  std::string uv_background_table_sha256 = "";
+  std::string metal_cooling_table_path = "";
+  std::string metal_cooling_table_sha256 = "";
+  std::string ssp_yield_table_path = "";
+  std::string ssp_yield_table_sha256 = "";
+  bool chemistry_metallicity_scaled_dust_proxy = false;
+  bool ssp_stochastic_sn_events = true;
+  bool ssp_clustered_associations = false;
 };
 
 enum class ScienceSnapshotLayout : std::uint8_t {
@@ -871,6 +986,16 @@ void writeNormalizedConfigSnapshot(
 [[nodiscard]] std::string selfShieldingModelToString(SelfShieldingModel model);
 [[nodiscard]] std::string coolingModelToString(CoolingModel model);
 [[nodiscard]] std::string metalSpeciesModeToString(MetalSpeciesMode mode);
+[[nodiscard]] std::string thermochemistryBackendModeToString(ThermochemistryBackendMode value);
+[[nodiscard]] std::string metalCoolingModeConfigToString(MetalCoolingModeConfig value);
+[[nodiscard]] std::string metalCoolingTableRangeConfigToString(MetalCoolingTableRangeConfig value);
+[[nodiscard]] std::string dustModelConfigToString(DustModelConfig value);
+[[nodiscard]] std::string ismRegimeModelConfigToString(IsmRegimeModelConfig value);
+[[nodiscard]] std::string sgsTurbulenceModelConfigToString(SgsTurbulenceModelConfig value);
+[[nodiscard]] std::string chemistryAdaptiveSelectionConfigToString(ChemistryAdaptiveSelectionConfig value);
+[[nodiscard]] std::string stellarPopulationModelConfigToString(StellarPopulationModelConfig value);
+[[nodiscard]] std::string supernovaFeedbackModelConfigToString(SupernovaFeedbackModelConfig value);
+
 [[nodiscard]] std::string metalDiffusionModelToString(MetalDiffusionModel model);
 [[nodiscard]] std::string metalDiffusionTimeIntegratorToString(
     MetalDiffusionTimeIntegrator integrator);
