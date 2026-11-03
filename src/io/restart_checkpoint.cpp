@@ -3359,6 +3359,7 @@ namespace {
       physics.ssp_yield_table_path == defaults.ssp_yield_table_path &&
       physics.ssp_yield_table_sha256 == defaults.ssp_yield_table_sha256 &&
       physics.chemistry_metallicity_scaled_dust_proxy == defaults.chemistry_metallicity_scaled_dust_proxy &&
+      physics.thermochemistry_allow_unqualified_rates == defaults.thermochemistry_allow_unqualified_rates &&
       physics.ssp_stochastic_sn_events == defaults.ssp_stochastic_sn_events &&
       physics.ssp_clustered_associations == defaults.ssp_clustered_associations;
 }
@@ -3529,6 +3530,7 @@ std::string restartConfigurationCompatibilityRecord(
         "ssp_yield_table_path",
         "ssp_yield_table_sha256",
         "chemistry_metallicity_scaled_dust_proxy",
+        "thermochemistry_allow_unqualified_rates",
         "ssp_stochastic_sn_events",
         "ssp_clustered_associations"});
   }

@@ -79,9 +79,6 @@ double rMutualNeutralization(const RateEnvironment& e, const NetworkState& n, do
 double rH2ElectronDissociation(const RateEnvironment& e, const NetworkState& n, double ne) {
   return rates::electronDissociationH2(e.temperature_k) * n[idx(S::kH2)] * ne;
 }
-double rH2HydrogenDissociation(const RateEnvironment& e, const NetworkState& n, double) {
-  return rates::hydrogenDissociationH2(e.temperature_k) * n[idx(S::kH2)] * n[idx(S::kHI)];
-}
 double rH2plusDissRec(const RateEnvironment& e, const NetworkState& n, double ne) {
   return rates::dissociativeRecombinationH2plus(e.temperature_k) * n[idx(S::kH2p)] * ne;
 }
@@ -137,8 +134,11 @@ std::vector<ReactionDefinition> hybridReactions() {
       {"R14", "H- + H+ -> 2H", gp98, change({{Hm, -1}, {HII, -1}, {HI, +2}}), rMutualNeutralization},
       {"R15", "H2 + e -> 2H + e", "Donahue & Shull 1991 ApJ 383 511 (via Abel et al. 1997 k12)",
        change({{H2, -1}, {HI, +2}}), rH2ElectronDissociation},
-      {"R16", "H2 + H -> 3H", "Dove & Mandy 1986 ApJ 311 L93 low-density limit (via Abel et al. 1997 k13)",
-       change({{H2, -1}, {HI, +2}}), rH2HydrogenDissociation},
+      // R16 (H2 + H -> 3H) REMOVED by the corrective gate: the transcribed
+      // Dove & Mandy / Abel et al. k13 form decreased with temperature above
+      // 1e4 K and vanished by 1e6 K (physically implausible; transcription
+      // defect). It is listed in omitted_channels until the coefficient is
+      // re-derived from the original publication.
       {"R17", "H2+ + e -> 2H", "Schneider et al. 1994 fit (Abel et al. 1997 k18)",
        change({{H2p, -1}, {E, -1}, {HI, +2}}), rH2plusDissRec},
       {"R18", "H + H (grain) -> H2", "Jura 1975 ApJ 197 575, scaled by D/D_MW",
@@ -191,6 +191,8 @@ const NetworkManifest& hybridLightNetworkManifest() {
         "H- photodetachment and H2+ photodissociation (no Lyman-Werner/IR spectrum beyond G0)",
         "H- + e -> H + 2e and H2 + H+ -> H2+ + H (relevant only at T > ~1e4 K where H2 is negligible)",
         "three-body H2 formation (n_H > 1e8 cm^-3 regime, outside target)",
+        "collisional dissociation H2 + H -> 3H (removed: transcription defect; H2 destruction in warm/hot "
+        "atomic gas is UNDERESTIMATED, mitigated only by H2 + e dissociation)",
         "HD chemistry and HD cooling",
         "metal electron donors other than C+ (Mg, Si, S, Fe photoionization in neutral gas)",
         "grain recombination cooling and grain-assisted recombination",
@@ -224,6 +226,14 @@ const NetworkManifest& detailedCarbonOxygenNetworkManifest() {
     return m;
   }();
   return manifest;
+}
+
+bool NetworkManifest::qualified() const noexcept {
+  if (cooling_verification == RateVerification::kUnverifiedTranscription) return false;
+  for (const ReactionDefinition& reaction : reactions) {
+    if (reaction.verification == RateVerification::kUnverifiedTranscription) return false;
+  }
+  return true;
 }
 
 NetworkValidationReport validateNetworkManifest(const NetworkManifest& manifest) {
@@ -306,6 +316,9 @@ double associativeDetachment(double t) {
   return t < 300.0 ? 1.5e-9 : 4.0e-9 * std::pow(t, -0.17);
 }
 double formationH2plus(double t) {
+  // UNQUALIFIED: the 3.2e4 K upper clamp is an implementation choice (not a
+  // verified validity limit of the published fit) that stops the log-cubic
+  // from diverging; documented in docs/chemistry_rate_provenance.md.
   t = std::clamp(t, 1.0, 3.2e4);
   const double lt = std::log10(t);
   return std::pow(10.0, -19.38 - 1.523 * lt + 1.118 * lt * lt - 0.1269 * lt * lt * lt);
@@ -318,12 +331,6 @@ double chargeTransferH2plus(double) { return 6.4e-10; }
 double electronDissociationH2(double t) {
   t = tClamp(t);
   return 5.6e-11 * std::sqrt(t) * std::exp(-102124.0 / t);
-}
-double hydrogenDissociationH2(double t) {
-  t = tClamp(t);
-  const double t_ev = t / 11604.518;
-  return 1.067e-10 * std::pow(t_ev, 2.012) *
-      std::exp(-(4.463 / t_ev) * std::pow(1.0 + 0.2472 * t_ev, 3.512));
 }
 double dissociativeRecombinationH2plus(double t) {
   t = tClamp(t);
@@ -438,8 +445,7 @@ CoolingHeatingTerms primordial(const RateEnvironment& env, const NetworkState& n
     const double r_form = rates::dustH2FormationCoefficient(env.dust_to_gas_relative_mw) * nh * hi +
         rates::associativeDetachment(t) * n[idx(S::kHm)] * hi;
     terms.heating += k_h2_binding_erg * thermalized * r_form;
-    terms.chemical_cooling += k_h2_binding_erg *
-        (rates::electronDissociationH2(t) * n_e + rates::hydrogenDissociationH2(t) * hi) * n[idx(S::kH2)];
+    terms.chemical_cooling += k_h2_binding_erg * rates::electronDissociationH2(t) * n_e * n[idx(S::kH2)];
     const double shield = rates::h2SelfShielding(env.h2_column_cm2, t) * std::exp(-3.74 * env.visual_extinction_mag);
     terms.heating += k_h2_photodissociation_heat_erg * 3.3e-11 * env.g0_habing * shield * n[idx(S::kH2)];
   }

@@ -1597,6 +1597,7 @@ struct ConfigKeySpec {
       {"physics.ssp_yield_table_path", ""},
       {"physics.ssp_yield_table_sha256", ""},
       {"physics.chemistry_metallicity_scaled_dust_proxy", "false"},
+      {"physics.thermochemistry_allow_unqualified_rates", "false"},
       {"physics.ssp_stochastic_sn_events", "true"},
       {"physics.ssp_clustered_associations", "false"},
       {"output.run_name", "cosmosim_run"},
@@ -1709,6 +1710,16 @@ void validatePart2BaryonicPhysics(const SimulationConfig& config) {
     throw ConfigError(
         "physics.metal_species_mode=core_elements is required by (and only valid with) a Part 2 "
         "thermochemistry_backend (analytic_reference, equilibrium_primordial, fixed_hybrid, fixed_detailed)");
+  }
+  if ((p.thermochemistry_backend == ThermochemistryBackendMode::kEquilibriumPrimordial ||
+       p.thermochemistry_backend == ThermochemistryBackendMode::kFixedHybrid ||
+       p.thermochemistry_backend == ThermochemistryBackendMode::kFixedDetailed) &&
+      !p.thermochemistry_allow_unqualified_rates) {
+    throw ConfigError(
+        "thermochemistry_backend " + thermochemistryBackendModeToString(p.thermochemistry_backend) +
+        " uses rate coefficients not yet verified against their publications (UNQUALIFIED; see "
+        "docs/chemistry_rate_provenance.md). Set physics.thermochemistry_allow_unqualified_rates = true to run it "
+        "as an explicitly unqualified research model");
   }
   if (part2 && p.enable_metal_diffusion) {
     throw ConfigError(
@@ -1833,6 +1844,11 @@ void validatePart2BaryonicPhysics(const SimulationConfig& config) {
     throw ConfigError(
         "a Part 2 stellar_population_model deposits element/dust-resolved ejecta through "
         "fb_supernova_model=mechanical_resolved_unresolved (the legacy deposition cannot carry them)");
+  }
+  if (p.ssp_clustered_associations) {
+    throw ConfigError(
+        "physics.ssp_clustered_associations=true is not implemented (it would have no effect); "
+        "refused instead of silently ignoring the request");
   }
   if (p.fb_supernova_model == SupernovaFeedbackModelConfig::kMechanicalResolvedUnresolved &&
       p.stellar_population_model == StellarPopulationModelConfig::kLegacyTable) {
@@ -3167,6 +3183,7 @@ class NormalizedConfigStream {
   stream << "ssp_yield_table_path = " << frozen.config.physics.ssp_yield_table_path << '\n';
   stream << "ssp_yield_table_sha256 = " << frozen.config.physics.ssp_yield_table_sha256 << '\n';
   stream << "chemistry_metallicity_scaled_dust_proxy = " << (frozen.config.physics.chemistry_metallicity_scaled_dust_proxy ? "true" : "false") << '\n';
+  stream << "thermochemistry_allow_unqualified_rates = " << (frozen.config.physics.thermochemistry_allow_unqualified_rates ? "true" : "false") << '\n';
   stream << "ssp_stochastic_sn_events = " << (frozen.config.physics.ssp_stochastic_sn_events ? "true" : "false") << '\n';
   stream << "ssp_clustered_associations = " << (frozen.config.physics.ssp_clustered_associations ? "true" : "false") << '\n';
   stream << "\n[output]\n";
@@ -4220,6 +4237,8 @@ class NormalizedConfigStream {
   frozen.config.physics.ssp_yield_table_sha256 = requireString(entries, consumed, "physics.ssp_yield_table_sha256", "");
   frozen.config.physics.chemistry_metallicity_scaled_dust_proxy = parseBool(
       requireString(entries, consumed, "physics.chemistry_metallicity_scaled_dust_proxy", "false"), "physics.chemistry_metallicity_scaled_dust_proxy");
+  frozen.config.physics.thermochemistry_allow_unqualified_rates = parseBool(
+      requireString(entries, consumed, "physics.thermochemistry_allow_unqualified_rates", "false"), "physics.thermochemistry_allow_unqualified_rates");
   frozen.config.physics.ssp_stochastic_sn_events = parseBool(
       requireString(entries, consumed, "physics.ssp_stochastic_sn_events", "true"), "physics.ssp_stochastic_sn_events");
   frozen.config.physics.ssp_clustered_associations = parseBool(

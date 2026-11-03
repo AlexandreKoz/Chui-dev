@@ -86,6 +86,8 @@ sf_random_seed = 123456789
 
 metal_species_mode = core_elements
 chemistry_metallicity_scaled_dust_proxy = false
+# UNQUALIFIED rates (docs/chemistry_rate_provenance.md): explicit research opt-in.
+thermochemistry_allow_unqualified_rates = true
 thermochemistry_backend = fixed_hybrid
 metal_cooling_mode = fine_structure_cold
 stellar_population_model = chabrier_reference_v1

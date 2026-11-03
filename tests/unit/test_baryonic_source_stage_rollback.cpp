@@ -106,6 +106,7 @@ void testRejectionPreservesEverything() {
   op_config.solver.backend = physics::ThermochemistryBackend::kFixedHybrid;
   op_config.solver.max_substeps = 1U;  // failure injection
   op_config.units = units();
+  op_config.solver.allow_unqualified_rates = true;
   const physics::ThermochemistryOperator chemistry(op_config, layout);
   physics::BaryonicSourceStage stage(chemistry, stageConfig());
   const Snapshot before = snapshot(state);
@@ -137,6 +138,7 @@ void testSuccessCommitsAllTogether() {
   physics::ThermochemistryOperatorConfig op_config;
   op_config.solver.backend = physics::ThermochemistryBackend::kFixedHybrid;
   op_config.units = units();
+  op_config.solver.allow_unqualified_rates = true;
   const physics::ThermochemistryOperator chemistry(op_config, layout);
   physics::BaryonicSourceStage stage(chemistry, stageConfig());
   double element_before = 0.0, energy_before = 0.0;

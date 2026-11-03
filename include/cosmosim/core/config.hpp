@@ -628,6 +628,9 @@ struct PhysicsConfig {
   std::string ssp_yield_table_path = "";
   std::string ssp_yield_table_sha256 = "";
   bool chemistry_metallicity_scaled_dust_proxy = false;
+  // Explicit opt-in to UNQUALIFIED (unverified) rate coefficients; see
+  // docs/chemistry_rate_provenance.md. Default refuses those backends.
+  bool thermochemistry_allow_unqualified_rates = false;
   bool ssp_stochastic_sn_events = true;
   bool ssp_clustered_associations = false;
 };

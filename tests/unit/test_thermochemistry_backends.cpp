@@ -73,6 +73,7 @@ void testRateReferences() {
 void testAnalyticReferenceExactSolution() {
   for (const double rtol : {1.0e-3, 1.0e-5}) {
     ThermochemistryConfig config;
+  config.allow_unqualified_rates = true;
     config.backend = ThermochemistryBackend::kAnalyticReference;
     config.relative_tolerance = rtol;
     config.analytic_relaxation_time_s = 1.0e13;
@@ -93,6 +94,7 @@ void testAnalyticReferenceExactSolution() {
 
 void testEquilibriumLimits() {
   ThermochemistryConfig config;
+  config.allow_unqualified_rates = true;
   config.backend = ThermochemistryBackend::kEquilibriumPrimordial;
   const ThermochemistrySolver solver(config);
   const RateEnvironment env{};  // no radiation
@@ -113,6 +115,7 @@ void testEquilibriumLimits() {
 
 void testHybridConservationOnIonizingTrajectory() {
   ThermochemistryConfig config;
+  config.allow_unqualified_rates = true;
   config.backend = ThermochemistryBackend::kFixedHybrid;
   const ThermochemistrySolver solver(config);
   // Neutral gas suddenly at ~2e5 K: collisional ionization + cooling.
@@ -138,6 +141,7 @@ void testHybridConservationOnIonizingTrajectory() {
 
 void testDustCatalysedH2Formation() {
   ThermochemistryConfig config;
+  config.allow_unqualified_rates = true;
   config.backend = ThermochemistryBackend::kFixedHybrid;
   const ThermochemistrySolver solver(config);
   ThermochemistryCellInput input = primordialInput(100.0, uFromTemperature(100.0, 1.22));
@@ -157,6 +161,7 @@ void testDustCatalysedH2Formation() {
 
 void testDetailedCarbonConservation() {
   ThermochemistryConfig config;
+  config.allow_unqualified_rates = true;
   config.backend = ThermochemistryBackend::kFixedDetailed;
   config.isrf_g0_habing = 1.0;
   config.metal_mode = MetalCoolingMode::kFineStructureCold;
@@ -180,6 +185,7 @@ void testDetailedCarbonConservation() {
 
 void testNetworkF2Rejection() {
   ThermochemistryConfig config;
+  config.allow_unqualified_rates = true;
   config.backend = ThermochemistryBackend::kFixedHybrid;
   config.max_substeps = 1U;
   const ThermochemistrySolver solver(config);
@@ -251,8 +257,26 @@ void testMetalTable() {
   assert(threw);
 }
 
+void testUnqualifiedRatesRefusedByDefault() {
+  // Corrective gate: unverified coefficients must not run silently.
+  for (const auto backend : {ThermochemistryBackend::kEquilibriumPrimordial, ThermochemistryBackend::kFixedHybrid,
+                             ThermochemistryBackend::kFixedDetailed}) {
+    ThermochemistryConfig config;
+    config.backend = backend;
+    bool threw = false;
+    try { const ThermochemistrySolver solver(config); } catch (const SourceModelUnavailableError&) { threw = true; }
+    assert(threw);
+  }
+  assert(!hybridLightNetworkManifest().qualified());
+  ThermochemistryConfig analytic;
+  analytic.backend = ThermochemistryBackend::kAnalyticReference;
+  const ThermochemistrySolver ok(analytic);  // reference model needs no rate data
+  (void)ok;
+}
+
 void testMissingTableRefusesModel() {
   ThermochemistryConfig config;
+  config.allow_unqualified_rates = true;
   config.backend = ThermochemistryBackend::kFixedHybrid;
   config.metal_mode = MetalCoolingMode::kElementTable;
   bool threw = false;
@@ -274,5 +298,6 @@ int main() {
   testUvBackgroundTableAndShielding();
   testMetalTable();
   testMissingTableRefusesModel();
+  testUnqualifiedRatesRefusedByDefault();
   return 0;
 }

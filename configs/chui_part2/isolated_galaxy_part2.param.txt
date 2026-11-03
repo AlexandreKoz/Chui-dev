@@ -73,6 +73,8 @@ metal_species_mode = core_elements
 uv_background_model = none
 self_shielding_model = rahmati13_like
 chemistry_metallicity_scaled_dust_proxy = false
+# UNQUALIFIED rates (docs/chemistry_rate_provenance.md): explicit research opt-in.
+thermochemistry_allow_unqualified_rates = true
 thermochemistry_backend = fixed_detailed
 metal_cooling_mode = fine_structure_cold
 isrf_g0_habing = 1.0

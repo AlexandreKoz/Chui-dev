@@ -107,6 +107,7 @@ ThermochemistryOperatorConfig makeThermochemistryOperatorConfig(
       ? MetalTableRangePolicy::kReject
       : MetalTableRangePolicy::kClampDensityAndRedshift;
   s.fine_structure_switch_temperature_k = p.metal_cooling_switch_temperature_k;
+  s.allow_unqualified_rates = p.thermochemistry_allow_unqualified_rates;
   s.cosmological = config.mode.mode == core::SimulationMode::kCosmoCube ||
       config.mode.mode == core::SimulationMode::kZoomIn;
   op.units.velocity_code_to_cm_s = units.velocity_si_per_code * 100.0;

@@ -4,6 +4,7 @@
 #include <cmath>
 #include <limits>
 #include <stdexcept>
+#include <string>
 
 namespace cosmosim::physics {
 namespace {
@@ -100,6 +101,18 @@ ThermochemistrySolver::ThermochemistrySolver(ThermochemistryConfig config) : m_c
       throw std::logic_error("network manifest '" + m_manifest->name + "' failed validation: " + report.diagnostic);
     }
     m_species_count = m_manifest->species_count;
+  }
+  // KWH96 equilibrium rates and the network manifests are UNQUALIFIED
+  // (unverified transcription); only the analytic reference is exempt.
+  const bool uses_unqualified_rates =
+      m_config.backend == ThermochemistryBackend::kEquilibriumPrimordial ||
+      (m_manifest != nullptr && !m_manifest->qualified());
+  if (uses_unqualified_rates && !m_config.allow_unqualified_rates) {
+    throw SourceModelUnavailableError(
+        "thermochemistry backend '" + std::string(thermochemistryBackendLabel(m_config.backend)) +
+        "' uses rate coefficients that are UNQUALIFIED (not yet verified against their publications; see "
+        "docs/chemistry_rate_provenance.md). Set physics.thermochemistry_allow_unqualified_rates = true to run it "
+        "as an explicitly unqualified research model");
   }
   const bool needs_table = m_config.metal_mode == MetalCoolingMode::kElementTable ||
       m_config.metal_mode == MetalCoolingMode::kElementTableAndFineStructure;

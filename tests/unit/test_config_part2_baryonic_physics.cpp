@@ -34,6 +34,7 @@ void testDefaultsAreLegacy() {
 void testRoundTripDetailedFullPhysics() {
   const std::string text = k_base +
       "metal_species_mode = core_elements\nthermochemistry_backend = fixed_detailed\n"
+      "thermochemistry_allow_unqualified_rates = true\n"
       "metal_cooling_mode = fine_structure_cold\ndust_model = two_reservoir_v1\n"
       "sgs_turbulence_model = budgeted_v1\nchemistry_adaptive_selection = local_v1\n"
       "stellar_population_model = chabrier_reference_v1\nfb_supernova_model = mechanical_resolved_unresolved\n"
@@ -54,33 +55,46 @@ void testRoundTripDetailedFullPhysics() {
 void testFailClosedCombinations() {
   // core_elements without a Part 2 backend and vice versa.
   CHUI_REQUIRE(rejects("metal_species_mode = core_elements\n"));
-  CHUI_REQUIRE(rejects("thermochemistry_backend = fixed_hybrid\n"));
+  CHUI_REQUIRE(rejects("thermochemistry_backend = fixed_hybrid\n"
+                       "thermochemistry_allow_unqualified_rates = true\n"));
   // Legacy analytic UV proxies refused by Part 2 backends.
   CHUI_REQUIRE(rejects("metal_species_mode = core_elements\nthermochemistry_backend = fixed_hybrid\n"
+                       "thermochemistry_allow_unqualified_rates = true\n"
                        "uv_background_model = hm12\n"));
   // Treecool without a path.
   CHUI_REQUIRE(rejects("metal_species_mode = core_elements\nthermochemistry_backend = fixed_hybrid\n"
+                       "thermochemistry_allow_unqualified_rates = true\n"
                        "uv_background_model = treecool_table\n"));
   // Table metal cooling without a file.
   CHUI_REQUIRE(rejects("metal_species_mode = core_elements\nthermochemistry_backend = fixed_hybrid\n"
+                       "thermochemistry_allow_unqualified_rates = true\n"
                        "metal_cooling_mode = element_table\n"));
   // Dust needs a network backend.
   CHUI_REQUIRE(rejects("metal_species_mode = core_elements\nthermochemistry_backend = equilibrium_primordial\n"
+                       "thermochemistry_allow_unqualified_rates = true\n"
                        "dust_model = two_reservoir_v1\n"));
   // Adaptive selection needs the detailed layout.
   CHUI_REQUIRE(rejects("metal_species_mode = core_elements\nthermochemistry_backend = fixed_hybrid\n"
+                       "thermochemistry_allow_unqualified_rates = true\n"
                        "chemistry_adaptive_selection = local_v1\n"));
   // Effective ISM + Part 2 needs the regime manager (no double cooling).
   CHUI_REQUIRE(rejects("metal_species_mode = core_elements\nthermochemistry_backend = fixed_hybrid\n"
+                       "thermochemistry_allow_unqualified_rates = true\n"
                        "star_formation_model = effective_multiphase_tng_like\n"));
   // Yield-table population needs a table; mechanical feedback needs a Part 2 population.
   CHUI_REQUIRE(rejects("metal_species_mode = core_elements\nthermochemistry_backend = fixed_hybrid\n"
+                       "thermochemistry_allow_unqualified_rates = true\n"
                        "stellar_population_model = chabrier_yield_table_v1\n"
                        "fb_supernova_model = mechanical_resolved_unresolved\n"));
   CHUI_REQUIRE(rejects("fb_supernova_model = mechanical_resolved_unresolved\n"));
   // Part 2 population with feedback on requires the mechanical deposition.
   CHUI_REQUIRE(rejects("metal_species_mode = core_elements\nthermochemistry_backend = fixed_hybrid\n"
+                       "thermochemistry_allow_unqualified_rates = true\n"
                        "stellar_population_model = chabrier_reference_v1\n"));
+  // Unqualified rates require the explicit opt-in; clustered associations
+  // are not implemented and are refused.
+  CHUI_REQUIRE(rejects("metal_species_mode = core_elements\nthermochemistry_backend = equilibrium_primordial\n"));
+  CHUI_REQUIRE(rejects("ssp_clustered_associations = true\n"));
   // Numerical ranges.
   CHUI_REQUIRE(rejects("metal_species_mode = core_elements\nthermochemistry_backend = fixed_hybrid\n"
                        "thermochemistry_relative_tolerance = 0.5\n"));

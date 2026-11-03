@@ -85,6 +85,20 @@ using NetworkState = std::array<double, k_chemical_species_count>;
 // Rate function: returns the volumetric reaction rate R [cm^-3 s^-1].
 using ReactionRateFunction = double (*)(const RateEnvironment&, const NetworkState&, double n_e);
 
+// Verification status of a coefficient against its publication (corrective
+// gate). kUnverifiedTranscription: written from the cited paper without a
+// documented line-by-line check against the original text; the backend that
+// uses it is UNQUALIFIED and refuses to run unless the owner explicitly opts
+// in (physics.thermochemistry_allow_unqualified_rates = true).
+// kDerivedFromConstants: computed from CODATA physical constants only.
+// kVerifiedAgainstSource: checked against the publication (record the check
+// in docs/chemistry_rate_provenance.md before setting this).
+enum class RateVerification : std::uint8_t {
+  kUnverifiedTranscription = 0,
+  kDerivedFromConstants = 1,
+  kVerifiedAgainstSource = 2,
+};
+
 struct ReactionDefinition {
   std::string_view id;
   std::string_view equation;
@@ -94,6 +108,7 @@ struct ReactionDefinition {
   ReactionRateFunction rate = nullptr;
   double valid_temperature_min_k = 1.0;
   double valid_temperature_max_k = 1.0e9;
+  RateVerification verification = RateVerification::kUnverifiedTranscription;
 };
 
 struct NetworkManifest {
@@ -105,6 +120,11 @@ struct NetworkManifest {
   std::vector<std::string> cooling_channels;
   std::vector<std::string> omitted_channels;
   std::string regime;  // validity statement
+  // Cooling/heating fits used by the backend (KWH96 terms, H2, fine
+  // structure, photoelectric) carry the same verification status.
+  RateVerification cooling_verification = RateVerification::kUnverifiedTranscription;
+  // True only if every reaction and the cooling fits are verified or derived.
+  [[nodiscard]] bool qualified() const noexcept;
 };
 
 // Manifests are immutable singletons: one catalog per model, never per cell.
@@ -140,9 +160,6 @@ double mutualNeutralization(double t);    // H- + H+ -> 2H
 double chargeTransferH2plus(double t);    // H2+ + H -> H2 + H+
 // Donahue & Shull (1991, ApJ 383, 511) as listed by Abel et al. (1997).
 double electronDissociationH2(double t);  // H2 + e -> 2H + e
-// Dove & Mandy (1986, ApJ 311, L93) low-density limit as listed by Abel et
-// al. (1997, NewA 2, 181), k13.
-double hydrogenDissociationH2(double t);  // H2 + H -> 3H
 // Abel et al. (1997) k18 (Schneider et al. 1994 fit).
 double dissociativeRecombinationH2plus(double t);  // H2+ + e -> 2H
 // Jura (1975, ApJ 197, 575): R_dust = 3e-17 (D/D_MW) n_H n_HI cm^-3 s^-1.

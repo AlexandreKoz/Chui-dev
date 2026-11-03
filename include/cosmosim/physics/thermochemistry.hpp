@@ -78,6 +78,12 @@ struct ThermochemistryConfig {
   MetalTableRangePolicy metal_table_range = MetalTableRangePolicy::kReject;
   double fine_structure_switch_temperature_k = 1.0e4;
   bool cosmological = false;  // enables Compton exchange with the CMB
+  // Corrective gate: the equilibrium, hybrid and detailed backends use rate
+  // coefficients that are not yet verified against their publications
+  // (docs/chemistry_rate_provenance.md). They refuse to run unless the owner
+  // explicitly accepts UNQUALIFIED rates; results are then not
+  // production-validated science.
+  bool allow_unqualified_rates = false;
 };
 
 struct ThermochemistryCellInput {
