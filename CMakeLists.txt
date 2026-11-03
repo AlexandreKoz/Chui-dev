@@ -584,6 +584,8 @@ add_library(cosmosim_physics STATIC
   src/physics/thermochemistry_operator.cpp
   src/physics/baryonic_runtime_config.cpp
   src/physics/ism_dust_sgs.cpp
+  src/physics/stellar_population.cpp
+  src/physics/supernova_feedback.cpp
   src/physics/source_interval.cpp)
 add_library(cosmosim_io STATIC
   src/io/internal/io_contract.cpp

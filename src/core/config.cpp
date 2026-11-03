@@ -1822,6 +1822,12 @@ void validatePart2BaryonicPhysics(const SimulationConfig& config) {
       p.ssp_yield_table_path.empty()) {
     throw ConfigError("stellar_population_model=chabrier_yield_table_v1 requires physics.ssp_yield_table_path (no yields are bundled)");
   }
+  if (p.stellar_population_model != StellarPopulationModelConfig::kLegacyTable && p.enable_feedback &&
+      p.fb_supernova_model != SupernovaFeedbackModelConfig::kMechanicalResolvedUnresolved) {
+    throw ConfigError(
+        "a Part 2 stellar_population_model deposits element/dust-resolved ejecta through "
+        "fb_supernova_model=mechanical_resolved_unresolved (the legacy deposition cannot carry them)");
+  }
   if (p.fb_supernova_model == SupernovaFeedbackModelConfig::kMechanicalResolvedUnresolved &&
       p.stellar_population_model == StellarPopulationModelConfig::kLegacyTable) {
     throw ConfigError("fb_supernova_model=mechanical_resolved_unresolved consumes discrete SN events from a Part 2 stellar_population_model");

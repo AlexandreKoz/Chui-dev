@@ -119,6 +119,9 @@ class CompositionLayout {
   static constexpr std::uint32_t k_layout_version = 1U;
 
   [[nodiscard]] static CompositionLayout make(const CompositionLayoutRequest& request);
+  // Reconstruct the manifest of a live sidecar; throws if the descriptor is
+  // not a known CHUI layout (signature check).
+  [[nodiscard]] static CompositionLayout fromDescriptor(const core::GasCompositionLayoutDescriptor& descriptor);
 
   [[nodiscard]] const core::GasCompositionLayoutDescriptor& descriptor() const noexcept {
     return m_descriptor;

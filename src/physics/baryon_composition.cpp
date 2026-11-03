@@ -157,6 +157,21 @@ CompositionLayout CompositionLayout::make(const CompositionLayoutRequest& reques
   return layout;
 }
 
+CompositionLayout CompositionLayout::fromDescriptor(const core::GasCompositionLayoutDescriptor& descriptor) {
+  CompositionLayoutRequest request;
+  request.network = descriptor.species_lane_count == 0U ? CompositionNetworkKind::kElementsOnly
+      : descriptor.species_lane_count == k_hybrid_species_count ? CompositionNetworkKind::kHybridLight
+                                                                : CompositionNetworkKind::kDetailedCarbonOxygen;
+  request.dust = descriptor.dust_lane_count == 0U ? CompositionDustKind::kNone : CompositionDustKind::kTwoReservoirV1;
+  request.sgs_energy = descriptor.sgs_energy_lane != core::GasCompositionLayoutDescriptor::k_no_lane;
+  CompositionLayout layout = make(request);
+  if (!(layout.descriptor() == descriptor)) {
+    throw std::runtime_error("composition descriptor '" + descriptor.layout_name +
+                             "' is not a known CHUI layout (signature mismatch)");
+  }
+  return layout;
+}
+
 std::uint32_t CompositionLayout::speciesLane(std::size_t species_slot) const {
   if (species_slot >= m_descriptor.species_lane_count) {
     throw std::out_of_range("CompositionLayout: species slot is not part of the active network");

@@ -27,6 +27,8 @@
 #include "cosmosim/physics/black_hole_agn.hpp"
 #include "cosmosim/physics/baryonic_runtime_config.hpp"
 #include "cosmosim/physics/thermochemistry_operator.hpp"
+#include "cosmosim/physics/stellar_population.hpp"
+#include "cosmosim/physics/supernova_feedback.hpp"
 #include "cosmosim/core/stage_transaction.hpp"
 #include "cosmosim/physics/effective_multiphase_ism.hpp"
 #include "cosmosim/parallel/distributed_memory.hpp"
@@ -42,6 +44,7 @@
 #include "workflows/internal/runtime_stage_resource_access.hpp"
 #include "workflows/internal/retained_population_growth.hpp"
 #include "workflows/internal/star_formation_geometry.hpp"
+#include "workflows/internal/star_formation_gradients.hpp"
 
 #if COSMOSIM_ENABLE_MPI
 #include <mpi.h>
@@ -471,6 +474,258 @@ class DistributedParticleIdRegistry final : public physics::ParticleIdPrecommit 
     m_memory_governor = governor;
   }
   void finishPrecommit() noexcept override { m_result_reservation.release(); }
+
+  // CHUI Part 2 stellar populations: age-resolved SSP mass/element return
+  // (AGB, CC continuous; Ia per event), discrete SN events from the
+  // restart-safe cumulative-Poisson chronology, and conservative mechanical
+  // feedback. Staged in a StageTransaction: event ordinals, star masses/ages,
+  // population records and gas deltas commit together or not at all.
+  void executePart2StellarPopulation(core::StepContext& context, double source_evaluation_scale_factor) {
+    core::SimulationState& state = context.state;
+    const std::uint64_t ranks_with_stars =
+        m_mpi_context.allreduceSumUint64(state.star_particles.size() > 0U ? 1ULL : 0ULL);
+    if (ranks_with_stars > 0U && m_mpi_context.isEnabled() && m_mpi_context.worldSize() > 1) {
+      throw std::runtime_error(
+          "Part 2 mechanical stellar feedback across MPI ranks requires Part 3 remote-ghost deposition; "
+          "refusing instead of renormalizing onto rank-local cells (fail closed)");
+    }
+    if (state.star_particles.size() == 0U) return;
+    const double elapsed_years = elapsedStellarEvolutionYears(context);
+    const physics::ThermochemistryUnitBridge bridge =
+        physics::makeThermochemistryOperatorConfig(m_full_config, m_units, m_baryonic_data).units;
+    physics::FeedbackUnits units;
+    units.mass_code_to_g = bridge.mass_code_to_g;
+    units.velocity_code_to_cm_s = bridge.velocity_code_to_cm_s;
+    units.length_code_to_cm = bridge.length_code_to_cm;
+    units.density_code_to_cgs = bridge.density_code_to_cgs;
+    units.scale_factor = source_evaluation_scale_factor;
+    units.comoving = bridge.comoving;
+    units.periodic = m_hydro_boundary == core::BoundaryCondition::kPeriodic;
+    units.box_extent_comoving = m_box_extent_comoving;
+    physics::MechanicalFeedbackConfig fb_config;
+    fb_config.neighbor_count = std::max<std::uint32_t>(m_physics_config.fb_neighbor_count, 1U);
+    fb_config.sgs_energy_fraction = m_physics_config.sgs_feedback_energy_fraction;
+    const physics::DustConfig dust_config = physics::makeDustConfig(m_physics_config);
+    fb_config.dust_sn_swept_mass_per_1e51_erg_g = dust_config.sn_swept_mass_per_1e51_erg_g;
+    fb_config.dust_sn_destruction_efficiency = dust_config.sn_destruction_efficiency;
+
+    buildOwnedLeafCellMetadata(context);
+    std::vector<std::uint32_t> owned_leaf;
+    owned_leaf.reserve(state.cells.size());
+    for (std::uint32_t row = 0; row < state.cells.size(); ++row) {
+      if (row < m_owned_leaf_mask.size() && m_owned_leaf_mask[row] != 0U) owned_leaf.push_back(row);
+    }
+    physics::MechanicalFeedbackDeposition deposition(fb_config, units);
+    deposition.setCandidates(state, std::move(owned_leaf));
+    physics::StellarPopulationStore store(state);
+
+    struct StarUpdate {
+      std::uint32_t star_index = 0;
+      std::uint32_t particle_index = 0;
+      std::uint64_t particle_id = 0;
+      double returned_mass_code = 0.0;
+      double age_end_years = 0.0;
+      double energy_erg = 0.0;
+      std::array<double, 3> channel_mass{};
+      std::array<double, 3> channel_energy{};
+      physics::StellarPopulationRecord record{};
+    };
+    std::vector<StarUpdate> updates;
+    std::vector<std::uint32_t> star_rows;
+    if (!context.active_set.particles_are_subset || context.active_set.particle_indices.empty()) {
+      for (std::uint32_t s = 0; s < state.star_particles.size(); ++s) star_rows.push_back(s);
+    } else {
+      std::pmr::vector<std::uint32_t> rows(std::pmr::get_default_resource());
+      buildActiveStarRows(context, rows, std::pmr::get_default_resource());
+      star_rows.assign(rows.begin(), rows.end());
+    }
+    // Deterministic source order: stable particle id (not row / rank order).
+    std::sort(star_rows.begin(), star_rows.end(), [&](std::uint32_t a, std::uint32_t b) {
+      return state.particle_sidecar.particle_id[state.star_particles.particle_index[a]] <
+          state.particle_sidecar.particle_id[state.star_particles.particle_index[b]];
+    });
+    const double msun_code = physics::k_solar_mass_g / bridge.mass_code_to_g;
+    const bool energy_coupled = m_physics_config.enable_feedback;
+    std::uint64_t newborn_skipped = 0U, legacy_initialized = 0U;
+    const internal::MpiStageCollectiveDecision decision(m_mpi_context);
+    core::StageTransaction transaction("sources.stellar_population", m_memory_governor, &decision);
+    (void)transaction.prepare([&] {
+      for (const std::uint32_t s : star_rows) {
+        const std::uint32_t p = state.star_particles.particle_index[s];
+        const std::uint64_t pid = state.particle_sidecar.particle_id[p];
+        // Audit F5: born at the end of this interval => zero age in it.
+        if (physics::stellarElapsedYearsInInterval(state.star_particles.birth_tick[s],
+                                                   context.integrator_state.step_index, elapsed_years) <= 0.0) {
+          ++newborn_skipped;
+          continue;
+        }
+        physics::StellarPopulationRecord record = store.get(pid);
+        if (record.initialized == 0U) {
+          // Explicit legacy initialization for stars created before Part 2:
+          // birth mixture = primordial H/He + solar-pattern metals at the
+          // stored birth metallicity; birth time unknown (0); stream key =
+          // the immutable birth key. Counted, never silent.
+          const double z = std::clamp(state.star_particles.metallicity_mass_fraction[s], 0.0, 0.5);
+          const auto masses = physics::initialElementMasses(1.0, z, physics::primordialPolicyFromConfig(m_physics_config));
+          record = physics::makeStellarPopulationRecord(masses, 0.0, state.star_particles.birth_key[s]);
+          ++legacy_initialized;
+        }
+        const double birth_mass = state.star_particles.birth_mass_code[s];
+        const double birth_msun = birth_mass / msun_code;
+        const double age_b = std::max(state.star_particles.stellar_age_years_last[s], 0.0);
+        const double age_e = age_b + elapsed_years;
+        const auto& x = record.birth_element_mass_fraction;
+        double z = 0.0;
+        for (std::size_t e = 2; e < physics::k_chemical_element_count; ++e) z += x[e];
+        const auto agb = m_ssp_model->massiveReturn(0, age_b, age_e, x);
+        const auto cc = m_ssp_model->massiveReturn(1, age_b, age_e, x);
+        double n_cc = 0.0, n_ia = 0.0;
+        const double lam_cc_end = m_ssp_model->ccCumulativeNumber(age_e, z) * birth_msun;
+        const double lam_ia_end = m_ssp_model->iaCumulativeNumber(age_e) * birth_msun;
+        if (m_ssp_model->config().stochastic_events) {
+          n_cc = physics::realizeEvents(record, 0U, lam_cc_end).count;
+          n_ia = physics::realizeEvents(record, 1U, lam_ia_end).count;
+        } else {
+          n_cc = lam_cc_end - m_ssp_model->ccCumulativeNumber(age_b, z) * birth_msun;
+          n_ia = lam_ia_end - m_ssp_model->iaCumulativeNumber(age_b) * birth_msun;
+        }
+        const auto ia = m_ssp_model->iaReturnPerEvent(x);
+        std::array<double, physics::k_chemical_element_count> agb_el{}, cc_el{}, ia_el{};
+        for (std::size_t e = 0; e < physics::k_chemical_element_count; ++e) {
+          agb_el[e] = agb.element_fraction[e] * birth_mass;
+          cc_el[e] = cc.element_fraction[e] * birth_mass;
+          ia_el[e] = ia.element_fraction[e] * n_ia * msun_code;
+        }
+        double returned = agb.mass_fraction * birth_mass + cc.mass_fraction * birth_mass +
+            ia.mass_fraction * n_ia * msun_code;
+        // Cumulative returned mass never exceeds the star's current mass.
+        const double current_mass = state.particles.mass_code[p];
+        double scale = 1.0;
+        if (returned > current_mass && returned > 0.0) scale = current_mass / returned;
+        returned *= scale;
+        const auto agb_part = physics::partitionEjectaIntoDust(agb_el, dust_config.agb_condensation_efficiency);
+        const auto cc_part = physics::partitionEjectaIntoDust(cc_el, dust_config.cc_condensation_efficiency);
+        physics::FeedbackSourceBudget budget;
+        budget.source_id = pid;
+        budget.position_comoving = {state.particles.position_x_comoving[p], state.particles.position_y_comoving[p],
+                                    state.particles.position_z_comoving[p]};
+        budget.velocity_peculiar = {state.particles.velocity_x_peculiar[p], state.particles.velocity_y_peculiar[p],
+                                    state.particles.velocity_z_peculiar[p]};
+        budget.ejecta_mass_code = returned;
+        const bool dust_lanes = state.gas_composition.enabled() &&
+            state.gas_composition.descriptor().dust_lane_count > 0U;
+        for (std::size_t e = 0; e < physics::k_chemical_element_count; ++e) {
+          // Without dust lanes the condensable mass stays in the gas.
+          budget.ejecta_elements_code[e] = scale *
+              (dust_lanes ? agb_part.gas_elements[e] + cc_part.gas_elements[e] : agb_el[e] + cc_el[e]) +
+              scale * ia_el[e];
+        }
+        if (dust_lanes) {
+          for (std::size_t r = 0; r < physics::k_dust_reservoir_count; ++r) {
+            budget.ejecta_dust_code[r] = scale * (agb_part.dust[r] + cc_part.dust[r]);
+          }
+        }
+        const double e_sn = energy_coupled ? (n_cc + n_ia) * m_ssp_model->config().energy_per_sn_erg : 0.0;
+        budget.supernova_count = energy_coupled ? n_cc + n_ia : 0.0;
+        budget.supernova_energy_erg = e_sn;
+        if (energy_coupled && m_physics_config.fb_presn_wind_momentum_lsun_per_c > 0.0 &&
+            age_b < m_ssp_model->lifetimeYears(m_ssp_model->config().cc_mass_min_msun, z)) {
+          // EXPERIMENTAL user closure: p_dot = q M_* L_sun / c for ages
+          // before the last core-collapse SN (no SSP luminosity table).
+          const double p_dot_cgs = m_physics_config.fb_presn_wind_momentum_lsun_per_c * birth_msun * 3.828e33 / 2.99792458e10;
+          budget.presn_momentum_code = p_dot_cgs * elapsed_years * physics::k_seconds_per_year /
+              (bridge.mass_code_to_g * bridge.velocity_code_to_cm_s);
+        }
+        deposition.stage(state, budget);
+        StarUpdate update;
+        update.star_index = s;
+        update.particle_index = p;
+        update.particle_id = pid;
+        update.returned_mass_code = returned;
+        update.age_end_years = age_e;
+        update.energy_erg = e_sn;
+        update.channel_mass = {scale * agb.mass_fraction * birth_mass, scale * cc.mass_fraction * birth_mass,
+                               scale * ia.mass_fraction * n_ia * msun_code};
+        update.channel_energy = {0.0, energy_coupled ? n_cc * m_ssp_model->config().energy_per_sn_erg : 0.0,
+                                 energy_coupled ? n_ia * m_ssp_model->config().energy_per_sn_erg : 0.0};
+        record.returned_mass_code += returned;
+        update.record = record;
+        updates.push_back(update);
+      }
+    });
+    if (!transaction.validate(true, core::StageRejectionKind::kNone, {})) {
+      throw core::StageTransactionRejected(transaction.outcome().rejection,
+          "stellar population stage rejected: " + transaction.outcome().reason);
+    }
+    std::vector<std::uint32_t> touched;
+    (void)transaction.commit([&] {
+      touched = deposition.commit(state);
+      for (const StarUpdate& u : updates) {
+        state.particles.mass_code[u.particle_index] =
+            std::max(state.particles.mass_code[u.particle_index] - u.returned_mass_code, 0.0);
+        state.star_particles.stellar_age_years_last[u.star_index] = u.age_end_years;
+        state.star_particles.stellar_returned_mass_cumulative_code[u.star_index] += u.returned_mass_code;
+        state.star_particles.stellar_feedback_energy_cumulative_erg[u.star_index] += u.energy_erg;
+        for (std::size_t c = 0; c < 3U; ++c) {
+          state.star_particles.stellar_returned_mass_channel_cumulative_code[c][u.star_index] += u.channel_mass[c];
+          state.star_particles.stellar_feedback_energy_channel_cumulative_erg[c][u.star_index] += u.channel_energy[c];
+        }
+        store.put(u.particle_id, u.record);  // event ordinals consumed only here
+      }
+      store.store(state);
+      if (!updates.empty()) state.notifyParticleMassMutation();
+    });
+    m_last_feedback_ledger = deposition.ledger();
+    internal::synchronizeParentParticleCompatibilityMirrors(state, m_world_rank, "SourceRuntime Part 2 stellar population");
+    if (!touched.empty()) {
+      state.notifyGasThermodynamicMutation();
+      std::unique_ptr<physics::EffectiveIsmThermodynamicClosure> closure;
+      if (m_effective_eos_table != nullptr) {
+        closure = std::make_unique<physics::EffectiveIsmThermodynamicClosure>(m_effective_eos_table);
+      }
+      const hydro::GasThermodynamicRefreshPolicy policy{
+          .adiabatic_index = 5.0 / 3.0,
+          .density_floor_code = m_hydro_density_floor_code,
+          .pressure_floor_code = m_hydro_pressure_floor_code,
+          .scale_factor = source_evaluation_scale_factor,
+          .redshift = m_is_cosmological ? std::max(0.0, 1.0 / source_evaluation_scale_factor - 1.0) : 0.0,
+          .closure = closure.get(),
+          .temperature_k_per_internal_energy_code =
+              hydro::temperatureKelvinPerInternalEnergyCode(5.0 / 3.0, m_units.velocity_si_per_code)};
+      std::vector<hydro::GasThermodynamicTouch> touches;
+      for (const std::uint32_t row : touched) {
+        touches.push_back({.cell_row = row, .internal_energy_before_code = state.gas_cells.internal_energy_code[row]});
+      }
+      (void)hydro::refreshGasThermodynamics(state, touches, policy);
+    }
+    if (context.profiler_session != nullptr) {
+      const physics::FeedbackLedger& l = m_last_feedback_ledger;
+      context.profiler_session->recordEvent(core::RuntimeEvent{
+          .event_kind = "sources.stellar_population",
+          .severity = core::RuntimeEventSeverity::kInfo,
+          .subsystem = "physics.stellar_feedback.mechanical",
+          .step_index = context.integrator_state.step_index,
+          .simulation_time_code = context.integrator_state.current_time_code,
+          .scale_factor = context.integrator_state.current_scale_factor,
+          .message = "Part 2 SSP return and mechanical feedback ledger",
+          .payload = {{"sources", std::to_string(l.sources)},
+                      {"newborn_skipped_f5", std::to_string(newborn_skipped)},
+                      {"legacy_initialized_records", std::to_string(legacy_initialized)},
+                      {"mass_injected_code", std::to_string(l.mass_injected_code)},
+                      {"energy_budget_code", std::to_string(l.energy_budget_code)},
+                      {"kinetic_energy_injected_code", std::to_string(l.kinetic_energy_injected_code)},
+                      {"thermal_energy_injected_code", std::to_string(l.thermal_energy_injected_code)},
+                      {"sgs_energy_injected_code", std::to_string(l.sgs_energy_injected_code)},
+                      {"radial_momentum_requested_code", std::to_string(l.radial_momentum_requested_code)},
+                      {"radial_momentum_delivered_code", std::to_string(l.radial_momentum_delivered_code)},
+                      {"net_vector_momentum_residual_code", std::to_string(l.net_vector_momentum_residual_code)},
+                      {"resolved_cells", std::to_string(l.resolved_cells)},
+                      {"unresolved_cells", std::to_string(l.unresolved_cells)},
+                      {"dust_injected_code", std::to_string(l.dust_injected_code)},
+                      {"dust_destroyed_code", std::to_string(l.dust_destroyed_code)},
+                      {"yield_table_clamps", std::to_string(m_ssp_model->table_clamps)}}});
+    }
+  }
 
   void preparePopulationGrowth(core::SimulationState& state, std::size_t count,
                                core::ParticleSpecies species) override {
@@ -927,6 +1182,28 @@ class SourceRuntimeImpl final : public SourceRuntime {
     // data stops construction with SourceModelUnavailableError.
     m_physics_config = config.physics;
     m_full_config = config;
+    m_box_extent_comoving = {config.cosmology.box_size_x_mpc_comoving, config.cosmology.box_size_y_mpc_comoving,
+                             config.cosmology.box_size_z_mpc_comoving};
+    if (config.physics.enable_stellar_evolution &&
+        config.physics.stellar_population_model != core::StellarPopulationModelConfig::kLegacyTable) {
+      physics::SspConfig ssp;
+      ssp.imf_mass_min_msun = config.physics.ssp_imf_mass_min_msun;
+      ssp.imf_mass_max_msun = config.physics.ssp_imf_mass_max_msun;
+      ssp.cc_mass_min_msun = config.physics.ssp_cc_mass_min_msun;
+      ssp.cc_mass_max_msun = config.physics.ssp_cc_mass_max_msun;
+      ssp.snia_per_msun = config.physics.ssp_snia_per_msun;
+      ssp.snia_delay_min_years = config.physics.ssp_snia_delay_min_years;
+      ssp.snia_delay_max_years = config.physics.ssp_snia_delay_max_years;
+      ssp.energy_per_sn_erg = config.physics.ssp_energy_per_sn_erg;
+      ssp.reference_net_metal_yield = config.physics.ssp_reference_net_metal_yield;
+      ssp.stochastic_events = config.physics.ssp_stochastic_sn_events;
+      if (config.physics.stellar_population_model == core::StellarPopulationModelConfig::kChabrierYieldTableV1) {
+        ssp.yield_mode = physics::SspYieldMode::kTable;
+        m_ssp_yield_table = std::make_shared<const physics::SspYieldTable>(physics::SspYieldTable::loadFromFile(
+            config.physics.ssp_yield_table_path, config.physics.ssp_yield_table_sha256));
+      }
+      m_ssp_model = std::make_unique<physics::SspModel>(ssp, m_ssp_yield_table.get());
+    }
     if (physics::part2ThermochemistrySelected(config.physics)) {
       m_baryonic_data = physics::loadBaryonicDataProducts(config.physics);
       m_thermochemistry = std::make_unique<physics::ThermochemistryOperator>(
@@ -1282,6 +1559,17 @@ class SourceRuntimeImpl final : public SourceRuntime {
       } catch (...) { parent_failure = std::current_exception(); }
       m_mpi_context.rethrowCollectivePreparationFailure(
           parent_failure, "source parent metadata preparation");
+      std::exception_ptr neighbor_failure;
+      try {
+        m_sf_gradient_unavailable_cells = 0U;
+        m_sf_gradient_coarse_fine_cells = 0U;
+        buildOwnedLeafCellMetadata(context);
+        m_sf_neighbor_index = std::make_unique<internal::StarFormationNeighborIndex>(
+            context.state, m_hydro_boundary == core::BoundaryCondition::kPeriodic, m_box_extent_comoving,
+            m_owned_leaf_mask);
+      } catch (...) { neighbor_failure = std::current_exception(); }
+      m_mpi_context.rethrowCollectivePreparationFailure(
+          neighbor_failure, "star-formation neighbour index preparation");
 
       const std::size_t particle_count_before_birth =
           context.state.particles.size();
@@ -1365,6 +1653,7 @@ class SourceRuntimeImpl final : public SourceRuntime {
         m_mpi_context.rethrowCollectivePreparationFailure(
             metadata_failure, "source birth/report metadata admission");
         if (report_reservation.pending()) report_reservation.commit();
+        m_star_formation.setBirthTimeCode(context.timeline_step.time_end_code);
         const physics::StarFormationStepReport batch_report =
             m_star_formation.applyFromInputs(
                 context.state,
@@ -1432,7 +1721,14 @@ class SourceRuntimeImpl final : public SourceRuntime {
       }
     }
 
-    executeStellarEvolutionAndEnrichment(context, source_evaluation_scale_factor);
+    m_sf_neighbor_index.reset();  // stage-local; release before the next phase
+    // One owner per stellar source: the Part 2 SSP/event/mechanical-feedback
+    // path replaces (never adds to) the legacy table evolution + deposition.
+    if (m_ssp_model != nullptr) {
+      executePart2StellarPopulation(context, source_evaluation_scale_factor);
+    } else {
+      executeStellarEvolutionAndEnrichment(context, source_evaluation_scale_factor);
+    }
     executeMetalDiffusion(context, source_evaluation_scale_factor);
 
     physics::BlackHoleAgnStepReport black_hole_report{};
@@ -2027,7 +2323,10 @@ class SourceRuntimeImpl final : public SourceRuntime {
       const physics::StellarEvolutionStepCounters evolution_counters =
           m_stellar_evolution.evaluateElapsedYearsGoverned(
               context.state, star_batch, elapsed_years, m_memory_governor,
-              evolution_workspace);
+              evolution_workspace,
+              // Audit F5: stars born by THIS source stage (birth tick = this
+              // step's tick, t_birth = t_end) have zero age in the interval.
+              context.integrator_state.step_index);
       m_feedback_events.clear();
       for (const physics::StellarEvolutionStarBudget& budget :
            evolution_workspace.budgets) {
@@ -2376,25 +2675,18 @@ class SourceRuntimeImpl final : public SourceRuntime {
         input.is_leaf = starFormationPatchIsLeaf(state, geometry.patch_index, patch_ids_with_children);
         input.is_ghost = !input.is_owned;
 
-        const double dx_phys = geometry.dx_stored * length_to_physical;
-        const double dy_phys = geometry.dy_stored * length_to_physical;
-        const double dz_phys = geometry.dz_stored * length_to_physical;
-        const std::array<std::span<const double>, 3> velocity_fields{
-            state.gas_cells.velocity_x_peculiar,
-            state.gas_cells.velocity_y_peculiar,
-            state.gas_cells.velocity_z_peculiar};
+        // CHUI Part 2: geometric face neighbours across patches, periodic
+        // images and coarse/fine interfaces; an unavailable neighbour makes
+        // the gradient NaN (never zero), which the adaptive collapse model
+        // treats as ineligible.
         std::array<std::array<double, 3>, 3> gradient{};
-        bool gradient_valid = true;
-        for (std::size_t component = 0; component < velocity_fields.size(); ++component) {
-          gradient[component][0] = starFormationDerivativeAtCell(
-              velocity_fields[component], geometry, 0, dx_phys, cell_index);
-          gradient[component][1] = starFormationDerivativeAtCell(
-              velocity_fields[component], geometry, 1, dy_phys, cell_index);
-          gradient[component][2] = starFormationDerivativeAtCell(
-              velocity_fields[component], geometry, 2, dz_phys, cell_index);
-          for (std::size_t axis = 0; axis < gradient[component].size(); ++axis) {
-            gradient_valid = gradient_valid && std::isfinite(gradient[component][axis]);
-          }
+        bool gradient_valid = false;
+        if (m_sf_neighbor_index != nullptr) {
+          const auto g = m_sf_neighbor_index->velocityGradient(cell_index, length_to_physical);
+          gradient = g.velocity;
+          gradient_valid = g.valid;
+          if (!g.valid) ++m_sf_gradient_unavailable_cells;
+          if (g.used_coarser_neighbor) ++m_sf_gradient_coarse_fine_cells;
         }
         if (gradient_valid) {
           input.velocity_divergence_code =
@@ -2445,6 +2737,13 @@ class SourceRuntimeImpl final : public SourceRuntime {
   physics::BaryonicDataProducts m_baryonic_data{};
   std::unique_ptr<physics::ThermochemistryOperator> m_thermochemistry;
   physics::SourceLedger m_last_thermochemistry_ledger{};
+  std::shared_ptr<const physics::SspYieldTable> m_ssp_yield_table;
+  std::unique_ptr<physics::SspModel> m_ssp_model;
+  physics::FeedbackLedger m_last_feedback_ledger{};
+  std::unique_ptr<internal::StarFormationNeighborIndex> m_sf_neighbor_index;
+  std::array<double, 3> m_box_extent_comoving{};
+  std::uint64_t m_sf_gradient_unavailable_cells = 0U;
+  std::uint64_t m_sf_gradient_coarse_fine_cells = 0U;
   core::SimulationConfig m_full_config{};
   physics::IsmRegimeReport m_last_ism_regime_report{};
   physics::ChemistryAdaptiveReport m_last_chemistry_adaptive_report{};

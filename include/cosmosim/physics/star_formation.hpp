@@ -318,6 +318,11 @@ class StarFormationModel {
       std::string_view configuration_hash = {},
       const StarFormationCounters* cumulative_counters = nullptr) const;
 
+  // CHUI Part 2 birth chronology: code time of the END of the accepted
+  // interval in which the source stage creates stars (t_birth = t_end).
+  // Recorded in the stellar population record (F5).
+  void setBirthTimeCode(double time_end_code) noexcept { m_birth_time_code = time_end_code; }
+
  private:
   [[nodiscard]] StarFormationCellOutcome evaluateCell(
       const StarFormationCellInput& cell,
@@ -327,6 +332,7 @@ class StarFormationModel {
 
   StarFormationConfig m_config;
   std::shared_ptr<const EffectiveMultiphaseEosTable> m_effective_eos_table;
+  double m_birth_time_code = 0.0;
 };
 
 [[nodiscard]] StarFormationConfig makeStarFormationConfig(const core::PhysicsConfig& physics_config);
