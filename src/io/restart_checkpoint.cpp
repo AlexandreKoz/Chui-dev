@@ -3356,6 +3356,7 @@ namespace {
       physics.uv_background_table_sha256 == defaults.uv_background_table_sha256 &&
       physics.metal_cooling_table_path == defaults.metal_cooling_table_path &&
       physics.metal_cooling_table_sha256 == defaults.metal_cooling_table_sha256 &&
+      physics.metal_cooling_accept_uv_background_mismatch == defaults.metal_cooling_accept_uv_background_mismatch &&
       physics.ssp_yield_table_path == defaults.ssp_yield_table_path &&
       physics.ssp_yield_table_sha256 == defaults.ssp_yield_table_sha256 &&
       physics.chemistry_metallicity_scaled_dust_proxy == defaults.chemistry_metallicity_scaled_dust_proxy &&
@@ -3527,12 +3528,23 @@ std::string restartConfigurationCompatibilityRecord(
         "uv_background_table_sha256",
         "metal_cooling_table_path",
         "metal_cooling_table_sha256",
+        "metal_cooling_accept_uv_background_mismatch",
         "ssp_yield_table_path",
         "ssp_yield_table_sha256",
         "chemistry_metallicity_scaled_dust_proxy",
         "thermochemistry_allow_unqualified_rates",
         "ssp_stochastic_sn_events",
         "ssp_clustered_associations"});
+  }
+  // CHUI Part 2.5 added one key to a Part 2 checkpoint's group; accepted only
+  // at its default (refusal) value, verified above by
+  // part2PhysicsKeysAtDefaults for pre-Part-2 files and here for Part 2 ones.
+  if (projected.find("\nmetal_cooling_accept_uv_background_mismatch = ") != std::string::npos &&
+      restart.normalized_config_text.find("\nmetal_cooling_accept_uv_background_mismatch = ") == std::string::npos) {
+    if (current.config.physics.metal_cooling_accept_uv_background_mismatch) {
+      fail("Part 2 checkpoint predates metal_cooling_accept_uv_background_mismatch; only its default is accepted");
+    }
+    removeKeyLines({"metal_cooling_accept_uv_background_mismatch"});
   }
   if (projected.find("\nhydro_reconstruction = ") != std::string::npos &&
       restart.normalized_config_text.find("\nhydro_reconstruction = ") == std::string::npos) {

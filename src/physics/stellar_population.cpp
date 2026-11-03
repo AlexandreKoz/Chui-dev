@@ -205,7 +205,14 @@ SspYieldTable::Row SspYieldTable::massive(std::size_t channel, double mass_msun,
                                           bool& clamped) const {
   const Channel& ch = m_channels.at(channel);
   const auto locate = [&clamped](const std::vector<double>& axis, double x, std::size_t& lo, double& w) {
-    if (axis.size() == 1U) { lo = 0; w = 0.0; return; }
+    // Part 2.5: a singleton axis covers only its one coordinate; any other
+    // query uses that row and is REPORTED as clamped (never silent).
+    if (axis.size() == 1U) {
+      lo = 0;
+      w = 0.0;
+      clamped = clamped || std::abs(x - axis[0]) > 1.0e-8 * std::max(1.0, std::abs(axis[0]));
+      return;
+    }
     if (x <= axis.front() || x >= axis.back()) clamped = clamped || x < axis.front() || x > axis.back();
     x = std::clamp(x, axis.front(), axis.back());
     const auto up = std::upper_bound(axis.begin(), axis.end(), x);
@@ -236,7 +243,12 @@ SspYieldTable::Row SspYieldTable::massive(std::size_t channel, double mass_msun,
 
 SspYieldTable::Row SspYieldTable::snia(double metallicity, bool& clamped) const {
   const Channel& ch = m_channels[2];
-  if (ch.metallicity.size() == 1U) return ch.rows[0];
+  if (ch.metallicity.size() == 1U) {
+    // Single-metallicity Ia table: used for every Z, reported as clamped
+    // whenever Z differs from the tabulated value (Part 2.5).
+    clamped = clamped || std::abs(metallicity - ch.metallicity[0]) > 1.0e-8 * std::max(1.0, std::abs(ch.metallicity[0]));
+    return ch.rows[0];
+  }
   const double z = std::clamp(metallicity, ch.metallicity.front(), ch.metallicity.back());
   clamped = clamped || z != metallicity;
   const auto up = std::upper_bound(ch.metallicity.begin(), ch.metallicity.end(), z);
@@ -414,9 +426,28 @@ SspModel::ChannelReturn SspModel::massiveReturn(std::size_t channel, double age_
   if (!(age_end > age_begin)) return result;
   const ChannelReturn end = cumulativeMassiveReturn(channel, age_end, birth_x);
   const ChannelReturn begin = cumulativeMassiveReturn(channel, age_begin, birth_x);
-  result.mass_fraction = std::max(end.mass_fraction - begin.mass_fraction, 0.0);
+  // The exact cumulative return is non-decreasing in age for the total and
+  // for every element (pointwise non-negative gross ejecta over a growing
+  // mass range). The fixed-node quadrature with an age-dependent lower limit
+  // can still produce a tiny negative difference (round-off, or table kinks
+  // between nodes). Part 2.5: such a difference is clamped to zero AND
+  // counted, and the returned mass is then re-derived as the sum of the
+  // clamped element returns so element closure (sum_e element = mass) is
+  // preserved; previously mass and elements were clamped independently and
+  // silently. Without a negative difference the result is unchanged.
+  bool nonmonotone = end.mass_fraction < begin.mass_fraction;
+  double element_sum = 0.0;
   for (std::size_t e = 0; e < k_chemical_element_count; ++e) {
-    result.element_fraction[e] = std::max(end.element_fraction[e] - begin.element_fraction[e], 0.0);
+    const double d = end.element_fraction[e] - begin.element_fraction[e];
+    nonmonotone = nonmonotone || d < 0.0;
+    result.element_fraction[e] = std::max(d, 0.0);
+    element_sum += result.element_fraction[e];
+  }
+  if (nonmonotone) {
+    ++nonmonotone_return_clamps;
+    result.mass_fraction = element_sum;
+  } else {
+    result.mass_fraction = end.mass_fraction - begin.mass_fraction;
   }
   return result;
 }

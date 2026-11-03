@@ -121,6 +121,9 @@ class SspModel {
   std::uint64_t mutable table_clamps = 0;
   std::uint64_t mutable negative_ejecta_clamps = 0;
   double mutable untracked_mass_residual_msun = 0.0;
+  // massiveReturn calls in which a quadrature difference was negative and
+  // clamped (Part 2.5; mass then re-derived from the clamped elements).
+  std::uint64_t mutable nonmonotone_return_clamps = 0;
 
  private:
   [[nodiscard]] double phi(double m) const;  // dN/dm normalized

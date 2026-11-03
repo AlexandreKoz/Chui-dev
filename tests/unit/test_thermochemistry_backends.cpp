@@ -18,7 +18,16 @@
 //    kRetryShorterInterval with completed < requested, never success;
 //  * UVB table: log interpolation, zero above z_max; Rahmati factor limits;
 //  * metal table: provenance mandatory, H/He columns refused, asinh-space
-//    interpolation is sign safe, out-of-range temperature refused.
+//    interpolation is sign safe, out-of-range temperature refused;
+//  * Part 2.5: WSS09 eq. 4 abundance scaling relative to HYDROGEN
+//    ((X_e/X_H)/(X_e,ref/X_H,ref)); uv_background and
+//    reference_hydrogen_mass_fraction mandatory; UVB mismatch refused unless
+//    explicitly accepted;
+//  * Part 2.5 interpolation safety: a SINGLETON axis (T, n_H or z) covers
+//    only its own coordinate (tolerance 1e-8 x max(1,|value|)). A
+//    one-redshift (z = 0) table evaluated at z = 3 is REFUSED under kReject
+//    and clamped + reported under kClampDensityAndRedshift; temperature is
+//    never clamped.
 #include <cassert>
 #include <cmath>
 #include <stdexcept>
@@ -217,9 +226,11 @@ void testUvBackgroundTableAndShielding() {
 
 std::string tinyMetalTable(bool with_h) {
   std::string t = "# chui_metal_cooling_table_v1\n# citation = unit-test fixture (not astrophysical data)\n"
-                  "# license = CC0 test fixture\n# solar_reference = Asplund et al. 2009\n";
+                  "# license = CC0 test fixture\n# solar_reference = Asplund et al. 2009\n"
+                  "# uv_background = none\n";
   t += with_h ? "elements H O\n" : "elements C O\n";
-  t += "log10_T 4 5\nlog10_nH -2 0\nredshift 0\nreference_mass_fraction 2.4e-3 5.8e-3\n";
+  t += "log10_T 4 5\nlog10_nH -2 0\nredshift 0\nreference_mass_fraction 2.4e-3 5.8e-3\n"
+       "reference_hydrogen_mass_fraction 0.7065\n";
   t += with_h ? "lambda H 1e-22 1e-22 1e-22 1e-22\n" : "lambda C 1e-23 1e-23 -1e-24 -1e-24\n";
   t += "lambda O 1e-22 1e-22 1e-21 1e-21\n";
   return t;
@@ -230,10 +241,27 @@ void testMetalTable() {
   MetalCoolingTable::Query q;
   q.temperature_k = std::pow(10.0, 4.5);
   q.hydrogen_number_density_cm3 = 0.1;
+  q.gas_mass_fraction[0] = 0.7065;
   q.gas_mass_fraction[2] = 2.4e-3;
   q.gas_mass_fraction[4] = 5.8e-3;
   const auto r = table.evaluate(q, MetalTableRangePolicy::kReject);
   assert(std::isfinite(r.net_cooling_erg_cm3_s));
+  {
+    // At exactly the reference abundances the result is the table value
+    // times n_H^2. At log T = 4.5, mid n_H column interpolation in asinh
+    // space: evaluate the reference from the same table points.
+    MetalCoolingTable::Query q_ref = q;
+    q_ref.temperature_k = 1.0e4;
+    q_ref.hydrogen_number_density_cm3 = 1.0e-2;  // grid corner: C = 1e-23, O = 1e-22
+    const auto corner = table.evaluate(q_ref, MetalTableRangePolicy::kReject);
+    assert(std::abs(corner.net_cooling_erg_cm3_s - (1.0e-23 + 1.0e-22) * 1.0e-4) <= 1.0e-12 * 1.1e-26);
+    // WSS09 eq. 4: halving X_H at fixed X_e and n_H doubles [e/H] => doubles
+    // the metal term. (The pre-Part-2.5 scaling X_e/X_e,ref left it fixed.)
+    q_ref.gas_mass_fraction[0] = 0.5 * 0.7065;
+    const auto doubled = table.evaluate(q_ref, MetalTableRangePolicy::kReject);
+    assert(std::abs(doubled.net_cooling_erg_cm3_s - 2.0 * corner.net_cooling_erg_cm3_s) <=
+           1.0e-12 * std::abs(corner.net_cooling_erg_cm3_s));
+  }
   // Depletion halves O and C => cooling halves (linear abundance scaling).
   q.gas_mass_fraction[2] *= 0.5;
   q.gas_mass_fraction[4] *= 0.5;
@@ -249,12 +277,127 @@ void testMetalTable() {
   try { (void)MetalCoolingTable::loadFromString(tinyMetalTable(true), "fixture"); }
   catch (const SourceModelUnavailableError&) { threw = true; }
   assert(threw);
+  for (const std::string& drop : {std::string("# uv_background = none\n"),
+                                  std::string("reference_hydrogen_mass_fraction 0.7065\n")}) {
+    std::string missing = tinyMetalTable(false);
+    missing.erase(missing.find(drop), drop.size());
+    threw = false;
+    try { (void)MetalCoolingTable::loadFromString(missing, "fixture"); }
+    catch (const SourceModelUnavailableError&) { threw = true; }
+    assert(threw);
+  }
   std::string no_citation = tinyMetalTable(false);
   no_citation.erase(no_citation.find("# citation"), no_citation.find("# license") - no_citation.find("# citation"));
   threw = false;
   try { (void)MetalCoolingTable::loadFromString(no_citation, "fixture"); }
   catch (const SourceModelUnavailableError&) { threw = true; }
   assert(threw);
+}
+
+// Fixture with configurable axes; every lambda value is 1e-22 (C only).
+std::string axisMetalTable(const std::string& log_t, std::size_t nt, const std::string& log_n, std::size_t nn,
+                           const std::string& z, std::size_t nz) {
+  std::string t = "# chui_metal_cooling_table_v1\n# citation = unit-test fixture (not astrophysical data)\n"
+                  "# license = CC0 test fixture\n# solar_reference = fixture\n# uv_background = none\n"
+                  "elements C\nlog10_T " + log_t + "\nlog10_nH " + log_n + "\nredshift " + z +
+                  "\nreference_mass_fraction 2.4e-3\nreference_hydrogen_mass_fraction 0.7065\nlambda C";
+  for (std::size_t i = 0; i < nt * nn * nz; ++i) t += " 1e-22";
+  return t + "\n";
+}
+
+bool metalRejects(const MetalCoolingTable& table, const MetalCoolingTable::Query& q, MetalTableRangePolicy policy) {
+  try { (void)table.evaluate(q, policy); } catch (const SourceModelUnavailableError&) { return true; }
+  return false;
+}
+
+void testMetalTableSingletonAxes() {
+  MetalCoolingTable::Query q;
+  q.temperature_k = std::pow(10.0, 4.5);
+  q.hydrogen_number_density_cm3 = 0.1;
+  q.gas_mass_fraction[0] = 0.7065;
+  q.gas_mass_fraction[2] = 2.4e-3;
+  const double expected = 1.0e-22 * 0.1 * 0.1;
+  {
+    // One-redshift table (as converted from WSS09 z_0.000.hdf5 alone).
+    const auto table = MetalCoolingTable::loadFromString(axisMetalTable("4 5", 2, "-2 0", 2, "0", 1), "z0");
+    q.redshift = 0.0;
+    auto r = table.evaluate(q, MetalTableRangePolicy::kReject);
+    assert(!r.clamped && std::abs(r.net_cooling_erg_cm3_s - expected) <= 1.0e-12 * expected);
+    q.redshift = 1.0e-12;  // round-off of 1/a - 1 at a = 1: inside tolerance, not a clamp
+    r = table.evaluate(q, MetalTableRangePolicy::kReject);
+    assert(!r.clamped);
+    q.redshift = 3.0;  // the regression: z = 0 rates must not be used at z = 3
+    assert(metalRejects(table, q, MetalTableRangePolicy::kReject));
+    r = table.evaluate(q, MetalTableRangePolicy::kClampDensityAndRedshift);
+    assert(r.clamped);  // explicit clamping is allowed but always reported
+    assert(std::abs(r.net_cooling_erg_cm3_s - expected) <= 1.0e-12 * expected);  // values unchanged
+    q.redshift = 1.0e-6;  // beyond tolerance: a genuine (small) offset is still out of range
+    assert(metalRejects(table, q, MetalTableRangePolicy::kReject));
+    q.redshift = 0.0;
+  }
+  {
+    // One-density table.
+    const auto table = MetalCoolingTable::loadFromString(axisMetalTable("4 5", 2, "-1", 1, "0 1", 2), "n1");
+    assert(!table.evaluate(q, MetalTableRangePolicy::kReject).clamped);  // n_H = 0.1 matches
+    q.hydrogen_number_density_cm3 = 1.0;
+    assert(metalRejects(table, q, MetalTableRangePolicy::kReject));
+    assert(table.evaluate(q, MetalTableRangePolicy::kClampDensityAndRedshift).clamped);
+    q.hydrogen_number_density_cm3 = 0.1;
+  }
+  {
+    // One-temperature table: temperature is NEVER clamped, under any policy.
+    const auto table = MetalCoolingTable::loadFromString(axisMetalTable("4", 1, "-2 0", 2, "0 1", 2), "t1");
+    q.temperature_k = 1.0e4;
+    assert(!table.evaluate(q, MetalTableRangePolicy::kReject).clamped);
+    q.temperature_k = 2.0e4;
+    assert(metalRejects(table, q, MetalTableRangePolicy::kReject));
+    assert(metalRejects(table, q, MetalTableRangePolicy::kClampDensityAndRedshift));
+  }
+  {
+    // Multi-point axes: an edge query within round-off is on the grid; a
+    // real overshoot is refused (reject) or clamped and reported.
+    const auto table = MetalCoolingTable::loadFromString(axisMetalTable("4 5", 2, "-2 0", 2, "0 1", 2), "multi");
+    q.temperature_k = 1.0e4;
+    q.hydrogen_number_density_cm3 = 1.0 * (1.0 + 1.0e-14);
+    q.redshift = 1.0 + 1.0e-12;
+    assert(!table.evaluate(q, MetalTableRangePolicy::kReject).clamped);
+    q.redshift = 1.5;
+    assert(metalRejects(table, q, MetalTableRangePolicy::kReject));
+    assert(table.evaluate(q, MetalTableRangePolicy::kClampDensityAndRedshift).clamped);
+    q.temperature_k = 1.0e5 * 1.001;
+    assert(metalRejects(table, q, MetalTableRangePolicy::kClampDensityAndRedshift));
+  }
+}
+
+void testMetalTableUvBackgroundPolicy() {
+  // Collisional table ("none") is compatible only with no CHUI UVB.
+  const auto collisional = MetalCoolingTable::loadFromString(tinyMetalTable(false), "fixture");
+  assert(collisional.checkUvBackgroundCompatibility("", false).compatible);
+  bool threw = false;
+  try { (void)collisional.checkUvBackgroundCompatibility("abc123", false); }
+  catch (const SourceModelUnavailableError&) { threw = true; }
+  assert(threw);
+  // Photoionized table (WSS09-like, HM01) against a FG20 TREECOOL: refused
+  // by default, accepted only explicitly (and flagged).
+  std::string hm01 = tinyMetalTable(false);
+  hm01.replace(hm01.find("# uv_background = none"), std::string("# uv_background = none").size(),
+               "# uv_background = HM01+CMB (Haardt & Madau 2001), CLOUDY 07.02");
+  const auto photo = MetalCoolingTable::loadFromString(hm01, "fixture");
+  threw = false;
+  try { (void)photo.checkUvBackgroundCompatibility("fg20sha", false); }
+  catch (const SourceModelUnavailableError&) { threw = true; }
+  assert(threw);
+  threw = false;
+  try { (void)photo.checkUvBackgroundCompatibility("", false); }  // photoionized table, CHUI without UVB
+  catch (const SourceModelUnavailableError&) { threw = true; }
+  assert(threw);
+  const auto accepted = photo.checkUvBackgroundCompatibility("fg20sha", true);
+  assert(!accepted.compatible && accepted.accepted_mismatch && !accepted.diagnostic.empty());
+  // Exact TREECOOL identity declared by the table => compatible.
+  std::string matched = hm01;
+  matched.insert(matched.find("elements"), "# uv_background_treecool_sha256 = fg20sha\n");
+  const auto same = MetalCoolingTable::loadFromString(matched, "fixture");
+  assert(same.checkUvBackgroundCompatibility("fg20sha", false).compatible);
 }
 
 void testUnqualifiedRatesRefusedByDefault() {
@@ -297,6 +440,8 @@ int main() {
   testNetworkF2Rejection();
   testUvBackgroundTableAndShielding();
   testMetalTable();
+  testMetalTableUvBackgroundPolicy();
+  testMetalTableSingletonAxes();
   testMissingTableRefusesModel();
   testUnqualifiedRatesRefusedByDefault();
   return 0;

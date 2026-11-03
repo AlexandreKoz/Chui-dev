@@ -1694,6 +1694,7 @@ class SourceRuntimeImpl final : public SourceRuntime {
                       {"accepted_substeps", std::to_string(l.accepted_substeps)},
                       {"rejected_substeps", std::to_string(l.rejected_substeps)},
                       {"newton_iterations", std::to_string(l.newton_iterations)},
+                      {"metal_table_clamps", std::to_string(l.metal_table_clamps)},
                       {"max_error_estimate", std::to_string(l.max_error_estimate)},
                       {"element_projection_residual", std::to_string(l.element_mass_residual_code)},
                       {"charge_residual", std::to_string(l.charge_residual)}}});
@@ -1778,6 +1779,7 @@ class SourceRuntimeImpl final : public SourceRuntime {
     const std::uint64_t yield_clamps_before = m_ssp_model->table_clamps;
     const std::uint64_t negative_clamps_before = m_ssp_model->negative_ejecta_clamps;
     const double untracked_residual_before = m_ssp_model->untracked_mass_residual_msun;
+    const std::uint64_t nonmonotone_before = m_ssp_model->nonmonotone_return_clamps;
     (void)transaction.prepare([&] {
       for (const std::uint32_t s : star_rows) {
         const std::uint32_t p = state.star_particles.particle_index[s];
@@ -1903,6 +1905,7 @@ class SourceRuntimeImpl final : public SourceRuntime {
       m_ssp_model->table_clamps = yield_clamps_before;
       m_ssp_model->negative_ejecta_clamps = negative_clamps_before;
       m_ssp_model->untracked_mass_residual_msun = untracked_residual_before;
+      m_ssp_model->nonmonotone_return_clamps = nonmonotone_before;
       throw core::StageTransactionRejected(transaction.outcome().rejection,
           "stellar population stage rejected: " + transaction.outcome().reason);
     }
@@ -1972,7 +1975,8 @@ class SourceRuntimeImpl final : public SourceRuntime {
                       {"unresolved_cells", std::to_string(l.unresolved_cells)},
                       {"dust_injected_code", std::to_string(l.dust_injected_code)},
                       {"dust_destroyed_code", std::to_string(l.dust_destroyed_code)},
-                      {"yield_table_clamps", std::to_string(m_ssp_model->table_clamps)}}});
+                      {"yield_table_clamps", std::to_string(m_ssp_model->table_clamps)},
+                      {"ssp_nonmonotone_return_clamps", std::to_string(m_ssp_model->nonmonotone_return_clamps)}}});
     }
   }
 

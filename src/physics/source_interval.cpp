@@ -37,6 +37,7 @@ SourceLedger& SourceLedger::operator+=(const SourceLedger& rhs) {
   rejected_substeps += rhs.rejected_substeps;
   newton_iterations += rhs.newton_iterations;
   floor_activations += rhs.floor_activations;
+  metal_table_clamps += rhs.metal_table_clamps;
   max_error_estimate = std::max(max_error_estimate, rhs.max_error_estimate);
   max_newton_residual = std::max(max_newton_residual, rhs.max_newton_residual);
   return *this;

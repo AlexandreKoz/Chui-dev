@@ -773,7 +773,7 @@ Record: `docs/repair/chui_part2_thermochemistry_stellar_physics_20261103.md`.
 | ID | Status | Remaining acceptance |
 |---|---|---|
 | CHUI-P2-BUILD | Source written, never compiled | Human build + the Part 2 unit tests listed in the record §11. |
-| CHUI-P2-RATES | UNQUALIFIED (arxiv.org blocked during the corrective gate); backends gated behind `thermochemistry_allow_unqualified_rates` | Owner verifies each rate per `docs/chemistry_rate_provenance.md`; R16 to be re-derived. |
-| CHUI-P2-DATA | BLOCKED BY DATA | Owner-supplied TREECOOL, element metal-cooling table, SSP yield table with licenses. |
+| CHUI-P2-RATES | Part 2.5: provenance checked against the literature. Primary: R01–R12, R14, R16 (restored from GA08), R19, plus KWH96/Wolfire/GP98 cooling. Secondary: R13, R15, R17, R20, R21, H₂ LTE and fine structure. Unverified: R18 and the 0.4 eV photodissociation heat. Corrections: b5, φ_PAH, the Cen term, O I ΔE. Backends are still gated behind `thermochemistry_allow_unqualified_rates`. | User-reserved: run `unit_chemistry_rate_references` and the one-zone validations in `docs/chemistry_rate_provenance.md` §6. Verify R18 against Jura 1975. Owner decision on the equilibrium gate. |
+| CHUI-P2-DATA | BLOCKED BY DATA (converters written, NOT RUN) | Sources, checksums and licences are in `tools/chui_data/data_sources.md`. The FG20 TREECOOL and WSS09 have no licence statement, so they are not committed. NuGrid yields are BSD-3 and need tolerance ≈ 0.02. WSS09 (HM01) with FG20 is a declared UVB mismatch, refused unless accepted explicitly. A Ploeckinger & Schaye 2020 converter is blocked. |
 | CHUI-P2-TOPOLOGY | Fail closed | Part 3: distributed composition ghosts/reflux, regrid composition transfer, remote feedback deposition. |
 | CHUI-P2-GAPS | Open | Element-resolved diffusion (refused by config), science-snapshot export of composition/dust/species/stellar records (not implemented), benchmarks; associations refused. |

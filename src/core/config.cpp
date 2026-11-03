@@ -1594,6 +1594,7 @@ struct ConfigKeySpec {
       {"physics.uv_background_table_sha256", ""},
       {"physics.metal_cooling_table_path", ""},
       {"physics.metal_cooling_table_sha256", ""},
+      {"physics.metal_cooling_accept_uv_background_mismatch", "false"},
       {"physics.ssp_yield_table_path", ""},
       {"physics.ssp_yield_table_sha256", ""},
       {"physics.chemistry_metallicity_scaled_dust_proxy", "false"},
@@ -1762,6 +1763,13 @@ void validatePart2BaryonicPhysics(const SimulationConfig& config) {
       p.metal_cooling_table_path.empty()) {
     throw ConfigError("element-table metal cooling requires physics.metal_cooling_table_path (no table is bundled)");
   }
+  if (p.metal_cooling_accept_uv_background_mismatch &&
+      p.metal_cooling_mode != MetalCoolingModeConfig::kElementTable &&
+      p.metal_cooling_mode != MetalCoolingModeConfig::kElementTableAndFineStructure) {
+    throw ConfigError(
+        "physics.metal_cooling_accept_uv_background_mismatch = true has no effect without an element-table "
+        "metal_cooling_mode (no-op options are refused)");
+  }
   if (p.chemistry_adaptive_selection == ChemistryAdaptiveSelectionConfig::kLocalV1 &&
       p.thermochemistry_backend != ThermochemistryBackendMode::kFixedDetailed) {
     throw ConfigError(
@@ -1839,6 +1847,26 @@ void validatePart2BaryonicPhysics(const SimulationConfig& config) {
       p.ssp_yield_table_path.empty()) {
     throw ConfigError("stellar_population_model=chabrier_yield_table_v1 requires physics.ssp_yield_table_path (no yields are bundled)");
   }
+  // Part 2.5 reproducibility repair: an external physics data file is bound
+  // to the run by its SHA-256. Without a configured checksum the normalized
+  // config (and therefore the config hash and restart identity) records only
+  // the path, so a replaced file at the same path would silently change the
+  // physics across a restart. Every configured data path therefore requires
+  // its 64-hex-digit lower-case SHA-256 (verified against the file at load).
+  const auto require_checksum = [](const std::string& path, const std::string& sha, const char* key) {
+    if (path.empty()) return;
+    const bool valid = sha.size() == 64U && std::all_of(sha.begin(), sha.end(), [](char c) {
+      return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+    });
+    if (!valid) {
+      throw ConfigError(std::string("physics.") + key + "_path is set, so physics." + key +
+                        "_sha256 must hold the file's 64-digit lower-case SHA-256 (data files are bound to the run "
+                        "by checksum; tools/chui_data/validate_treecool.py and the converters print it)");
+    }
+  };
+  require_checksum(p.uv_background_table_path, p.uv_background_table_sha256, "uv_background_table");
+  require_checksum(p.metal_cooling_table_path, p.metal_cooling_table_sha256, "metal_cooling_table");
+  require_checksum(p.ssp_yield_table_path, p.ssp_yield_table_sha256, "ssp_yield_table");
   if (p.stellar_population_model != StellarPopulationModelConfig::kLegacyTable && p.enable_feedback &&
       p.fb_supernova_model != SupernovaFeedbackModelConfig::kMechanicalResolvedUnresolved) {
     throw ConfigError(
@@ -3180,6 +3208,8 @@ class NormalizedConfigStream {
   stream << "uv_background_table_sha256 = " << frozen.config.physics.uv_background_table_sha256 << '\n';
   stream << "metal_cooling_table_path = " << frozen.config.physics.metal_cooling_table_path << '\n';
   stream << "metal_cooling_table_sha256 = " << frozen.config.physics.metal_cooling_table_sha256 << '\n';
+  stream << "metal_cooling_accept_uv_background_mismatch = "
+         << (frozen.config.physics.metal_cooling_accept_uv_background_mismatch ? "true" : "false") << '\n';
   stream << "ssp_yield_table_path = " << frozen.config.physics.ssp_yield_table_path << '\n';
   stream << "ssp_yield_table_sha256 = " << frozen.config.physics.ssp_yield_table_sha256 << '\n';
   stream << "chemistry_metallicity_scaled_dust_proxy = " << (frozen.config.physics.chemistry_metallicity_scaled_dust_proxy ? "true" : "false") << '\n';
@@ -4233,6 +4263,9 @@ class NormalizedConfigStream {
   frozen.config.physics.uv_background_table_sha256 = requireString(entries, consumed, "physics.uv_background_table_sha256", "");
   frozen.config.physics.metal_cooling_table_path = requireString(entries, consumed, "physics.metal_cooling_table_path", "");
   frozen.config.physics.metal_cooling_table_sha256 = requireString(entries, consumed, "physics.metal_cooling_table_sha256", "");
+  frozen.config.physics.metal_cooling_accept_uv_background_mismatch = parseBool(
+      requireString(entries, consumed, "physics.metal_cooling_accept_uv_background_mismatch", "false"),
+      "physics.metal_cooling_accept_uv_background_mismatch");
   frozen.config.physics.ssp_yield_table_path = requireString(entries, consumed, "physics.ssp_yield_table_path", "");
   frozen.config.physics.ssp_yield_table_sha256 = requireString(entries, consumed, "physics.ssp_yield_table_sha256", "");
   frozen.config.physics.chemistry_metallicity_scaled_dust_proxy = parseBool(

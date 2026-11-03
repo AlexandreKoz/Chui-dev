@@ -9,14 +9,23 @@
 //  * returned mass never exceeds formed mass; AGB+CC return over a Hubble
 //    time is O(0.3-0.45) of the formed mass for this IMF/IFMR;
 //  * Ia cumulative number reaches N_Ia at t_max and is zero before t_min;
+//  * step subdivision (Part 2.5 review): the additivity check is only
+//    meaningful if NO non-monotone clamp fired (massiveReturn clamps a
+//    negative quadrature difference element-wise); the test asserts the
+//    clamp counter stayed zero, that every sub-interval keeps element
+//    closure, and that the cumulative return is non-decreasing for the
+//    total and every element on a fine age grid;
+//  * singleton yield-table axes report clamping when queried off-grid;
 //  * event chronology is invariant under step subdivision and restart
 //    (same thresholds => same realized ordinals);
 //  * mechanical feedback: mass, every element, and vector momentum (lab
 //    frame: m_ej v_star) conserved exactly; injected kinetic + thermal energy
 //    equals the budget; asymmetric stencil still has zero net star-frame
 //    momentum; unresolved cells use the KO15 terminal momentum.
+#include <algorithm>
 #include <cassert>
 #include <cmath>
+#include <cstdint>
 #include <limits>
 #include <optional>
 #include <string>
@@ -57,11 +66,40 @@ void testSspBudgets() {
   assert(ssp.iaCumulativeNumber(1.0e7) == 0.0);
   assert(std::abs(ssp.iaCumulativeNumber(2.0e10) - 1.3e-3) < 1.0e-12);
   // Subdivision: integral over [0,t1] + [t1,t2] equals [0,t2].
+  const std::uint64_t clamps_before = ssp.nonmonotone_return_clamps;
   const auto a = ssp.massiveReturn(1, 0.0, 1.0e7, x);
   const auto b = ssp.massiveReturn(1, 1.0e7, 4.0e7, x);
   const auto c = ssp.massiveReturn(1, 0.0, 4.0e7, x);
+  // Telescoping holds only when no difference was clamped; otherwise the
+  // equality below could pass or fail for the wrong reason.
+  assert(ssp.nonmonotone_return_clamps == clamps_before);
+  assert(c.mass_fraction > 0.0 && a.mass_fraction >= 0.0 && b.mass_fraction > 0.0);
   // Exactly additive (cumulative-difference construction), up to round-off.
   assert(std::abs(a.mass_fraction + b.mass_fraction - c.mass_fraction) < 1.0e-12 * c.mass_fraction);
+  for (const auto* part : {&a, &b, &c}) {
+    double sum = 0.0;
+    for (std::size_t e = 0; e < x.size(); ++e) sum += part->element_fraction[e];
+    assert(std::abs(sum - part->mass_fraction) <= 1.0e-12 * std::max(part->mass_fraction, 1.0e-300));
+  }
+  for (std::size_t e = 0; e < x.size(); ++e) {
+    assert(std::abs(a.element_fraction[e] + b.element_fraction[e] - c.element_fraction[e]) <=
+           1.0e-12 * std::max(c.mass_fraction, 1.0e-300));
+  }
+  // Monotonicity of the cumulative return on a fine log-age grid (both
+  // channels, total and per element): the exact function is
+  // non-decreasing; allow only double round-off of the running sum.
+  for (std::size_t channel = 0; channel < 2; ++channel) {
+    physics::SspModel::ChannelReturn previous{};
+    for (int k = 0; k <= 400; ++k) {
+      const double age = std::pow(10.0, 6.0 + 4.15 * k / 400.0);
+      const auto cum = ssp.cumulativeMassiveReturn(channel, age, x);
+      assert(cum.mass_fraction >= previous.mass_fraction - 1.0e-14);
+      for (std::size_t e = 0; e < x.size(); ++e) {
+        assert(cum.element_fraction[e] >= previous.element_fraction[e] - 1.0e-14);
+      }
+      previous = cum;
+    }
+  }
 }
 
 void testEventReplayIsSubdivisionAndRestartInvariant() {
@@ -170,6 +208,16 @@ void testYieldTableIsNeverRebalanced() {
   const auto row = table.massive(0, 3.0, 0.02, clamped);
   assert(std::abs(row.net_yield_msun[0] + 0.08) < 1.0e-15);
   assert(table.max_net_yield_residual < 1.0e-12);
+  // Part 2.5: the fixture has ONE metallicity (0.02). On-grid queries are
+  // not clamps; off-grid metallicities use that row and are REPORTED.
+  assert(!clamped);
+  bool off_grid = false;
+  (void)table.massive(0, 3.0, 0.001, off_grid);
+  assert(off_grid);
+  bool ia_on = false, ia_off = false;
+  (void)table.snia(0.02, ia_on);
+  (void)table.snia(0.001, ia_off);
+  assert(!ia_on && ia_off);
   // Unbalanced by 0.08 / 2.0 = 4% > tolerance: refused, never moved into H.
   bool threw = false;
   try { (void)physics::SspYieldTable::loadFromString(yieldTable(0.0), "fixture"); }

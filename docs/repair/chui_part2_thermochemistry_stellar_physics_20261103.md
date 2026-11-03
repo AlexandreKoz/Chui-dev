@@ -17,6 +17,253 @@ only) · REFERENCE ONLY · EXPERIMENTAL/UNQUALIFIED · BLOCKED BY DATA/TOPOLOGY 
 NOT RUN — USER-RESERVED.
 
 
+## P2.5 Scientific provenance and physics-data qualification (2026-11-03, from `ed18d36`)
+
+**Still SOURCE ONLY.** Nothing was configured, compiled, built, tested,
+benchmarked or simulated. Every test is **NOT RUN — USER-RESERVED**.
+Production qualification is **not** declared.
+
+The literature was read from arXiv in this pass, so the corrective-gate
+statement that no coefficient could be verified (§0.3) is superseded.
+Section §0.3 is retained for history.
+
+### P2.5.1 Rates
+
+Full record: `docs/chemistry_rate_provenance.md`.
+
+- **Primary-verified:**
+  - R01–R06: KWH96 Table 2.
+  - R07–R09: TREECOOL contract plus Rahmati 2013 eqs. 13–14.
+  - R10–R12, R14: GP98 Table 1.
+  - R16: GA08 reaction 9.
+  - R19: GML07 eqs. 32/34 and DB96 eq. 37.
+  - Cooling: KWH96 Table 1 and eq. 23; Wolfire 2003 eqs. 23–24; GP98 A5–A7.
+  - Compton: derived from constants.
+- **Secondary-verified** (primary inaccessible, reproduced by a compilation):
+  - R13, R15, R17 via Abel et al. 1997.
+  - R20, R21 via Glover & Clark 2012.
+  - HM79 H₂ LTE and HM89 fine structure via KROME.
+- **Unverified:** R18 (Jura 1975) and the 0.4 eV H₂ photodissociation heat.
+- **Corrections:**
+  - R16 restored from GA08.
+  - H₂ self-shielding b5 fixed; it was 10× too small.
+  - φ_PAH = 0.5 added to photoelectric heating.
+  - The Cen 1992 He 2³S term, which is not in KWH96, was removed.
+  - O I ΔE set to 227.7 K.
+  - R12's 3.2e4 K cap is now documented as GP98's published validity limit.
+- **Case A vs case B.** The KWH96 fit is case-A-like. Case B is not
+  implemented. Ferland 1992 cross-check functions were added.
+- **Gate.** The gate is retained for all three backends. The hybrid and
+  detailed manifests are not `qualified()`. For the equilibrium backend,
+  provenance is complete but validation is user-reserved.
+
+### P2.5.2 Public interface changes (migration notes)
+
+- `include/cosmosim/physics/chemical_network.hpp`:
+  - New `RateVerification::kVerifiedAgainstSecondarySource`, plus
+    `rateVerificationQualifies` and `rateVerificationLabel`.
+  - **`NetworkManifest::cooling_verification` was removed** and replaced by
+    `std::vector<CoolingChannelRecord> cooling_records`. `qualified()` is
+    false when the record list is empty.
+  - New `equilibriumPrimordialManifest()`.
+  - `RateEnvironment::helium_nuclei_cm3`.
+  - New rate functions: `recombinationHIICaseA/BFerland1992`,
+    `collisionalDissociationH2ByH*`, `h2DissociationCriticalDensity` and
+    `h2ThermalDopplerB5`.
+  - `k_wolfire2003_phi_pah`.
+  - Migration: callers of `cooling_verification` iterate `cooling_records`.
+- `include/cosmosim/physics/metal_cooling_table.hpp`:
+  - `MetalCoolingTableProvenance::{uv_background, uv_background_treecool_sha256}`.
+  - `UvBackgroundCompatibility`, `checkUvBackgroundCompatibility()` and
+    `referenceHydrogenMassFraction()`.
+  - The `chui_metal_cooling_table_v1` **input** format now *requires*
+    `# uv_background = ...` and a `reference_hydrogen_mass_fraction` block.
+    Older tables are refused loudly; regenerate them with
+    `tools/chui_data/convert_wss09_metal_cooling.py`. No production table
+    existed before this pass.
+- `include/cosmosim/physics/baryonic_runtime_config.hpp`: new
+  `BaryonicDataProducts::uv_background_compatibility`.
+- `include/cosmosim/core/config.hpp`: new
+  `PhysicsConfig::metal_cooling_accept_uv_background_mismatch`.
+
+### P2.5.3 Consistency audit (§C)
+
+Confirmed defects, each fixed with a regression test:
+
+1. **Metal-table abundance scaling.** It used X_e/X_e,ref, while WSS09 eq. 4
+   defines the scaling relative to hydrogen. Now
+   (X_e/X_H)/(X_e,ref/X_H,ref). Test: `unit_thermochemistry_backends` in
+   `testMetalTable`.
+2. **Undeclared UVB in metal tables.** WSS09/HM01 against an FG20 TREECOOL
+   could mix silently. A declared UVB is now required, and a mismatch is
+   refused unless `metal_cooling_accept_uv_background_mismatch = true`.
+   Tests: `testMetalTableUvBackgroundPolicy` and
+   `testUvBackgroundMismatchKeyRoundTrip`.
+3. **Data files not bound to the run.** A `*_table_path` without a checksum
+   recorded only the path in the config hash, so a replaced file could
+   change a restarted run silently. Every configured data path now requires
+   its 64-hex SHA-256, which is verified at load. Test:
+   `unit_config_part2_baryonic_physics`.
+4. **Rate defects in §P2.5.1** (R16, b5, φ_PAH, Cen term, O I ΔE). Test:
+   `unit_chemistry_rate_references`.
+
+Checked and found consistent (no change):
+
+- **Comoving to physical.** Density is multiplied by a⁻³ at the evaluation
+  epoch, volume by a³ in the stager, and isolated modes use a = 1, z = 0.
+  Isolated runs therefore evaluate the TREECOOL and metal table at z = 0.
+- **Compton.** It is added in `primordial()` and removed exactly for
+  non-cosmological modes, with the sign handled.
+- **Mean molecular weight.** μ (amu units) is consistent between the
+  thermochemistry EOS (`particleDensity`: metals neutral, CO merges C+O)
+  and the ISM Jeans length (`k_amu_g`).
+  - Risk: the effective multiphase ISM uses its own configured μ with m_p
+    (a 0.7% unit difference). It does not consume the sidecar μ.
+- **Composition and dust.** Thermochemistry inputs use gas-phase element
+  lanes (dust held separately), consistent with the WSS09 scaling by
+  gas-phase abundances.
+- **Stellar mass return.** Table mode uses the table ejecta (M − M_final)
+  and net yields, and does not rebalance. Untracked mass stays in the star
+  as a diagnostic, and ejecta are re-capped at the star mass (corrective
+  gate).
+- **Effective vs resolved ISM.** Ownership is unchanged (regime decision
+  staged in `BaryonicSourceStage`). Element-table metal cooling is not
+  evaluated for effective-regime cells.
+
+Risk hypotheses (not confirmed defects):
+
+- The Rahmati factor uses σ̄ = 2.49e-18 (HM01, z = 3) for any UVB.
+- The same factor is applied to He rates.
+
+### P2.5.4 Configuration, restart and schema
+
+- **New key** `physics.metal_cooling_accept_uv_background_mismatch`
+  (default `false`).
+  - Typed bool, with a no-op refusal when no table mode is set.
+  - Included in the normalized dump and `part2PhysicsKeysAtDefaults`.
+  - A restart projection removes the line only at the default value.
+- **Reproducibility impact.**
+  - The normalized config text, and therefore the config hash, gains one
+    line.
+  - Part 2 checkpoints written before Part 2.5 restart only with the key
+    at its default.
+  - Configs that set a data path without a checksum are now refused.
+- **No snapshot or restart payload schema change.** The baryonic sidecars
+  are unchanged.
+
+### P2.5.5 Data products
+
+Recorded in `tools/chui_data/data_sources.md`. Nothing was committed.
+
+- **TREECOOL FG20.** Both files were obtained from a GitHub mirror; the
+  original host was unreachable. SHA-256 values are recorded. The columns
+  match the reader. No licence is stated.
+- **WSS09.**
+  - `z_0.000.hdf5` was obtained from the pyathena mirror; the original
+    tarballs returned 403.
+  - Its layout and sign convention were inspected.
+  - No licence is stated.
+- **NuPyCEE/NuGrid.**
+  - Licence: BSD-3.
+  - Gross isotope yields; Σ yields = M − M_final within 2.1e-4.
+  - The untracked net residual reaches 1.66% of the ejecta for massive
+    stars, so tolerance ≈ 0.02 must be declared explicitly.
+- **Tools** (written, NOT RUN):
+  - `validate_treecool.py`;
+  - `convert_wss09_metal_cooling.py` (streaming, bounded memory, never
+    converts `Metal_free`);
+  - `convert_nugrid_yields.py` (net = yield − X0·ejecta, refuses rather
+    than rebalances, explicit Ia untracked policy).
+- **Blocked:**
+  - a Ploeckinger & Schaye 2020 converter (element-resolved semantics and
+    shielding convention unspecified);
+  - an HM01 TREECOOL that would make WSS09 UVB-compatible (none verified).
+
+### P2.5.6 Tests (NOT RUN — USER-RESERVED)
+
+- New: `unit_chemistry_rate_references`
+  (`tests/unit/test_chemistry_rate_references.cpp`, registered in
+  `CMakeLists.txt`).
+- Extended:
+  - `unit_thermochemistry_backends`: metal H-normalization, mandatory
+    fields, UVB policy.
+  - `unit_config_part2_baryonic_physics`: new key round trip and no-op
+    refusal, checksum requirement.
+- Expected behavioural shifts in existing tests:
+  - Larger b5 means weaker H₂ self-shielding, so photodissociation is
+    stronger when G₀ > 0.
+  - R16 adds H₂ destruction in warm gas.
+  - φ_PAH lowers ψ, raising photoelectric heating efficiency at fixed n_e.
+  - Removing the Cen term changes HeII cooling slightly at high density.
+
+  Thresholds in `testDustCatalysedH2Formation` and
+  `testDetailedCarbonConservation` may need review on the first run. They
+  were not weakened.
+
+### P2.5.7 Compile and validation risks
+
+- New aggregate initializations go through `withStatus(...)`.
+- The `CoolingChannelRecord` vector literals.
+- `std::all_of` in the config checksum lambda.
+- These must compile on the first build.
+
+All remaining numerical validation is listed in
+`docs/chemistry_rate_provenance.md` §6.
+
+### P2.5.8 Interpolation-safety correction (after review of `618b276`)
+
+**Status: SOURCE ONLY.** Nothing was compiled or run; every test is NOT RUN
+— USER-RESERVED.
+
+- **Confirmed defect.** In `src/physics/metal_cooling_table.cpp`, `locate()`
+  accepted any query on a singleton axis. A table converted from WSS09
+  `z_0.000.hdf5` alone therefore supplied z = 0 rates at every redshift,
+  even under `kReject`.
+- **Fix.** A singleton axis now matches only its own coordinate.
+  - Tolerance is 1e-8 × max(1, |value|). This is at least 20× the %.9g
+    ASCII representation error and the double round-off of log10 T,
+    log10 n_H and 1/a − 1, and about 1e6× below a WSS09 grid step.
+  - A query on a multi-point axis that lies just past an end, but within
+    the same tolerance, is snapped onto the grid.
+  - Under `kReject`, out-of-range T, n_H and z throw.
+  - Under `kClampDensityAndRedshift`, n_H and z are clamped and
+    `Result::clamped` is set. T is never clamped.
+  - Clamps are now **reported**: `CoolingHeatingTerms::metal_table_clamped`
+    feeds `SourceLedger::metal_table_clamps`, counted once per accepted
+    substep and logged by the source stage.
+  - Table values are unchanged.
+- **Related helper.** `SspYieldTable::massive()` and `snia()` had the same
+  silent singleton behaviour. Off-grid queries now set the existing
+  `clamped` flag, counted as `table_clamps`. Interpolated values are
+  unchanged.
+- **Converter.** The WSS09 converter refuses one-redshift output unless
+  `--allow-single-redshift` is given, and it writes `redshift_coverage`.
+  The restriction is documented in `tools/chui_data/data_sources.md`.
+- **Step-subdivision review.**
+  - Findings:
+    - `massiveReturn` clamped a negative quadrature difference independently
+      for the mass and for each element, silently. That breaks element
+      closure and invalidates the additivity check whenever it fires.
+    - The cumulative return uses age-dependent quadrature nodes, so
+      monotonicity is numerical, not structural.
+  - Fix: a negative difference is still clamped to zero, but it is now
+    counted (`SspModel::nonmonotone_return_clamps`, restored on stage
+    rejection and logged). The mass is then re-derived as the sum of the
+    clamped elements. Results without a negative difference are unchanged.
+  - Test changes:
+    - The subdivision test now asserts that no such clamp fired.
+    - It checks per-interval element closure and element-wise additivity.
+    - It checks that the cumulative return is non-decreasing on a 401-point
+      log-age grid for both channels, for the total and for every element.
+    - A failure of that monotonicity check would be a genuine quadrature
+      finding. The tolerance must not be widened to hide it.
+- **Tests.**
+  - `unit_thermochemistry_backends`: `testMetalTableSingletonAxes`. It covers
+    z = 0 evaluated at z = 3 under reject, plus T, n_H and z singletons,
+    clamp reporting and edge snapping.
+  - `unit_stellar_population_feedback`: the extended subdivision test and
+    singleton yield-axis clamp reporting.
+
 ## 0. Corrective gate (2026-11-03, after independent review of `5625b20`)
 
 **Still SOURCE ONLY — nothing compiled or run; every check NOT RUN — USER-RESERVED.**

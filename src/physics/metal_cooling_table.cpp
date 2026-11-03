@@ -39,18 +39,38 @@ void requireIncreasing(const std::vector<double>& axis, const char* name, const 
   }
 }
 
-// Locate interval and weight along one axis (single-point axes allowed).
+// Coordinate-match tolerance for range checks (Part 2.5 interpolation
+// safety). Axis values are read from ASCII written with >= 9 significant
+// digits (convert_wss09_metal_cooling.py uses %.9g: relative representation
+// error <= 5e-10), and query coordinates are log10 T, log10 n_H (double
+// round-off ~1e-15 relative) or z = 1/a - 1 (round-off ~1e-15 (1+z)). An
+// absolute tolerance of 1e-8 x max(1, |axis value|) therefore exceeds every
+// representation/round-off error by >= 20x, while remaining 1e6 times
+// smaller than any physically meaningful offset (a WSS09 grid step is 0.02
+// dex in T, 0.1 dex in n_H, and >= 0.05 in z). A query within this tolerance
+// of a boundary is treated as ON the grid (snapped, not counted as a clamp).
+[[nodiscard]] double axisTolerance(double value) noexcept { return 1.0e-8 * std::max(1.0, std::abs(value)); }
+
+// Locate interval and weight along one axis. A SINGLETON axis is a single
+// tabulated coordinate, not a wildcard: a query that does not match it is out
+// of range exactly like a query beyond the ends of a longer axis (rejected,
+// or clamped and reported when clamping is allowed). Before Part 2.5 a
+// singleton axis accepted every query, so a table converted from WSS09
+// z_0.000.hdf5 alone silently supplied z = 0 rates at any redshift.
 [[nodiscard]] bool locate(const std::vector<double>& axis, double x, std::size_t& lo, double& w,
                           bool clamp_allowed, bool& clamped) {
+  if (!std::isfinite(x)) return false;
+  const double tol_lo = axisTolerance(axis.front());
+  const double tol_hi = axisTolerance(axis.back());
+  if (x < axis.front() - tol_lo || x > axis.back() + tol_hi) {
+    if (!clamp_allowed) return false;
+    clamped = true;
+  }
+  x = std::clamp(x, axis.front(), axis.back());  // snaps in-tolerance queries; clamps reported above
   if (axis.size() == 1U) {
     lo = 0U;
     w = 0.0;
     return true;
-  }
-  if (x < axis.front() || x > axis.back()) {
-    if (!clamp_allowed) return false;
-    clamped = true;
-    x = std::clamp(x, axis.front(), axis.back());
   }
   const auto upper = std::upper_bound(axis.begin(), axis.end(), x);
   std::size_t hi = static_cast<std::size_t>(std::distance(axis.begin(), upper));
@@ -102,6 +122,8 @@ MetalCoolingTable MetalCoolingTable::loadFromString(const std::string& text, con
         if (key == "citation") table.m_provenance.citation = value;
         if (key == "license") table.m_provenance.license = value;
         if (key == "solar_reference") table.m_provenance.solar_reference = value;
+        if (key == "uv_background") table.m_provenance.uv_background = value;
+        if (key == "uv_background_treecool_sha256") table.m_provenance.uv_background_treecool_sha256 = value;
       }
       continue;
     }
@@ -126,6 +148,13 @@ MetalCoolingTable MetalCoolingTable::loadFromString(const std::string& text, con
     else if (key == "log10_nH") table.m_log_n = values;
     else if (key == "redshift") table.m_redshift = values;
     else if (key == "reference_mass_fraction") table.m_reference_mass_fraction = values;
+    else if (key == "reference_hydrogen_mass_fraction") {
+      if (values.size() != 1U) {
+        throw SourceModelUnavailableError("metal cooling table '" + label +
+                                          "': reference_hydrogen_mass_fraction must hold exactly one value");
+      }
+      table.m_reference_hydrogen_mass_fraction = values[0];
+    }
     else if (key == "ne_over_nH") table.m_ne_over_nh = values;
     else if (key == "lambda") lambda_blocks[block_name] = values;
     else throw SourceModelUnavailableError("metal cooling table '" + label + "': unknown block '" + key + "'");
@@ -135,6 +164,18 @@ MetalCoolingTable MetalCoolingTable::loadFromString(const std::string& text, con
       table.m_provenance.solar_reference.empty()) {
     throw SourceModelUnavailableError("metal cooling table '" + label +
                                       "' must declare citation, license and solar_reference (provenance is mandatory)");
+  }
+  if (table.m_provenance.uv_background.empty()) {
+    throw SourceModelUnavailableError(
+        "metal cooling table '" + label +
+        "' must declare uv_background (the UV background embedded in the table, or 'none' for a collisional "
+        "table); required since Part 2.5 so that UVB mismatches cannot pass silently");
+  }
+  if (!(table.m_reference_hydrogen_mass_fraction > 0.0) || !(table.m_reference_hydrogen_mass_fraction < 1.0)) {
+    throw SourceModelUnavailableError(
+        "metal cooling table '" + label +
+        "' must declare reference_hydrogen_mass_fraction in (0, 1): WSS09 eq. 4 scales by abundances relative to "
+        "hydrogen, (X_e/X_H)/(X_e,ref/X_H,ref)");
   }
   requireIncreasing(table.m_log_t, "log10_T", label);
   requireIncreasing(table.m_log_n, "log10_nH", label);
@@ -224,13 +265,46 @@ MetalCoolingTable::Result MetalCoolingTable::evaluate(const Query& query, MetalT
     const double eq = std::sinh(interpolate(m_ne_over_nh, query.redshift, lt, ln, c, policy));
     if (eq > 0.0) electron_correction = query.electron_per_hydrogen / eq;
   }
+  const double x_h = query.gas_mass_fraction[static_cast<std::size_t>(ChemicalElement::kH)];
+  const double hydrogen_scale = x_h > 0.0 ? m_reference_hydrogen_mass_fraction / x_h : 0.0;
   for (std::size_t i = 0; i < m_elements.size(); ++i) {
     const double transformed = interpolate(m_lambda_transformed[i], query.redshift, lt, ln, result.clamped, policy);
     const double lambda_ref = k_asinh_scale * std::sinh(transformed);
-    const double abundance_ratio =
+    // WSS09 eq. 4: 10^[e/H] = (X_e/X_H) / (X_e,ref/X_H,ref).
+    const double abundance_ratio = hydrogen_scale *
         query.gas_mass_fraction[static_cast<std::size_t>(m_elements[i])] / m_reference_mass_fraction[i];
     result.net_cooling_erg_cm3_s += lambda_ref * nh * nh * electron_correction * std::max(abundance_ratio, 0.0);
   }
+  return result;
+}
+
+UvBackgroundCompatibility MetalCoolingTable::checkUvBackgroundCompatibility(const std::string& chui_uvb_sha256,
+                                                                            bool accept_mismatch) const {
+  UvBackgroundCompatibility result;
+  const std::string& declared = m_provenance.uv_background;
+  const std::string& declared_sha = m_provenance.uv_background_treecool_sha256;
+  if (declared == "none") {
+    result.compatible = chui_uvb_sha256.empty();
+  } else if (!declared_sha.empty() && !chui_uvb_sha256.empty()) {
+    result.compatible = declared_sha == chui_uvb_sha256;
+  }
+  if (result.compatible) {
+    result.diagnostic = "metal table uv_background '" + declared + "' matches the configured UV background";
+    return result;
+  }
+  result.diagnostic = "metal cooling table '" + m_provenance.source_path + "' embeds uv_background '" + declared +
+      "'" + (declared_sha.empty() ? std::string() : " (TREECOOL sha256 " + declared_sha + ")") +
+      " but CHUI's H/He photo-rates use " +
+      (chui_uvb_sha256.empty() ? std::string("no UV background")
+                               : "the TREECOOL file with sha256 " + chui_uvb_sha256) +
+      ": metal photoheating and ionization balance are inconsistent with the H/He network";
+  if (!accept_mismatch) {
+    throw SourceModelUnavailableError(result.diagnostic +
+                                      ". Use a table computed with the same UVB, or set "
+                                      "physics.metal_cooling_accept_uv_background_mismatch = true to accept it "
+                                      "explicitly (recorded in the run provenance)");
+  }
+  result.accepted_mismatch = true;
   return result;
 }
 

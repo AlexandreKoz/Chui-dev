@@ -1,9 +1,10 @@
 # CHUI Part 2 source fixture for cosmo_cube (NOT RUN — USER-RESERVED).
 # Derived from configs/cosmo_cube.param.txt; only the [physics] Part 2 keys
 # differ. UV background is 'none' because no TREECOOL table is bundled:
-# set uv_background_model = treecool_table and uv_background_table_path to a
-# licensed TREECOOL file for production runs. Element-table metal cooling and
-# production SSP yields likewise require owner-supplied data files.
+# set uv_background_model = treecool_table, uv_background_table_path and the
+# file's uv_background_table_sha256 (required since Part 2.5) for production
+# runs. Element-table metal cooling and production SSP yields likewise require
+# owner-supplied data files with checksums (tools/chui_data/).
 schema_version = 1
 
 [units]

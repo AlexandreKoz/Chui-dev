@@ -102,8 +102,13 @@ ThermochemistrySolver::ThermochemistrySolver(ThermochemistryConfig config) : m_c
     }
     m_species_count = m_manifest->species_count;
   }
-  // KWH96 equilibrium rates and the network manifests are UNQUALIFIED
-  // (unverified transcription); only the analytic reference is exempt.
+  // Part 2.5 policy: provenance verification alone never lifts the gate.
+  // The equilibrium backend's rate set is primary-verified (see
+  // equilibriumPrimordialManifest) but its numerical validation is
+  // USER-RESERVED and not yet recorded, so it stays behind the opt-in like
+  // the network backends (whose manifests are not qualified(): R13/R15/R17/
+  // R20/R21 secondary-verified, R18 and H2 photodissociation heating
+  // unverified). Only the analytic reference is exempt.
   const bool uses_unqualified_rates =
       m_config.backend == ThermochemistryBackend::kEquilibriumPrimordial ||
       (m_manifest != nullptr && !m_manifest->qualified());
@@ -154,6 +159,7 @@ RateEnvironment ThermochemistrySolver::environment(const ThermochemistryCellInpu
   };
   env.temperature_k = std::max(temperature_k, 1.0);
   env.hydrogen_nuclei_cm3 = nuclei(ChemicalElement::kH);
+  env.helium_nuclei_cm3 = nuclei(ChemicalElement::kHe);
   env.oxygen_gas_nuclei_cm3 = nuclei(ChemicalElement::kO);
   env.carbon_gas_nuclei_cm3 = nuclei(ChemicalElement::kC);
   env.redshift = input.redshift;
@@ -270,7 +276,9 @@ CoolingHeatingTerms ThermochemistrySolver::coolingHeating(const ThermochemistryC
     query.gas_mass_fraction = input.gas_element_mass_fraction;
     query.hydrogen_mass_fraction = input.gas_element_mass_fraction[0];
     const double weight = m_config.metal_mode == MetalCoolingMode::kElementTable ? 1.0 : w_table;
-    metal += weight * m_config.metal_table->evaluate(query, m_config.metal_table_range).net_cooling_erg_cm3_s;
+    const MetalCoolingTable::Result table_result = m_config.metal_table->evaluate(query, m_config.metal_table_range);
+    metal += weight * table_result.net_cooling_erg_cm3_s;
+    terms.metal_table_clamped = table_result.clamped;
   }
   if (metal >= 0.0) {
     terms.radiative_cooling += metal;
@@ -470,7 +478,7 @@ void ThermochemistrySolver::advanceCell(const ThermochemistryCellInput& input, d
   std::uint32_t attempts = 0;
   double radiative = 0.0, heating = 0.0, chemical = 0.0, floor_injection = 0.0;
   double max_error = 0.0;
-  std::uint64_t accepted = 0, rejected = 0, floor_count = 0;
+  std::uint64_t accepted = 0, rejected = 0, floor_count = 0, metal_clamp_count = 0;
 
   while (!sourceIntervalClosed(t_done, t_request)) {
     if (++attempts > m_config.max_substeps) {
@@ -550,6 +558,7 @@ void ThermochemistrySolver::advanceCell(const ThermochemistryCellInput& input, d
       }
       if (m_config.backend != ThermochemistryBackend::kAnalyticReference) {
         const CoolingHeatingTerms terms = coolingHeating(input, n, t);
+        if (terms.metal_table_clamped) ++metal_clamp_count;  // once per accepted substep
         radiative += h * terms.radiative_cooling;
         heating += h * terms.heating;
         chemical += h * terms.chemical_cooling;
@@ -628,6 +637,7 @@ void ThermochemistrySolver::advanceCell(const ThermochemistryCellInput& input, d
   ledger.rejected_substeps += rejected;
   ledger.newton_iterations += newton_iterations;
   ledger.floor_activations += floor_count;
+  ledger.metal_table_clamps += metal_clamp_count;
   ledger.max_error_estimate = std::max(ledger.max_error_estimate, max_error);
   ledger.max_newton_residual = std::max(ledger.max_newton_residual, max_newton_residual);
   (void)t_begin;
