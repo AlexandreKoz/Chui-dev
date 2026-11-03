@@ -765,3 +765,15 @@ The current source includes collective TreePM fallback coherence, tied-SFC refit
 - triage the CPU-floor failures exposed by the 2026-10-02 full inventory attempt (uniform rung-zero append fixtures, stage-6 memory-report fixture, unique-ID fixture semantics, and diagnostic-governor fixture) before calling the repository qualification-clean.
 
 Do not weaken M48 compact/bounded representations or the restart/identity/memory-governor checks to close these items.
+
+## 2026-11-03 — CHUI Part 2 (source only; NOT RUN — USER-RESERVED)
+
+Record: `docs/repair/chui_part2_thermochemistry_stellar_physics_20261103.md`.
+
+| ID | Status | Remaining acceptance |
+|---|---|---|
+| CHUI-P2-BUILD | Source written, never compiled | Human build + the Part 2 unit tests listed in the record §11. |
+| CHUI-P2-RATES | Coefficients transcribed from publications | Independent check of every rate in `chemical_network.cpp` against the cited papers. |
+| CHUI-P2-DATA | BLOCKED BY DATA | Owner-supplied TREECOOL, element metal-cooling table, SSP yield table with licenses. |
+| CHUI-P2-TOPOLOGY | Fail closed | Part 3: distributed composition ghosts/reflux, regrid composition transfer, remote feedback deposition. |
+| CHUI-P2-GAPS | Open | Element-resolved diffusion, snapshot export of composition, associations, benchmarks, SF gradient test, transactional regime/dust/SGS decisions. |

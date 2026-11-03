@@ -1710,6 +1710,12 @@ void validatePart2BaryonicPhysics(const SimulationConfig& config) {
         "physics.metal_species_mode=core_elements is required by (and only valid with) a Part 2 "
         "thermochemistry_backend (analytic_reference, equilibrium_primordial, fixed_hybrid, fixed_detailed)");
   }
+  if (part2 && p.enable_metal_diffusion) {
+    throw ConfigError(
+        "physics.enable_metal_diffusion diffuses total Z only; with element-resolved composition the Z mirror is "
+        "derived from element lanes, so element-resolved diffusion is required and is not implemented yet "
+        "(refused instead of silently discarding the diffusion)");
+  }
   if (part2 && !p.enable_cooling) {
     throw ConfigError("a Part 2 thermochemistry_backend requires physics.enable_cooling=true");
   }
