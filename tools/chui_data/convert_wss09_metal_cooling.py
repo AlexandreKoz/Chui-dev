@@ -34,6 +34,15 @@ Memory: bounded by one (N_T, N_nH) dataset (~114 kB) at a time; the output is
 streamed. The output file is large (~4.6 MB of text per element per
 redshift); use --zmax to restrict the redshift range.
 
+Redshift coverage (Part 2.5 interpolation-safety correction): a table built
+from ONE redshift file (e.g. only z_0.000.hdf5) is valid at that redshift
+only. The CHUI reader treats a singleton redshift axis as a single
+coordinate: under metal_cooling_table_range = reject it refuses any other z;
+under clamp_density_redshift it clamps and reports it (ledger
+metal_table_clamps). This converter refuses to write a one-redshift table
+unless --allow-single-redshift is given, and records the covered redshift
+range in the header, so a z=0 table cannot masquerade as a cosmological one.
+
 Licence: the WSS09 tables carry no licence statement on their distribution
 page. The converter therefore REQUIRES --license; it never invents one.
 """
@@ -46,7 +55,7 @@ import math
 import sys
 from pathlib import Path
 
-CONVERTER_VERSION = "chui_wss09_converter_v1"
+CONVERTER_VERSION = "chui_wss09_converter_v2"
 ELEMENTS = [  # (WSS09 group, CHUI symbol)
     ("Carbon", "C"), ("Nitrogen", "N"), ("Oxygen", "O"), ("Neon", "Ne"), ("Magnesium", "Mg"),
     ("Silicon", "Si"), ("Sulphur", "S"), ("Calcium", "Ca"), ("Iron", "Fe"),
@@ -94,6 +103,9 @@ def main() -> int:
     parser.add_argument("--uv-background-treecool-sha256", default="",
                         help="SHA-256 of the TREECOOL file that reproduces the embedded UVB, if one exists")
     parser.add_argument("--zmax", type=float, default=math.inf)
+    parser.add_argument("--allow-single-redshift", action="store_true",
+                        help="permit a one-redshift table (valid ONLY at that z; refused elsewhere by the reader "
+                             "under the reject policy)")
     parser.add_argument("--elements", default=",".join(s for _, s in ELEMENTS),
                         help="comma-separated CHUI symbols to convert (default: all nine)")
     args = parser.parse_args()
@@ -144,6 +156,10 @@ def main() -> int:
     if not files:
         fail("no input file at or below --zmax")
     files.sort(key=lambda item: item[0])
+    if len(files) == 1 and not args.allow_single_redshift:
+        fail(f"only one redshift (z={files[0][0]:g}) selected: such a table is valid at that redshift only and "
+             "would be refused (or clamped and reported) at every other z. Convert the full WSS09 redshift set "
+             "for cosmological runs, or pass --allow-single-redshift for a deliberately fixed-redshift table")
     for a, b in zip(files, files[1:]):
         if not b[0] > a[0]:
             fail(f"duplicate redshift {a[0]} ({a[1]}, {b[1]})")
@@ -189,6 +205,8 @@ def main() -> int:
         if args.uv_background_treecool_sha256:
             out.write(f"# uv_background_treecool_sha256 = {args.uv_background_treecool_sha256}\n")
         out.write(f"# converter = {CONVERTER_VERSION}\n")
+        out.write(f"# redshift_coverage = [{files[0][0]:g}, {files[-1][0]:g}] ({len(files)} tabulated redshifts"
+                  + ("; SINGLE REDSHIFT: valid only at this z" if len(files) == 1 else "") + ")\n")
         out.write("# units = Lambda/n_H^2 [erg cm^3 s^-1]; sign: positive = net cooling (WSS09 Net_Cooling, unchanged)\n")
         out.write("# electron_reference = Solar/Electron_density_over_n_h (WSS09 eq. 4 denominator)\n")
         out.write("# excluded = Metal_free (H, He, Compton: owned by the CHUI network; never converted)\n")

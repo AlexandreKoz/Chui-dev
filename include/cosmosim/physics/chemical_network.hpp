@@ -231,6 +231,7 @@ struct CoolingHeatingTerms {
   double chemical_cooling = 0.0;   // collisional ionization + dissociation (to binding reservoir)
   double heating = 0.0;            // photoheating, photoelectric, H2 formation
   double metal_cooling = 0.0;      // subset of radiative_cooling (diagnostic)
+  bool metal_table_clamped = false;  // metal table queried outside n_H/z range (clamp policy)
   [[nodiscard]] double net() const noexcept { return heating - radiative_cooling - chemical_cooling; }
 };
 

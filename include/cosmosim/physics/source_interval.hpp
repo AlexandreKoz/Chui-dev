@@ -75,6 +75,9 @@ struct SourceLedger {
   std::uint64_t rejected_substeps = 0U;
   std::uint64_t newton_iterations = 0U;
   std::uint64_t floor_activations = 0U;
+  // Accepted substeps whose metal-table evaluation was clamped in n_H or z
+  // (only possible under metal_cooling_table_range = clamp_density_redshift).
+  std::uint64_t metal_table_clamps = 0U;
   double max_error_estimate = 0.0;
   double max_newton_residual = 0.0;
 

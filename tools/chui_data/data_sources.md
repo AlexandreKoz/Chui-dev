@@ -43,6 +43,27 @@ Validator: `validate_treecool.py <file> [--expect-sha256 ...]` (NOT RUN).
 | Assumptions | HM01 (quasars + galaxies) plus CMB photoionization, CLOUDY 07.02, optically thin, ionization equilibrium, dust free. |
 | Licence | **None stated** on the WSS08 page or the mirror. **Do not commit.** |
 
+**Redshift coverage restriction (Part 2.5 interpolation-safety correction).**
+Only `z_0.000.hdf5` was obtained in this pass. A table converted from it
+alone has a **single redshift (z = 0)** and is **not** a cosmological cooling
+table.
+
+- The CHUI reader treats every singleton axis (T, n_H or z) as one
+  coordinate, matched within 1e-8 × max(1, |value|).
+- Under `metal_cooling_table_range = reject`, any other redshift (for
+  example z = 3) is **refused**.
+- Under `clamp_density_redshift`, the z = 0 rates are used and every such
+  evaluation is **reported** as a clamp (thermochemistry ledger
+  `metal_table_clamps`, logged per source stage).
+- Temperature is never clamped.
+- Before this correction a singleton axis matched any query, so z = 0 rates
+  were applied silently at all redshifts.
+- The converter refuses a one-redshift output unless
+  `--allow-single-redshift` is given, and it records `redshift_coverage` in
+  the header.
+- Cosmological runs need the full WSS09 redshift set (z = 0–8.989, one HDF5
+  file per redshift). Those files were not obtainable here.
+
 Converter: `convert_wss09_metal_cooling.py` (NOT RUN). It converts
 per-element `Net_Cooling` and `Solar/Electron_density_over_n_h`, and never
 `Metal_free` (CHUI owns H, He and Compton).

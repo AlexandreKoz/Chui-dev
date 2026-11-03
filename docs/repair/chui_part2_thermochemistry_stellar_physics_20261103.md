@@ -210,6 +210,60 @@ Recorded in `tools/chui_data/data_sources.md`. Nothing was committed.
 All remaining numerical validation is listed in
 `docs/chemistry_rate_provenance.md` §6.
 
+### P2.5.8 Interpolation-safety correction (after review of `618b276`)
+
+**Status: SOURCE ONLY.** Nothing was compiled or run; every test is NOT RUN
+— USER-RESERVED.
+
+- **Confirmed defect.** In `src/physics/metal_cooling_table.cpp`, `locate()`
+  accepted any query on a singleton axis. A table converted from WSS09
+  `z_0.000.hdf5` alone therefore supplied z = 0 rates at every redshift,
+  even under `kReject`.
+- **Fix.** A singleton axis now matches only its own coordinate.
+  - Tolerance is 1e-8 × max(1, |value|). This is at least 20× the %.9g
+    ASCII representation error and the double round-off of log10 T,
+    log10 n_H and 1/a − 1, and about 1e6× below a WSS09 grid step.
+  - A query on a multi-point axis that lies just past an end, but within
+    the same tolerance, is snapped onto the grid.
+  - Under `kReject`, out-of-range T, n_H and z throw.
+  - Under `kClampDensityAndRedshift`, n_H and z are clamped and
+    `Result::clamped` is set. T is never clamped.
+  - Clamps are now **reported**: `CoolingHeatingTerms::metal_table_clamped`
+    feeds `SourceLedger::metal_table_clamps`, counted once per accepted
+    substep and logged by the source stage.
+  - Table values are unchanged.
+- **Related helper.** `SspYieldTable::massive()` and `snia()` had the same
+  silent singleton behaviour. Off-grid queries now set the existing
+  `clamped` flag, counted as `table_clamps`. Interpolated values are
+  unchanged.
+- **Converter.** The WSS09 converter refuses one-redshift output unless
+  `--allow-single-redshift` is given, and it writes `redshift_coverage`.
+  The restriction is documented in `tools/chui_data/data_sources.md`.
+- **Step-subdivision review.**
+  - Findings:
+    - `massiveReturn` clamped a negative quadrature difference independently
+      for the mass and for each element, silently. That breaks element
+      closure and invalidates the additivity check whenever it fires.
+    - The cumulative return uses age-dependent quadrature nodes, so
+      monotonicity is numerical, not structural.
+  - Fix: a negative difference is still clamped to zero, but it is now
+    counted (`SspModel::nonmonotone_return_clamps`, restored on stage
+    rejection and logged). The mass is then re-derived as the sum of the
+    clamped elements. Results without a negative difference are unchanged.
+  - Test changes:
+    - The subdivision test now asserts that no such clamp fired.
+    - It checks per-interval element closure and element-wise additivity.
+    - It checks that the cumulative return is non-decreasing on a 401-point
+      log-age grid for both channels, for the total and for every element.
+    - A failure of that monotonicity check would be a genuine quadrature
+      finding. The tolerance must not be widened to hide it.
+- **Tests.**
+  - `unit_thermochemistry_backends`: `testMetalTableSingletonAxes`. It covers
+    z = 0 evaluated at z = 3 under reject, plus T, n_H and z singletons,
+    clamp reporting and edge snapping.
+  - `unit_stellar_population_feedback`: the extended subdivision test and
+    singleton yield-axis clamp reporting.
+
 ## 0. Corrective gate (2026-11-03, after independent review of `5625b20`)
 
 **Still SOURCE ONLY — nothing compiled or run; every check NOT RUN — USER-RESERVED.**

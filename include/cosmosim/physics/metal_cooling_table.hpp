@@ -64,8 +64,14 @@ namespace cosmosim::physics {
 // asinh(Lambda / 1e-30): smooth, sign-safe (net metal heating can be
 // negative under photoionization) and continuous across grid cells — never a
 // blind log of a signed quantity.
-// Out of range: T outside the table => kReject throws; kClampDensityOnly
-// clamps n_H and z to the table edges (counted) but still rejects T.
+// Out of range: T outside the table => always throws; kReject also throws
+// for n_H or z outside the table; kClampDensityAndRedshift clamps n_H and z
+// to the table edges and sets Result::clamped (counted by the thermo-
+// chemistry ledger as metal_table_clamps). A SINGLETON axis covers exactly
+// its one coordinate (match tolerance 1e-8 x max(1, |value|)): e.g. a
+// one-redshift table is refused at any other redshift under kReject, and is
+// clamped AND reported under kClampDensityAndRedshift — never silently
+// treated as valid at all redshifts (Part 2.5 correction).
 // ---------------------------------------------------------------------------
 enum class MetalTableRangePolicy : std::uint8_t {
   kReject = 0,
