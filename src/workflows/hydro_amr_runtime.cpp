@@ -28,6 +28,7 @@
 #include "cosmosim/core/units.hpp"
 #include "cosmosim/physics/cooling_heating.hpp"
 #include "cosmosim/physics/baryon_composition.hpp"
+#include "cosmosim/physics/baryonic_runtime_config.hpp"
 #include "cosmosim/physics/composition_transport.hpp"
 #include "cosmosim/physics/effective_multiphase_ism.hpp"
 #include "cosmosim/hydro/gas_thermodynamic_refresh.hpp"
@@ -491,7 +492,11 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
         m_solver(k_gamma_adiabatic, hydroNumericsPolicyFromConfig(config)),
         m_reconstruction(makeConfiguredReconstruction(config, {0.0, 0.0, 0.0})),
         m_riemann_solver(hydro::makeHydroRiemannSolver(hydroRiemannSolverKindFromConfig(config))) {
-    if (m_config.physics.enable_cooling) {
+    // CHUI Part 2: one owner per physical source. A Part 2 thermochemistry
+    // backend is advanced by the SourceRuntime thermochemistry stage; the
+    // legacy in-solver cooling source is then NOT registered (no double
+    // cooling). legacy_cooling keeps the (F2-repaired) in-solver path.
+    if (m_config.physics.enable_cooling && !physics::part2ThermochemistrySelected(m_config.physics)) {
       constexpr double k_mean_molecular_weight_ionized = 0.59;
       constexpr double k_proton_mass_kg = 1.67262192369e-27;
       constexpr double k_boltzmann_j_per_k = 1.380649e-23;
@@ -729,6 +734,8 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
       return m_mpi_context.allreduceSumUint64(local_has_hydro_cells);
     };
     m_current_world_rank = static_cast<std::uint32_t>(std::max(m_mpi_context.worldRank(), 0));
+    // CHUI Part 2: composition must exist before the first transport.
+    (void)physics::ensureGasCompositionInitialized(context.state, m_config.physics);
     m_last_ghost_refresh = internal::refreshParticleGhostsForSolver(
         context, m_mpi_context, "hydro.godunov", &m_ghost_cache_lifecycle);
     // sent_bytes/received_bytes are traffic counters, not resident-memory

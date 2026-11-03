@@ -1783,6 +1783,13 @@ void validatePart2BaryonicPhysics(const SimulationConfig& config) {
       p.ism_regime_hysteresis_fraction >= 1.0 || p.ism_regime_min_dwell_years < 0.0) {
     throw ConfigError("ism_jeans_resolution_cells >= 1, ism_regime_hysteresis_fraction in [0,1), dwell >= 0 required");
   }
+  if (part2 && p.ism_regime_model == IsmRegimeModelConfig::kLegacy &&
+      p.star_formation_model == StarFormationModelKind::kEffectiveMultiphaseTngLike) {
+    throw ConfigError(
+        "a Part 2 thermochemistry_backend with the effective multiphase ISM requires "
+        "ism_regime_model=effective_or_resolved, so effective-regime cells are excluded from resolved "
+        "thermochemistry (no double cooling)");
+  }
   if (p.ism_regime_model == IsmRegimeModelConfig::kEffectiveOrResolved &&
       p.star_formation_model != StarFormationModelKind::kEffectiveMultiphaseTngLike) {
     throw ConfigError(

@@ -25,6 +25,9 @@
 #include "cosmosim/core/time_scheduler.hpp"
 #include "cosmosim/hydro/gas_thermodynamic_refresh.hpp"
 #include "cosmosim/physics/black_hole_agn.hpp"
+#include "cosmosim/physics/baryonic_runtime_config.hpp"
+#include "cosmosim/physics/thermochemistry_operator.hpp"
+#include "cosmosim/core/stage_transaction.hpp"
 #include "cosmosim/physics/effective_multiphase_ism.hpp"
 #include "cosmosim/parallel/distributed_memory.hpp"
 #include "cosmosim/physics/star_formation.hpp"
@@ -33,6 +36,7 @@
 #include "cosmosim/physics/metal_diffusion.hpp"
 #include "cosmosim/workflows/runtime_services.hpp"
 #include "workflows/internal/gas_cell_ownership.hpp"
+#include "workflows/internal/mpi_stage_collective_decision.hpp"
 #include "workflows/internal/particle_id_registry.hpp"
 #include "workflows/internal/metal_diffusion_topology.hpp"
 #include "workflows/internal/runtime_stage_resource_access.hpp"
@@ -918,6 +922,16 @@ class SourceRuntimeImpl final : public SourceRuntime {
         (8.0 * core::constants::k_pi * g_code) * config.cosmology.omega_baryon;
     m_hydro_density_floor_code = config.numerics.hydro_density_floor_code;
     m_hydro_pressure_floor_code = config.numerics.hydro_pressure_floor_code;
+    // CHUI Part 2: resolve the thermochemistry model, its data products and
+    // the composition layout ONCE (never in cell loops). Missing production
+    // data stops construction with SourceModelUnavailableError.
+    m_physics_config = config.physics;
+    if (physics::part2ThermochemistrySelected(config.physics)) {
+      m_baryonic_data = physics::loadBaryonicDataProducts(config.physics);
+      m_thermochemistry = std::make_unique<physics::ThermochemistryOperator>(
+          physics::makeThermochemistryOperatorConfig(config, units, m_baryonic_data),
+          physics::CompositionLayout::make(physics::compositionLayoutRequestFromConfig(config.physics)));
+    }
   }
 
   [[nodiscard]] core::MemoryReport memoryReport() const override {
@@ -1158,6 +1172,12 @@ class SourceRuntimeImpl final : public SourceRuntime {
       core::HierarchicalTimeBinScheduler*& slot;
       ~GrowthSchedulerReset() { slot = nullptr; }
     } growth_scheduler_reset{m_growth_scheduler};
+
+    // CHUI Part 2 operator order inside the accepted interval (Lie split,
+    // hydro already done): thermochemistry -> star formation -> stellar
+    // evolution/feedback -> metal diffusion -> BH. Each source term has one
+    // owner; cooling is never also applied inside the hydro solver.
+    executeThermochemistry(context, source_evaluation_scale_factor);
 
     const std::size_t cell_count = context.state.cells.size();
     const bool local_has_mutable_gravity_sources =
@@ -1496,6 +1516,111 @@ class SourceRuntimeImpl final : public SourceRuntime {
   }
 
  private:
+  [[nodiscard]] physics::SourceInterval makeSourceInterval(
+      const core::StepContext& context, double source_evaluation_scale_factor) const {
+    physics::SourceInterval interval;
+    interval.time_begin_code = context.timeline_step.time_begin_code;
+    interval.time_end_code = context.timeline_step.time_end_code;
+    interval.scale_factor_begin = m_is_cosmological ? context.timeline_step.scale_factor_begin : 1.0;
+    interval.scale_factor_end = m_is_cosmological ? context.timeline_step.scale_factor_end : 1.0;
+    interval.physical_seconds = elapsedStellarEvolutionYears(context) * physics::k_seconds_per_year;
+    interval.evaluation_scale_factor = source_evaluation_scale_factor;
+    interval.evaluation_redshift = m_is_cosmological
+        ? std::max(0.0, 1.0 / source_evaluation_scale_factor - 1.0)
+        : 0.0;
+    interval.cosmological = m_is_cosmological;
+    interval.accepted_step_index = context.integrator_state.step_index;
+    return interval;
+  }
+
+  // CHUI Part 2 thermochemistry stage. Staged inside a StageTransaction with
+  // one collective vote: a cell that cannot integrate the full interval
+  // rejects the stage on EVERY rank (kNumericalRetry) and nothing is
+  // committed (audit F2 contract). Touched rows are refreshed before any CFL
+  // or source consumer reads P, T or c_s (audit F4 contract).
+  void executeThermochemistry(core::StepContext& context, double source_evaluation_scale_factor) {
+    (void)physics::ensureGasCompositionInitialized(context.state, m_physics_config);
+    if (m_thermochemistry == nullptr) return;
+    const physics::SourceInterval interval = makeSourceInterval(context, source_evaluation_scale_factor);
+    const bool all_cells_active =
+        !context.active_set.cells_are_subset && context.active_set.cell_indices.empty();
+    const std::span<const std::uint32_t> rows = all_cells_active
+        ? std::span<const std::uint32_t>{}
+        : std::span<const std::uint32_t>(context.active_set.cell_indices);
+    const std::size_t row_count = all_cells_active ? context.state.cells.size() : rows.size();
+    const internal::MpiStageCollectiveDecision decision(m_mpi_context);
+    core::StageTransaction transaction("sources.thermochemistry", m_memory_governor, &decision);
+    (void)transaction.reserve(core::MemoryClass::kPhaseResident,
+                              physics::ThermochemistryOperator::stagingBytes(row_count),
+                              "sources.thermochemistry.staged_rows");
+    const bool local_work = row_count > 0U && interval.valid();
+    if (local_work) {
+      (void)transaction.prepare([&] { m_thermochemistry->prepare(context.state, interval, rows); });
+    } else {
+      (void)transaction.prepare([] {});
+    }
+    if (!transaction.validate(true, core::StageRejectionKind::kNone, {})) {
+      throw core::StageTransactionRejected(
+          transaction.outcome().rejection,
+          "thermochemistry stage rejected (" +
+              std::string(core::stageRejectionKindLabel(transaction.outcome().rejection)) +
+              "): " + transaction.outcome().reason);
+    }
+    std::vector<std::uint32_t> touched;
+    (void)transaction.commit([&] {
+      if (local_work) touched = m_thermochemistry->commit(context.state);
+    });
+    m_last_thermochemistry_ledger = m_thermochemistry->ledger();
+    if (!touched.empty()) {
+      context.state.notifyGasThermodynamicMutation();
+      std::unique_ptr<physics::EffectiveIsmThermodynamicClosure> closure;
+      if (m_effective_eos_table != nullptr) {
+        closure = std::make_unique<physics::EffectiveIsmThermodynamicClosure>(m_effective_eos_table);
+      }
+      const hydro::GasThermodynamicRefreshPolicy policy{
+          .adiabatic_index = 5.0 / 3.0,
+          .density_floor_code = m_hydro_density_floor_code,
+          .pressure_floor_code = m_hydro_pressure_floor_code,
+          .scale_factor = source_evaluation_scale_factor,
+          .redshift = interval.evaluation_redshift,
+          .closure = closure.get(),
+          .temperature_k_per_internal_energy_code =
+              hydro::temperatureKelvinPerInternalEnergyCode(5.0 / 3.0, m_units.velocity_si_per_code)};
+      std::vector<hydro::GasThermodynamicTouch> touches;
+      touches.reserve(touched.size());
+      for (const std::uint32_t row : touched) {
+        touches.push_back(hydro::GasThermodynamicTouch{
+            .cell_row = row, .internal_energy_before_code = context.state.gas_cells.internal_energy_code[row]});
+      }
+      (void)hydro::refreshGasThermodynamics(context.state, touches, policy);
+    }
+    if (context.profiler_session != nullptr) {
+      const physics::SourceLedger& l = m_last_thermochemistry_ledger;
+      context.profiler_session->recordEvent(core::RuntimeEvent{
+          .event_kind = "sources.thermochemistry",
+          .severity = core::RuntimeEventSeverity::kInfo,
+          .subsystem = "physics.thermochemistry",
+          .step_index = context.integrator_state.step_index,
+          .simulation_time_code = context.integrator_state.current_time_code,
+          .scale_factor = context.integrator_state.current_scale_factor,
+          .message = "thermochemistry source ledger for the accepted interval",
+          .payload = {{"cells", std::to_string(l.cells)},
+                      {"skipped_effective_regime_cells", std::to_string(m_thermochemistry->skippedEffectiveRows())},
+                      {"physical_seconds", std::to_string(interval.physical_seconds)},
+                      {"radiative_loss_erg", std::to_string(l.radiative_loss_erg)},
+                      {"heating_gain_erg", std::to_string(l.heating_gain_erg)},
+                      {"chemical_binding_delta_erg", std::to_string(l.chemical_binding_delta_erg)},
+                      {"thermal_energy_delta_erg", std::to_string(l.thermal_energy_delta_erg)},
+                      {"floor_injection_erg", std::to_string(l.floor_injection_erg)},
+                      {"accepted_substeps", std::to_string(l.accepted_substeps)},
+                      {"rejected_substeps", std::to_string(l.rejected_substeps)},
+                      {"newton_iterations", std::to_string(l.newton_iterations)},
+                      {"max_error_estimate", std::to_string(l.max_error_estimate)},
+                      {"element_projection_residual", std::to_string(l.element_mass_residual_code)},
+                      {"charge_residual", std::to_string(l.charge_residual)}}});
+    }
+  }
+
   void preparePopulationGrowth(core::SimulationState& state, std::size_t count,
                                core::ParticleSpecies species) {
     auto* scheduler = m_growth_scheduler;
@@ -2255,6 +2380,10 @@ class SourceRuntimeImpl final : public SourceRuntime {
   physics::MetalDiffusionModel m_metal_diffusion;
   physics::StellarFeedbackModuleState m_stellar_feedback_state;
   physics::BlackHoleAgnModel m_black_hole;
+  core::PhysicsConfig m_physics_config{};
+  physics::BaryonicDataProducts m_baryonic_data{};
+  std::unique_ptr<physics::ThermochemistryOperator> m_thermochemistry;
+  physics::SourceLedger m_last_thermochemistry_ledger{};
   DistributedParticleIdRegistry m_particle_id_registry;
   const parallel::MpiContext& m_mpi_context;
   const RuntimeServices* m_runtime_services = nullptr;

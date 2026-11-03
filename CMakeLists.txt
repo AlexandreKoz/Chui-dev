@@ -577,6 +577,12 @@ add_library(cosmosim_physics STATIC
   src/physics/tracer_support.cpp
   src/physics/baryon_composition.cpp
   src/physics/composition_transport.cpp
+  src/physics/chemical_network.cpp
+  src/physics/radiation_background.cpp
+  src/physics/metal_cooling_table.cpp
+  src/physics/thermochemistry.cpp
+  src/physics/thermochemistry_operator.cpp
+  src/physics/baryonic_runtime_config.cpp
   src/physics/source_interval.cpp)
 add_library(cosmosim_io STATIC
   src/io/internal/io_contract.cpp
@@ -1327,6 +1333,9 @@ if(COSMOSIM_ENABLE_TESTS)
   add_executable(test_unit_composition_transport tests/unit/test_composition_transport.cpp)
   target_link_libraries(test_unit_composition_transport PRIVATE cosmosim_all)
   add_test(NAME unit_composition_transport COMMAND test_unit_composition_transport)
+  add_executable(test_unit_cooling_f2_complete_interval tests/unit/test_cooling_f2_complete_interval.cpp)
+  target_link_libraries(test_unit_cooling_f2_complete_interval PRIVATE cosmosim_all)
+  add_test(NAME unit_cooling_f2_complete_interval COMMAND test_unit_cooling_f2_complete_interval)
 
   add_executable(test_integration_gas_cell_identity_migration tests/integration/test_gas_cell_identity_migration.cpp)
   target_link_libraries(test_integration_gas_cell_identity_migration PRIVATE cosmosim_core)
