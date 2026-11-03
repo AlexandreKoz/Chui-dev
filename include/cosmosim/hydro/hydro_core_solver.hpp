@@ -324,6 +324,34 @@ class HydroCellSourcePropertyProvider {
       std::size_t cell_index) const = 0;
 };
 
+// CHUI Part 2: per-face mass transfer of the FINAL (conservative) flux of
+// one advance, used to transport composition lanes with the identical mass
+// flux (consistent multi-fluid advection: species flux = F_rho * X_donor).
+// mass_transfer_code = (dt/a) * A_f * F_rho, i.e. code MASS moved from
+// owner_cell to neighbor_cell across the face (negative = reverse). Cells are
+// solver geometry rows; neighbor_cell is k_invalid_cell_index for outflow /
+// physical-boundary faces without a real or ghost target. Called once per
+// active face per advance, single-threaded, in active-face order.
+class HydroFaceMassFluxSink {
+ public:
+  virtual ~HydroFaceMassFluxSink() = default;
+  // Called by the RUNTIME (fixed grid / AMR orchestrator) around each patch
+  // advance so the sink can resolve solver rows into stable identities.
+  // dense_row_by_real_cell maps real geometry rows [0, cellCount) to
+  // SimulationState rows; ghost_origin_gas_cell_id_by_slot gives the stable
+  // id of the cell that supplied each ghost slot (0 = unknown/physical).
+  virtual void beginAdvance(const HydroPatchGeometry& geometry,
+                            std::span<const std::uint32_t> dense_row_by_real_cell,
+                            std::span<const std::uint64_t> ghost_origin_gas_cell_id_by_slot) {
+    (void)geometry;
+    (void)dense_row_by_real_cell;
+    (void)ghost_origin_gas_cell_id_by_slot;
+  }
+  virtual void endAdvance() noexcept {}
+  virtual void recordFaceMassTransfer(std::size_t face_index, std::size_t owner_cell,
+                                      std::size_t neighbor_cell, double mass_transfer_code) = 0;
+};
+
 struct HydroSourceContext {
   HydroUpdateContext update;
   // Scale-free comoving gravitational kernel A from TreePM. The comoving
@@ -349,6 +377,8 @@ struct HydroSourceContext {
   // source ledgers can integrate energy densities into energies (audit F7).
   // Direct callers of HydroSourceTerm::sourceForCell must set it explicitly.
   double cell_volume_comoving = 0.0;
+  // Optional composition-transport hook (CHUI Part 2). Null = no recording.
+  HydroFaceMassFluxSink* face_mass_flux_sink = nullptr;
 };
 
 // Volume-integrated conserved diagnostics over a selected set of real cells.

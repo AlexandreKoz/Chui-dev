@@ -27,6 +27,8 @@
 #include "cosmosim/core/profiling.hpp"
 #include "cosmosim/core/units.hpp"
 #include "cosmosim/physics/cooling_heating.hpp"
+#include "cosmosim/physics/baryon_composition.hpp"
+#include "cosmosim/physics/composition_transport.hpp"
 #include "cosmosim/physics/effective_multiphase_ism.hpp"
 #include "cosmosim/hydro/gas_thermodynamic_refresh.hpp"
 #include "cosmosim/hydro/hydro_boundary_conditions.hpp"
@@ -937,6 +939,23 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
     }
     const hydro::HydroActiveBatchPolicy active_batch_policy = selectHydroActiveBatchPolicy();
     auto active_batch_reservation = reserveHydroActiveBatch(active_batch_policy);
+    // CHUI Part 2: composition lanes are advected with the final hydro mass
+    // flux (physics::CompositionFluxAccumulator). Deltas are staged and
+    // committed inside the same StageTransaction as the hydro state.
+    std::unique_ptr<physics::CompositionFluxAccumulator> composition_flux;
+    core::MemoryReservation composition_transport_reservation;
+    if (context.state.gas_composition.enabled()) {
+      composition_flux = std::make_unique<physics::CompositionFluxAccumulator>(context.state);
+      if (m_memory_governor != nullptr) {
+        composition_transport_reservation = m_memory_governor->reserve(
+            core::MemoryClass::kPhaseResident,
+            physics::CompositionFluxAccumulator::deltaBufferBytes(
+                context.state.gas_composition.laneCount(), context.state.cells.size()),
+            "hydro.composition_transport.delta_buffer");
+      }
+      source_context.face_mass_flux_sink = composition_flux.get();
+      composition_flux->beginAdvance(m_geometry, m_dense_row_by_geometry_row, {});
+    }
     m_solver.advancePatchActiveSetBatchedWithScratch(
         m_conserved,
         m_geometry,
@@ -950,6 +969,9 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
         nullptr,
         active_batch_policy,
         &m_last_hydro_profile);
+    if (composition_flux != nullptr) {
+      composition_flux->endAdvance();
+    }
     if (context.profiler_session != nullptr) {
       const hydro::HydroConservationReport& conservation = m_last_hydro_profile.conservation;
       context.profiler_session->recordEvent(core::RuntimeEvent{
@@ -1075,8 +1097,21 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
       hydro_transaction.adoptReservation(std::move(*active_batch_reservation));
       active_batch_reservation.reset();
     }
+    if (composition_transport_reservation.pending()) {
+      hydro_transaction.adoptReservation(std::move(composition_transport_reservation));
+    }
     std::string staged_failure;
-    const bool staged_admissible = stagedConservedStateIsAdmissible(staged_failure);
+    bool staged_admissible = stagedConservedStateIsAdmissible(staged_failure);
+    if (staged_admissible && composition_flux != nullptr) {
+      // Composition deltas use the step-start sidecar and need the
+      // post-hydro mass only for reconciliation inside commit().
+      try {
+        composition_flux->prepare(context.state);
+      } catch (const std::exception& error) {
+        staged_admissible = false;
+        staged_failure = std::string("composition transport: ") + error.what();
+      }
+    }
     if (!hydro_transaction.validate(
             staged_admissible, core::StageRejectionKind::kNumericalRetry, staged_failure)) {
       throw core::StageTransactionRejected(
@@ -1142,6 +1177,12 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
       context.state.gas_cells.velocity_x_peculiar[cell_index] = primitive.vel_x_peculiar;
       context.state.gas_cells.velocity_y_peculiar[cell_index] = primitive.vel_y_peculiar;
       context.state.gas_cells.velocity_z_peculiar[cell_index] = primitive.vel_z_peculiar;
+    }
+    if (composition_flux != nullptr) {
+      m_last_composition_transport = composition_flux->commit(context.state);
+      // Z is a derived mirror of element (+dust) inventory when composition
+      // is authoritative: the hydro passive metal lane is overwritten.
+      (void)physics::synchronizeMetalMirrorFromComposition(context.state, std::span<const std::uint32_t>{});
     }
     });
 
@@ -1792,7 +1833,7 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
             : 1.0;
     const double physical_density_cgs_per_density_code =
         m_units.densityCodeToCgs(density_frame_factor);
-    const hydro::HydroSourceContext source_context{
+    hydro::HydroSourceContext source_context{
         .update = update,
         .gravity_accel_x_peculiar = {},
         .gravity_accel_y_peculiar = {},
@@ -1851,6 +1892,24 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
     std::size_t remote_flux_register_count = 0;
     std::size_t inbound_flux_register_count = 0;
     parallel::DirectedAmrExchangeDiagnostics directed_amr_diagnostics{};
+    // CHUI Part 2 composition transport on the production AMR path. The
+    // distributed path would need remote composition ghosts and composition
+    // reflux payloads, which are Part 3 deliverables: refuse collectively
+    // BEFORE any patch advances instead of silently dropping species.
+    std::unique_ptr<physics::CompositionFluxAccumulator> composition_flux;
+    {
+      const std::uint64_t composition_ranks = m_mpi_context.allreduceSumUint64(
+          context.state.gas_composition.enabled() ? 1ULL : 0ULL);
+      if (composition_ranks > 0U && m_mpi_context.isEnabled() && m_mpi_context.worldSize() > 1) {
+        throw std::runtime_error(
+            "distributed production AMR hydro with an enabled CHUI composition sidecar is not supported "
+            "until Part 3 adds remote composition ghosts and composition reflux payloads (fail closed)");
+      }
+      if (context.state.gas_composition.enabled()) {
+        composition_flux = std::make_unique<physics::CompositionFluxAccumulator>(context.state);
+        source_context.face_mass_flux_sink = composition_flux.get();
+      }
+    }
     if (m_mpi_context.isEnabled() && m_mpi_context.worldSize() > 1) {
       const auto local_patch_records =
           internal::buildMigrationAmrPatchPayloadRecords(
@@ -2292,6 +2351,14 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
           amr_options);
     }
     m_last_amr_hydro_diagnostics = amr_diagnostics;
+    if (composition_flux != nullptr) {
+      // AMR is not transactional yet (Part 3): patches already scattered, so
+      // the composition update is prepared (may throw = hard stage failure)
+      // and committed immediately after the hydro sweep.
+      composition_flux->prepare(context.state);
+      m_last_composition_transport = composition_flux->commit(context.state);
+      (void)physics::synchronizeMetalMirrorFromComposition(context.state, std::span<const std::uint32_t>{});
+    }
     m_communication_high_water_bytes = std::max(
         m_communication_high_water_bytes,
         directed_amr_diagnostics.communication_workspace_high_water_bytes);
@@ -2668,6 +2735,7 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
   std::unique_ptr<hydro::HydroReconstruction> m_reconstruction;
   std::unique_ptr<hydro::HydroRiemannSolver> m_riemann_solver;
   std::unique_ptr<physics::CoolingHeatingSource> m_cooling_source;
+  physics::CompositionTransportCommitReport m_last_composition_transport{};
   std::unique_ptr<physics::EffectiveIsmThermodynamicClosure> m_effective_ism_closure;
   std::unique_ptr<physics::EffectiveIsmEnergyRelaxationSource> m_effective_ism_energy_source;
   hydro::HydroConservedStateSoa m_conserved;

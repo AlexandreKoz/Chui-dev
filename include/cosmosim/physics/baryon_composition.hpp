@@ -185,6 +185,9 @@ void restrictComposition(std::span<const double> child_lanes_row_major,
 double synchronizeMetalMirrorFromComposition(core::SimulationState& state,
                                              const CompositionLayout& layout,
                                              std::span<const std::uint32_t> rows);
+// Same, using the state's own descriptor (element lanes in catalog order).
+double synchronizeMetalMirrorFromComposition(core::SimulationState& state,
+                                             std::span<const std::uint32_t> rows);
 
 // Enable the composition sidecar on a state that has gas rows, initializing
 // from the existing total-metal lane with the explicit policy. Throws if the

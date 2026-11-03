@@ -576,6 +576,7 @@ add_library(cosmosim_physics STATIC
   src/physics/metal_diffusion.cpp
   src/physics/tracer_support.cpp
   src/physics/baryon_composition.cpp
+  src/physics/composition_transport.cpp
   src/physics/source_interval.cpp)
 add_library(cosmosim_io STATIC
   src/io/internal/io_contract.cpp
@@ -1323,6 +1324,9 @@ if(COSMOSIM_ENABLE_TESTS)
   target_include_directories(test_unit_gas_composition_substrate PRIVATE ${PROJECT_SOURCE_DIR}/src)
   target_link_libraries(test_unit_gas_composition_substrate PRIVATE cosmosim_workflows)
   add_test(NAME unit_gas_composition_substrate COMMAND test_unit_gas_composition_substrate)
+  add_executable(test_unit_composition_transport tests/unit/test_composition_transport.cpp)
+  target_link_libraries(test_unit_composition_transport PRIVATE cosmosim_all)
+  add_test(NAME unit_composition_transport COMMAND test_unit_composition_transport)
 
   add_executable(test_integration_gas_cell_identity_migration tests/integration/test_gas_cell_identity_migration.cpp)
   target_link_libraries(test_integration_gas_cell_identity_migration PRIVATE cosmosim_core)

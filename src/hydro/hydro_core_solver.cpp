@@ -1505,6 +1505,12 @@ void HydroCoreSolver::advancePatchActiveSetBatchedWithScratch(
       if (neighbor_slot != k_invalid_touched_slot) {
         scratch.cell_delta[neighbor_slot] += face_delta;
       }
+      if (source_context.face_mass_flux_sink != nullptr) {
+        // face_delta is a density change (dt/(aV) A F); times V = mass moved.
+        source_context.face_mass_flux_sink->recordFaceMassTransfer(
+            face_index, face.owner_cell, neighbor_target,
+            face_delta.mass_density_comoving * geometry.cell_volume_comoving);
+      }
       if (use_dual_energy) {
         // Upwinded advective flux of rho*e and the face normal velocity for
         // the pdV term of the auxiliary internal-energy equation.

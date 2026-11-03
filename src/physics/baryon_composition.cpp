@@ -255,22 +255,32 @@ double compositionGasMass(const core::GasCompositionSidecar& sidecar, std::size_
 double synchronizeMetalMirrorFromComposition(core::SimulationState& state,
                                              const CompositionLayout& layout,
                                              std::span<const std::uint32_t> rows) {
+  if (state.gas_composition.enabled() && !(state.gas_composition.descriptor() == layout.descriptor())) {
+    throw std::runtime_error("synchronizeMetalMirrorFromComposition: layout mismatch");
+  }
+  return synchronizeMetalMirrorFromComposition(state, rows);
+}
+
+double synchronizeMetalMirrorFromComposition(core::SimulationState& state,
+                                             std::span<const std::uint32_t> rows) {
   auto& sidecar = state.gas_composition;
   if (!sidecar.enabled()) return 0.0;
-  if (!(sidecar.descriptor() == layout.descriptor())) {
-    throw std::runtime_error("synchronizeMetalMirrorFromComposition: layout mismatch");
+  const auto& descriptor = sidecar.descriptor();
+  if (descriptor.element_lane_count != k_chemical_element_count ||
+      descriptor.dust_lane_count > k_dust_reservoir_count) {
+    throw std::runtime_error("synchronizeMetalMirrorFromComposition: unsupported layout");
   }
   double max_drift = 0.0;
   const auto sync_row = [&](std::size_t row) {
     double metals = 0.0;
     for (std::size_t e = 2; e < k_chemical_element_count; ++e) {
-      metals += sidecar.value(layout.elementLane(static_cast<ChemicalElement>(e)), row);
+      metals += sidecar.value(descriptor.element_lane_begin + e, row);
     }
-    for (std::size_t d = 0; d < sidecar.descriptor().dust_lane_count; ++d) {
+    for (std::size_t d = 0; d < descriptor.dust_lane_count; ++d) {
       const auto& frac = dustElementMassFractions(static_cast<DustReservoir>(d));
       double metal_fraction = 0.0;
       for (std::size_t e = 2; e < k_chemical_element_count; ++e) metal_fraction += frac[e];
-      metals += metal_fraction * sidecar.value(layout.dustLane(d), row);
+      metals += metal_fraction * sidecar.value(descriptor.dust_lane_begin + d, row);
     }
     const double old_value = state.gas_cells.metal_mass_code[row];
     const double scale = std::max({std::abs(old_value), std::abs(metals), 1.0e-300});
