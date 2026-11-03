@@ -140,7 +140,9 @@ HydroPatchGeometry makeCartesianPatchGeometry(const HydroCartesianPatchSpec& spe
             .normal_x = 1.0,
             .normal_y = 0.0,
             .normal_z = 0.0,
-            .axis = HydroFaceAxis::kX});
+            .axis = HydroFaceAxis::kX,
+            .owner_minus2_cell = geometry.neighborCell(owner, -2, 0, 0),
+            .neighbor_plus2_cell = geometry.neighborCell(neighbor, 2, 0, 0)});
       }
     }
   }
@@ -159,7 +161,9 @@ HydroPatchGeometry makeCartesianPatchGeometry(const HydroCartesianPatchSpec& spe
             .normal_x = 0.0,
             .normal_y = 1.0,
             .normal_z = 0.0,
-            .axis = HydroFaceAxis::kY});
+            .axis = HydroFaceAxis::kY,
+            .owner_minus2_cell = geometry.neighborCell(owner, 0, -2, 0),
+            .neighbor_plus2_cell = geometry.neighborCell(neighbor, 0, 2, 0)});
       }
     }
   }
@@ -178,7 +182,9 @@ HydroPatchGeometry makeCartesianPatchGeometry(const HydroCartesianPatchSpec& spe
             .normal_x = 0.0,
             .normal_y = 0.0,
             .normal_z = 1.0,
-            .axis = HydroFaceAxis::kZ});
+            .axis = HydroFaceAxis::kZ,
+            .owner_minus2_cell = geometry.neighborCell(owner, 0, 0, -2),
+            .neighbor_plus2_cell = geometry.neighborCell(neighbor, 0, 0, 2)});
       }
     }
   }

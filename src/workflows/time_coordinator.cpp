@@ -325,6 +325,16 @@ struct LocalGasCellCflMetadata {
     double scale_factor,
     AdaptiveTimeStepCriteriaStorage& storage) {
   state.requireGasCellIdentityMapCoversDenseRows("adaptive time-bin view construction");
+  // Audit F4: the gas CFL candidate reads GasCellSidecar::sound_speed_code.
+  // A source stage that changed density/internal energy must have run the
+  // thermodynamic refresh contract before the next timestep is selected.
+  if (!state.gasThermodynamicCachesFresh()) {
+    throw std::logic_error(
+        "timestep selection refused stale gas thermodynamic caches: a source stage mutated gas "
+        "thermodynamics without hydro::refreshGasThermodynamics() (mutation epoch " +
+        std::to_string(state.gasThermodynamicMutationEpoch()) + ", refresh epoch " +
+        std::to_string(state.gasThermodynamicRefreshEpoch()) + ")");
+  }
   const auto particle_row_by_id = internal::buildParticleRowById(state);
   constexpr std::uint32_t k_no_parent_particle = std::numeric_limits<std::uint32_t>::max();
   storage.gas_particle_index_by_cell.clear();

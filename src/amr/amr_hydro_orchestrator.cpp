@@ -1329,6 +1329,11 @@ void validatePendingCompatible(
 void accumulateDiagnostics(ProductionAmrHydroDiagnostics& lhs, const ProductionAmrHydroDiagnostics& rhs) {
   lhs.patch_count = std::max(lhs.patch_count, rhs.patch_count);
   lhs.advanced_patch_count += rhs.advanced_patch_count;
+  lhs.riemann_solve_count += rhs.riemann_solve_count;
+  lhs.positivity_fallback_count += rhs.positivity_fallback_count;
+  lhs.stencil_degradation_count += rhs.stencil_degradation_count;
+  lhs.ctu_transverse_degraded_states += rhs.ctu_transverse_degraded_states;
+  lhs.dual_energy_auxiliary_cells += rhs.dual_energy_auxiliary_cells;
   lhs.active_cell_count += rhs.active_cell_count;
   lhs.active_face_count += rhs.active_face_count;
   lhs.flux_register_entry_count += rhs.flux_register_entry_count;
@@ -2342,17 +2347,31 @@ struct AmrSynchronizedSweepWorkspace {
         .redshift = global_source_context.redshift};
 
     const auto widths = cellWidths(patch_geometry.patch);
-    hydro::MusclHancockReconstruction reconstruction(hydro::HydroReconstructionPolicy{
-        .limiter = hydro::HydroSlopeLimiter::kMonotonizedCentral,
-        .dt_over_dx_code = update.dt_code / std::max(widths[0], 1.0e-12),
-        .dt_over_cell_width_code = {
-            update.dt_code / std::max(widths[0], 1.0e-12),
-            update.dt_code / std::max(widths[1], 1.0e-12),
-            update.dt_code / std::max(widths[2], 1.0e-12)},
-        .rho_floor = options.density_floor,
-        .pressure_floor = options.pressure_floor,
+    // Audit F1 follow-up: predictor Courant factors are dt/(a dx), matching
+    // the conservative update dt/(a V) sum A F at the same epoch.
+    const std::array<double, 3> courant_factors = hydro::hydroTransportCourantFactors(
+        update.dt_code,
+        update.scale_factor,
+        std::max(widths[0], 1.0e-12),
+        std::max(widths[1], 1.0e-12),
+        std::max(widths[2], 1.0e-12));
+    const hydro::HydroReconstructionPolicy reconstruction_policy{
+        .limiter = options.slope_limiter,
+        .dt_over_dx_code = courant_factors[0],
+        .dt_over_cell_width_code = courant_factors,
+        .rho_floor = options.density_floor > 0.0 ? options.density_floor : 1.0e-30,
+        .pressure_floor = options.pressure_floor > 0.0 ? options.pressure_floor : 1.0e-30,
         .enable_muscl_hancock_predictor = true,
-        .adiabatic_index = options.adiabatic_index});
+        .adiabatic_index = options.adiabatic_index};
+    hydro::PiecewiseConstantReconstruction pcm_reconstruction;
+    hydro::MusclHancockReconstruction plm_reconstruction(reconstruction_policy);
+    hydro::PpmReconstruction ppm_reconstruction(reconstruction_policy);
+    const hydro::HydroReconstruction& reconstruction =
+        options.reconstruction_scheme == hydro::HydroReconstructionScheme::kPiecewiseConstant
+            ? static_cast<const hydro::HydroReconstruction&>(pcm_reconstruction)
+            : (options.reconstruction_scheme == hydro::HydroReconstructionScheme::kPiecewiseParabolic
+                   ? static_cast<const hydro::HydroReconstruction&>(ppm_reconstruction)
+                   : static_cast<const hydro::HydroReconstruction&>(plm_reconstruction));
     auto& scratch = sweep_workspace.scratch;
     const std::uint64_t scratch_capacity_before = scratch.ownedCapacityBytes();
     hydro::HydroProfileEvent profile;
@@ -2384,6 +2403,11 @@ struct AmrSynchronizedSweepWorkspace {
         state, patch_geometry, conserved_state, options.adiabatic_index,
         parent_mirror_index);
     diagnostics.advanced_patch_count += 1U;
+    diagnostics.riemann_solve_count += profile.riemann_solve_count;
+    diagnostics.positivity_fallback_count += profile.positivity_fallback_count;
+    diagnostics.stencil_degradation_count += profile.stencil_degradation_count;
+    diagnostics.ctu_transverse_degraded_states += profile.ctu_transverse_degraded_states;
+    diagnostics.dual_energy_auxiliary_cells += profile.dual_energy_auxiliary_cells;
     diagnostics.active_cell_count += active_patch_cells.size();
     diagnostics.active_face_count += active_faces.size();
     diagnostics.scratch_high_water_bytes = std::max(

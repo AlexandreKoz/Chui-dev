@@ -7,6 +7,7 @@
 #include <span>
 #include <stdexcept>
 #include <string_view>
+#include <vector>
 
 namespace cosmosim::core {
 
@@ -120,6 +121,22 @@ struct MemoryGovernorSnapshot {
       reserved_by_class{};
 };
 
+// Bounded per-owner telemetry. The governor keeps at most
+// k_memory_owner_telemetry_slots distinct owner labels (first come, first
+// served); later labels are aggregated in the final "<other>" slot, so the
+// table never grows and reservation never allocates for telemetry.
+inline constexpr std::size_t k_memory_owner_telemetry_slots = 64U;
+inline constexpr std::size_t k_memory_owner_label_capacity = 63U;
+
+struct MemoryOwnerTelemetry {
+  std::string label;
+  // Reserved + committed bytes currently live for this owner.
+  std::uint64_t live_bytes = 0U;
+  std::uint64_t peak_live_bytes = 0U;
+  std::uint64_t reservation_count = 0U;
+  std::uint64_t rejection_count = 0U;
+};
+
 [[nodiscard]] DeterministicBatchSizingResult selectDeterministicBatchSize(
     const MemoryGovernorSnapshot& snapshot,
     const DeterministicBatchSizingPolicy& policy);
@@ -174,12 +191,14 @@ class MemoryReservation final {
   MemoryReservation(
       MemoryGovernor* governor,
       MemoryClass memory_class,
-      std::uint64_t bytes) noexcept;
+      std::uint64_t bytes,
+      std::uint16_t owner_slot) noexcept;
 
   MemoryGovernor* m_governor = nullptr;
   MemoryClass m_memory_class = MemoryClass::kCanonicalPersistent;
   std::uint64_t m_bytes = 0U;
   State m_state = State::kInert;
+  std::uint16_t m_owner_slot = 0U;
 };
 
 class MemoryGovernor final {
@@ -203,17 +222,34 @@ class MemoryGovernor final {
 
   [[nodiscard]] MemoryGovernorSnapshot snapshot() const;
   [[nodiscard]] const MemoryGovernorPolicy& policy() const noexcept;
+  // Diagnostic-boundary copy of the bounded per-owner table (allocates the
+  // returned vector; never call from a hot path).
+  [[nodiscard]] std::vector<MemoryOwnerTelemetry> ownerTelemetry() const;
 
  private:
   friend class MemoryReservation;
 
+  struct OwnerSlot {
+    std::array<char, k_memory_owner_label_capacity + 1U> label{};
+    std::uint64_t live_bytes = 0U;
+    std::uint64_t peak_live_bytes = 0U;
+    std::uint64_t reservation_count = 0U;
+    std::uint64_t rejection_count = 0U;
+    bool used = false;
+  };
+
+  [[nodiscard]] std::uint16_t ownerSlotLocked(std::string_view owner) noexcept;
+  void releaseOwnerBytesLocked(std::uint16_t owner_slot, std::uint64_t bytes) noexcept;
   void commitReservation(MemoryClass memory_class, std::uint64_t bytes);
-  void releasePendingReservation(MemoryClass memory_class, std::uint64_t bytes) noexcept;
-  void releaseCommittedReservation(MemoryClass memory_class, std::uint64_t bytes) noexcept;
+  void releasePendingReservation(
+      MemoryClass memory_class, std::uint64_t bytes, std::uint16_t owner_slot) noexcept;
+  void releaseCommittedReservation(
+      MemoryClass memory_class, std::uint64_t bytes, std::uint16_t owner_slot) noexcept;
   void reconcileBaselineAndReleaseCommittedReservation(
       MemoryClass memory_class,
       std::uint64_t bytes,
-      std::uint64_t baseline_owned_bytes);
+      std::uint64_t baseline_owned_bytes,
+      std::uint16_t owner_slot);
 
   [[nodiscard]] std::uint64_t rawAccountedBytesLocked() const;
   [[nodiscard]] std::uint64_t safetyAdjustedBytes(std::uint64_t raw_bytes) const;
@@ -235,6 +271,7 @@ class MemoryGovernor final {
       m_committed_by_class{};
   std::array<std::uint64_t, static_cast<std::size_t>(MemoryClass::kCount)>
       m_reserved_by_class{};
+  std::array<OwnerSlot, k_memory_owner_telemetry_slots> m_owner_slots{};
 };
 
 }  // namespace cosmosim::core

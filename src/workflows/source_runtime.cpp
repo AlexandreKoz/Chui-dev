@@ -13,6 +13,7 @@
 #include <memory_resource>
 #include <span>
 #include <stdexcept>
+#include <string>
 #include <unordered_set>
 #include <vector>
 
@@ -20,7 +21,9 @@
 #include "cosmosim/core/memory_governor.hpp"
 #include "cosmosim/core/governed_scratch_arena.hpp"
 #include "cosmosim/core/memory_accounting.hpp"
+#include "cosmosim/core/profiling.hpp"
 #include "cosmosim/core/time_scheduler.hpp"
+#include "cosmosim/hydro/gas_thermodynamic_refresh.hpp"
 #include "cosmosim/physics/black_hole_agn.hpp"
 #include "cosmosim/physics/effective_multiphase_ism.hpp"
 #include "cosmosim/parallel/distributed_memory.hpp"
@@ -114,6 +117,77 @@ makeRuntimeEffectiveEosTable(
       units,
       physics::makeEffectiveIsmReferenceCoolingProvider(config.physics));
 }
+
+// Audit F4: records every gas cell mutated by feedback deposition together
+// with its specific internal energy before the first mutation, so the single
+// thermodynamic refresh contract can update P / c_s / T before the next CFL
+// decision. Capacity is admitted through the MemoryGovernor BEFORE each event
+// batch (old + new storage coexist during growth); recordGasCellMutation never
+// allocates inside a deposition, so a refusal cannot leave a half-deposited
+// batch.
+class FeedbackThermodynamicTouchLog final
+    : public physics::StellarFeedbackThermodynamicTouchSink {
+ public:
+  explicit FeedbackThermodynamicTouchLog(core::MemoryGovernor* governor) noexcept
+      : m_governor(governor) {}
+
+  void reserveAdditional(std::size_t additional_touches) {
+    const std::size_t required = core::checkedSizeAdd(
+        m_touches.size(), additional_touches, "feedback thermodynamic touch log size");
+    if (required <= m_touches.capacity()) {
+      return;
+    }
+    const std::size_t new_capacity = std::max(required, core::checkedSizeMultiply(
+        m_touches.capacity(), 2U, "feedback thermodynamic touch log growth"));
+    const std::uint64_t bytes = static_cast<std::uint64_t>(core::checkedSizeMultiply(
+        new_capacity, sizeof(hydro::GasThermodynamicTouch), "feedback thermodynamic touch log bytes"));
+    core::MemoryReservation replacement_reservation;
+    if (m_governor != nullptr) {
+      replacement_reservation = m_governor->reserve(
+          core::MemoryClass::kScratchArena, bytes, "sources.feedback.thermodynamic_touch_log");
+    }
+    std::vector<hydro::GasThermodynamicTouch> replacement;
+    replacement.reserve(new_capacity);
+    replacement.insert(replacement.end(), m_touches.begin(), m_touches.end());
+    m_touches.swap(replacement);
+    if (m_governor != nullptr) {
+      replacement_reservation.commit();
+      m_reservation.release();
+      m_reservation = std::move(replacement_reservation);
+    }
+  }
+
+  void recordGasCellMutation(std::uint32_t cell_index, double internal_energy_before_code) override {
+    if (m_touches.size() == m_touches.capacity()) {
+      throw std::logic_error(
+          "feedback thermodynamic touch log exceeded its pre-admitted capacity; "
+          "reserveAdditional() must bound every deposition batch");
+    }
+    m_touches.push_back(hydro::GasThermodynamicTouch{
+        .cell_row = cell_index, .internal_energy_before_code = internal_energy_before_code});
+  }
+
+  // Sort by row and keep the FIRST record of each row (its pre-stage energy).
+  [[nodiscard]] std::span<const hydro::GasThermodynamicTouch> collapse() {
+    std::stable_sort(m_touches.begin(), m_touches.end(),
+        [](const hydro::GasThermodynamicTouch& a, const hydro::GasThermodynamicTouch& b) {
+          return a.cell_row < b.cell_row;
+        });
+    const auto last = std::unique(m_touches.begin(), m_touches.end(),
+        [](const hydro::GasThermodynamicTouch& a, const hydro::GasThermodynamicTouch& b) {
+          return a.cell_row == b.cell_row;
+        });
+    m_touches.erase(last, m_touches.end());
+    return m_touches;
+  }
+
+  [[nodiscard]] bool empty() const noexcept { return m_touches.empty(); }
+
+ private:
+  core::MemoryGovernor* m_governor = nullptr;
+  core::MemoryReservation m_reservation;
+  std::vector<hydro::GasThermodynamicTouch> m_touches;
+};
 
 template <class TFunction>
 void prepareIdCollectively(const parallel::MpiContext& mpi_context,
@@ -842,6 +916,8 @@ class SourceRuntimeImpl final : public SourceRuntime {
     const double g_code = newtonGCodeFromUnits(units);
     m_mean_baryon_density0_code = 3.0 * hubble_code * hubble_code /
         (8.0 * core::constants::k_pi * g_code) * config.cosmology.omega_baryon;
+    m_hydro_density_floor_code = config.numerics.hydro_density_floor_code;
+    m_hydro_pressure_floor_code = config.numerics.hydro_pressure_floor_code;
   }
 
   [[nodiscard]] core::MemoryReport memoryReport() const override {
@@ -1319,7 +1395,7 @@ class SourceRuntimeImpl final : public SourceRuntime {
       }
     }
 
-    executeStellarEvolutionAndEnrichment(context);
+    executeStellarEvolutionAndEnrichment(context, source_evaluation_scale_factor);
     executeMetalDiffusion(context, source_evaluation_scale_factor);
 
     physics::BlackHoleAgnStepReport black_hole_report{};
@@ -1477,10 +1553,12 @@ class SourceRuntimeImpl final : public SourceRuntime {
     return std::max(elapsed_si / k_seconds_per_year, 0.0);
   }
 
-  void executeStellarEvolutionAndEnrichment(core::StepContext& context) {
+  void executeStellarEvolutionAndEnrichment(
+      core::StepContext& context, double source_evaluation_scale_factor) {
     if (!m_stellar_evolution.config().enabled) {
       return;
     }
+    FeedbackThermodynamicTouchLog thermodynamic_touches(m_memory_governor);
     const bool all_stars_active =
         !context.active_set.particles_are_subset ||
         context.active_set.particle_indices.empty();
@@ -1661,6 +1739,7 @@ class SourceRuntimeImpl final : public SourceRuntime {
             context.state.gas_cells.internal_energy_code,
         .gas_metal_mass_code = context.state.gas_cells.metal_mass_code,
         .cell_volume_provider = &volume_provider,
+        .thermodynamic_touch_sink = &thermodynamic_touches,
     };
     m_feedback_events.clear();
     if (required_event_capacity > m_feedback_events.capacity()) {
@@ -1720,6 +1799,12 @@ class SourceRuntimeImpl final : public SourceRuntime {
         });
       }
       if (!m_feedback_events.empty()) {
+        // Admit the touch-log capacity for this batch before any deposition:
+        // each event deposits into at most neighbor_count target cells.
+        thermodynamic_touches.reserveAdditional(core::checkedSizeMultiply(
+            m_feedback_events.size(),
+            static_cast<std::size_t>(m_stellar_feedback.config().neighbor_count),
+            "feedback thermodynamic touch batch bound"));
         m_stellar_feedback.applyEventsCountersOnly(
             context.state,
             m_stellar_feedback_state,
@@ -1746,6 +1831,46 @@ class SourceRuntimeImpl final : public SourceRuntime {
     internal::synchronizeParentParticleCompatibilityMirrors(
         context.state, m_world_rank,
         "SourceRuntime stellar-evolution enrichment batch");
+    if (!thermodynamic_touches.empty()) {
+      // Audit F4: feedback changed density / internal energy / metals. Mark
+      // the derived caches stale and refresh them through the single
+      // closure contract at the source epoch, so the next CFL decision (and
+      // any output) sees the post-feedback signal speed.
+      context.state.notifyGasThermodynamicMutation();
+      std::unique_ptr<physics::EffectiveIsmThermodynamicClosure> closure;
+      if (m_effective_eos_table != nullptr) {
+        closure = std::make_unique<physics::EffectiveIsmThermodynamicClosure>(m_effective_eos_table);
+      }
+      const hydro::GasThermodynamicRefreshReport refresh_report = hydro::refreshGasThermodynamics(
+          context.state,
+          thermodynamic_touches.collapse(),
+          hydro::GasThermodynamicRefreshPolicy{
+              .adiabatic_index = 5.0 / 3.0,
+              .density_floor_code = m_hydro_density_floor_code,
+              .pressure_floor_code = m_hydro_pressure_floor_code,
+              .scale_factor = source_evaluation_scale_factor,
+              .redshift = std::max(0.0, 1.0 / source_evaluation_scale_factor - 1.0),
+              .closure = closure.get()});
+      m_last_thermodynamic_refresh = refresh_report;
+      if (context.profiler_session != nullptr) {
+        context.profiler_session->recordEvent(core::RuntimeEvent{
+            .event_kind = "sources.thermodynamic_refresh",
+            .severity = core::RuntimeEventSeverity::kInfo,
+            .subsystem = "sources.stellar_feedback",
+            .step_index = context.integrator_state.step_index,
+            .simulation_time_code = context.integrator_state.current_time_code,
+            .scale_factor = source_evaluation_scale_factor,
+            .message = "refreshed derived gas thermodynamics after feedback deposition (audit F4)",
+            .payload = {
+                {"refreshed_cells", std::to_string(refresh_report.refreshed_cells)},
+                {"effective_closure_cells", std::to_string(refresh_report.effective_closure_cells)},
+                {"pressure_floor_cells", std::to_string(refresh_report.pressure_floor_cells)},
+                {"temperature_unscaled_cells", std::to_string(refresh_report.temperature_unscaled_cells)},
+                {"max_sound_speed_increase_ratio",
+                 std::to_string(refresh_report.max_sound_speed_increase_ratio)},
+                {"max_sound_speed_code", std::to_string(refresh_report.max_sound_speed_code)}}});
+      }
+    }
   }
 
   void executeMetalDiffusion(
@@ -2093,6 +2218,9 @@ class SourceRuntimeImpl final : public SourceRuntime {
   bool m_bh_seeding_requested = false;
   bool m_is_cosmological = false;
   double m_mean_baryon_density0_code = 0.0;
+  double m_hydro_density_floor_code = 0.0;
+  double m_hydro_pressure_floor_code = 0.0;
+  hydro::GasThermodynamicRefreshReport m_last_thermodynamic_refresh{};
   std::vector<std::uint32_t> m_contiguous_cell_batch;
   std::vector<physics::StarFormationCellInput> m_star_formation_inputs;
   std::vector<std::uint32_t> m_contiguous_star_batch;

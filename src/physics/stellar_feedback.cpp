@@ -668,6 +668,11 @@ StellarFeedbackStepReport StellarFeedbackModel::applyEventsWithViews(
         const double old_mass = deposition_view.cell_mass_code[cell_index];
         const double old_density = deposition_view.gas_density_code[cell_index];
         const double old_u = deposition_view.gas_internal_energy_code[cell_index];
+        if (deposition_view.thermodynamic_touch_sink != nullptr) {
+          // Audit F4: report the mutation before it happens so the caller
+          // can refresh derived P / c_s / T before the next CFL decision.
+          deposition_view.thermodynamic_touch_sink->recordGasCellMutation(cell_index, old_u);
+        }
         double volume = 0.0;
         if (!deposition_view.cell_volume_code.empty()) {
           volume = deposition_view.cell_volume_code[cell_index];
@@ -884,6 +889,11 @@ void StellarFeedbackModel::applyEventsCountersOnly(
         const double old_mass = deposition_view.cell_mass_code[cell_index];
         const double old_density = deposition_view.gas_density_code[cell_index];
         const double old_u = deposition_view.gas_internal_energy_code[cell_index];
+        if (deposition_view.thermodynamic_touch_sink != nullptr) {
+          // Audit F4: report the mutation before it happens so the caller
+          // can refresh derived P / c_s / T before the next CFL decision.
+          deposition_view.thermodynamic_touch_sink->recordGasCellMutation(cell_index, old_u);
+        }
         double volume = 0.0;
         if (!deposition_view.cell_volume_code.empty()) {
           volume = deposition_view.cell_volume_code[cell_index];

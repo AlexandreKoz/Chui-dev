@@ -1,5 +1,10 @@
 # Hydrodynamics core solver (finite-volume Godunov scaffold)
 
+> Part 1 (20261103): the reconstruction/integration/Riemann method matrix, the
+> corrected Hancock predictor, CTU, PPM, dual energy and the passive-scalar
+> contract are specified in [`hydro_numerics.md`](hydro_numerics.md), which
+> supersedes conflicting statements below.
+
 ## Variable definitions
 
 The hydro core uses comoving conserved variables per cell:

@@ -1,5 +1,15 @@
 ## Round 8 corrective source changes — 2026-10-29
 
+20261103 CHUI Part 1 — source complete, NOT compiled/run. Closed in source:
+F1 (Hancock predictor sign + 1/a), F3 (HLL passive lanes), F4 (post-feedback
+thermodynamic refresh before CFL), F7 (ISM ledger volume), periodic fixed-grid
+double boundary flux. Open: F2 cooling interval acceptance (Part 2), F5
+newborn stellar age (Part 2), F6 automatic distributed AMR hierarchy (Part 3),
+multi-layer AMR ghosts for full-order PPM/CTU at patch boundaries (Part 3),
+persistent entropy lane if validation item 3 shows it is needed. See the
+[Part 1 record](repair/chui_part1_foundation_hydro_20261103.md).
+
+
 - Collective science snapshots require one MPI-shared run root: the source-runtime star-formation test now supplies the same initial/resumed directory on every rank. The production path-consensus guard is unchanged.
 - IC reader fixed non-routing collective count updated to 37 (Round 7 instrumentation: 66 actual = 37 fixed + 1 cosmology + 2 files + 20 audit + 6 Bcast); strict per-rank protocol assertions remain enabled.
 - Owned grouped TreePM pair accounting now excludes exact same-source identity, while counting physically distinct coincident particles, matching the per-target walk. MPI and force-convergence qualification still required.

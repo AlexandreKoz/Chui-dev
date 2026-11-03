@@ -27,6 +27,46 @@ enum class HydroSolver {
   kGodunovFv,
 };
 
+// Hydro numerical-method selectors. These are core-owned configuration
+// enums (core must not include hydro headers); workflows map them onto
+// cosmosim::hydro types. Defaults preserve the historical PLM/MC/MUSCL-Hancock/HLLC path.
+enum class HydroReconstructionMode {
+  kPiecewiseConstant,
+  kPiecewiseLinear,
+  kPiecewiseParabolic,
+};
+
+enum class HydroSlopeLimiterMode {
+  kMinmod,
+  kMonotonizedCentral,
+  kVanLeer,
+};
+
+enum class HydroIntegrationMode {
+  kMusclHancock,
+  kCornerTransportUpwind,
+};
+
+enum class HydroRiemannSolverMode {
+  kHllc,
+  kHlle,
+};
+
+enum class HydroDualEnergyConfigMode {
+  kOff,
+  kThermalFraction,
+};
+
+// Node-level memory admission policy. kOff preserves historical semantics:
+// only parallel.process_memory_budget_bytes (0 = unlimited) bounds a rank.
+enum class NodeMemoryAdmissionMode {
+  kOff,
+  // Determine a node limit (explicit node budget, cgroup/job limit, physical
+  // RAM; minimum of the known values), subtract the node reserve once and
+  // give each co-located rank an equal share.
+  kSharedEqual,
+};
+
 enum class TreePmAssignmentScheme {
   kCic,
   kTsc,
@@ -281,6 +321,14 @@ struct NumericsConfig {
   // scratch batch. 0 selects the deterministic runtime automatic maximum,
   // further bounded by current MemoryGovernor headroom.
   std::uint64_t hydro_active_batch_max_cells = 0;
+  HydroReconstructionMode hydro_reconstruction = HydroReconstructionMode::kPiecewiseLinear;
+  HydroSlopeLimiterMode hydro_slope_limiter = HydroSlopeLimiterMode::kMonotonizedCentral;
+  HydroIntegrationMode hydro_integration_scheme = HydroIntegrationMode::kMusclHancock;
+  HydroRiemannSolverMode hydro_riemann_solver = HydroRiemannSolverMode::kHllc;
+  HydroDualEnergyConfigMode hydro_dual_energy = HydroDualEnergyConfigMode::kOff;
+  // Dual-energy switch eta in (0, 1): use the auxiliary internal energy when
+  // the conservative thermal energy falls below eta times the total energy.
+  double hydro_dual_energy_eta = 1.0e-3;
   int max_global_steps = 1024;
   // Zero retains the safe global KDK default. Nonzero selects the provisional
   // synchronized collisionless DMO hierarchy; scientific qualification pending.
@@ -598,6 +646,12 @@ struct ParallelConfig {
   // integrator owns the canonical state because those lifetimes do not overlap.
   std::uint64_t process_output_restart_overlap_bytes = 0U;
   double process_memory_safety_margin_fraction = 0.0;
+  // Node-aware admission (see NodeMemoryAdmissionMode). The node budget is an
+  // explicit node-wide byte limit (0 = discover); the node reserve is
+  // subtracted exactly once at node level before the per-rank share.
+  NodeMemoryAdmissionMode node_memory_admission = NodeMemoryAdmissionMode::kOff;
+  std::uint64_t node_memory_budget_bytes = 0U;
+  std::uint64_t node_memory_reserve_bytes = 0U;
 };
 
 struct UnitsConfig {
@@ -781,6 +835,12 @@ void writeNormalizedConfigSnapshot(
 [[nodiscard]] std::string modeToString(SimulationMode mode);
 [[nodiscard]] std::string gravitySolverToString(GravitySolver solver);
 [[nodiscard]] std::string hydroSolverToString(HydroSolver solver);
+[[nodiscard]] std::string hydroReconstructionModeToString(HydroReconstructionMode mode);
+[[nodiscard]] std::string hydroSlopeLimiterModeToString(HydroSlopeLimiterMode mode);
+[[nodiscard]] std::string hydroIntegrationModeToString(HydroIntegrationMode mode);
+[[nodiscard]] std::string hydroRiemannSolverModeToString(HydroRiemannSolverMode mode);
+[[nodiscard]] std::string hydroDualEnergyConfigModeToString(HydroDualEnergyConfigMode mode);
+[[nodiscard]] std::string nodeMemoryAdmissionModeToString(NodeMemoryAdmissionMode mode);
 [[nodiscard]] std::string coordinateFrameToString(CoordinateFrame frame);
 [[nodiscard]] std::string initialConditionConventionToString(
     InitialConditionConvention convention);

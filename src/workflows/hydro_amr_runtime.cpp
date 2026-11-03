@@ -38,6 +38,8 @@
 #include "workflows/internal/gas_cell_ownership.hpp"
 #include "workflows/internal/amr_migration_payload.hpp"
 #include "workflows/internal/particle_ghost_runtime.hpp"
+#include "workflows/internal/mpi_stage_collective_decision.hpp"
+#include "cosmosim/core/stage_transaction.hpp"
 
 #if COSMOSIM_ENABLE_MPI
 #include <mpi.h>
@@ -47,6 +49,82 @@ namespace cosmosim::workflows {
 namespace {
 
 constexpr double k_gamma_adiabatic = 5.0 / 3.0;
+
+// Mapping of the core-owned configuration selectors onto hydro types. Policy
+// resolution happens once at runtime construction / per step, never inside
+// per-face loops.
+[[nodiscard]] hydro::HydroNumericsPolicy hydroNumericsPolicyFromConfig(const core::SimulationConfig& config) {
+  hydro::HydroNumericsPolicy policy;
+  policy.integration_scheme =
+      config.numerics.hydro_integration_scheme == core::HydroIntegrationMode::kCornerTransportUpwind
+          ? hydro::HydroIntegrationScheme::kCornerTransportUpwind
+          : hydro::HydroIntegrationScheme::kMusclHancock;
+  policy.dual_energy.mode =
+      config.numerics.hydro_dual_energy == core::HydroDualEnergyConfigMode::kThermalFraction
+          ? hydro::HydroDualEnergyMode::kThermalFraction
+          : hydro::HydroDualEnergyMode::kOff;
+  policy.dual_energy.thermal_fraction_switch = config.numerics.hydro_dual_energy_eta;
+  return policy;
+}
+
+[[nodiscard]] hydro::HydroSlopeLimiter hydroSlopeLimiterFromConfig(const core::SimulationConfig& config) {
+  switch (config.numerics.hydro_slope_limiter) {
+    case core::HydroSlopeLimiterMode::kMinmod:
+      return hydro::HydroSlopeLimiter::kMinmod;
+    case core::HydroSlopeLimiterMode::kMonotonizedCentral:
+      return hydro::HydroSlopeLimiter::kMonotonizedCentral;
+    case core::HydroSlopeLimiterMode::kVanLeer:
+      return hydro::HydroSlopeLimiter::kVanLeer;
+  }
+  return hydro::HydroSlopeLimiter::kMonotonizedCentral;
+}
+
+[[nodiscard]] hydro::HydroReconstructionScheme hydroReconstructionSchemeFromConfig(
+    const core::SimulationConfig& config) {
+  switch (config.numerics.hydro_reconstruction) {
+    case core::HydroReconstructionMode::kPiecewiseConstant:
+      return hydro::HydroReconstructionScheme::kPiecewiseConstant;
+    case core::HydroReconstructionMode::kPiecewiseLinear:
+      return hydro::HydroReconstructionScheme::kPiecewiseLinear;
+    case core::HydroReconstructionMode::kPiecewiseParabolic:
+      return hydro::HydroReconstructionScheme::kPiecewiseParabolic;
+  }
+  return hydro::HydroReconstructionScheme::kPiecewiseLinear;
+}
+
+[[nodiscard]] hydro::HydroRiemannSolverKind hydroRiemannSolverKindFromConfig(
+    const core::SimulationConfig& config) {
+  return config.numerics.hydro_riemann_solver == core::HydroRiemannSolverMode::kHlle
+      ? hydro::HydroRiemannSolverKind::kHlle
+      : hydro::HydroRiemannSolverKind::kHllc;
+}
+
+// Build the selected reconstruction for one advance. courant_factors must be
+// dt/(a dx_axis) at the flux-update epoch (hydroTransportCourantFactors).
+[[nodiscard]] std::unique_ptr<hydro::HydroReconstruction> makeConfiguredReconstruction(
+    const core::SimulationConfig& config,
+    const std::array<double, 3>& courant_factors) {
+  const hydro::HydroReconstructionPolicy policy{
+      .limiter = hydroSlopeLimiterFromConfig(config),
+      .dt_over_dx_code = courant_factors[0],
+      .dt_over_cell_width_code = courant_factors,
+      .rho_floor = config.numerics.hydro_density_floor_code > 0.0
+          ? config.numerics.hydro_density_floor_code : 1.0e-30,
+      .pressure_floor = config.numerics.hydro_pressure_floor_code > 0.0
+          ? config.numerics.hydro_pressure_floor_code : 1.0e-30,
+      .enable_muscl_hancock_predictor = true,
+      .adiabatic_index = k_gamma_adiabatic,
+  };
+  switch (hydroReconstructionSchemeFromConfig(config)) {
+    case hydro::HydroReconstructionScheme::kPiecewiseConstant:
+      return std::make_unique<hydro::PiecewiseConstantReconstruction>();
+    case hydro::HydroReconstructionScheme::kPiecewiseLinear:
+      return std::make_unique<hydro::MusclHancockReconstruction>(policy);
+    case hydro::HydroReconstructionScheme::kPiecewiseParabolic:
+      return std::make_unique<hydro::PpmReconstruction>(policy);
+  }
+  throw std::invalid_argument("unhandled hydro reconstruction scheme");
+}
 
 class SimulationStateHydroSourcePropertyProvider final
     : public hydro::HydroCellSourcePropertyProvider {
@@ -384,15 +462,9 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
         m_memory_governor(services.memory_governor),
         m_units(core::makeUnitSystem(
             config.units.length_unit, config.units.mass_unit, config.units.velocity_unit)),
-        m_solver(k_gamma_adiabatic),
-        m_reconstruction(hydro::HydroReconstructionPolicy{
-            .limiter = hydro::HydroSlopeLimiter::kMonotonizedCentral,
-            .dt_over_dx_code = 0.0,
-            .rho_floor = m_config.numerics.hydro_density_floor_code,
-            .pressure_floor = m_config.numerics.hydro_pressure_floor_code,
-            .enable_muscl_hancock_predictor = true,
-            .adiabatic_index = k_gamma_adiabatic,
-        }) {
+        m_solver(k_gamma_adiabatic, hydroNumericsPolicyFromConfig(config)),
+        m_reconstruction(makeConfiguredReconstruction(config, {0.0, 0.0, 0.0})),
+        m_riemann_solver(hydro::makeHydroRiemannSolver(hydroRiemannSolverKindFromConfig(config))) {
     if (m_config.physics.enable_cooling) {
       constexpr double k_mean_molecular_weight_ionized = 0.59;
       constexpr double k_proton_mass_kg = 1.67262192369e-27;
@@ -774,6 +846,18 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
             m_config.units.coordinate_frame == core::CoordinateFrame::kComoving,
     };
 
+    // Audit F1 follow-up: the Hancock/CTU predictors use the same
+    // dt/(a dx) transport factor as the conservative flux update
+    // dt/(a V) sum A F, evaluated at the same epoch a = update.scale_factor.
+    m_reconstruction = makeConfiguredReconstruction(
+        m_config,
+        hydro::hydroTransportCourantFactors(
+            update.dt_code,
+            update.scale_factor,
+            m_geometry.cell_width_x_comoving,
+            m_geometry.cell_width_y_comoving,
+            m_geometry.cell_width_z_comoving));
+
     const double density_frame_factor =
         m_config.units.coordinate_frame == core::CoordinateFrame::kComoving
             ? 1.0 / std::pow(update.scale_factor, 3.0)
@@ -815,8 +899,8 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
         m_geometry,
         active_view,
         update,
-        m_reconstruction,
-        m_riemann_solver,
+        *m_reconstruction,
+        *m_riemann_solver,
         sources,
         source_context,
         m_scratch,
@@ -849,6 +933,14 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
                       {"source_delta_total_energy", std::to_string(conservation.source_delta.total_energy)},
                       {"floor_delta_total_energy", std::to_string(conservation.floor_delta.total_energy)},
                       {"internal_energy_floor_count", std::to_string(conservation.internal_energy_floor_count)},
+                      {"dual_energy_sync_count", std::to_string(conservation.dual_energy_sync_count)},
+                      {"dual_energy_sync_delta_total_energy", std::to_string(conservation.dual_energy_sync_delta.total_energy)},
+                      {"riemann_solve_count", std::to_string(m_last_hydro_profile.riemann_solve_count)},
+                      {"positivity_fallback_count", std::to_string(m_last_hydro_profile.positivity_fallback_count)},
+                      {"stencil_degradation_count", std::to_string(m_last_hydro_profile.stencil_degradation_count)},
+                      {"ctu_transverse_corrected_states", std::to_string(m_last_hydro_profile.ctu_transverse_corrected_states)},
+                      {"ctu_transverse_degraded_states", std::to_string(m_last_hydro_profile.ctu_transverse_degraded_states)},
+                      {"ctu_transverse_inadmissible_states", std::to_string(m_last_hydro_profile.ctu_transverse_inadmissible_states)},
                       {"mass_tolerance", "1e-10"},
                       {"momentum_tolerance", "1e-10"},
                       {"energy_tolerance", "1e-10"}}});
@@ -928,6 +1020,29 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
                       {"remote_payload_bytes", std::to_string(m_last_remote_ghost_boundary_report.payload_bytes)}}});
     }
 
+    // Part 1 stage transaction. m_conserved is solver-owned staging storage;
+    // SimulationState gas truth is written only inside commit() below, after
+    // the staged state passed admissibility and the (communicator-wide) vote.
+    // A rejection therefore leaves density, momentum, energy, metals,
+    // identity maps and time metadata exactly as they were at step start.
+    const internal::MpiStageCollectiveDecision hydro_collective_decision(m_mpi_context);
+    core::StageTransaction hydro_transaction(
+        "hydro.fixed_grid.update", m_memory_governor, &hydro_collective_decision);
+    if (active_batch_reservation.has_value()) {
+      hydro_transaction.adoptReservation(std::move(*active_batch_reservation));
+      active_batch_reservation.reset();
+    }
+    std::string staged_failure;
+    const bool staged_admissible = stagedConservedStateIsAdmissible(staged_failure);
+    if (!hydro_transaction.validate(
+            staged_admissible, core::StageRejectionKind::kNumericalRetry, staged_failure)) {
+      throw core::StageTransactionRejected(
+          hydro_transaction.outcome().rejection,
+          "fixed-grid hydro update rejected before commit (" +
+              std::string(core::stageRejectionKindLabel(hydro_transaction.outcome().rejection)) +
+              "): " + hydro_transaction.outcome().reason);
+    }
+    (void)hydro_transaction.commit([&]() {
     for (std::size_t cell_index = 0; cell_index < context.state.cells.size(); ++cell_index) {
       const std::uint32_t gas_cell_owner_rank = internal::gasCellOwnerRankForLocalRow(
           context.state,
@@ -971,6 +1086,7 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
       context.state.gas_cells.velocity_y_peculiar[cell_index] = primitive.vel_y_peculiar;
       context.state.gas_cells.velocity_z_peculiar[cell_index] = primitive.vel_z_peculiar;
     }
+    });
 
     internal::synchronizeParentParticleCompatibilityMirrors(
         context.state, world_rank, "hydro callback parent compatibility mirror");
@@ -980,6 +1096,55 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
   }
 
  private:
+  // Validation predicate of the fixed-grid hydro transaction: every staged
+  // real-cell conserved lane is finite, mass is positive and the thermal
+  // energy E - |p|^2/(2 rho) is non-negative. O(N_cells) streaming check over
+  // the solver-owned staging copy; no allocation.
+  [[nodiscard]] bool stagedConservedStateIsAdmissible(std::string& failure) const {
+    const std::size_t real_cells = m_geometry.cellCount();
+    for (std::size_t row = 0; row < real_cells; ++row) {
+      const hydro::HydroConservedState cell = m_conserved.loadCell(row);
+      const bool finite = std::isfinite(cell.mass_density_comoving) &&
+          std::isfinite(cell.momentum_density_x_comoving) &&
+          std::isfinite(cell.momentum_density_y_comoving) &&
+          std::isfinite(cell.momentum_density_z_comoving) &&
+          std::isfinite(cell.total_energy_density_comoving) &&
+          std::isfinite(cell.metal_mass_density_comoving);
+      if (!finite || !(cell.mass_density_comoving > 0.0)) {
+        failure = "staged conserved state is non-finite or has non-positive mass at solver row " +
+            std::to_string(row);
+        return false;
+      }
+      const double kinetic = 0.5 *
+          (cell.momentum_density_x_comoving * cell.momentum_density_x_comoving +
+           cell.momentum_density_y_comoving * cell.momentum_density_y_comoving +
+           cell.momentum_density_z_comoving * cell.momentum_density_z_comoving) /
+          cell.mass_density_comoving;
+      if (cell.total_energy_density_comoving < kinetic) {
+        failure = "staged conserved state has negative thermal energy at solver row " +
+            std::to_string(row);
+        return false;
+      }
+    }
+    return true;
+  }
+
+  // Per-active-cell transient budget. The optional CTU / dual-energy lanes
+  // scale with touched cells (<= 1 + 2 * 6 per active cell).
+  [[nodiscard]] std::uint64_t hydroBatchScratchBytesPerCell() const {
+    constexpr std::uint64_t k_touched_per_active_cell = 13U;
+    const hydro::HydroActiveBatchPolicy features =
+        m_solver.requiredWorkspaceFeatures(hydro::HydroActiveBatchPolicy{});
+    std::uint64_t bytes = hydro::k_hydro_runtime_batch_scratch_budget_bytes_per_cell;
+    if (features.ctu_transverse_workspace) {
+      bytes += k_touched_per_active_cell * sizeof(std::array<hydro::HydroConservedState, 3>);
+    }
+    if (features.dual_energy_workspace) {
+      bytes += k_touched_per_active_cell * 2U * sizeof(double);
+    }
+    return bytes;
+  }
+
   [[nodiscard]] hydro::HydroActiveBatchPolicy selectHydroActiveBatchPolicy() const {
     std::uint64_t requested = m_config.numerics.hydro_active_batch_max_cells == 0U
         ? static_cast<std::uint64_t>(hydro::k_hydro_automatic_active_batch_max_cells)
@@ -990,7 +1155,7 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
               m_memory_governor->snapshot(),
               core::DeterministicBatchSizingPolicy{
                   .requested_max_items = requested,
-                  .bytes_per_item = hydro::k_hydro_runtime_batch_scratch_budget_bytes_per_cell,
+                  .bytes_per_item = hydroBatchScratchBytesPerCell(),
                   .fixed_reserve_bytes = 0U,
                   .minimum_items = 1U,
                   .alignment_items = hydro::k_hydro_active_batch_alignment_cells,
@@ -1004,8 +1169,8 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
     }
     requested = std::min<std::uint64_t>(
         requested, static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max()));
-    return hydro::HydroActiveBatchPolicy{
-        .max_active_cells = static_cast<std::size_t>(std::max<std::uint64_t>(1U, requested))};
+    return m_solver.requiredWorkspaceFeatures(hydro::HydroActiveBatchPolicy{
+        .max_active_cells = static_cast<std::size_t>(std::max<std::uint64_t>(1U, requested))});
   }
 
   [[nodiscard]] std::optional<core::MemoryReservation> reserveHydroActiveBatch(
@@ -1014,13 +1179,13 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
       return std::nullopt;
     }
     const std::uint64_t cells = static_cast<std::uint64_t>(batch_policy.max_active_cells);
-    if (cells > std::numeric_limits<std::uint64_t>::max() /
-        hydro::k_hydro_runtime_batch_scratch_budget_bytes_per_cell) {
+    const std::uint64_t bytes_per_cell = hydroBatchScratchBytesPerCell();
+    if (cells > std::numeric_limits<std::uint64_t>::max() / bytes_per_cell) {
       throw std::overflow_error("hydro active-batch reservation byte count overflow");
     }
     auto reservation = m_memory_governor->reserve(
         core::MemoryClass::kScratchArena,
-        cells * hydro::k_hydro_runtime_batch_scratch_budget_bytes_per_cell,
+        cells * bytes_per_cell,
         "hydro.active_batch");
     reservation.commit();
     return std::optional<core::MemoryReservation>(std::move(reservation));
@@ -1076,6 +1241,7 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
     double cumulative_removed = 0.0;
     double cumulative_net = 0.0;
     std::uint64_t cumulative_cells = 0U;
+    bool legacy_density_ledger_discarded = false;
     if (const core::ModuleSidecarBlock* prior = state.sidecars.find("effective_multiphase_ism");
         prior != nullptr) {
       std::string text;
@@ -1100,6 +1266,28 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
         }
       }
     }
+    if (const core::ModuleSidecarBlock* prior = state.sidecars.find("effective_multiphase_ism");
+        prior != nullptr) {
+      std::string text;
+      text.reserve(prior->payload.size());
+      for (const std::byte value : prior->payload) text.push_back(static_cast<char>(value));
+      const std::string version_key = "energy_ledger_version=" +
+          std::to_string(physics::kEffectiveIsmEnergyLedgerVersion);
+      const bool carried_legacy_flag =
+          text.find("legacy_density_ledger_discarded=1") != std::string::npos;
+      if (text.find(version_key) == std::string::npos) {
+        // Pre-F7 sidecar: cumulative values are energy-density sums without
+        // cell volume. They cannot be converted after the fact, so discard
+        // them explicitly and record that the cumulative ledger restarted.
+        cumulative_added = 0.0;
+        cumulative_removed = 0.0;
+        cumulative_net = 0.0;
+        cumulative_cells = 0U;
+        legacy_density_ledger_discarded = true;
+      } else if (carried_legacy_flag) {
+        legacy_density_ledger_discarded = true;
+      }
+    }
     cumulative_added += latest.energy_added_code;
     cumulative_removed += latest.energy_removed_code;
     cumulative_net += latest.net_energy_adjustment_code;
@@ -1110,6 +1298,9 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
     stream << "parameter_set=" << m_effective_ism_closure->table().config().parameter_set << "\n";
     stream << "table_hash=" << m_effective_ism_closure->table().tableHashHex() << "\n";
     stream << "cooling_reference=" << m_effective_ism_closure->table().coolingReferenceDescription() << "\n";
+    stream << "energy_ledger_version=" << physics::kEffectiveIsmEnergyLedgerVersion << "\n";
+    stream << "energy_ledger_units=integrated_code_energy\n";
+    stream << "legacy_density_ledger_discarded=" << (legacy_density_ledger_discarded ? 1 : 0) << "\n";
     stream << "latest.energy_added_code=" << latest.energy_added_code << "\n";
     stream << "latest.energy_removed_code=" << latest.energy_removed_code << "\n";
     stream << "latest.net_energy_adjustment_code=" << latest.net_energy_adjustment_code << "\n";
@@ -1339,6 +1530,7 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
           .decomposition_epoch = decomposition_epoch});
       face.neighbor_cell = ghost_cell;
       face.neighbor_plus_cell = hydro::k_invalid_cell_index;
+      face.neighbor_plus2_cell = hydro::k_invalid_cell_index;
       face.ghost_cell_slot = ghost_slot;
       if (!ghost_slot_by_face_key.emplace(face_key, ghost_slot).second) {
         throw std::runtime_error("hydro internal remote boundary discovery produced duplicate face keys");
@@ -1576,7 +1768,9 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
         .ghost_fill_time_code = context.integrator_state.current_time_code,
         .active_batch_policy = active_batch_policy,
         .physical_density_cgs_per_density_code = physical_density_cgs_per_density_code,
-        .regrid_memory_governor = m_memory_governor};
+        .regrid_memory_governor = m_memory_governor,
+        .reconstruction_scheme = hydroReconstructionSchemeFromConfig(m_config),
+        .slope_limiter = hydroSlopeLimiterFromConfig(m_config)};
     amr::ProductionAmrHydroDiagnostics amr_diagnostics;
     std::size_t remote_patch_count = 0;
     std::size_t remote_flux_register_count = 0;
@@ -1874,7 +2068,7 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
             update,
             source_context,
             m_solver,
-            m_riemann_solver,
+            *m_riemann_solver,
             sources,
             amr_options,
             amr::DistributedAmrHydroExchange{
@@ -2014,7 +2208,7 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
           update,
           source_context,
           m_solver,
-          m_riemann_solver,
+          *m_riemann_solver,
           sources,
           amr_options);
     }
@@ -2088,6 +2282,11 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
           .message = "advanced production AMR hydro patches from SimulationState-authoritative gas rows",
           .payload = {{"patch_count", std::to_string(amr_diagnostics.patch_count)},
                       {"advanced_patch_count", std::to_string(amr_diagnostics.advanced_patch_count)},
+                      {"riemann_solve_count", std::to_string(amr_diagnostics.riemann_solve_count)},
+                      {"positivity_fallback_count", std::to_string(amr_diagnostics.positivity_fallback_count)},
+                      {"stencil_degradation_count", std::to_string(amr_diagnostics.stencil_degradation_count)},
+                      {"ctu_transverse_degraded_states", std::to_string(amr_diagnostics.ctu_transverse_degraded_states)},
+                      {"dual_energy_auxiliary_cells", std::to_string(amr_diagnostics.dual_energy_auxiliary_cells)},
                       {"active_cell_count", std::to_string(amr_diagnostics.active_cell_count)},
                       {"active_face_count", std::to_string(amr_diagnostics.active_face_count)},
                       {"flux_register_entry_count", std::to_string(amr_diagnostics.flux_register_entry_count)},
@@ -2236,18 +2435,13 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
     hydro::appendCartesianBoundaryGhostFaces(
         m_geometry,
         hydroBoundaryKindFromModePolicy(m_mode_policy.hydro_boundary));
-    const double dx = std::max(1.0e-6, spec.cell_width_x_comoving);
-    const double dy = std::max(1.0e-6, spec.cell_width_y_comoving);
-    const double dz = std::max(1.0e-6, spec.cell_width_z_comoving);
-    m_reconstruction = hydro::MusclHancockReconstruction(hydro::HydroReconstructionPolicy{
-        .limiter = hydro::HydroSlopeLimiter::kMonotonizedCentral,
-        .dt_over_dx_code = dt_time_code / dx,
-        .dt_over_cell_width_code = {dt_time_code / dx, dt_time_code / dy, dt_time_code / dz},
-        .rho_floor = m_config.numerics.hydro_density_floor_code,
-        .pressure_floor = m_config.numerics.hydro_pressure_floor_code,
-        .enable_muscl_hancock_predictor = true,
-        .adiabatic_index = k_gamma_adiabatic,
-    });
+    if (hydroBoundaryKindFromModePolicy(m_mode_policy.hydro_boundary) == hydro::HydroBoundaryKind::kPeriodic) {
+      // Full-order periodic reconstruction stencils (PLM and PPM) across the
+      // box boundary; the wrapped cells are authoritative real rows.
+      (void)hydro::completePeriodicReconstructionStencils(m_geometry);
+    }
+    // The reconstruction (and its dt/(a dx) Courant factors) is rebuilt per
+    // step once the flux-update epoch is known; see the hydro callback.
   }
 
   [[nodiscard]] hydro::HydroActiveSetView buildActiveFaceView(std::span<const std::uint32_t> active_cells) {
@@ -2266,15 +2460,28 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
       if (m_remote_non_authority_faces.contains(face_index)) {
         continue;
       }
+      std::size_t neighbor_for_activity = face.neighbor_cell;
       if (face.ghost_cell_slot != hydro::k_invalid_ghost_cell_slot) {
         const hydro::HydroGhostCell& ghost = m_geometry.ghost_cells.at(face.ghost_cell_slot);
         if (ghost.boundary_kind == hydro::HydroBoundaryKind::kImportedMpi &&
             m_current_world_rank > static_cast<std::uint32_t>(ghost.origin_rank)) {
           continue;
         }
+        if (ghost.boundary_kind == hydro::HydroBoundaryKind::kPeriodic) {
+          // A periodic box face appears twice (lower-side ghost face of cell
+          // 0 and upper-side ghost face of cell n-1); both deposit on the
+          // same two real cells. Evaluate only the upper-side copy so the
+          // boundary flux is applied exactly once, and treat its wrapped
+          // source cell as the neighbor for activity.
+          if (ghost.side == hydro::HydroFaceSide::kLower) {
+            continue;
+          }
+          neighbor_for_activity = ghost.source_real_cell;
+        }
       }
       if (active_cell_lookup.contains(face.owner_cell) ||
-          (face.neighbor_cell != hydro::k_invalid_cell_index && active_cell_lookup.contains(face.neighbor_cell))) {
+          (neighbor_for_activity != hydro::k_invalid_cell_index &&
+           active_cell_lookup.contains(neighbor_for_activity))) {
         m_active_faces.push_back(face_index);
       }
     }
@@ -2413,8 +2620,8 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
   core::UnitSystem m_units;
   std::uint32_t m_current_world_rank = 0;
   hydro::HydroCoreSolver m_solver;
-  hydro::MusclHancockReconstruction m_reconstruction;
-  hydro::HllcRiemannSolver m_riemann_solver;
+  std::unique_ptr<hydro::HydroReconstruction> m_reconstruction;
+  std::unique_ptr<hydro::HydroRiemannSolver> m_riemann_solver;
   std::unique_ptr<physics::CoolingHeatingSource> m_cooling_source;
   std::unique_ptr<physics::EffectiveIsmThermodynamicClosure> m_effective_ism_closure;
   std::unique_ptr<physics::EffectiveIsmEnergyRelaxationSource> m_effective_ism_energy_source;

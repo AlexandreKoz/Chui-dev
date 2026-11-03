@@ -791,3 +791,40 @@ eta_AREPO)`), snapshots at the same scale factors (z = 9, 3, 1, 0), first with
 the exact reference policies, then with each experimental policy toggled
 separately (`multirate_outer_kick`, `finite_difference_4`, group walk,
 topology refit) so differences are attributable.
+
+## CHUI Part 1 human-run acceptance (hydro suite, F1/F3/F4/F7, memory) — 20261103
+
+All items below are **NOT RUN — USER-RESERVED**. Unit sources:
+`test_hydro_muscl_hancock_predictor`, `test_hydro_riemann_passive_scalars`,
+`test_hydro_ppm`, `test_hydro_ctu`, `test_hydro_dual_energy`,
+`test_gas_thermodynamic_refresh`, `test_effective_ism_energy_ledger`,
+`test_node_memory_admission`, `test_stage_transaction`,
+`test_config_hydro_numerics` (ctest names `unit_<name>`).
+
+Additional campaign checks to run on top of the unit tests:
+1. Smooth-wave and oblique advection convergence for PLM/PPM x MH/CTU at
+   N = 16, 32, 64, 128 (`bench_hydro_method_matrix` prints the L1 error);
+   expect ~2nd order for PLM, >= 2nd for PPM on smooth data, and CTU error
+   below MH at equal Courant for oblique flow.
+2. Sod, strong-shock (pressure ratio 1e5), Sedov and contact problems with
+   each reconstruction; check positivity fallback counts and absence of
+   negative pressure.
+3. High-Mach cold advection (Mach 1e2-1e4) over >= 100 steps with
+   `hydro_dual_energy = off` vs `thermal_fraction`; decide from the measured
+   pressure error and `dual_energy_sync_delta` whether a persistent entropy
+   lane is needed (Part 2/3 decision).
+4. a != 1 consistency: identical results for (dt, a) and (dt/2, 1) in an
+   isolated (non-expanding) box; comoving Zel'dovich pancake for the combined
+   1/a and expansion-drag path.
+5. Feedback heating x100: verify the next accepted interval drops by ~10 in
+   a production `isolated_galaxy` run (`sources.thermodynamic_refresh` event,
+   `max_sound_speed_increase_ratio`).
+6. AMR: synchronized two-level patch run with PPM/CTU; inspect
+   `stencil_degradation_count`/`ctu_transverse_degraded_states` and reflux
+   conservation (mass, momentum, energy and metals) to round-off.
+7. Mode smoke for `cosmo_cube`, `zoom_in`, `isolated_galaxy`,
+   `isolated_cluster` with defaults (behavior must match pre-Part-1 apart from
+   the documented F1/F3/periodic-face fixes).
+8. Memory: run with `node_memory_admission = shared_equal` and 1, 2, 4 ranks per
+   node; confirm `memory.node_admission` shares and that refusals are reported,
+   not crashes.

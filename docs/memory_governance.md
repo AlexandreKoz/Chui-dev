@@ -506,3 +506,58 @@ just as the communication arena has its own owner. No per-particle storage is
 added by this optimization; existing optional hierarchical split-force lanes
 remain governed by their existing transactions. This does not certify a large
 DMO simulation's whole-process fit.
+
+## Node-aware admission, owner telemetry and stage transactions (CHUI Part 1, 20261103)
+
+Status: source only, NOT RUN.
+
+**Rank vs node.** `MemoryGovernor` remains the single rank-local authority.
+`core::computeNodeMemoryAdmission()` (`include/cosmosim/core/node_memory_admission.hpp`)
+derives its hard limit when `parallel.node_memory_admission = shared_equal`:
+
+    node_limit  = min(node_memory_budget_bytes [if set], cgroup v2/v1 limit,
+                      SLURM_MEM_PER_NODE, physical RAM)
+    node_usable = node_limit - node_memory_reserve_bytes      (once)
+    rank_share  = floor(node_usable / ranks_on_node)           (MPI_COMM_TYPE_SHARED size)
+    hard_limit  = min(rank_share, process_memory_budget_bytes if non-zero)
+
+`sum(hard_limit) <= node_usable` for every co-located rank set, independent of
+how unevenly ranks allocate, so no node-level shared counter or MPI window is
+required. Rank-local external reserves (`process_*_unknown_reserve_bytes`) stay
+inside each rank's share: nothing is subtracted twice. Discovery is
+best-effort and never throws; if no limit is known the admission refuses and
+asks for an explicit node budget. Assumptions: a discovered cgroup/scheduler
+limit is shared by all co-located ranks (conservative for per-task cgroups);
+physical RAM is optimistic on shared nodes. The 36/42 GiB numbers of the
+historical 48 GiB workstation are only an illustrative profile; the rule is
+size-independent (unit tests use synthetic 8/16/48/128 GiB nodes). Serial and
+non-MPI builds use `ranks_on_node = 1` and never call MPI. The selection is
+reported in the `memory.node_admission` profiler event.
+
+**Owner telemetry.** `MemoryGovernor::ownerTelemetry()` returns, per owner label
+(first 63 labels, then `<other>`), live bytes, peak live bytes, reservation and
+rejection counts. The table is fixed-size; reservation never allocates for it.
+Accounting remains an estimate of CHUI-owned allocations, not OS residency
+(`observeProcessMemory()` stays diagnostic evidence).
+
+**Batch-scoped hydro scratch.** CTU (`3 x HydroConservedState` per touched
+cell) and dual-energy (`2 x double` per touched cell) lanes are planned by
+`HydroScratchBuffers::workspaceBytes/prepareForActiveSet` when the batch policy
+requests them (`HydroCoreSolver::requiredWorkspaceFeatures`), are sized by the
+active patch/batch, and are never persistent all-mesh copies. The batched
+solver refuses an unplanned lane rather than growing after admission. PPM
+stages up to six primitive stencil cells per face (was four).
+
+**Stage transactions.** `core::StageTransaction` admits all transient bytes
+before work (refusal is recorded, not thrown, so every rank still votes),
+classifies preparation failures (numerical retry / model downgrade / resource /
+invalid state), performs exactly one collective vote, commits pending
+reservations before the authoritative mutation, and releases everything exactly
+once on every path. Wired today around the fixed-grid hydro commit (staged
+conserved state -> `SimulationState`). Feedback touch-log capacity is admitted
+before each deposition batch (old + new storage coexist during growth).
+
+**Known ungoverned allocations (unchanged by Part 1):** FFTW/MPI/HDF5 internal
+buffers (covered only by the explicit reserves), per-step reconstruction /
+Riemann solver objects (a few hundred bytes), the `ownerTelemetry()` result
+vector at diagnostic boundaries.

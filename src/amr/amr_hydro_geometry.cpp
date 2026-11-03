@@ -429,16 +429,22 @@ AmrHydroPatchGeometry buildAmrHydroPatchGeometry(
           case hydro::HydroFaceAxis::kX:
             face.owner_minus_cell = result.geometry.neighborCell(owner, -1, 0, 0);
             face.neighbor_plus_cell = result.geometry.neighborCell(neighbor, 1, 0, 0);
+            face.owner_minus2_cell = result.geometry.neighborCell(owner, -2, 0, 0);
+            face.neighbor_plus2_cell = result.geometry.neighborCell(neighbor, 2, 0, 0);
             face.normal_x = 1.0;
             break;
           case hydro::HydroFaceAxis::kY:
             face.owner_minus_cell = result.geometry.neighborCell(owner, 0, -1, 0);
             face.neighbor_plus_cell = result.geometry.neighborCell(neighbor, 0, 1, 0);
+            face.owner_minus2_cell = result.geometry.neighborCell(owner, 0, -2, 0);
+            face.neighbor_plus2_cell = result.geometry.neighborCell(neighbor, 0, 2, 0);
             face.normal_y = 1.0;
             break;
           case hydro::HydroFaceAxis::kZ:
             face.owner_minus_cell = result.geometry.neighborCell(owner, 0, 0, -1);
             face.neighbor_plus_cell = result.geometry.neighborCell(neighbor, 0, 0, 1);
+            face.owner_minus2_cell = result.geometry.neighborCell(owner, 0, 0, -2);
+            face.neighbor_plus2_cell = result.geometry.neighborCell(neighbor, 0, 0, 2);
             face.normal_z = 1.0;
             break;
         }
@@ -547,16 +553,22 @@ AmrHydroPatchGeometry buildRemoteAmrHydroPatchGeometry(
           case hydro::HydroFaceAxis::kX:
             face.owner_minus_cell = result.geometry.neighborCell(owner, -1, 0, 0);
             face.neighbor_plus_cell = result.geometry.neighborCell(neighbor, 1, 0, 0);
+            face.owner_minus2_cell = result.geometry.neighborCell(owner, -2, 0, 0);
+            face.neighbor_plus2_cell = result.geometry.neighborCell(neighbor, 2, 0, 0);
             face.normal_x = 1.0;
             break;
           case hydro::HydroFaceAxis::kY:
             face.owner_minus_cell = result.geometry.neighborCell(owner, 0, -1, 0);
             face.neighbor_plus_cell = result.geometry.neighborCell(neighbor, 0, 1, 0);
+            face.owner_minus2_cell = result.geometry.neighborCell(owner, 0, -2, 0);
+            face.neighbor_plus2_cell = result.geometry.neighborCell(neighbor, 0, 2, 0);
             face.normal_y = 1.0;
             break;
           case hydro::HydroFaceAxis::kZ:
             face.owner_minus_cell = result.geometry.neighborCell(owner, 0, 0, -1);
             face.neighbor_plus_cell = result.geometry.neighborCell(neighbor, 0, 0, 1);
+            face.owner_minus2_cell = result.geometry.neighborCell(owner, 0, 0, -2);
+            face.neighbor_plus2_cell = result.geometry.neighborCell(neighbor, 0, 0, 2);
             face.normal_z = 1.0;
             break;
         }

@@ -117,6 +117,13 @@ class EffectiveIsmThermodynamicClosure final : public hydro::HydroThermodynamicC
   std::shared_ptr<const EffectiveMultiphaseEosTable> m_table;
 };
 
+// Integrated code-energy ledger (energy, not energy density): every entry is
+// sum(rho_comoving * delta_u * V_comoving) over adjusted cells. Persisted in the
+// "effective_multiphase_ism" sidecar with energy_ledger_version=2; sidecars
+// without that key carry the pre-repair energy-density sums, which are
+// dimensionally invalid and are discarded (not reinterpreted) on restart.
+inline constexpr int kEffectiveIsmEnergyLedgerVersion = 2;
+
 struct EffectiveIsmEnergyLedger {
   double energy_added_code = 0.0;
   double energy_removed_code = 0.0;

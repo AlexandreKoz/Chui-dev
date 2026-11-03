@@ -222,6 +222,29 @@ Einstein-de Sitter (`omega_matter=1`, `omega_lambda=0`) is accepted.
   - the existing process `MemoryGovernor` may only reduce this cap from current
     headroom; it does not create a second hydro memory authority or adaptive AIMD
     controller. The selected batch is aligned to eight cells when headroom permits.
+- Hydro numerical-method selectors (CHUI Part 1; equations and compatibility
+  matrix in `docs/hydro_numerics.md`). Defaults reproduce the historical
+  PLM/MC/MUSCL-Hancock/HLLC path apart from the documented F1/F3 bug fixes.
+  - `hydro_reconstruction` (`piecewise_constant` | `piecewise_linear` |
+    `piecewise_parabolic`, default `piecewise_linear`). PPM needs a 3-cell
+    stencil per side; near non-periodic patch boundaries it reduces to PLM and
+    the reduction is counted (`stencil_degradation_count`).
+  - `hydro_slope_limiter` (`minmod` | `mc` | `van_leer`, default `mc`). Used by
+    PLM and by the PPM interface slopes/flattening fallback.
+  - `hydro_integration_scheme` (`muscl_hancock` | `ctu`, default
+    `muscl_hancock`). `ctu` is the simplified 3D corner-transport-upwind variant
+    (2 Riemann solves per face). It is stable for Courant <= 1/2 in 3D; the
+    runtime hydro CFL coefficient is 0.4.
+  - `hydro_riemann_solver` (`hllc` | `hlle`, default `hllc`). HLLC falls back to
+    HLLE (Einfeldt bounds) for degenerate/inadmissible star states.
+  - `hydro_dual_energy` (`off` | `thermal_fraction`, default `off`) and
+    `hydro_dual_energy_eta` (double in (0, 1), default `1.0e-3`). See the
+    dual-energy section of `docs/hydro_numerics.md`; enabling it trades exact
+    total-energy conservation for thermal accuracy in cold high-Mach flows, and
+    the change is measured in `dual_energy_sync_delta`.
+  - Validation is fail-closed: unknown enum spellings and eta outside (0, 1)
+    are rejected. All six keys appear in the normalized dump, so enabling them
+    changes the normalized-config hash (reproducibility: intended).
 
 Time/scale semantics (anti-ambiguity contract):
 
@@ -491,6 +514,19 @@ GPU execution contract:
 - `isolated_pm_root_workspace_limit_bytes` (default `268435456`): maximum rank-0 transient workspace allowed for the current isolated/open PM root-gather path. Multi-rank isolated PM is accepted only inside this explicit small-grid budget and diagnostics must not describe it as scalable.
 - `gravity_memory_budget_bytes` (default `0`, meaning unlimited): backward-compatible gravity-only preflight ceiling. CHUI-owned PM/FFT `PlanResources` arrays are now explicit known memory; only genuinely library-owned FFTW/CUDA plan/runtime allocations remain external.
 - `process_memory_budget_bytes` (default `0`, meaning no total-process ceiling): authoritative composed per-rank process ceiling when set. The existing DMO preflight combines live canonical state, retained scheduler state, gravity/tree staging, PM fields, explicit FFT plan arrays, bounded PM/Tree communication, configured output/restart overlap, external reserves, and the process safety margin before large gravity staging allocations. M1B also constructs the process `MemoryGovernor` from this same ceiling for reserve-before-allocate runtime admission; zero remains unlimited while accounting/high-water stays active. This does not silently change the legacy gravity-only key and no second memory-budget configuration surface exists.
+- Node-aware admission (CHUI Part 1; `docs/memory_governance.md`):
+  - `node_memory_admission` (`off` | `shared_equal`, default `off`). `off`
+    preserves the historical per-process semantics exactly
+    (`process_memory_budget_bytes = 0` stays unlimited). `shared_equal` derives
+    the node limit as the minimum of `node_memory_budget_bytes` (if non-zero),
+    the job cgroup limit, `SLURM_MEM_PER_NODE`, and physical RAM; subtracts
+    `node_memory_reserve_bytes` once; and gives each co-located MPI rank
+    `floor(usable / ranks_on_node)`. The per-rank governor ceiling is the
+    smaller of that share and a non-zero `process_memory_budget_bytes`.
+  - `node_memory_budget_bytes` (uint64, default `0` = discover) and
+    `node_memory_reserve_bytes` (uint64, default `0`). Setting either while
+    `node_memory_admission = off` is rejected (it would be silently ignored).
+    A reserve that consumes the whole node limit is rejected.
 - `process_mpi_unknown_reserve_bytes`, `process_fftw_unknown_reserve_bytes`, `process_hdf5_unknown_reserve_bytes`, `process_allocator_unknown_reserve_bytes` (defaults `0`): explicit per-rank reserves for library/allocator memory CHUI cannot derive from owned container geometry. Known CHUI arrays must not be hidden in these reserves.
 - `process_output_restart_overlap_bytes` (default `0`): explicit owned I/O/restart staging allowance that may overlap the resident DMO+gravity state. IC import staging is excluded from the gravity-phase peak because importer ownership ends before the production integrator takes over the canonical state.
 - `process_memory_safety_margin_fraction` (default `0`, range `[0,1]`): multiplicative margin applied after known owned bytes plus external reserves. The M1B governor applies the same multiplicative/ceiling rule to reconciled runtime demand so preflight and runtime admission use compatible policy arithmetic. Swap and host overcommit are not part of this budget.

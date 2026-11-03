@@ -1,5 +1,6 @@
 #include "cosmosim/hydro/hydro_boundary_conditions.hpp"
 
+#include <array>
 #include <stdexcept>
 
 namespace cosmosim::hydro {
@@ -165,7 +166,69 @@ void validateGhostMetadata(const HydroPatchGeometry& geometry, const HydroGhostC
   }
 }
 
+[[nodiscard]] std::size_t periodicWrap(
+    const HydroPatchGeometry& geometry, std::size_t row, HydroFaceAxis axis, long long delta) {
+  const std::array<std::size_t, 3> ijk = geometry.cellIjk(row);
+  std::array<std::size_t, 3> wrapped = ijk;
+  const std::size_t axis_index = axis == HydroFaceAxis::kX ? 0U : (axis == HydroFaceAxis::kY ? 1U : 2U);
+  const std::array<std::size_t, 3> extent{geometry.nx, geometry.ny, geometry.nz};
+  const long long n = static_cast<long long>(extent[axis_index]);
+  long long index = (static_cast<long long>(ijk[axis_index]) + delta) % n;
+  if (index < 0) {
+    index += n;
+  }
+  wrapped[axis_index] = static_cast<std::size_t>(index);
+  return geometry.linearCellIndex(wrapped[0], wrapped[1], wrapped[2]);
+}
+
+[[nodiscard]] double normalSignAlongAxis(const HydroFace& face) {
+  switch (face.axis) {
+    case HydroFaceAxis::kX:
+      return face.normal_x >= 0.0 ? 1.0 : -1.0;
+    case HydroFaceAxis::kY:
+      return face.normal_y >= 0.0 ? 1.0 : -1.0;
+    case HydroFaceAxis::kZ:
+      return face.normal_z >= 0.0 ? 1.0 : -1.0;
+  }
+  return 1.0;
+}
+
 }  // namespace
+
+std::size_t completePeriodicReconstructionStencils(HydroPatchGeometry& geometry) {
+  const std::size_t real_cell_count = geometry.cellCount();
+  for (const HydroGhostCell& ghost : geometry.ghost_cells) {
+    if (ghost.boundary_kind != HydroBoundaryKind::kPeriodic) {
+      throw std::invalid_argument(
+          "periodic reconstruction stencils require every ghost cell to be periodic");
+    }
+  }
+  std::size_t filled = 0U;
+  for (HydroFace& face : geometry.faces) {
+    if (face.owner_cell >= real_cell_count) {
+      throw std::invalid_argument("periodic stencil completion requires real face owners");
+    }
+    std::size_t neighbor_real = face.neighbor_cell;
+    if (face.ghost_cell_slot != k_invalid_ghost_cell_slot) {
+      neighbor_real = geometry.ghost_cells.at(face.ghost_cell_slot).source_real_cell;
+    }
+    if (neighbor_real == k_invalid_cell_index || neighbor_real >= real_cell_count) {
+      continue;
+    }
+    const long long step = normalSignAlongAxis(face) > 0.0 ? 1 : -1;
+    const auto fill = [&](std::size_t& slot, std::size_t value) {
+      if (slot == k_invalid_cell_index) {
+        slot = value;
+        ++filled;
+      }
+    };
+    fill(face.owner_minus_cell, periodicWrap(geometry, face.owner_cell, face.axis, -step));
+    fill(face.owner_minus2_cell, periodicWrap(geometry, face.owner_cell, face.axis, -2 * step));
+    fill(face.neighbor_plus_cell, periodicWrap(geometry, neighbor_real, face.axis, step));
+    fill(face.neighbor_plus2_cell, periodicWrap(geometry, neighbor_real, face.axis, 2 * step));
+  }
+  return filled;
+}
 
 void appendCartesianBoundaryGhostFaces(
     HydroPatchGeometry& geometry,

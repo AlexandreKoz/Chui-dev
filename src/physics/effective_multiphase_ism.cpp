@@ -380,12 +380,23 @@ hydro::HydroConservedState EffectiveIsmEnergyRelaxationSource::sourceForCell(
 
   const double delta_energy_density = conserved.mass_density_comoving * delta_u;
   source.total_energy_density_comoving = delta_energy_density / context.update.dt_code;
-  if (delta_energy_density > 0.0) {
-    m_ledger.energy_added_code += delta_energy_density;
-  } else {
-    m_ledger.energy_removed_code += -delta_energy_density;
+  // Audit F7: the ledger is an integrated code energy,
+  //   Delta E_code = rho_comoving * Delta u * V_comoving  (= m_gas * Delta u),
+  // so it is invariant under refinement (one parent vs eight children) and
+  // correct for unequal-volume AMR cells. The cell volume is the authoritative
+  // patch geometry volume injected by HydroCoreSolver.
+  if (!(context.cell_volume_comoving > 0.0) || !std::isfinite(context.cell_volume_comoving)) {
+    throw std::invalid_argument(
+        "effective-ISM energy ledger requires HydroSourceContext::cell_volume_comoving > 0 "
+        "(integrated energy = rho_comoving * delta_u * V_comoving)");
   }
-  m_ledger.net_energy_adjustment_code += delta_energy_density;
+  const double delta_energy_code = delta_energy_density * context.cell_volume_comoving;
+  if (delta_energy_code > 0.0) {
+    m_ledger.energy_added_code += delta_energy_code;
+  } else {
+    m_ledger.energy_removed_code += -delta_energy_code;
+  }
+  m_ledger.net_energy_adjustment_code += delta_energy_code;
   ++m_ledger.adjusted_cell_count;
   return source;
 }

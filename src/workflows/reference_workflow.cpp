@@ -39,6 +39,7 @@
 #include "cosmosim/core/cosmology.hpp"
 #include "cosmosim/core/cuda_runtime.hpp"
 #include "cosmosim/core/memory_governor.hpp"
+#include "cosmosim/core/node_memory_admission.hpp"
 #include "cosmosim/core/profiling.hpp"
 #include "cosmosim/core/simulation_mode.hpp"
 #include "cosmosim/core/time_integration.hpp"
@@ -383,8 +384,30 @@ ReferenceWorkflowReport ReferenceWorkflowRunner::runImpl(
       external_runtime_reserve_bytes,
       config.parallel.process_allocator_unknown_reserve_bytes,
       "reference workflow allocator reserve");
+  // Node-aware admission (parallel.node_memory_admission). Off preserves the
+  // historical per-process semantics (0 = unlimited). shared_equal derives a
+  // conservative per-rank ceiling from the node limit; every rank computes
+  // the same rule locally, so no collective is needed and none can block.
+  std::uint64_t rank_hard_limit_bytes = config.parallel.process_memory_budget_bytes;
+  std::optional<core::NodeMemoryAdmissionResult> node_admission;
+  if (config.parallel.node_memory_admission == core::NodeMemoryAdmissionMode::kSharedEqual) {
+    std::exception_ptr node_admission_failure;
+    try {
+      node_admission = core::computeNodeMemoryAdmission(core::NodeMemoryAdmissionInput{
+          .explicit_node_budget_bytes = config.parallel.node_memory_budget_bytes,
+          .node_reserve_bytes = config.parallel.node_memory_reserve_bytes,
+          .ranks_on_node = static_cast<std::uint32_t>(std::max(1, mpi_context.localSize())),
+          .process_budget_bytes = config.parallel.process_memory_budget_bytes,
+          .discovery = core::discoverNodeMemory()});
+      rank_hard_limit_bytes = node_admission->rank_hard_limit_bytes;
+    } catch (...) {
+      node_admission_failure = std::current_exception();
+    }
+    mpi_context.rethrowCollectivePreparationFailure(
+        node_admission_failure, "node memory admission");
+  }
   core::MemoryGovernor memory_governor(core::MemoryGovernorPolicy{
-      .hard_limit_bytes = config.parallel.process_memory_budget_bytes,
+      .hard_limit_bytes = rank_hard_limit_bytes,
       .external_runtime_reserve_bytes = external_runtime_reserve_bytes,
       .planned_overlap_reserve_bytes =
           config.parallel.process_output_restart_overlap_bytes,
@@ -400,6 +423,25 @@ ReferenceWorkflowReport ReferenceWorkflowRunner::runImpl(
   const FailureCoordinator failure_coordinator(runtime_services);
   const internal::MigrationBalanceRuntime migration_balance(
       config, runtime_services);
+  if (node_admission.has_value()) {
+    profiler.recordEvent(core::RuntimeEvent{
+        .event_kind = "memory.node_admission",
+        .severity = core::RuntimeEventSeverity::kInfo,
+        .subsystem = "core.memory_governor",
+        .step_index = options.step_index,
+        .simulation_time_code = config.numerics.t_code_begin,
+        .scale_factor = 1.0,
+        .message = "node-aware memory admission selected the per-rank hard limit",
+        .payload = {{"node_limit_bytes", std::to_string(node_admission->node_limit_bytes)},
+                    {"node_limit_source",
+                     std::string(core::nodeMemoryLimitSourceLabel(node_admission->node_limit_source))},
+                    {"node_usable_bytes", std::to_string(node_admission->node_usable_bytes)},
+                    {"ranks_on_node", std::to_string(node_admission->ranks_on_node)},
+                    {"rank_share_bytes", std::to_string(node_admission->rank_share_bytes)},
+                    {"rank_hard_limit_bytes", std::to_string(node_admission->rank_hard_limit_bytes)},
+                    {"process_budget_binding", node_admission->process_budget_was_binding ? "true" : "false"}},
+    });
+  }
   const core::OpenMpRuntimeInfo omp_runtime = core::openMpRuntimeInfo();
   profiler.recordEvent(core::RuntimeEvent{
       .event_kind = "runtime.topology",

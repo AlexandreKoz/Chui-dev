@@ -267,11 +267,13 @@ std::uint64_t checkedMemoryBytesAdd(
 MemoryReservation::MemoryReservation(
     MemoryGovernor* governor,
     MemoryClass memory_class,
-    std::uint64_t bytes) noexcept
+    std::uint64_t bytes,
+    std::uint16_t owner_slot) noexcept
     : m_governor(governor),
       m_memory_class(memory_class),
       m_bytes(bytes),
-      m_state(State::kPending) {}
+      m_state(State::kPending),
+      m_owner_slot(owner_slot) {}
 
 MemoryReservation::~MemoryReservation() noexcept {
   release();
@@ -281,7 +283,8 @@ MemoryReservation::MemoryReservation(MemoryReservation&& other) noexcept
     : m_governor(std::exchange(other.m_governor, nullptr)),
       m_memory_class(other.m_memory_class),
       m_bytes(std::exchange(other.m_bytes, 0U)),
-      m_state(std::exchange(other.m_state, State::kInert)) {}
+      m_state(std::exchange(other.m_state, State::kInert)),
+      m_owner_slot(std::exchange(other.m_owner_slot, std::uint16_t{0U})) {}
 
 MemoryReservation& MemoryReservation::operator=(MemoryReservation&& other) noexcept {
   if (this == &other) {
@@ -292,6 +295,7 @@ MemoryReservation& MemoryReservation::operator=(MemoryReservation&& other) noexc
   m_memory_class = other.m_memory_class;
   m_bytes = std::exchange(other.m_bytes, 0U);
   m_state = std::exchange(other.m_state, State::kInert);
+  m_owner_slot = std::exchange(other.m_owner_slot, std::uint16_t{0U});
   return *this;
 }
 
@@ -330,7 +334,7 @@ void MemoryReservation::reconcileBaselineOwnedAndRelease(
         "MemoryReservation.reconcileBaselineOwnedAndRelease requires one live committed reservation");
   }
   m_governor->reconcileBaselineAndReleaseCommittedReservation(
-      m_memory_class, m_bytes, baseline_owned_bytes);
+      m_memory_class, m_bytes, baseline_owned_bytes, m_owner_slot);
   m_state = State::kReleased;
   m_governor = nullptr;
   m_bytes = 0U;
@@ -344,9 +348,9 @@ void MemoryReservation::release() noexcept {
     return;
   }
   if (m_state == State::kPending) {
-    m_governor->releasePendingReservation(m_memory_class, m_bytes);
+    m_governor->releasePendingReservation(m_memory_class, m_bytes, m_owner_slot);
   } else if (m_state == State::kCommitted) {
-    m_governor->releaseCommittedReservation(m_memory_class, m_bytes);
+    m_governor->releaseCommittedReservation(m_memory_class, m_bytes, m_owner_slot);
   }
   m_state = State::kReleased;
   m_governor = nullptr;
@@ -389,6 +393,7 @@ MemoryReservation MemoryGovernor::reserve(
         current_raw, requested_bytes, "MemoryGovernor.reserve prospective demand");
   } catch (const std::overflow_error&) {
     ++m_rejection_count;
+    ++m_owner_slots[ownerSlotLocked(owner)].rejection_count;
     MemoryGovernorSnapshot current;
     current.hard_limit_bytes = m_policy.hard_limit_bytes;
     current.baseline_owned_bytes = m_baseline_owned_bytes;
@@ -418,6 +423,7 @@ MemoryReservation MemoryGovernor::reserve(
   if (m_policy.hard_limit_bytes != 0U &&
       prospective_adjusted > m_policy.hard_limit_bytes) {
     ++m_rejection_count;
+    ++m_owner_slots[ownerSlotLocked(owner)].rejection_count;
     MemoryGovernorSnapshot current;
     current.hard_limit_bytes = m_policy.hard_limit_bytes;
     current.baseline_owned_bytes = m_baseline_owned_bytes;
@@ -451,7 +457,65 @@ MemoryReservation MemoryGovernor::reserve(
       "MemoryGovernor.reserve class reserved total");
   m_peak_reserved_bytes = std::max(m_peak_reserved_bytes, m_reserved_bytes);
   updatePeakAccountedLocked();
-  return MemoryReservation(this, memory_class, requested_bytes);
+  const std::uint16_t owner_slot = ownerSlotLocked(owner);
+  OwnerSlot& slot = m_owner_slots[owner_slot];
+  slot.live_bytes = slot.live_bytes > std::numeric_limits<std::uint64_t>::max() - requested_bytes
+      ? std::numeric_limits<std::uint64_t>::max()
+      : slot.live_bytes + requested_bytes;
+  slot.peak_live_bytes = std::max(slot.peak_live_bytes, slot.live_bytes);
+  ++slot.reservation_count;
+  return MemoryReservation(this, memory_class, requested_bytes, owner_slot);
+}
+
+std::uint16_t MemoryGovernor::ownerSlotLocked(std::string_view owner) noexcept {
+  const std::size_t label_length = std::min(owner.size(), k_memory_owner_label_capacity);
+  const std::string_view key = owner.substr(0U, label_length);
+  constexpr std::size_t k_other_slot = k_memory_owner_telemetry_slots - 1U;
+  for (std::size_t index = 0; index < k_other_slot; ++index) {
+    OwnerSlot& slot = m_owner_slots[index];
+    if (!slot.used) {
+      slot.used = true;
+      std::copy(key.begin(), key.end(), slot.label.begin());
+      slot.label[label_length] = '\0';
+      return static_cast<std::uint16_t>(index);
+    }
+    if (std::string_view(slot.label.data()) == key) {
+      return static_cast<std::uint16_t>(index);
+    }
+  }
+  OwnerSlot& other = m_owner_slots[k_other_slot];
+  if (!other.used) {
+    other.used = true;
+    constexpr std::string_view k_other_label = "<other>";
+    std::copy(k_other_label.begin(), k_other_label.end(), other.label.begin());
+    other.label[k_other_label.size()] = '\0';
+  }
+  return static_cast<std::uint16_t>(k_other_slot);
+}
+
+void MemoryGovernor::releaseOwnerBytesLocked(std::uint16_t owner_slot, std::uint64_t bytes) noexcept {
+  if (owner_slot >= m_owner_slots.size()) {
+    return;
+  }
+  OwnerSlot& slot = m_owner_slots[owner_slot];
+  slot.live_bytes = slot.live_bytes >= bytes ? slot.live_bytes - bytes : 0U;
+}
+
+std::vector<MemoryOwnerTelemetry> MemoryGovernor::ownerTelemetry() const {
+  std::lock_guard lock(m_mutex);
+  std::vector<MemoryOwnerTelemetry> result;
+  for (const OwnerSlot& slot : m_owner_slots) {
+    if (!slot.used) {
+      continue;
+    }
+    result.push_back(MemoryOwnerTelemetry{
+        .label = std::string(slot.label.data()),
+        .live_bytes = slot.live_bytes,
+        .peak_live_bytes = slot.peak_live_bytes,
+        .reservation_count = slot.reservation_count,
+        .rejection_count = slot.rejection_count});
+  }
+  return result;
 }
 
 void MemoryGovernor::setBaselineOwnedBytes(std::uint64_t baseline_owned_bytes) {
@@ -520,8 +584,10 @@ void MemoryGovernor::commitReservation(MemoryClass memory_class, std::uint64_t b
 
 void MemoryGovernor::releasePendingReservation(
     MemoryClass memory_class,
-    std::uint64_t bytes) noexcept {
+    std::uint64_t bytes,
+    std::uint16_t owner_slot) noexcept {
   std::lock_guard lock(m_mutex);
+  releaseOwnerBytesLocked(owner_slot, bytes);
   const std::size_t class_index = memoryClassIndex(memory_class);
   if (m_reserved_bytes < bytes || m_reserved_by_class[class_index] < bytes) {
     std::terminate();
@@ -532,8 +598,10 @@ void MemoryGovernor::releasePendingReservation(
 
 void MemoryGovernor::releaseCommittedReservation(
     MemoryClass memory_class,
-    std::uint64_t bytes) noexcept {
+    std::uint64_t bytes,
+    std::uint16_t owner_slot) noexcept {
   std::lock_guard lock(m_mutex);
+  releaseOwnerBytesLocked(owner_slot, bytes);
   const std::size_t class_index = memoryClassIndex(memory_class);
   if (m_committed_bytes < bytes || m_committed_by_class[class_index] < bytes) {
     std::terminate();
@@ -545,7 +613,8 @@ void MemoryGovernor::releaseCommittedReservation(
 void MemoryGovernor::reconcileBaselineAndReleaseCommittedReservation(
     MemoryClass memory_class,
     std::uint64_t bytes,
-    std::uint64_t baseline_owned_bytes) {
+    std::uint64_t baseline_owned_bytes,
+    std::uint16_t owner_slot) {
   std::lock_guard lock(m_mutex);
   const std::size_t class_index = memoryClassIndex(memory_class);
   if (m_committed_bytes < bytes || m_committed_by_class[class_index] < bytes) {
@@ -571,6 +640,7 @@ void MemoryGovernor::reconcileBaselineAndReleaseCommittedReservation(
   m_committed_bytes = remaining_committed;
   m_committed_by_class[class_index] -= bytes;
   m_baseline_owned_bytes = baseline_owned_bytes;
+  releaseOwnerBytesLocked(owner_slot, bytes);
   m_peak_accounted_bytes = std::max(m_peak_accounted_bytes, prospective);
 }
 

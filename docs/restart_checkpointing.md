@@ -404,7 +404,7 @@ Schema 21 remains explicitly readable. Fields absent from schema 21 are initiali
 
 ## Star formation and effective-ISM continuation
 
-Restart schema v22 persists gas metal mass, stellar immutable birth identity, scheduler sidecars, integration tick, module metadata, and latest/cumulative star-formation ledgers. The effective EOS itself is reconstructed deterministically from normalized configuration and cooling policy; the restart-persistent `effective_multiphase_ism` sidecar records parameter set, EOS schema, table hash, cooling reference, and latest/cumulative energy adjustments for verification. Derived cold fractions and pressures are recomputed rather than stored as writable authorities.
+Restart schema v22 persists gas metal mass, stellar immutable birth identity, scheduler sidecars, integration tick, module metadata, and latest/cumulative star-formation ledgers. The effective EOS itself is reconstructed deterministically from normalized configuration and cooling policy; the restart-persistent `effective_multiphase_ism` sidecar records parameter set, EOS schema, table hash, cooling reference, and latest/cumulative energy adjustments for verification. Since CHUI Part 1 (audit F7) the adjustments are integrated code energies `sum(rho_comoving * delta_u * V_comoving)` and the sidecar carries `energy_ledger_version=2`, `energy_ledger_units=integrated_code_energy` and `legacy_density_ledger_discarded=0|1`. A restart from a sidecar without the version key discards (does not reinterpret) the legacy energy-density sums and sets `legacy_density_ledger_discarded=1`; the HDF5 restart schema version is unchanged because the sidecar payload is versioned inside the block. Derived cold fractions and pressures are recomputed rather than stored as writable authorities.
 
 The particle-ID registry is reconstructed exactly from loaded particle IDs and then updated incrementally. A restart cannot silently select a different star-formation model or EOS table.
 
@@ -639,3 +639,18 @@ state is not restart-safe is refused when a multirate segment starts.
 
 The transactional cycle rollback (see `docs/time_integration.md`) is
 in-memory only. It never writes or reads a checkpoint.
+
+## CHUI Part 1 normalized-config migration (20261103)
+
+Part 1 adds nine normalized keys (`numerics.hydro_reconstruction`,
+`hydro_slope_limiter`, `hydro_integration_scheme`, `hydro_riemann_solver`,
+`hydro_dual_energy`, `hydro_dual_energy_eta`, `parallel.node_memory_admission`,
+`node_memory_budget_bytes`, `node_memory_reserve_bytes`). Resuming an
+integrity-verified v23/v24 checkpoint written before Part 1 goes through the
+existing exact-default projection in `restartConfigurationCompatibilityRecord`:
+the nine lines are removed only if every one of them holds its default value
+in the current configuration; any other value refuses the resume. No HDF5
+schema version changes. Reproducibility impact: a resumed run continues with
+the corrected numerics (F1 predictor sign and `1/a`, F3 passive lanes,
+periodic box faces evaluated once), so it is not bit-identical to a
+continuation under the pre-Part-1 binary.

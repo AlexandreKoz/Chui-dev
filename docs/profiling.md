@@ -515,3 +515,16 @@ multipoles/target, traversal and PM milliseconds together with the error
 quantiles; the measured table is in `docs/tree_pm_coupling.md`. Hierarchical
 runs additionally record `coarse_limiter` and `rank_local_bin_occupancy` in
 every `time.hierarchical_block` event of `operational_report.json`.
+
+## Hydro method matrix benchmark (CHUI Part 1, source only)
+
+`bench/hydro/bench_hydro_method_matrix.cpp` (target `bench_hydro_method_matrix`,
+built with `COSMOSIM_ENABLE_BENCHMARKS=ON`) runs PCM/PLM/PPM x MH/CTU x
+HLLC/HLLE on a periodic N^3 smooth oblique wave and prints, per
+configuration: `wall_ms`, `cells_per_s`, `faces_per_s`, `riemann_solves`,
+`riemann_fallbacks`, `positivity_fallbacks`, `stencil_degradations`,
+`ctu_degraded_states`, `scratch_high_water_bytes`, `moved_bytes`,
+`l1_density_error`. Arguments: `[cells_per_axis=32] [steps=8] [batch_cells=0]`.
+Compare methods by error at fixed wall time; sweep batch_cells (e.g. 512,
+2048, 8192, 16384) as candidates. Targets (not claims): <= 5% overhead of the
+default path versus pre-Part-1 with advanced options disabled. NOT RUN.

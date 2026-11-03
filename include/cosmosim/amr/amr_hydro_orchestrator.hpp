@@ -52,6 +52,15 @@ struct ProductionAmrHydroOptions {
   // fail closed when this authority is absent; ordinary hydro stepping does
   // not require it. Runtime composition must pass the process MemoryGovernor.
   core::MemoryGovernor* regrid_memory_governor = nullptr;
+  // Spatial reconstruction and limiter used for every patch advance. The
+  // time-integration family (MUSCL-Hancock / CTU) and dual-energy policy are
+  // owned by the HydroCoreSolver passed to the advance entry points. PPM and
+  // CTU use the patch-interior stencils; within two cells of a patch boundary
+  // PPM reduces to PLM and CTU transverse terms from non-periodic ghosts are
+  // omitted (both counted in HydroProfileEvent / diagnostics). Multi-layer
+  // AMR ghost shells are Part 3 scope.
+  hydro::HydroReconstructionScheme reconstruction_scheme = hydro::HydroReconstructionScheme::kPiecewiseLinear;
+  hydro::HydroSlopeLimiter slope_limiter = hydro::HydroSlopeLimiter::kMonotonizedCentral;
 };
 
 // Complete physical workspace for immutable step-start ghost snapshots.
@@ -60,6 +69,12 @@ struct ProductionAmrHydroOptions {
     std::size_t patch_count, std::size_t prepared_ghost_count);
 
 struct ProductionAmrHydroDiagnostics {
+  // Numerical-method telemetry accumulated from per-patch HydroProfileEvent.
+  std::uint64_t riemann_solve_count = 0;
+  std::uint64_t positivity_fallback_count = 0;
+  std::uint64_t stencil_degradation_count = 0;
+  std::uint64_t ctu_transverse_degraded_states = 0;
+  std::uint64_t dual_energy_auxiliary_cells = 0;
   std::size_t patch_count = 0;
   std::size_t advanced_patch_count = 0;
   std::size_t active_cell_count = 0;
