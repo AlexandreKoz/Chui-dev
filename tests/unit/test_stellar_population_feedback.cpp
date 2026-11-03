@@ -19,10 +19,12 @@
 #include <cmath>
 #include <limits>
 #include <optional>
+#include <string>
 #include <vector>
 
 #include "cosmosim/core/simulation_state.hpp"
 #include "cosmosim/physics/stellar_evolution.hpp"
+#include "cosmosim/physics/source_interval.hpp"
 #include "cosmosim/physics/stellar_population.hpp"
 #include "cosmosim/physics/supernova_feedback.hpp"
 
@@ -58,7 +60,8 @@ void testSspBudgets() {
   const auto a = ssp.massiveReturn(1, 0.0, 1.0e7, x);
   const auto b = ssp.massiveReturn(1, 1.0e7, 4.0e7, x);
   const auto c = ssp.massiveReturn(1, 0.0, 4.0e7, x);
-  assert(std::abs(a.mass_fraction + b.mass_fraction - c.mass_fraction) < 1.0e-3 * c.mass_fraction);
+  // Exactly additive (cumulative-difference construction), up to round-off.
+  assert(std::abs(a.mass_fraction + b.mass_fraction - c.mass_fraction) < 1.0e-12 * c.mass_fraction);
 }
 
 void testEventReplayIsSubdivisionAndRestartInvariant() {
@@ -148,6 +151,32 @@ void testMechanicalFeedbackConservation() {
   assert(l.radial_momentum_delivered_code <= l.radial_momentum_requested_code + 1.0e-9);
 }
 
+std::string yieldTable(double h_net) {
+  // Synthetic UNIT-TEST fixture (not astrophysical data): one Z, two masses.
+  std::string t = "# chui_ssp_yield_table_v1\n# citation = unit-test fixture (not astrophysical data)\n"
+                  "# license = CC0 test fixture\n# net_yield_sum_tolerance = 1e-3\n"
+                  "elements H He C N O Ne Mg Si S Ca Fe\n";
+  const std::string row_ok = " 2.0 " + std::to_string(h_net) + " 0.01 0.02 0 0.05 0 0 0 0 0 0\n";
+  t += "channel agb\nmetallicity 0.02\nmass 1 5\nrow 0 0" + row_ok + "row 0 1" + row_ok;
+  t += "channel cc\nmetallicity 0.02\nmass 10 30\nrow 0 0" + row_ok + "row 0 1" + row_ok;
+  t += "channel ia\nmetallicity 0.02\nrow 0 1.4 0 0 0.05 0 0.15 0 0.01 0.15 0.08 0.01 0.95\n";
+  return t;
+}
+
+void testYieldTableIsNeverRebalanced() {
+  // Balanced: -0.08 H balances +0.08 metals -> accepted, values untouched.
+  const auto table = physics::SspYieldTable::loadFromString(yieldTable(-0.08), "fixture");
+  bool clamped = false;
+  const auto row = table.massive(0, 3.0, 0.02, clamped);
+  assert(std::abs(row.net_yield_msun[0] + 0.08) < 1.0e-15);
+  assert(table.max_net_yield_residual < 1.0e-12);
+  // Unbalanced by 0.08 / 2.0 = 4% > tolerance: refused, never moved into H.
+  bool threw = false;
+  try { (void)physics::SspYieldTable::loadFromString(yieldTable(0.0), "fixture"); }
+  catch (const physics::SourceModelUnavailableError&) { threw = true; }
+  assert(threw);
+}
+
 void testTerminalMomentumScaling() {
   const double p1 = physics::kimOstriker2015TerminalMomentumMsunKms(1.0e51, 1.0);
   assert(std::abs(p1 - 2.17e5) < 1.0);
@@ -162,5 +191,6 @@ int main() {
   testEventReplayIsSubdivisionAndRestartInvariant();
   testMechanicalFeedbackConservation();
   testTerminalMomentumScaling();
+  testYieldTableIsNeverRebalanced();
   return 0;
 }

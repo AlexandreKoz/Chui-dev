@@ -32,7 +32,8 @@ namespace cosmosim::physics {
 //   [t_min, t_max] normalized to N_Ia per formed Msun (Maoz & Mannucci 2012,
 //   PASA 29, 447: N_Ia ~ 1.3e-3 Msun^-1), Chandrasekhar ejecta 1.38 Msun
 //   taken from the remnant reservoir.
-// Element yields: REFERENCE mode returns the BIRTH element mixture with an
+// Element yields: REFERENCE mode (chabrier_reference_v1, REFERENCE ONLY —
+//   not a physically calibrated enrichment model) returns the BIRTH element mixture with an
 //   optional configured net metal yield in the solar pattern (labelled
 //   REFERENCE ONLY, not astrophysical yields). PRODUCTION mode requires a
 //   user-supplied chui_ssp_yield_table_v1 (net yields per element vs
@@ -73,7 +74,10 @@ class SspYieldTable {
   [[nodiscard]] const std::string& citation() const noexcept { return m_citation; }
   [[nodiscard]] const std::string& license() const noexcept { return m_license; }
   [[nodiscard]] const std::string& sha256() const noexcept { return m_sha256; }
-  std::uint64_t balanced_rows = 0;  // rows whose net-yield imbalance was moved to H
+  // Largest |sum of tracked net yields| / ejecta seen at load (diagnostic).
+  double max_net_yield_residual = 0.0;
+  // Declared tolerance for that residual (header net_yield_sum_tolerance).
+  double net_yield_sum_tolerance = 1.0e-3;
 
  private:
   struct Channel {
@@ -108,8 +112,15 @@ class SspModel {
   // per event.
   [[nodiscard]] ChannelReturn massiveReturn(std::size_t channel, double age_begin, double age_end,
                                             const std::array<double, k_chemical_element_count>& birth_x) const;
+  // Cumulative channel return from birth to `age` (per formed mass);
+  // massiveReturn(age_b, age_e) = cumulative(age_e) - cumulative(age_b).
+  [[nodiscard]] ChannelReturn cumulativeMassiveReturn(std::size_t channel, double age,
+                                                      const std::array<double, k_chemical_element_count>& birth_x) const;
   [[nodiscard]] ChannelReturn iaReturnPerEvent(const std::array<double, k_chemical_element_count>& birth_x) const;
+  // Diagnostics (mutable counters; the runtime restores them on rejection).
   std::uint64_t mutable table_clamps = 0;
+  std::uint64_t mutable negative_ejecta_clamps = 0;
+  double mutable untracked_mass_residual_msun = 0.0;
 
  private:
   [[nodiscard]] double phi(double m) const;  // dN/dm normalized

@@ -103,6 +103,16 @@ SspYieldTable SspYieldTable::loadFromString(const std::string& text, const std::
         const std::string key = trim(body.substr(0, eq)), value = trim(body.substr(eq + 1U));
         if (key == "citation") table.m_citation = value;
         if (key == "license") table.m_license = value;
+        if (key == "net_yield_sum_tolerance") {
+          try {
+            table.net_yield_sum_tolerance = std::stod(value);
+          } catch (const std::exception&) {
+            fail("net_yield_sum_tolerance is not a number");
+          }
+          if (!(table.net_yield_sum_tolerance >= 0.0) || table.net_yield_sum_tolerance > 0.05) {
+            fail("net_yield_sum_tolerance must be in [0, 0.05]");
+          }
+        }
       }
       continue;
     }
@@ -159,13 +169,22 @@ SspYieldTable SspYieldTable::loadFromString(const std::string& text, const std::
         Row r = it->second;
         if (!(r.ejecta_msun >= 0.0)) fail("negative ejecta");
         if (c != 2) {
-          // Net yields must conserve mass: sum_e p_e = 0. Documented
-          // balancing: the residual is moved to hydrogen and counted.
+          // Corrective gate: yields are NEVER modified. The 11 tracked net
+          // yields of a mass-conserving set sum to ~0; elements outside the
+          // CHUI vector make the tracked sum non-zero. The declared
+          // tolerance (header key net_yield_sum_tolerance, relative to the
+          // ejecta mass, default 1e-3) bounds that untracked residual; a
+          // larger residual rejects the table (inconsistent input) instead
+          // of being moved silently into hydrogen.
           double sum = 0.0;
           for (const double p : r.net_yield_msun) sum += p;
-          if (std::abs(sum) > 1.0e-3 * std::max(r.ejecta_msun, 1.0e-30)) {
-            r.net_yield_msun[0] -= sum;
-            ++table.balanced_rows;
+          const double residual = std::abs(sum) / std::max(r.ejecta_msun, 1.0e-30);
+          table.max_net_yield_residual = std::max(table.max_net_yield_residual, residual);
+          if (residual > table.net_yield_sum_tolerance) {
+            fail("net yields of channel " + std::to_string(c) + " (Z index " + std::to_string(iz) +
+                 ", mass index " + std::to_string(im) + ") sum to " + std::to_string(sum) +
+                 " Msun, i.e. " + std::to_string(residual) + " of the ejecta, above net_yield_sum_tolerance=" +
+                 std::to_string(table.net_yield_sum_tolerance) + "; the table is refused (yields are never rebalanced)");
           }
         } else {
           double sum = 0.0;
@@ -316,13 +335,22 @@ std::array<double, k_chemical_element_count> SspModel::ejectaElements(
     bool clamped = false;
     const SspYieldTable::Row row = m_table->massive(channel, m, metallicity, clamped);
     if (clamped) ++table_clamps;
-    ejecta = row.ejecta_msun;
+    // Gross ejecta per element = X_birth,e m_ej + p_e (net-yield convention).
+    // No renormalization: the ejected mass is DEFINED as the sum of the
+    // tracked element ejecta (element-conserving); its difference from the
+    // tabulated ejecta mass (untracked elements, within the table tolerance)
+    // is accumulated as a diagnostic. A negative gross ejecta (a net
+    // destruction exceeding the birth content, possible when interpolating
+    // across metallicity) is clamped to zero and COUNTED.
     double sum = 0.0;
     for (std::size_t e = 0; e < k_chemical_element_count; ++e) {
-      out[e] = std::max(birth_x[e] * ejecta + row.net_yield_msun[e], 0.0);
+      const double gross = birth_x[e] * row.ejecta_msun + row.net_yield_msun[e];
+      if (gross < 0.0) ++negative_ejecta_clamps;
+      out[e] = std::max(gross, 0.0);
       sum += out[e];
     }
-    if (sum > 0.0) for (double& v : out) v *= ejecta / sum;  // exact mass closure
+    untracked_mass_residual_msun += row.ejecta_msun - sum;
+    ejecta = sum;
     return out;
   }
   ejecta = std::max(m - remnantMassMsun(m), 0.0);
@@ -345,14 +373,17 @@ std::array<double, k_chemical_element_count> SspModel::ejectaElements(
   return out;
 }
 
-SspModel::ChannelReturn SspModel::massiveReturn(std::size_t channel, double age_begin, double age_end,
-                                                const std::array<double, k_chemical_element_count>& birth_x) const {
+SspModel::ChannelReturn SspModel::cumulativeMassiveReturn(
+    std::size_t channel, double age, const std::array<double, k_chemical_element_count>& birth_x) const {
+  // Everything ejected by the channel up to `age`: stars with masses between
+  // the turnoff mass m_to(age) and the channel's upper limit. A FIXED
+  // quadrature in log m over [m_to, m_hi] makes the cumulative function a
+  // deterministic function of age, so interval returns (differences) are
+  // exactly additive under step subdivision (telescoping), up to round-off.
   ChannelReturn result;
-  if (!(age_end > age_begin)) return result;
   const double z = metallicityOf(birth_x);
-  const double m_hi_age = turnoffMassMsun(age_begin, z);
-  const double m_lo_age = turnoffMassMsun(age_end, z);
-  double lo = m_lo_age, hi = m_hi_age;
+  double lo = turnoffMassMsun(age, z);
+  double hi = m_config.imf_mass_max_msun;
   if (channel == 0) {
     hi = std::min(hi, m_config.cc_mass_min_msun);
   } else {
@@ -361,19 +392,31 @@ SspModel::ChannelReturn SspModel::massiveReturn(std::size_t channel, double age_
   }
   lo = std::max(lo, m_config.imf_mass_min_msun);
   if (!(hi > lo)) return result;
-  const int n = 16;
+  const int n = 32;
   const double a = std::log10(lo), b = std::log10(hi);
   const double h = (b - a) / n;
   for (int i = 0; i <= n; ++i) {
     const double x = a + i * h;
     const double m = std::pow(10.0, x);
     const double w = (i == 0 || i == n) ? 1.0 : (i % 2 == 1 ? 4.0 : 2.0);
-    // dN = phi(m) dm = phi(m) m ln10 dx
-    const double weight = w * h / 3.0 * phi(m) * m * k_ln10;
+    const double weight = w * h / 3.0 * phi(m) * m * k_ln10;  // dN = phi dm
     double ejecta = 0.0;
     const auto elements = ejectaElements(channel, m, z, birth_x, ejecta);
     result.mass_fraction += weight * ejecta;
     for (std::size_t e = 0; e < k_chemical_element_count; ++e) result.element_fraction[e] += weight * elements[e];
+  }
+  return result;
+}
+
+SspModel::ChannelReturn SspModel::massiveReturn(std::size_t channel, double age_begin, double age_end,
+                                                const std::array<double, k_chemical_element_count>& birth_x) const {
+  ChannelReturn result;
+  if (!(age_end > age_begin)) return result;
+  const ChannelReturn end = cumulativeMassiveReturn(channel, age_end, birth_x);
+  const ChannelReturn begin = cumulativeMassiveReturn(channel, age_begin, birth_x);
+  result.mass_fraction = std::max(end.mass_fraction - begin.mass_fraction, 0.0);
+  for (std::size_t e = 0; e < k_chemical_element_count; ++e) {
+    result.element_fraction[e] = std::max(end.element_fraction[e] - begin.element_fraction[e], 0.0);
   }
   return result;
 }

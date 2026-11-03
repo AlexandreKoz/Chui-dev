@@ -113,8 +113,12 @@ class StarFormationNeighborIndex {
         } else if (r_minus != core::kInvalidGasCellRow && plus_physical && x_minus < 0.0) {
           derivative = (f0 - v[c][r_minus]) / (x_minus * length_to_physical);
           g.used_one_sided = true;
-        } else if (axisCollapsed(axis)) {
-          derivative = 0.0;  // genuinely lower-dimensional domain along this axis
+        } else if (axisCollapsed(axis) || (minus_physical && plus_physical)) {
+          // Genuinely lower-dimensional domain along this axis (a single
+          // periodic cell, or both faces on physical boundaries): no
+          // resolvable gradient. A MISSING neighbour that is not a physical
+          // boundary never reaches this branch (stays NaN).
+          derivative = 0.0;
         }
         g.velocity[c][axis] = derivative;
       }

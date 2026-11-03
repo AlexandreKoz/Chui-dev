@@ -1774,7 +1774,10 @@ class SourceRuntimeImpl final : public SourceRuntime {
     std::uint64_t newborn_skipped = 0U, legacy_initialized = 0U;
     const internal::MpiStageCollectiveDecision decision(m_mpi_context);
     core::StageTransaction transaction("sources.stellar_population", m_memory_governor, &decision);
-    const std::uint64_t yield_clamps_before = m_ssp_model->table_clamps;  // diagnostic restored on rejection
+    // SSP diagnostics are restored if the stage is rejected.
+    const std::uint64_t yield_clamps_before = m_ssp_model->table_clamps;
+    const std::uint64_t negative_clamps_before = m_ssp_model->negative_ejecta_clamps;
+    const double untracked_residual_before = m_ssp_model->untracked_mass_residual_msun;
     (void)transaction.prepare([&] {
       for (const std::uint32_t s : star_rows) {
         const std::uint32_t p = state.star_particles.particle_index[s];
@@ -1851,6 +1854,16 @@ class SourceRuntimeImpl final : public SourceRuntime {
             budget.ejecta_dust_code[r] = scale * (agb_part.dust[r] + cc_part.dust[r]);
           }
         }
+        // Corrective gate: the deposited mass is DEFINED by the element and
+        // dust budgets so the gas mass and the composition lanes change by
+        // exactly the same amount (the star loses the same mass).
+        {
+          double element_sum = 0.0;
+          for (const double m : budget.ejecta_elements_code) element_sum += m;
+          for (const double m : budget.ejecta_dust_code) element_sum += m;
+          returned = element_sum;
+          budget.ejecta_mass_code = element_sum;
+        }
         const double e_sn = energy_coupled ? (n_cc + n_ia) * m_ssp_model->config().energy_per_sn_erg : 0.0;
         budget.supernova_count = energy_coupled ? n_cc + n_ia : 0.0;
         budget.supernova_energy_erg = e_sn;
@@ -1881,6 +1894,8 @@ class SourceRuntimeImpl final : public SourceRuntime {
     });
     if (!transaction.validate(true, core::StageRejectionKind::kNone, {})) {
       m_ssp_model->table_clamps = yield_clamps_before;
+      m_ssp_model->negative_ejecta_clamps = negative_clamps_before;
+      m_ssp_model->untracked_mass_residual_msun = untracked_residual_before;
       throw core::StageTransactionRejected(transaction.outcome().rejection,
           "stellar population stage rejected: " + transaction.outcome().reason);
     }
