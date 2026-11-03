@@ -59,6 +59,10 @@ struct EffectiveMultiphaseEosEntry {
 struct EffectiveMultiphaseEosLookup {
   bool above_threshold = false;
   bool valid = false;
+  // CHUI Part 2: density above the tabulated range; u follows the power-law
+  // asymptote of the last table segment (slope bounded below by zero so P
+  // stays monotone). Counted by callers that care.
+  bool extrapolated = false;
   EffectiveMultiphaseEosEntry entry;
 };
 

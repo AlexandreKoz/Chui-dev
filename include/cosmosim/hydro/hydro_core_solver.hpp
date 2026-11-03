@@ -379,7 +379,19 @@ struct HydroSourceContext {
   double cell_volume_comoving = 0.0;
   // Optional composition-transport hook (CHUI Part 2). Null = no recording.
   HydroFaceMassFluxSink* face_mass_flux_sink = nullptr;
+  // CHUI Part 2 ISM regime gate. Empty = no gate (legacy). Otherwise indexed
+  // by SOLVER row for HydroCoreSolver (the AMR orchestrator receives a
+  // dense-row span and builds patch-local spans): 0 = the effective
+  // multiphase closure must NOT be applied (resolved regime owns the cell),
+  // 1 = the effective closure may apply. Keeps hydro closure, relaxation and
+  // thermochemistry mutually exclusive per cell.
+  std::span<const std::uint8_t> effective_closure_allowed;
 };
+
+[[nodiscard]] inline bool effectiveClosureAllowed(const HydroSourceContext& context, std::size_t cell_index) noexcept {
+  return context.effective_closure_allowed.empty() ||
+      (cell_index < context.effective_closure_allowed.size() && context.effective_closure_allowed[cell_index] != 0U);
+}
 
 // Volume-integrated conserved diagnostics over a selected set of real cells.
 // Density-like conserved lanes are multiplied by HydroPatchGeometry::cell_volume_comoving.

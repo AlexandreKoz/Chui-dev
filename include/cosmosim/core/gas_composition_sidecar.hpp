@@ -39,6 +39,13 @@ namespace cosmosim::core {
 //   thermochemistry commit and consumed by the gas thermodynamic refresh to
 //   convert specific internal energy into kelvin. It is not restart truth;
 //   it is rebuilt from the lanes after restart.
+// ISM regime tags (GasCompositionSidecar::ism_regime_tag). Owned by the
+// physics ISM regime manager; consumed by hydro closures, thermodynamic
+// refresh, thermochemistry and star formation so exactly one regime owns a
+// cell's thermal physics.
+inline constexpr std::uint8_t k_gas_ism_regime_resolved = 0U;
+inline constexpr std::uint8_t k_gas_ism_regime_effective = 1U;
+
 struct GasCompositionLayoutDescriptor {
   // 0 = disabled. Bumped by the physics manifest when lane meaning changes.
   std::uint32_t layout_version = 0;
@@ -63,7 +70,7 @@ struct GasCompositionLayoutDescriptor {
 class GasCompositionSidecar {
  public:
   // Number of trailing metadata values appended by packRow().
-  static constexpr std::size_t k_packed_metadata_count = 3U;
+  static constexpr std::size_t k_packed_metadata_count = 4U;
 
   void configure(const GasCompositionLayoutDescriptor& descriptor, std::size_t row_count);
   void clear() noexcept;
@@ -89,7 +96,8 @@ class GasCompositionSidecar {
   void scaleRow(std::size_t row, double factor);
 
   // Migration payload: lane values followed by the three metadata values
-  // (chemistry_model_tag, ism_regime_tag, model_dwell_years). Empty when the
+  // (chemistry_model_tag, ism_regime_tag, model_dwell_years,
+  // ism_regime_dwell_years). Empty when the
   // sidecar is disabled.
   [[nodiscard]] std::vector<double> packRow(std::size_t row) const;
   void unpackRow(std::size_t row, std::span<const double> payload, std::uint64_t gas_cell_id_value);
@@ -114,6 +122,8 @@ class GasCompositionSidecar {
   AlignedVector<std::uint8_t> chemistry_model_tag;
   AlignedVector<std::uint8_t> ism_regime_tag;
   AlignedVector<double> model_dwell_years;
+  // Physical time spent in the current ISM regime (hysteresis / dwell rule).
+  AlignedVector<double> ism_regime_dwell_years;
   AlignedVector<double> mean_molecular_weight;
 
  private:

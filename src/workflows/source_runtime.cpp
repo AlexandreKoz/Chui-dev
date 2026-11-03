@@ -926,6 +926,7 @@ class SourceRuntimeImpl final : public SourceRuntime {
     // the composition layout ONCE (never in cell loops). Missing production
     // data stops construction with SourceModelUnavailableError.
     m_physics_config = config.physics;
+    m_full_config = config;
     if (physics::part2ThermochemistrySelected(config.physics)) {
       m_baryonic_data = physics::loadBaryonicDataProducts(config.physics);
       m_thermochemistry = std::make_unique<physics::ThermochemistryOperator>(
@@ -1548,6 +1549,20 @@ class SourceRuntimeImpl final : public SourceRuntime {
         ? std::span<const std::uint32_t>{}
         : std::span<const std::uint32_t>(context.active_set.cell_indices);
     const std::size_t row_count = all_cells_active ? context.state.cells.size() : rows.size();
+    // Synchronization-point decisions (accepted interval boundary only):
+    // ISM regime ownership, then local chemistry fidelity.
+    if (m_physics_config.ism_regime_model == core::IsmRegimeModelConfig::kEffectiveOrResolved) {
+      m_last_ism_regime_report = physics::updateIsmRegimes(
+          context.state, physics::makeIsmRegimeConfig(m_physics_config),
+          physics::makeThermochemistryOperatorConfig(m_full_config, m_units, m_baryonic_data).units,
+          interval, rows);
+      if (!m_last_ism_regime_report.changed_rows.empty()) {
+        // Ownership changed: P/c_s of those rows must be re-derived (effective
+        // closure on/off) before any consumer reads them.
+        m_regime_changed_rows = m_last_ism_regime_report.changed_rows;
+      }
+    }
+    m_last_chemistry_adaptive_report = m_thermochemistry->selectChemistryFidelity(context.state, interval, rows);
     const internal::MpiStageCollectiveDecision decision(m_mpi_context);
     core::StageTransaction transaction("sources.thermochemistry", m_memory_governor, &decision);
     (void)transaction.reserve(core::MemoryClass::kPhaseResident,
@@ -1571,6 +1586,52 @@ class SourceRuntimeImpl final : public SourceRuntime {
       if (local_work) touched = m_thermochemistry->commit(context.state);
     });
     m_last_thermochemistry_ledger = m_thermochemistry->ledger();
+    // Live dust and SGS dissipation: exact analytic per-cell updates after the
+    // thermochemistry commit (operator split; cannot fail for valid state).
+    if (local_work) {
+      const bool dust_on = context.state.gas_composition.descriptor().dust_lane_count > 0U;
+      const physics::CompositionLayout layout =
+          physics::CompositionLayout::make(physics::compositionLayoutRequestFromConfig(m_physics_config));
+      const bool sgs_on = layout.hasSgs();
+      if (dust_on || sgs_on) {
+        const physics::DustConfig dust_config = physics::makeDustConfig(m_physics_config);
+        const physics::SgsConfig sgs_config = physics::makeSgsConfig(m_physics_config);
+        const physics::ThermochemistryUnitBridge bridge =
+            physics::makeThermochemistryOperatorConfig(m_full_config, m_units, m_baryonic_data).units;
+        const double a = interval.evaluation_scale_factor;
+        const double dt_code_physical = interval.physical_seconds / m_units.timeSiPerCode();
+        const std::size_t count = all_cells_active ? context.state.cells.size() : rows.size();
+        for (std::size_t i = 0; i < count; ++i) {
+          const std::uint32_t row = all_cells_active ? static_cast<std::uint32_t>(i) : rows[i];
+          if (dust_on) {
+            const double rho_cgs = context.state.gas_cells.density_code[row] *
+                (bridge.comoving ? 1.0 / (a * a * a) : 1.0) * bridge.density_code_to_cgs;
+            const double mass = physics::compositionGasMass(context.state.gas_composition, row);
+            const double x_h = mass > 0.0 ? context.state.gas_composition.value(layout.elementLane(physics::ChemicalElement::kH), row) / mass : 0.0;
+            const double n_h = x_h * rho_cgs / (physics::chemicalElementInfo(physics::ChemicalElement::kH).atomic_mass_amu * physics::k_amu_g);
+            const double t_k = context.state.gas_cells.temperature_code[row];
+            physics::advanceDustCell(context.state.gas_composition, layout, row, n_h, t_k,
+                                     interval.physical_seconds, dust_config, m_last_dust_ledger);
+          }
+          if (sgs_on) {
+            const double volume = context.state.cells.mass_code[row] /
+                std::max(context.state.gas_cells.density_code[row], 1.0e-300);
+            const double dx_proper = std::cbrt(volume) * (bridge.comoving ? a : 1.0);
+            if (physics::advanceSgsCell(context.state, layout, row, dt_code_physical, dx_proper, sgs_config,
+                                        m_last_sgs_ledger) > 0.0) {
+              touched.push_back(row);
+            }
+          }
+        }
+        if (dust_on) {
+          (void)physics::synchronizeMetalMirrorFromComposition(context.state, std::span<const std::uint32_t>{});
+        }
+      }
+    }
+    touched.insert(touched.end(), m_regime_changed_rows.begin(), m_regime_changed_rows.end());
+    m_regime_changed_rows.clear();
+    std::sort(touched.begin(), touched.end());
+    touched.erase(std::unique(touched.begin(), touched.end()), touched.end());
     if (!touched.empty()) {
       context.state.notifyGasThermodynamicMutation();
       std::unique_ptr<physics::EffectiveIsmThermodynamicClosure> closure;
@@ -2384,6 +2445,12 @@ class SourceRuntimeImpl final : public SourceRuntime {
   physics::BaryonicDataProducts m_baryonic_data{};
   std::unique_ptr<physics::ThermochemistryOperator> m_thermochemistry;
   physics::SourceLedger m_last_thermochemistry_ledger{};
+  core::SimulationConfig m_full_config{};
+  physics::IsmRegimeReport m_last_ism_regime_report{};
+  physics::ChemistryAdaptiveReport m_last_chemistry_adaptive_report{};
+  physics::DustUpdateLedger m_last_dust_ledger{};
+  physics::SgsLedger m_last_sgs_ledger{};
+  std::vector<std::uint32_t> m_regime_changed_rows;
   DistributedParticleIdRegistry m_particle_id_registry;
   const parallel::MpiContext& m_mpi_context;
   const RuntimeServices* m_runtime_services = nullptr;

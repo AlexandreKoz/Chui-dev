@@ -6,6 +6,7 @@
 #include "cosmosim/core/units.hpp"
 #include "cosmosim/physics/baryon_composition.hpp"
 #include "cosmosim/physics/chemical_network.hpp"
+#include "cosmosim/physics/ism_dust_sgs.hpp"
 #include "cosmosim/physics/metal_cooling_table.hpp"
 #include "cosmosim/physics/radiation_background.hpp"
 #include "cosmosim/physics/thermochemistry_operator.hpp"
@@ -44,5 +45,9 @@ struct BaryonicDataProducts {
 
 [[nodiscard]] ThermochemistryOperatorConfig makeThermochemistryOperatorConfig(
     const core::SimulationConfig& config, const core::UnitSystem& units, const BaryonicDataProducts& data);
+
+[[nodiscard]] IsmRegimeConfig makeIsmRegimeConfig(const core::PhysicsConfig& physics);
+[[nodiscard]] DustConfig makeDustConfig(const core::PhysicsConfig& physics);
+[[nodiscard]] SgsConfig makeSgsConfig(const core::PhysicsConfig& physics);
 
 }  // namespace cosmosim::physics

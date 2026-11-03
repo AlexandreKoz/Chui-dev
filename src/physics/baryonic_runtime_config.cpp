@@ -113,7 +113,34 @@ ThermochemistryOperatorConfig makeThermochemistryOperatorConfig(
                                                             op.units.length_code_to_cm);
   op.units.comoving = config.units.coordinate_frame == core::CoordinateFrame::kComoving;
   op.metallicity_scaled_dust_proxy = p.chemistry_metallicity_scaled_dust_proxy;
+  op.adaptive.enabled = p.chemistry_adaptive_selection == core::ChemistryAdaptiveSelectionConfig::kLocalV1;
+  op.adaptive.cold_temperature_k = p.chemistry_adaptive_cold_temperature_k;
+  op.adaptive.dense_n_h_cm3 = p.chemistry_adaptive_dense_nh_cm3;
+  op.adaptive.hysteresis_fraction = p.chemistry_adaptive_hysteresis_fraction;
+  op.adaptive.minimum_dwell_years = p.chemistry_adaptive_min_dwell_years;
+  op.shadow.sample_fraction = p.chemistry_shadow_sample_fraction;
+  op.shadow.max_cells = p.chemistry_shadow_max_cells;
   return op;
+}
+
+IsmRegimeConfig makeIsmRegimeConfig(const core::PhysicsConfig& p) {
+  return IsmRegimeConfig{.effective_threshold_n_h_cm3 = p.sf_effective_n_h_threshold_cgs,
+                         .jeans_resolution_cells = p.ism_jeans_resolution_cells,
+                         .hysteresis_fraction = p.ism_regime_hysteresis_fraction,
+                         .minimum_dwell_years = p.ism_regime_min_dwell_years};
+}
+
+DustConfig makeDustConfig(const core::PhysicsConfig& p) {
+  return DustConfig{.accretion_timescale_ref_s = p.dust_accretion_timescale_ref_years * k_seconds_per_year,
+                    .sputtering_timescale_ref_s = p.dust_sputtering_timescale_ref_years * k_seconds_per_year,
+                    .sn_swept_mass_per_1e51_erg_g = p.dust_sn_swept_mass_msun * k_solar_mass_g,
+                    .sn_destruction_efficiency = p.dust_sn_destruction_efficiency,
+                    .agb_condensation_efficiency = p.dust_agb_condensation_efficiency,
+                    .cc_condensation_efficiency = p.dust_cc_condensation_efficiency};
+}
+
+SgsConfig makeSgsConfig(const core::PhysicsConfig& p) {
+  return SgsConfig{.dissipation_coefficient = p.sgs_dissipation_coefficient};
 }
 
 }  // namespace cosmosim::physics

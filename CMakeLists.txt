@@ -583,6 +583,7 @@ add_library(cosmosim_physics STATIC
   src/physics/thermochemistry.cpp
   src/physics/thermochemistry_operator.cpp
   src/physics/baryonic_runtime_config.cpp
+  src/physics/ism_dust_sgs.cpp
   src/physics/source_interval.cpp)
 add_library(cosmosim_io STATIC
   src/io/internal/io_contract.cpp
@@ -1339,6 +1340,9 @@ if(COSMOSIM_ENABLE_TESTS)
   add_executable(test_unit_thermochemistry_backends tests/unit/test_thermochemistry_backends.cpp)
   target_link_libraries(test_unit_thermochemistry_backends PRIVATE cosmosim_all)
   add_test(NAME unit_thermochemistry_backends COMMAND test_unit_thermochemistry_backends)
+  add_executable(test_unit_ism_dust_sgs_adaptive tests/unit/test_ism_dust_sgs_adaptive.cpp)
+  target_link_libraries(test_unit_ism_dust_sgs_adaptive PRIVATE cosmosim_all)
+  add_test(NAME unit_ism_dust_sgs_adaptive COMMAND test_unit_ism_dust_sgs_adaptive)
 
   add_executable(test_integration_gas_cell_identity_migration tests/integration/test_gas_cell_identity_migration.cpp)
   target_link_libraries(test_integration_gas_cell_identity_migration PRIVATE cosmosim_core)

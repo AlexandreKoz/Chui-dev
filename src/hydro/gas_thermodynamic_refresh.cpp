@@ -41,7 +41,12 @@ struct RefreshedCell {
   RefreshedCell result;
   result.pressure = (policy.adiabatic_index - 1.0) * rho * u;
   double c_squared = policy.adiabatic_index * result.pressure / rho;
-  if (policy.closure != nullptr) {
+  // CHUI Part 2: with an enabled composition sidecar the ISM regime tag owns
+  // the decision; resolved-regime rows never receive the effective closure.
+  const bool regime_allows_closure = !state.gas_composition.enabled() ||
+      (row < state.gas_composition.rowCount() &&
+       state.gas_composition.ism_regime_tag[row] == core::k_gas_ism_regime_effective);
+  if (policy.closure != nullptr && regime_allows_closure) {
     HydroPrimitiveState ideal;
     ideal.rho_comoving = rho;
     ideal.vel_x_peculiar = vx;

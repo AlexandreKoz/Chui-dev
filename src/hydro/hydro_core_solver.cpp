@@ -190,7 +190,7 @@ void validateActiveSet(const HydroActiveSetView& active_set, const HydroConserve
   const HydroConservedState cell = conserved.loadCell(cell_index);
   HydroPrimitiveState primitive = HydroCoreSolver::primitiveFromConserved(cell, adiabatic_index);
   (void)selectDualEnergyThermalState(conserved, cell_index, cell, dual_energy, adiabatic_index, primitive);
-  if (source_context.thermodynamic_closure != nullptr) {
+  if (source_context.thermodynamic_closure != nullptr && effectiveClosureAllowed(source_context, cell_index)) {
     const HydroThermodynamicClosureResult closure =
         source_context.thermodynamic_closure->evaluate(
             cell_index,

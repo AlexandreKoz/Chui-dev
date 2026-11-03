@@ -58,6 +58,7 @@ void GasCompositionSidecar::clear() noexcept {
   chemistry_model_tag = {};
   ism_regime_tag = {};
   model_dwell_years = {};
+  ism_regime_dwell_years = {};
   mean_molecular_weight = {};
 }
 
@@ -75,6 +76,7 @@ void GasCompositionSidecar::resizeRows(std::size_t row_count) {
   chemistry_model_tag.resize(row_count, 0U);
   ism_regime_tag.resize(row_count, 0U);
   model_dwell_years.resize(row_count, 0.0);
+  ism_regime_dwell_years.resize(row_count, 0.0);
   mean_molecular_weight.resize(row_count, std::numeric_limits<double>::quiet_NaN());
 }
 
@@ -136,6 +138,7 @@ std::vector<double> GasCompositionSidecar::packRow(std::size_t row) const {
   payload.push_back(static_cast<double>(chemistry_model_tag[row]));
   payload.push_back(static_cast<double>(ism_regime_tag[row]));
   payload.push_back(model_dwell_years[row]);
+  payload.push_back(ism_regime_dwell_years[row]);
   return payload;
 }
 
@@ -165,6 +168,7 @@ void GasCompositionSidecar::unpackRow(
   chemistry_model_tag[row] = static_cast<std::uint8_t>(payload[meta]);
   ism_regime_tag[row] = static_cast<std::uint8_t>(payload[meta + 1U]);
   model_dwell_years[row] = payload[meta + 2U];
+  ism_regime_dwell_years[row] = payload[meta + 3U];
   mean_molecular_weight[row] = std::numeric_limits<double>::quiet_NaN();
   gas_cell_id[row] = gas_cell_id_value;
 }
@@ -205,6 +209,7 @@ bool GasCompositionSidecar::isConsistent(std::size_t expected_rows) const noexce
   if (!m_descriptor.isConsistent() || m_lanes.size() != m_descriptor.lane_count ||
       gas_cell_id.size() != expected_rows || chemistry_model_tag.size() != expected_rows ||
       ism_regime_tag.size() != expected_rows || model_dwell_years.size() != expected_rows ||
+      ism_regime_dwell_years.size() != expected_rows ||
       mean_molecular_weight.size() != expected_rows) {
     return false;
   }
@@ -222,7 +227,8 @@ std::uint64_t GasCompositionSidecar::ownedCapacityBytes() const noexcept {
   for (const auto& values : m_lanes) bytes += values.capacity() * sizeof(double);
   bytes += gas_cell_id.capacity() * sizeof(std::uint64_t);
   bytes += chemistry_model_tag.capacity() + ism_regime_tag.capacity();
-  bytes += (model_dwell_years.capacity() + mean_molecular_weight.capacity()) * sizeof(double);
+  bytes += (model_dwell_years.capacity() + ism_regime_dwell_years.capacity() + mean_molecular_weight.capacity()) *
+      sizeof(double);
   return bytes;
 }
 
@@ -231,7 +237,7 @@ std::uint64_t GasCompositionSidecar::currentSizeBytes() const noexcept {
   for (const auto& values : m_lanes) bytes += values.size() * sizeof(double);
   bytes += gas_cell_id.size() * sizeof(std::uint64_t);
   bytes += chemistry_model_tag.size() + ism_regime_tag.size();
-  bytes += (model_dwell_years.size() + mean_molecular_weight.size()) * sizeof(double);
+  bytes += (model_dwell_years.size() + ism_regime_dwell_years.size() + mean_molecular_weight.size()) * sizeof(double);
   return bytes;
 }
 
