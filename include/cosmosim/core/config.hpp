@@ -631,6 +631,10 @@ struct PhysicsConfig {
   // Explicit opt-in to UNQUALIFIED (unverified) rate coefficients; see
   // docs/chemistry_rate_provenance.md. Default refuses those backends.
   bool thermochemistry_allow_unqualified_rates = false;
+  // Part 2.5: explicit acceptance of a metal cooling table whose embedded UV
+  // background does not match the configured CHUI UVB (see
+  // MetalCoolingTable::checkUvBackgroundCompatibility). Default refuses.
+  bool metal_cooling_accept_uv_background_mismatch = false;
   bool ssp_stochastic_sn_events = true;
   bool ssp_clustered_associations = false;
 };

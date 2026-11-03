@@ -102,8 +102,13 @@ ThermochemistrySolver::ThermochemistrySolver(ThermochemistryConfig config) : m_c
     }
     m_species_count = m_manifest->species_count;
   }
-  // KWH96 equilibrium rates and the network manifests are UNQUALIFIED
-  // (unverified transcription); only the analytic reference is exempt.
+  // Part 2.5 policy: provenance verification alone never lifts the gate.
+  // The equilibrium backend's rate set is primary-verified (see
+  // equilibriumPrimordialManifest) but its numerical validation is
+  // USER-RESERVED and not yet recorded, so it stays behind the opt-in like
+  // the network backends (whose manifests are not qualified(): R13/R15/R17/
+  // R20/R21 secondary-verified, R18 and H2 photodissociation heating
+  // unverified). Only the analytic reference is exempt.
   const bool uses_unqualified_rates =
       m_config.backend == ThermochemistryBackend::kEquilibriumPrimordial ||
       (m_manifest != nullptr && !m_manifest->qualified());
@@ -154,6 +159,7 @@ RateEnvironment ThermochemistrySolver::environment(const ThermochemistryCellInpu
   };
   env.temperature_k = std::max(temperature_k, 1.0);
   env.hydrogen_nuclei_cm3 = nuclei(ChemicalElement::kH);
+  env.helium_nuclei_cm3 = nuclei(ChemicalElement::kHe);
   env.oxygen_gas_nuclei_cm3 = nuclei(ChemicalElement::kO);
   env.carbon_gas_nuclei_cm3 = nuclei(ChemicalElement::kC);
   env.redshift = input.redshift;

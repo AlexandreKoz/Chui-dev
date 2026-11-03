@@ -60,3 +60,20 @@ python3.8 tests/python/test_treepm_snapshot_tools.py
 Missing NumPy/h5py gives explicit exit 77 (CTest SKIP); all data/semantic
 rejections use assertions on named error categories. See the
 [repair report](../docs/repair/treepm_p1p5_qualification_and_test_reliability_repair_20261010.md) for the full matrix and commands.
+
+## CHUI physics-data tools (`tools/chui_data/`, Part 2.5)
+
+These tools were written but **not executed** by the author. Executable
+validation is user-reserved.
+
+- `validate_treecool.py`: checks a TREECOOL file against the CHUI 7-column
+  reader contract and prints its SHA-256 and config lines.
+- `convert_wss09_metal_cooling.py`: streams the Wiersma, Schaye & Smith (2009)
+  per-redshift HDF5 tables into `chui_metal_cooling_table_v1`. It needs
+  h5py, preserves the sign and axes, never converts `Metal_free`, and
+  requires `--license` and `--uv-background`.
+- `convert_nugrid_yields.py`: converts NuPyCEE/NuGrid yields into
+  `chui_ssp_yield_table_v1` (net = yield − X0·ejecta). It refuses rather
+  than rebalances and requires an explicit Ia untracked-mass policy.
+- `data_sources.md`: URLs, checksums, licence status and the format facts
+  checked for each source. No third-party data is committed.

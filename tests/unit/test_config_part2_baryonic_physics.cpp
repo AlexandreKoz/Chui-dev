@@ -52,6 +52,24 @@ void testRoundTripDetailedFullPhysics() {
   CHUI_REQUIRE(frozen.normalized_text == reparsed.normalized_text);
 }
 
+void testUvBackgroundMismatchKeyRoundTrip() {
+  const std::string text = k_base +
+      "metal_species_mode = core_elements\nthermochemistry_backend = fixed_hybrid\n"
+      "thermochemistry_allow_unqualified_rates = true\nmetal_cooling_mode = element_table\n"
+      "metal_cooling_table_path = /data/wss09_chui_v1.txt\n"
+      "metal_cooling_table_sha256 = " + std::string(64, 'a') + "\n"
+      "metal_cooling_accept_uv_background_mismatch = true\n";
+  const auto frozen = co::loadFrozenConfigFromString(text, "part25_uvb");
+  CHUI_REQUIRE(frozen.config.physics.metal_cooling_accept_uv_background_mismatch);
+  CHUI_REQUIRE(frozen.normalized_text.find("metal_cooling_accept_uv_background_mismatch = true") != std::string::npos);
+  const auto reparsed = co::loadFrozenConfigFromString(frozen.normalized_text, "part25_uvb_reparse");
+  CHUI_REQUIRE(reparsed.normalized_text == frozen.normalized_text);
+  const auto defaults = co::loadFrozenConfigFromString("[mode]\nmode = zoom_in\n", "part25_defaults");
+  CHUI_REQUIRE(!defaults.config.physics.metal_cooling_accept_uv_background_mismatch);
+  CHUI_REQUIRE(defaults.normalized_text.find("metal_cooling_accept_uv_background_mismatch = false") !=
+               std::string::npos);
+}
+
 void testFailClosedCombinations() {
   // core_elements without a Part 2 backend and vice versa.
   CHUI_REQUIRE(rejects("metal_species_mode = core_elements\n"));
@@ -95,6 +113,30 @@ void testFailClosedCombinations() {
   // are not implemented and are refused.
   CHUI_REQUIRE(rejects("metal_species_mode = core_elements\nthermochemistry_backend = equilibrium_primordial\n"));
   CHUI_REQUIRE(rejects("ssp_clustered_associations = true\n"));
+  // Part 2.5: a data path without its SHA-256 (or with a malformed one) is
+  // refused, so a replaced file cannot silently change a restarted run.
+  for (const std::string sha : {std::string(), std::string("ABC"), std::string(64, 'G')}) {
+    CHUI_REQUIRE(rejects("metal_species_mode = core_elements\nthermochemistry_backend = fixed_hybrid\n"
+                         "thermochemistry_allow_unqualified_rates = true\nmetal_cooling_mode = element_table\n"
+                         "metal_cooling_table_path = /data/t.txt\nmetal_cooling_table_sha256 = " + sha + "\n"));
+  }
+  {
+    // TREECOOL path without checksum (own base: k_base already sets the UVB model).
+    const std::string treecool = "[mode]\nmode = isolated_galaxy\n[physics]\nmetal_species_mode = core_elements\n"
+                                 "thermochemistry_backend = fixed_hybrid\nthermochemistry_allow_unqualified_rates = true\n"
+                                 "uv_background_model = treecool_table\nuv_background_table_path = /data/treecool\n";
+    bool refused = false;
+    try { (void)co::loadFrozenConfigFromString(treecool, "part25_treecool_nosha"); }
+    catch (const std::exception&) { refused = true; }
+    CHUI_REQUIRE(refused);
+    const auto ok = co::loadFrozenConfigFromString(
+        treecool + "uv_background_table_sha256 = " + std::string(64, '0') + "\n", "part25_treecool_sha");
+    CHUI_REQUIRE(ok.config.physics.uv_background_table_sha256 == std::string(64, '0'));
+  }
+  // Part 2.5: UVB-mismatch acceptance is a no-op without an element table.
+  CHUI_REQUIRE(rejects("metal_species_mode = core_elements\nthermochemistry_backend = fixed_hybrid\n"
+                       "thermochemistry_allow_unqualified_rates = true\n"
+                       "metal_cooling_accept_uv_background_mismatch = true\n"));
   // Numerical ranges.
   CHUI_REQUIRE(rejects("metal_species_mode = core_elements\nthermochemistry_backend = fixed_hybrid\n"
                        "thermochemistry_relative_tolerance = 0.5\n"));
@@ -107,5 +149,6 @@ int main() {
   testDefaultsAreLegacy();
   testRoundTripDetailedFullPhysics();
   testFailClosedCombinations();
+  testUvBackgroundMismatchKeyRoundTrip();
   return 0;
 }

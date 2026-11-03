@@ -29,11 +29,13 @@ namespace cosmosim::physics {
 //
 // Rate provenance labels
 // ----------------------
-// Every rate cites its publication. Coefficients were TRANSCRIBED from the
-// cited papers for this source pass and must be independently re-checked by
-// the owner against the originals (NOT RUN — USER-RESERVED). Where a channel
-// is not implemented it is NAMED in `omitted_channels` — the network does not
-// claim it.
+// Every rate cites its publication and carries a RateVerification status.
+// Part 2.5 (scientific provenance pass) checked each coefficient against the
+// cited text; the per-rate record (equation/table number, coefficients,
+// units, validity range, assumptions, independent reference values) is
+// docs/chemistry_rate_provenance.md. Where a channel is not implemented it is
+// NAMED in `omitted_channels` — the network does not claim it. Numerical
+// validation of the network remains NOT RUN — USER-RESERVED.
 // ---------------------------------------------------------------------------
 
 inline constexpr std::size_t k_network_slot_count = k_chemical_species_count + 2U;
@@ -62,6 +64,7 @@ enum class ThermochemistryBackend : std::uint8_t {
 struct RateEnvironment {
   double temperature_k = 1.0e4;
   double hydrogen_nuclei_cm3 = 1.0;       // n_H (all chemical forms)
+  double helium_nuclei_cm3 = 0.0;         // n_He (all forms; GA08 eq. 14 critical density)
   double oxygen_gas_nuclei_cm3 = 0.0;     // gas-phase O nuclei (after depletion)
   double carbon_gas_nuclei_cm3 = 0.0;     // gas-phase C nuclei (after depletion)
   // Shielded photo-rates [s^-1] and photoheating per photoionization [erg].
@@ -85,18 +88,37 @@ using NetworkState = std::array<double, k_chemical_species_count>;
 // Rate function: returns the volumetric reaction rate R [cm^-3 s^-1].
 using ReactionRateFunction = double (*)(const RateEnvironment&, const NetworkState&, double n_e);
 
-// Verification status of a coefficient against its publication (corrective
-// gate). kUnverifiedTranscription: written from the cited paper without a
-// documented line-by-line check against the original text; the backend that
-// uses it is UNQUALIFIED and refuses to run unless the owner explicitly opts
-// in (physics.thermochemistry_allow_unqualified_rates = true).
+// Verification status of a coefficient against its publication.
+// kUnverifiedTranscription: the primary publication was not accessible and no
+// independent compilation was checked; the backend is UNQUALIFIED.
 // kDerivedFromConstants: computed from CODATA physical constants only.
-// kVerifiedAgainstSource: checked against the publication (record the check
-// in docs/chemistry_rate_provenance.md before setting this).
+// kVerifiedAgainstSource: coefficients, units and validity range checked
+// against the cited PRIMARY text (Part 2.5; recorded with equation/table
+// numbers in docs/chemistry_rate_provenance.md).
+// kVerifiedAgainstSecondarySource: the primary was not accessible; the
+// coefficients were checked against a peer-reviewed compilation that
+// reproduces them (named in the provenance string). Treated as NOT qualified.
+// A manifest is qualified() only if every reaction and cooling channel is
+// kVerifiedAgainstSource or kDerivedFromConstants. Even then the thermo-
+// chemistry backends stay behind physics.thermochemistry_allow_unqualified_
+// rates until the owner's numerical validation (USER-RESERVED) is recorded.
 enum class RateVerification : std::uint8_t {
   kUnverifiedTranscription = 0,
   kDerivedFromConstants = 1,
   kVerifiedAgainstSource = 2,
+  kVerifiedAgainstSecondarySource = 3,
+};
+[[nodiscard]] constexpr bool rateVerificationQualifies(RateVerification v) noexcept {
+  return v == RateVerification::kVerifiedAgainstSource || v == RateVerification::kDerivedFromConstants;
+}
+[[nodiscard]] std::string_view rateVerificationLabel(RateVerification v) noexcept;
+
+// One cooling/heating channel of a backend with its own provenance status.
+struct CoolingChannelRecord {
+  std::string_view id;
+  std::string_view description;
+  std::string_view provenance;
+  RateVerification verification = RateVerification::kUnverifiedTranscription;
 };
 
 struct ReactionDefinition {
@@ -120,14 +142,18 @@ struct NetworkManifest {
   std::vector<std::string> cooling_channels;
   std::vector<std::string> omitted_channels;
   std::string regime;  // validity statement
-  // Cooling/heating fits used by the backend (KWH96 terms, H2, fine
-  // structure, photoelectric) carry the same verification status.
-  RateVerification cooling_verification = RateVerification::kUnverifiedTranscription;
-  // True only if every reaction and the cooling fits are verified or derived.
+  // Per-channel provenance of the cooling/heating fits (Part 2.5; replaces the
+  // former single cooling_verification field).
+  std::vector<CoolingChannelRecord> cooling_records;
+  // True only if every reaction and every cooling record qualifies
+  // (rateVerificationQualifies). Never true merely because a record exists.
   [[nodiscard]] bool qualified() const noexcept;
 };
 
 // Manifests are immutable singletons: one catalog per model, never per cell.
+// The equilibrium backend's rate set (R01-R09 + KWH96 cooling + Compton +
+// photoheating) is described by its own manifest for provenance reporting.
+[[nodiscard]] const NetworkManifest& equilibriumPrimordialManifest();
 [[nodiscard]] const NetworkManifest& hybridLightNetworkManifest();
 [[nodiscard]] const NetworkManifest& detailedCarbonOxygenNetworkManifest();
 
@@ -143,28 +169,54 @@ struct NetworkValidationReport {
 // Rate coefficients (cm^3 s^-1 unless noted). Exposed for unit tests.
 // ---------------------------------------------------------------------------
 namespace rates {
-// Katz, Weinberg & Hernquist (1996, ApJS 105, 19), Table 2 (after Cen 1992).
+// Katz, Weinberg & Hernquist (1996, ApJS 105, 19), Table 2 (after Cen 1992),
+// verified line by line (Part 2.5). The KWH96 alpha_H+ fit gives
+// 5.10e-13 cm^3/s at 1e4 K, i.e. CASE-A-like (Ferland et al. 1992 case A
+// 4.30e-13, case B 2.59e-13, as tabulated by Glover & Abel 2008 Table A1).
+// CHUI uses these optically thin (case A) rates everywhere; case B for
+// self-shielded gas is NOT implemented (named regime limitation).
 double collisionalIonizationHI(double t);
 double collisionalIonizationHeI(double t);
 double collisionalIonizationHeII(double t);
-double recombinationHII(double t);        // case A
+double recombinationHII(double t);        // case A (KWH96 Table 2)
 double recombinationHeII(double t);       // radiative, case A
 double dielectronicHeII(double t);
 double recombinationHeIII(double t);      // case A
-// Galli & Palla (1998, A&A 335, 403), Table 1/3.
+// Ferland et al. (1992) case A / case B H+ recombination fits as printed in
+// Glover & Abel (2008, MNRAS 388, 1627) Table A1 — used ONLY as independent
+// cross-checks of the case convention (not called by the network).
+double recombinationHIICaseAFerland1992(double t);
+double recombinationHIICaseBFerland1992(double t);
+// Galli & Palla (1998, A&A 335, 403), Table 1 (H3, H5, H8, H7).
 double formationHminus(double t);         // H + e -> H- + gamma
 double associativeDetachment(double t);   // H- + H -> H2 + e
+// GP98 H8; published validity 1 K <= T <= 32000 K. Outside that range the
+// value at the nearest limit is held (documented, counted nowhere because
+// H2+ formation is negligible above 3.2e4 K).
 double formationH2plus(double t);         // H + H+ -> H2+ + gamma
-double mutualNeutralization(double t);    // H- + H+ -> 2H
-// Karpas, Anicich & Huntress (1979, J. Chem. Phys. 70, 2877).
+double mutualNeutralization(double t);    // H- + H+ -> 2H (GP98 H7; no range stated)
+// Karpas, Anicich & Huntress (1979) as listed by Abel et al. (1997) k10.
 double chargeTransferH2plus(double t);    // H2+ + H -> H2 + H+
-// Donahue & Shull (1991, ApJ 383, 511) as listed by Abel et al. (1997).
+// Donahue & Shull (1991, ApJ 383, 511) as listed by Abel et al. (1997) k12.
 double electronDissociationH2(double t);  // H2 + e -> 2H + e
+// Glover & Abel (2008) Table A1 reaction 9, H2 + H -> 3H: v=0 limit
+// (Mac Low & Shull 1986) and LTE limit (Lepp & Shull 1983) combined with the
+// critical-density blend of GA08 eqs. 13-17. n_h_nuclei = n (hydrogen nuclei
+// number density); x_h = n_HI/n, x_h2 = 2 n_H2/n, x_he = n_He/n.
+double collisionalDissociationH2ByHLowDensity(double t);
+double collisionalDissociationH2ByHLte(double t);
+double h2DissociationCriticalDensity(double t, double x_h, double x_h2, double x_he);
+double collisionalDissociationH2ByH(double t, double n_h_nuclei, double x_h, double x_h2, double x_he);
 // Abel et al. (1997) k18 (Schneider et al. 1994 fit).
 double dissociativeRecombinationH2plus(double t);  // H2+ + e -> 2H
-// Jura (1975, ApJ 197, 575): R_dust = 3e-17 (D/D_MW) n_H n_HI cm^-3 s^-1.
+// Jura (1975, ApJ 197, 575): R_dust = 3e-17 (D/D_MW) n_H n_HI cm^-3 s^-1
+// (UNVERIFIED: primary not accessible during Part 2.5).
 double dustH2FormationCoefficient(double dust_to_gas_relative_mw);
-// Draine & Bertoldi (1996, ApJ 468, 269) H2 self-shielding function.
+// Thermal Doppler parameter of H2 in units of km/s: b5 = sqrt(2 k T / m_H2)
+// / 1e5 = sqrt(k T / m_H) / 1e5 = 0.0908 sqrt(T). Thermal only — no
+// turbulent broadening is added (documented limitation).
+double h2ThermalDopplerB5(double temperature_k);
+// Draine & Bertoldi (1996, ApJ 468, 269) eq. 37 H2 self-shielding function.
 double h2SelfShielding(double h2_column_cm2, double temperature_k);
 }  // namespace rates
 
@@ -189,11 +241,17 @@ namespace cooling {
 CoolingHeatingTerms primordial(const RateEnvironment& env, const NetworkState& n,
                                std::size_t species_count, double n_e);
 // Fine-structure cooling of C+ (158 um) and O I (63 um), two-level atoms
-// with collision rates of Hollenbach & McKee (1989, ApJ 342, 306) Table 8.
+// with collision rates of Hollenbach & McKee (1989, ApJ 342, 306) Table 8
+// (primary not accessible; verified against the KROME compilation, Grassi
+// et al. 2014 MNRAS 439 2386, Table B). O I: only the 63 um 3P1->3P2 line,
+// Delta E = 227.7 K (hc/lambda for lambda = 63.18 um).
 double fineStructureCII(double t, double n_cii, double n_h, double n_e);
 double fineStructureOI(double t, double n_oi, double n_h);
-// Photoelectric heating, Bakes & Tielens (1994, ApJ 427, 822) as in
-// Wolfire et al. (2003, ApJ 587, 278) eq. 19-20, scaled by D/D_MW.
+// Photoelectric heating, Bakes & Tielens (1994, ApJ 427, 822) as revised by
+// Wolfire et al. (2003, ApJ 587, 278) eqs. 23-24 with the PAH recombination
+// parameter phi_PAH = 0.5 (their standard model), scaled by D/D_MW. Grain
+// recombination cooling (Wolfire et al. eq. 25) is omitted (named channel).
+inline constexpr double k_wolfire2003_phi_pah = 0.5;
 double photoelectricHeating(double t, double n_h, double n_e, double g0, double d_rel);
 double comptonCoolingCoefficient(double redshift);  // erg s^-1 K^-1 per electron
 }  // namespace cooling

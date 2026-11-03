@@ -73,6 +73,10 @@ BaryonicDataProducts loadBaryonicDataProducts(const core::PhysicsConfig& physics
       physics.metal_cooling_mode == core::MetalCoolingModeConfig::kElementTableAndFineStructure) {
     data.metal_cooling_table = std::make_shared<const MetalCoolingTable>(
         MetalCoolingTable::loadFromFile(physics.metal_cooling_table_path, physics.metal_cooling_table_sha256));
+    // Throws on a refused UVB mismatch (Part 2.5 policy).
+    data.uv_background_compatibility = data.metal_cooling_table->checkUvBackgroundCompatibility(
+        data.uv_background != nullptr ? data.uv_background->provenance().sha256_hex : std::string(),
+        physics.metal_cooling_accept_uv_background_mismatch);
   }
   return data;
 }

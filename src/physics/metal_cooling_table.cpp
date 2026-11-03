@@ -102,6 +102,8 @@ MetalCoolingTable MetalCoolingTable::loadFromString(const std::string& text, con
         if (key == "citation") table.m_provenance.citation = value;
         if (key == "license") table.m_provenance.license = value;
         if (key == "solar_reference") table.m_provenance.solar_reference = value;
+        if (key == "uv_background") table.m_provenance.uv_background = value;
+        if (key == "uv_background_treecool_sha256") table.m_provenance.uv_background_treecool_sha256 = value;
       }
       continue;
     }
@@ -126,6 +128,13 @@ MetalCoolingTable MetalCoolingTable::loadFromString(const std::string& text, con
     else if (key == "log10_nH") table.m_log_n = values;
     else if (key == "redshift") table.m_redshift = values;
     else if (key == "reference_mass_fraction") table.m_reference_mass_fraction = values;
+    else if (key == "reference_hydrogen_mass_fraction") {
+      if (values.size() != 1U) {
+        throw SourceModelUnavailableError("metal cooling table '" + label +
+                                          "': reference_hydrogen_mass_fraction must hold exactly one value");
+      }
+      table.m_reference_hydrogen_mass_fraction = values[0];
+    }
     else if (key == "ne_over_nH") table.m_ne_over_nh = values;
     else if (key == "lambda") lambda_blocks[block_name] = values;
     else throw SourceModelUnavailableError("metal cooling table '" + label + "': unknown block '" + key + "'");
@@ -135,6 +144,18 @@ MetalCoolingTable MetalCoolingTable::loadFromString(const std::string& text, con
       table.m_provenance.solar_reference.empty()) {
     throw SourceModelUnavailableError("metal cooling table '" + label +
                                       "' must declare citation, license and solar_reference (provenance is mandatory)");
+  }
+  if (table.m_provenance.uv_background.empty()) {
+    throw SourceModelUnavailableError(
+        "metal cooling table '" + label +
+        "' must declare uv_background (the UV background embedded in the table, or 'none' for a collisional "
+        "table); required since Part 2.5 so that UVB mismatches cannot pass silently");
+  }
+  if (!(table.m_reference_hydrogen_mass_fraction > 0.0) || !(table.m_reference_hydrogen_mass_fraction < 1.0)) {
+    throw SourceModelUnavailableError(
+        "metal cooling table '" + label +
+        "' must declare reference_hydrogen_mass_fraction in (0, 1): WSS09 eq. 4 scales by abundances relative to "
+        "hydrogen, (X_e/X_H)/(X_e,ref/X_H,ref)");
   }
   requireIncreasing(table.m_log_t, "log10_T", label);
   requireIncreasing(table.m_log_n, "log10_nH", label);
@@ -224,13 +245,46 @@ MetalCoolingTable::Result MetalCoolingTable::evaluate(const Query& query, MetalT
     const double eq = std::sinh(interpolate(m_ne_over_nh, query.redshift, lt, ln, c, policy));
     if (eq > 0.0) electron_correction = query.electron_per_hydrogen / eq;
   }
+  const double x_h = query.gas_mass_fraction[static_cast<std::size_t>(ChemicalElement::kH)];
+  const double hydrogen_scale = x_h > 0.0 ? m_reference_hydrogen_mass_fraction / x_h : 0.0;
   for (std::size_t i = 0; i < m_elements.size(); ++i) {
     const double transformed = interpolate(m_lambda_transformed[i], query.redshift, lt, ln, result.clamped, policy);
     const double lambda_ref = k_asinh_scale * std::sinh(transformed);
-    const double abundance_ratio =
+    // WSS09 eq. 4: 10^[e/H] = (X_e/X_H) / (X_e,ref/X_H,ref).
+    const double abundance_ratio = hydrogen_scale *
         query.gas_mass_fraction[static_cast<std::size_t>(m_elements[i])] / m_reference_mass_fraction[i];
     result.net_cooling_erg_cm3_s += lambda_ref * nh * nh * electron_correction * std::max(abundance_ratio, 0.0);
   }
+  return result;
+}
+
+UvBackgroundCompatibility MetalCoolingTable::checkUvBackgroundCompatibility(const std::string& chui_uvb_sha256,
+                                                                            bool accept_mismatch) const {
+  UvBackgroundCompatibility result;
+  const std::string& declared = m_provenance.uv_background;
+  const std::string& declared_sha = m_provenance.uv_background_treecool_sha256;
+  if (declared == "none") {
+    result.compatible = chui_uvb_sha256.empty();
+  } else if (!declared_sha.empty() && !chui_uvb_sha256.empty()) {
+    result.compatible = declared_sha == chui_uvb_sha256;
+  }
+  if (result.compatible) {
+    result.diagnostic = "metal table uv_background '" + declared + "' matches the configured UV background";
+    return result;
+  }
+  result.diagnostic = "metal cooling table '" + m_provenance.source_path + "' embeds uv_background '" + declared +
+      "'" + (declared_sha.empty() ? std::string() : " (TREECOOL sha256 " + declared_sha + ")") +
+      " but CHUI's H/He photo-rates use " +
+      (chui_uvb_sha256.empty() ? std::string("no UV background")
+                               : "the TREECOOL file with sha256 " + chui_uvb_sha256) +
+      ": metal photoheating and ionization balance are inconsistent with the H/He network";
+  if (!accept_mismatch) {
+    throw SourceModelUnavailableError(result.diagnostic +
+                                      ". Use a table computed with the same UVB, or set "
+                                      "physics.metal_cooling_accept_uv_background_mismatch = true to accept it "
+                                      "explicitly (recorded in the run provenance)");
+  }
+  result.accepted_mismatch = true;
   return result;
 }
 

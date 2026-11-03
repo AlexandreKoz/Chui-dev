@@ -37,6 +37,11 @@ bool ensureGasCompositionInitialized(core::SimulationState& state, const core::P
 struct BaryonicDataProducts {
   std::shared_ptr<const UvBackgroundTable> uv_background;
   std::shared_ptr<const MetalCoolingTable> metal_cooling_table;
+  // Part 2.5: metal-table / CHUI UVB compatibility decision (only meaningful
+  // when metal_cooling_table is loaded). An accepted mismatch is recorded in
+  // the normalized configuration (metal_cooling_accept_uv_background_mismatch
+  // = true is part of the config hash) and in this diagnostic.
+  UvBackgroundCompatibility uv_background_compatibility;
 };
 // Loads every external data file required by the configuration. Missing or
 // corrupt data throw SourceModelUnavailableError with acquisition guidance;

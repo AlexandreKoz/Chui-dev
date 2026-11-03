@@ -798,7 +798,7 @@ Handoff: `docs/repair/chui_part2_thermochemistry_stellar_physics_20261103.md`.
 | `thermochemistry_backend` | `legacy_cooling` \| `analytic_reference` \| `equilibrium_primordial` \| `fixed_hybrid` \| `fixed_detailed` | Part 2 backends run in the source stage and require `metal_species_mode = core_elements` and `enable_cooling = true`. |
 | `metal_species_mode` | `total_only` \| `core_elements` | `core_elements` enables the 11-element composition sidecar (only with a Part 2 backend). |
 | `uv_background_model` | adds `treecool_table` | Part 2 backends accept only `none` or `treecool_table` (`hm12`/`fg20` are legacy analytic proxies). |
-| `uv_background_table_path`, `uv_background_table_sha256` | "" | TREECOOL file and optional expected SHA-256. |
+| `uv_background_table_path`, `uv_background_table_sha256` | "" | TREECOOL file and its SHA-256. Since Part 2.5 the checksum is **required** whenever a path is set (64 lower-case hex digits), for this pair and likewise for `metal_cooling_table_*` and `ssp_yield_table_*`. Data files are thereby bound to the config hash and restart identity. `tools/chui_data/validate_treecool.py` prints the value. |
 | `thermochemistry_relative_tolerance` | 1e-4, (0, 0.1) | stiff-solver relative tolerance |
 | `thermochemistry_abundance_absolute_tolerance` | 1e-12, (0, 1e-4] | per-H-nucleus abundance atol |
 | `thermochemistry_max_substeps`, `thermochemistry_max_newton_iterations` | 4096, 12 | step-attempt and Newton budgets; exhaustion rejects the stage (F2) |
@@ -807,6 +807,7 @@ Handoff: `docs/repair/chui_part2_thermochemistry_stellar_physics_20261103.md`.
 | `chemistry_shielding_length_max_pc` | 100 | cap on the Jeans shielding length |
 | `metal_cooling_mode` | `none` \| `fine_structure_cold` \| `element_table` \| `element_table_and_fine_structure` | network backends only; table modes need `metal_cooling_table_path` |
 | `metal_cooling_table_path`, `metal_cooling_table_sha256`, `metal_cooling_table_range` (`reject` \| `clamp_density_redshift`), `metal_cooling_switch_temperature_k` (1e4) | | element-resolved table (`chui_metal_cooling_table_v1`) |
+| `metal_cooling_accept_uv_background_mismatch` | false | Part 2.5. A metal table must declare its embedded `uv_background`. A table is compatible only if it declares `none` and no CHUI UVB is configured, or if its `uv_background_treecool_sha256` equals the configured TREECOOL SHA-256. Any other pairing (for example WSS09/HM01 tables with an FG20 TREECOOL) is refused unless this key is `true`. Setting it `true` without an element-table `metal_cooling_mode` is refused as a no-op. The key is part of the normalized config and the config hash. Part 2 checkpoints that predate it restart only at the default. |
 | `chemistry_primordial_helium_mass_fraction` | 0.2449 | initialization policy |
 | `chemistry_metallicity_scaled_dust_proxy` | false | D/D_MW = Z/Z_sun when no live dust lanes |
 | `dust_model` | `none` \| `two_reservoir_v1` | live silicate + carbon dust (network backends) |
@@ -825,7 +826,7 @@ Handoff: `docs/repair/chui_part2_thermochemistry_stellar_physics_20261103.md`.
 | `ssp_reference_net_metal_yield` | 0 | REFERENCE yields only |
 | `ssp_stochastic_sn_events` | true | discrete events vs expectation |
 | `ssp_clustered_associations` | false | NOT implemented; `true` is refused |
-| `thermochemistry_allow_unqualified_rates` | false | required for `equilibrium_primordial`/`fixed_hybrid`/`fixed_detailed` (rates UNQUALIFIED, see `docs/chemistry_rate_provenance.md`) |
+| `thermochemistry_allow_unqualified_rates` | false | Required for `equilibrium_primordial`, `fixed_hybrid` and `fixed_detailed`. After Part 2.5 the equilibrium rate set is primary-verified, but numerical validation is USER-RESERVED and pending. The network manifests still contain secondary-verified (R13/R15/R17/R20/R21) and unverified (R18) entries. See `docs/chemistry_rate_provenance.md`. |
 | `fb_supernova_model` | `legacy` \| `mechanical_resolved_unresolved` | required by Part 2 populations when feedback is on |
 | `fb_presn_wind_momentum_lsun_per_c` | 0 | EXPERIMENTAL pre-SN momentum closure |
 
