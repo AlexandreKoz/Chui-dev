@@ -1,9 +1,9 @@
 // CHUI Part 3 bounded microbenchmarks (NOT RUN — USER-RESERVED; no numbers
 // are claimed from source inspection). Measures, on deterministic synthetic
 // inputs sized by argv[1] (cells per line, default 4096):
-//   * element-resolved diffusion: lane-cell updates per second;
-//   * composition regrid: refine + derefine of an 8^3-cell patch with a
-//     hybrid+dust+SGS sidecar (wall time per operation, includes admission);
+//   * element-resolved diffusion: lane-face updates per second.
+// (Composition-regrid and remote-exchange benchmarks are NOT yet written;
+// they are listed as open in the Part 3 handoff.)
 // Output: one "key value" line per metric (machine-readable, for the owner's
 // regression tables in docs/profiling.md). Methodology: median of 5 repeats
 // after one warm-up; report hardware and build preset alongside.
@@ -14,9 +14,6 @@
 #include <optional>
 #include <vector>
 
-#include "cosmosim/amr/amr_production_regrid.hpp"
-#include "cosmosim/core/memory_accounting.hpp"
-#include "cosmosim/core/memory_governor.hpp"
 #include "cosmosim/physics/baryon_composition.hpp"
 #include "cosmosim/physics/element_diffusion.hpp"
 
@@ -24,7 +21,6 @@ namespace {
 
 namespace core = cosmosim::core;
 namespace ph = cosmosim::physics;
-namespace amr = cosmosim::amr;
 
 double medianSeconds(std::vector<double> samples) {
   std::sort(samples.begin(), samples.end());

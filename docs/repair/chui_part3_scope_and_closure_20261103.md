@@ -1,5 +1,11 @@
 # CHUI Part 3 — requirement-by-requirement scope and closure ledger
 
+> **Final state (end of campaign):** the authoritative closed/open matrix is
+> §2 of `docs/repair/chui_part3_distributed_amr_multirate_20261103.md`; rows
+> below that still say "open" for C, D, E, F, G or I were superseded there
+> (checkpoint commits `aef9b9e`, `d34f06d`, `20a5d88`, `3865b08`, `4280cdf`).
+> Everything remains NOT RUN — USER-RESERVED.
+
 Date: 2026-11-03/04. Parent: `f5a92555de2c199d860755a727a7f661612912aa`
 (Part 2 + Part 2.5). Branch: `claude/bold-dirac-ig5u6l` (the session's
 designated feature branch, created at exactly the parent SHA; `main`, the

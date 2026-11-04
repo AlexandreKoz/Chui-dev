@@ -1,5 +1,30 @@
 # Current repository status
 
+## CHUI Part 3 distributed AMR / remote sources / science output — 2026-11-04
+
+**IMPLEMENTED IN SOURCE — NOT COMPILED, NOT TESTED (user-reserved).** The
+following now exist in source only:
+
+* periodic cross-patch and cross-rank AMR topology, with multi-layer ghosts;
+* automatic conservative regrid (F6), carrying composition;
+* distributed composition transport;
+* element-resolved diffusion (single rank);
+* cross-rank stellar feedback and SF gradients;
+* a table-driven wind channel (data-blocked) and research associations;
+* collective global-step rollback (rung zero);
+* a TreePM–AMR force fixture and a zoom contamination diagnostic;
+* a global adaptive-chemistry bias and predictive refinement;
+* composition and stellar-population science snapshots;
+* four-mode decks.
+
+Still open:
+
+* recursive ≥3-level gas/source multirate;
+* multi-rank diffusion;
+* MPI integration tests.
+
+See the [Part 3 handoff](docs/repair/chui_part3_distributed_amr_multirate_20261103.md).
+
 ## CHUI Part 1 foundation + hydro suite — 2026-11-03
 
 **IMPLEMENTED IN SOURCE — NOT COMPILED, NOT TESTED (user-reserved).** Audit

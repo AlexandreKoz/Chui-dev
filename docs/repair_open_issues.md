@@ -777,3 +777,19 @@ Record: `docs/repair/chui_part2_thermochemistry_stellar_physics_20261103.md`.
 | CHUI-P2-DATA | BLOCKED BY DATA (converters written, NOT RUN) | Sources, checksums and licences are in `tools/chui_data/data_sources.md`. The FG20 TREECOOL and WSS09 have no licence statement, so they are not committed. NuGrid yields are BSD-3 and need tolerance ≈ 0.02. WSS09 (HM01) with FG20 is a declared UVB mismatch, refused unless accepted explicitly. A Ploeckinger & Schaye 2020 converter is blocked. |
 | CHUI-P2-TOPOLOGY | Fail closed | Part 3: distributed composition ghosts/reflux, regrid composition transfer, remote feedback deposition. |
 | CHUI-P2-GAPS | Open | Element-resolved diffusion (refused by config), science-snapshot export of composition/dust/species/stellar records (not implemented), benchmarks; associations refused. |
+
+## CHUI Part 3 open items (2026-11-04; source only, NOT RUN)
+
+* Recursive >=3-level gas/particle/source multirate (T02) not implemented.
+* Multi-rank element diffusion refused (needs per-subcycle remote exchange).
+* Derefinement of octets split across ranks skipped; grandparent link may be
+  unrecoverable after full sibling refinement.
+* Same-level AMR patch faces conserve to roundoff (two-sided evaluation).
+* Global step rollback: rung zero only; full-state copy; adaptive-chemistry
+  bias of a rejected attempt not reverted.
+* Wind/pre-SN channel BLOCKED BY DATA (no chui_ssp_wind_table_v1 bundled).
+* Associations grouped per owner rank (decomposition-dependent research mode).
+* MPI tests (2/4 ranks) for periodic AMR, distributed composition, remote
+  feedback/SF gradients, regrid restart and rollback bit-identity not written.
+* See docs/repair/chui_part3_distributed_amr_multirate_20261103.md.
+
