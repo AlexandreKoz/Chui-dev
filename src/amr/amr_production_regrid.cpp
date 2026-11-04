@@ -258,6 +258,9 @@ ProductionAmrRegridPlan planProductionAmrRegrid(
         continue;
       }
       ++plan.derefine_requests;
+      // G2.2: runtime migration co-locates octet families (enforceAmrFamilyColocation),
+      // so a split family is transient and is retried after the next migration
+      // boundary rather than being a permanent derefinement barrier.
       if (children.size() != 8U || remote_children.contains(parent_id)) {
         ++plan.skipped_remote_sibling;
         continue;

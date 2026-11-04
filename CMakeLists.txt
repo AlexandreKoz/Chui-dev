@@ -955,6 +955,18 @@ if(COSMOSIM_ENABLE_TESTS)
       tests/integration/test_distributed_element_diffusion_mpi.cpp)
     target_include_directories(test_integration_distributed_element_diffusion_mpi PRIVATE ${PROJECT_SOURCE_DIR}/src)
     target_link_libraries(test_integration_distributed_element_diffusion_mpi PRIVATE cosmosim_all)
+    # G2.2 octet-family co-location of migration plans (NOT RUN — USER-RESERVED).
+    add_executable(test_integration_amr_family_colocation_mpi tests/integration/test_amr_family_colocation_mpi.cpp)
+    target_include_directories(test_integration_amr_family_colocation_mpi PRIVATE ${PROJECT_SOURCE_DIR}/src)
+    target_link_libraries(test_integration_amr_family_colocation_mpi PRIVATE cosmosim_all)
+    foreach(chui_family_np IN ITEMS 2 4)
+      add_test(
+        NAME integration_amr_family_colocation_mpi_np${chui_family_np}
+        COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} ${chui_family_np} ${MPIEXEC_PREFLAGS}
+                $<TARGET_FILE:test_integration_amr_family_colocation_mpi> ${MPIEXEC_POSTFLAGS})
+      set_tests_properties(integration_amr_family_colocation_mpi_np${chui_family_np}
+        PROPERTIES SKIP_RETURN_CODE 77 LABELS "chui_part3;mpi;distributed;amr;integration")
+    endforeach()
     foreach(chui_diffusion_np IN ITEMS 2 4)
       add_test(
         NAME integration_distributed_element_diffusion_mpi_np${chui_diffusion_np}

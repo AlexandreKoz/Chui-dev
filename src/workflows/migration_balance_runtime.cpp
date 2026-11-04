@@ -5,6 +5,7 @@
 #include "cosmosim/hydro/hydro_core_solver.hpp"
 #include "cosmosim/physics/stellar_evolution.hpp"
 #include "cosmosim/physics/stellar_feedback.hpp"
+#include "workflows/internal/amr_family_colocation.hpp"
 #include "workflows/internal/amr_migration_payload.hpp"
 #include "workflows/internal/gas_cell_ownership.hpp"
 #include "workflows/internal/migration_wire.hpp"
@@ -2071,6 +2072,106 @@ struct CompactDmoMigrationCommitResult {
   };
 }
 
+// G2.2: octet families (leaf siblings sharing parent_patch_id at level > 0)
+// are co-located on one rank after every migration decision, so production
+// derefinement never meets a sibling set split across ranks (the planner's
+// split-sibling skip becomes a transient that this rule removes at the next
+// migration boundary; refinement creates all eight children on the parent's
+// rank). Family owner = post-plan owner of the minimum-id child: global
+// agreement through one bounded all-gather of (parent, child, owner) triples
+// of level > 0 patches (patch metadata, not cells). Local children whose
+// post-plan owner differs are (re)assigned to the family owner; a local
+// child already on the family owner keeps no outbound update. Returns the
+// GLOBAL number of changed assignments (identical on every rank).
+[[nodiscard]] std::uint64_t enforceAmrFamilyColocationImpl(
+    const core::SimulationState& state,
+    const parallel::MpiContext& mpi_context,
+    core::MemoryGovernor* governor,
+    int world_rank,
+    parallel::RuntimeRebalancePlan& plan) {
+  struct FamilyTriple {
+    std::uint64_t parent_patch_id = 0U;
+    std::uint64_t patch_id = 0U;
+    std::int64_t owner_rank = 0;
+  };
+  static_assert(std::is_trivially_copyable_v<FamilyTriple>);
+  std::vector<FamilyTriple> local;
+  std::exception_ptr failure;
+  try {
+    for (std::size_t p = 0; p < state.patches.size(); ++p) {
+      if (state.patches.owning_rank[p] != static_cast<std::uint32_t>(world_rank)) continue;
+      if (state.patches.parent_patch_id[p] == 0U || state.patches.level[p] <= 0) continue;
+      int owner = world_rank;
+      for (const parallel::AmrPatchOwnershipUpdate& update : plan.amr_patch_ownership_updates) {
+        if (update.patch_id == state.patches.patch_id[p] && update.old_owner_rank == world_rank) {
+          owner = update.new_owner_rank;
+        }
+      }
+      local.push_back(FamilyTriple{state.patches.parent_patch_id[p], state.patches.patch_id[p], owner});
+    }
+  } catch (...) {
+    failure = std::current_exception();
+  }
+  mpi_context.rethrowCollectivePreparationFailure(failure, "AMR family co-location census");
+  const std::uint64_t global_count = mpi_context.allreduceSumUint64(local.size());
+  if (global_count == 0U) return 0U;
+  core::MemoryReservation reservation;
+  try {
+    if (governor != nullptr) {
+      reservation = governor->reserve(
+          core::MemoryClass::kCommunication,
+          core::checkedMemoryBytesAdd(global_count * 2U * sizeof(FamilyTriple), 0U, "AMR family triples"),
+          "migration.amr_family_colocation");
+      reservation.commit();
+    }
+  } catch (...) {
+    failure = std::current_exception();
+  }
+  mpi_context.rethrowCollectivePreparationFailure(failure, "AMR family co-location admission");
+  const std::vector<std::uint8_t> bytes = mpi_context.allgatherBytesBounded(std::span<const std::uint8_t>(
+      reinterpret_cast<const std::uint8_t*>(local.data()), local.size() * sizeof(FamilyTriple)));
+  std::uint64_t local_changes = 0U;
+  try {
+    if (bytes.size() != global_count * sizeof(FamilyTriple)) {
+      throw std::runtime_error("AMR family co-location: gathered triple stream has the wrong size");
+    }
+    std::vector<FamilyTriple> global(static_cast<std::size_t>(global_count));
+    std::memcpy(global.data(), bytes.data(), bytes.size());
+    std::sort(global.begin(), global.end(), [](const FamilyTriple& l, const FamilyTriple& r) {
+      return l.parent_patch_id != r.parent_patch_id ? l.parent_patch_id < r.parent_patch_id : l.patch_id < r.patch_id;
+    });
+    for (const FamilyTriple& child : local) {
+      const auto first = std::lower_bound(global.begin(), global.end(), child.parent_patch_id,
+                                          [](const FamilyTriple& t, std::uint64_t id) { return t.parent_patch_id < id; });
+      if (first == global.end() || first->parent_patch_id != child.parent_patch_id) {
+        throw std::logic_error("AMR family co-location: local child missing from the gathered census");
+      }
+      const int family_owner = static_cast<int>(first->owner_rank);  // owner of the minimum-id child
+      if (family_owner == static_cast<int>(child.owner_rank)) continue;
+      ++local_changes;
+      auto& updates = plan.amr_patch_ownership_updates;
+      updates.erase(std::remove_if(updates.begin(), updates.end(),
+                                   [&](const parallel::AmrPatchOwnershipUpdate& u) {
+                                     return u.patch_id == child.patch_id && u.old_owner_rank == world_rank;
+                                   }),
+                    updates.end());
+      if (family_owner != world_rank) {
+        updates.push_back(parallel::AmrPatchOwnershipUpdate{
+            .patch_id = child.patch_id, .old_owner_rank = world_rank, .new_owner_rank = family_owner});
+      }
+    }
+  } catch (...) {
+    failure = std::current_exception();
+  }
+  mpi_context.rethrowCollectivePreparationFailure(failure, "AMR family co-location assignment");
+  const std::uint64_t global_changes = mpi_context.allreduceSumUint64(local_changes);
+  if (global_changes != 0U) {
+    plan.should_rebalance = true;
+    plan.reason += plan.reason.empty() ? "amr_family_colocation" : "; amr_family_colocation";
+  }
+  return global_changes;
+}
+
 [[nodiscard]] bool applyMeasuredRuntimeRebalancePlan(
     core::SimulationState& state,
     core::HierarchicalTimeBinScheduler& scheduler,
@@ -2084,7 +2185,7 @@ struct CompactDmoMigrationCommitResult {
     core::ProfilerSession* profiler,
     std::uint64_t step_index) {
   const parallel::MpiContext& mpi_context = services.mpi_context;
-  if (!config.parallel.decomposition_runtime_rebalance_enabled || mpi_context.worldSize() <= 1) {
+  if (mpi_context.worldSize() <= 1) {
     return false;
   }
   if (world_rank < 0 || world_rank >= mpi_context.worldSize()) {
@@ -2092,7 +2193,9 @@ struct CompactDmoMigrationCommitResult {
   }
   parallel::RuntimeRebalancePlan rebalance;
   core::MemoryReservation decomposition_reservation;
-  {
+  // G2.2: with load rebalance disabled only the octet-family co-location
+  // migration (below) may move patches.
+  if (config.parallel.decomposition_runtime_rebalance_enabled) {
     std::exception_ptr decomposition_admission_failure;
     try {
       if (services.memory_governor != nullptr) {
@@ -2291,6 +2394,10 @@ struct CompactDmoMigrationCommitResult {
         makeWorkflowFeedbackCoefficients(config));
   }
   rebalance.exact_debug_audit_enabled = config.parallel.decomposition_debug_exact_ownership_audit;
+  (void)enforceAmrFamilyColocationImpl(state, mpi_context, services.memory_governor, world_rank, rebalance);
+  if (!config.parallel.decomposition_runtime_rebalance_enabled && !rebalance.should_rebalance) {
+    return false;  // unchanged legacy behaviour: no exchange when nothing moves
+  }
   if (!rebalance.should_rebalance) {
     exchangeAndValidateAmrPatchPayloads(state, mpi_context, world_rank, step_index, profiler);
     recordRuntimeRebalanceDecision(profiler, rebalance, step_index);
@@ -3177,6 +3284,15 @@ void applyInitialGravityAwareDecomposition(
 
 
 }  // namespace
+
+std::uint64_t enforceAmrFamilyColocation(
+    const core::SimulationState& state,
+    const parallel::MpiContext& mpi_context,
+    core::MemoryGovernor* governor,
+    int world_rank,
+    parallel::RuntimeRebalancePlan& plan) {
+  return enforceAmrFamilyColocationImpl(state, mpi_context, governor, world_rank, plan);
+}
 
 MigrationBalanceRuntime::MigrationBalanceRuntime(
     const core::SimulationConfig& config,
