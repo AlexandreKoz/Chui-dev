@@ -40,6 +40,29 @@ class AmrRetainedStateAdmission final {
   AmrRetainedStateAdmission(const AmrRetainedStateAdmission&) = delete;
   AmrRetainedStateAdmission& operator=(const AmrRetainedStateAdmission&) = delete;
 
+  // In-place retirement needs no candidate allocation. Validate every byte
+  // calculation before the nonthrowing erase, then reconcile freed capacity.
+  template <class TCommit>
+  void commitShrink(std::uint64_t old_owned, std::uint64_t new_owned,
+                    TCommit&& commit_state) {
+    static_assert(std::is_nothrow_invocable_v<TCommit>);
+    if (m_consumed || new_owned > old_owned || m_reservation.bytes() != 0U) {
+      throw std::logic_error("invalid AMR retained in-place shrink");
+    }
+    if (m_governor != nullptr) {
+      if (old_owned > m_state_before || old_owned > m_process_before) {
+        throw std::logic_error("AMR retained shrink has stale baseline");
+      }
+      const auto baseline_after = m_process_before - (old_owned - new_owned);
+      std::forward<TCommit>(commit_state)();
+      m_consumed = true;
+      m_reservation.reconcileBaselineOwnedAndRelease(baseline_after);
+    } else {
+      std::forward<TCommit>(commit_state)();
+      m_consumed = true;
+    }
+  }
+
   template <class TCommit>
   void commit(std::uint64_t old_owned, std::uint64_t new_owned,
               TCommit&& commit_state) {

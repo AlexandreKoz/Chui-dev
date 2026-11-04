@@ -566,7 +566,14 @@ class AmrTemporalBoundaryHistoryStore {
   [[nodiscard]] std::span<const AmrTemporalBoundaryHistoryRecord> records() const noexcept { return m_records; }
   [[nodiscard]] std::span<AmrTemporalBoundaryHistoryRecord> mutableRecords() noexcept { return m_records; }
   void clear() noexcept { m_records.clear(); }
-  void assign(std::vector<AmrTemporalBoundaryHistoryRecord> records) { m_records = std::move(records); }
+  void assign(std::vector<AmrTemporalBoundaryHistoryRecord> records) noexcept { m_records = std::move(records); }
+  // Stable compaction retains the outer allocation, destroys retired nested
+  // storage and performs no allocations. Negative level retires every record.
+  void eraseLevel(int level) noexcept {
+    std::erase_if(m_records, [level](const AmrTemporalBoundaryHistoryRecord& record) noexcept {
+      return level < 0 || static_cast<int>(record.patch_level) == level;
+    });
+  }
   [[nodiscard]] const AmrTemporalBoundaryHistoryRecord* findByPatchId(std::uint64_t patch_id) const noexcept {
     for (const auto& record : m_records) {
       if (record.patch_id == patch_id) {

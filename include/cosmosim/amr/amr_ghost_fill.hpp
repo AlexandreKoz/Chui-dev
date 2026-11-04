@@ -95,20 +95,25 @@ void captureAmrTemporalBoundaryHistoryEnd(
     std::span<const PatchDescriptor> patches,
     double interval_end_code,
     double adiabatic_index, core::MemoryGovernor* governor = nullptr);
-void retireAmrTemporalBoundaryHistory(core::SimulationState& state);
+void retireAmrTemporalBoundaryHistory(core::SimulationState& state, core::MemoryGovernor* governor = nullptr);
 
 // CHUI Part 3 Milestone I: nested per-level intervals for recursive
 // subcycling (>= 3 levels). StartForLevel captures only level-`level` coarse
 // sources and refuses if that level already has an open interval; records of
 // other levels are preserved. EndForLevel completes only that level (level
 // -1 = all, the historical behaviour); RetireLevel removes only that level.
+// Start/end build admitted candidates and publish once. Any allocation,
+// identity, geometry, state or admission failure preserves every old record.
+// Retirement allocates no record storage; pass the same governor used at
+// capture to reconcile released nested capacities. Defaults preserve callers.
 void captureAmrTemporalBoundaryHistoryStartForLevel(
     core::SimulationState& state, std::span<const PatchDescriptor> patches, int level,
     double interval_start_code, double adiabatic_index, core::MemoryGovernor* governor = nullptr);
 void captureAmrTemporalBoundaryHistoryEndForLevel(
     core::SimulationState& state, std::span<const PatchDescriptor> patches, int level,
     double interval_end_code, double adiabatic_index, core::MemoryGovernor* governor = nullptr);
-void retireAmrTemporalBoundaryHistoryLevel(core::SimulationState& state, int level);
+void retireAmrTemporalBoundaryHistoryLevel(
+    core::SimulationState& state, int level, core::MemoryGovernor* governor = nullptr);
 
 
 // A single reusable selection is sufficient: at most one record per source

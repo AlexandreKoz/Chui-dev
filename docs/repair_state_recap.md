@@ -1,5 +1,16 @@
 # Repair state recap (post-repair audit snapshot)
 
+## 2026-11-04 — design conformance A1/A2 source checkpoint
+
+Recursive-driver working-set admission precedes allocation, and temporal-history
+start/end operations publish complete candidates. Retirement is allocation-free
+for record storage and reconciles freed nested capacities. This is local AMR
+correctness work, not distributed multirate completion. A3–A5 remain open.
+All authored/retained tests are **NOT RUN — USER-RESERVED**; no executable
+validation was performed. See
+[`repair/chui_conformance_closure_20261104.md`](repair/chui_conformance_closure_20261104.md)
+for the H01–X01 map, ownership/API changes and continuation.
+
 20261103 CHUI Part 1 (foundation + hydro suite): audit F1, F3, F4, F7 repaired
 in source; PPM, CTU, HLLE selection, dual energy, thermodynamic refresh
 contract, node-aware admission, owner telemetry and stage transactions added.

@@ -1,5 +1,17 @@
 # Validation plan
 
+## 2026-11-04 AMR admission/history checkpoint — owner-run only
+
+New `unit_amr_history_atomicity` and extended `unit_amr_recursive_subcycling` /
+`unit_amr_pending_flux_registers` cover preallocation refusal, injected C++
+allocation failures, atomic multi-level history start/end publication and pending
+register publication. History fields and rejection-state gas lanes are exact
+bit targets; existing hydro/interpolation/conservation tolerances remain
+numerical targets. All are **NOT RUN — USER-RESERVED**. No build, test,
+benchmark, simulator, converter, sanitizer, static-analysis executable or CI
+workflow was run. The standalone command selection and unimplemented MPI/science
+families are in [the closure ledger](repair/chui_conformance_closure_20261104.md).
+
 The [20261012 test regression closure](repair/treepm_deep_hotpath_test_regression_closure_20261012.md)
 repairs invalid split-only/config fixtures and stale PM/rung expectations.
 New controls require field-specific rejection, ten stable experiment decks,

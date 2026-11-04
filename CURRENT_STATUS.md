@@ -1,5 +1,16 @@
 # Current repository status
 
+## Design conformance A1/A2 checkpoint — 2026-11-04
+
+**SOURCE REPAIRED — NOT RUN — USER-RESERVED.** Recursive AMR driver rows and
+descriptor copies are admitted before allocation. Temporal start/end capture
+publishes complete candidates, and retirement reconciles freed nested capacity.
+Allocation/refusal/late-validation tests are written and registered. No build,
+test, simulation, benchmark or CI workflow was run. **Milestone A remains
+PARTIAL:** diffusion full-path accounting, association safety and private
+chemistry-controller rollback (A3–A5) are next; distributed multirate integration
+remains OPEN. See the [requirement ledger and continuation](docs/repair/chui_conformance_closure_20261104.md).
+
 ## CHUI Part 3 distributed AMR / remote sources / science output — 2026-11-04
 
 **IMPLEMENTED IN SOURCE — NOT COMPILED, NOT TESTED (user-reserved).** The
