@@ -79,6 +79,18 @@ class RungZeroTimeState {
 // orchestrator retains timeline/PM invariants but receives this coordinator's
 // typed dispatcher; no production owner receives StepContext through its public
 // interface.
+// G1.2: the criterion that limited this rank's timestep candidate at the
+// last adaptive-bin refresh (the rank whose candidate equals the global
+// minimum reports the step's actual limiter).
+struct TimestepLimiterRecord {
+  double dt_time_code = 0.0;
+  const char* criterion = "none";
+  bool gas_cell = false;
+  std::uint32_t element = 0U;
+  int amr_level = -1;
+  double hydro_cfl_level_relaxation = 1.0;
+};
+
 class TimeCoordinator {
  public:
   TimeCoordinator(
@@ -137,6 +149,7 @@ class TimeCoordinator {
       std::span<const std::uint32_t> active_particle_indices,
       std::span<const std::uint32_t> active_cell_indices,
       bool update_all_elements);
+  [[nodiscard]] const TimestepLimiterRecord& lastTimestepLimiter() const noexcept { return m_last_timestep_limiter; }
 
  private:
   void runHierarchicalSegment(
@@ -164,6 +177,7 @@ class TimeCoordinator {
   // not once per adaptive-bin refresh.
   std::shared_ptr<const physics::EffectiveMultiphaseEosTable> m_effective_eos_table;
   core::StepOrchestrator m_lifecycle;
+  TimestepLimiterRecord m_last_timestep_limiter{};
 };
 
 }  // namespace cosmosim::workflows

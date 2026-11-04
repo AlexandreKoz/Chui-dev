@@ -1,7 +1,10 @@
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
+#include <exception>
+#include <limits>
 #include <span>
 #include <vector>
 
@@ -164,6 +167,12 @@ struct DistributedAmrRemotePatch {
   std::uint64_t ghost_hydro_epoch = 0;
   std::uint64_t expected_ghost_hydro_epoch = 0;
   std::vector<AmrHydroSparseRemoteCell> boundary_cells;
+  // G1.1: physical-time label of boundary_cells. NaN (default) = the sweep's
+  // state_time_code (synchronized legacy behaviour). The distributed
+  // recursive driver labels current states with their level clock and
+  // coarse sources temporally interpolated to the fill time with that time,
+  // so a stale coarse state can never satisfy a time-consistency check.
+  double state_time_code = std::numeric_limits<double>::quiet_NaN();
 };
 
 struct DistributedAmrHydroExchange {
@@ -172,7 +181,21 @@ struct DistributedAmrHydroExchange {
   std::uint64_t expected_ghost_hydro_epoch = 0;
   std::span<const DistributedAmrRemotePatch> remote_patches;
   std::vector<FluxRegisterEntry>* outbound_remote_flux_registers = nullptr;
+  // G2.3: when set (synchronized distributed sweep), local register entries
+  // that are INCOMPLETE because their other side lives on another rank are
+  // returned here instead of being skipped; the caller merges them with the
+  // inbound remote entries (mergeFluxRegisterEntriesByKey) and applies once.
+  std::vector<FluxRegisterEntry>* deferred_local_flux_registers = nullptr;
 };
+
+// G2.3: combine register halves with the same register_key (local coarse
+// side + any number of remote fine sides, or vice versa). Area-weighted flux
+// averages, areas and face counts are summed; input order (caller-sorted:
+// local first, then inbound by source rank) fixes the floating-point
+// summation order, so the result is deterministic for a given decomposition.
+// Throws on incompatible metadata (coarse cell, level, axis, orientation, dt).
+[[nodiscard]] std::vector<FluxRegisterEntry> mergeFluxRegisterEntriesByKey(
+    std::span<const FluxRegisterEntry> entries);
 
 struct ProductionAmrRegridDiagnostics {
   std::size_t refined_patch_count = 0;
@@ -298,13 +321,76 @@ void prepareAmrActiveLevelRows(
     const ProductionAmrHydroOptions& options,
     const DistributedAmrHydroExchange& exchange);
 
+// G1.1 — collective services for the DISTRIBUTED recursive driver. Every
+// method is collective over the world communicator and is entered by every
+// rank the same number of times in the same order, including ranks that hold
+// no cell on the level being advanced. Implementations live in the workflow
+// layer (MPI); the AMR library stays MPI-free.
+class RecursiveAmrDistributedHooks {
+ public:
+  virtual ~RecursiveAmrDistributedHooks() = default;
+  // Rethrows on every rank if any rank holds a failure.
+  virtual void reduceFailure(std::exception_ptr local_failure, const char* stage) = 0;
+  // Bitwise OR over ranks (populated-level set, 256 levels).
+  virtual void globalLevelUnion(std::array<std::uint64_t, 4>& level_bits) = 0;
+  // Bitwise OR / max of a scalar flag over ranks.
+  [[nodiscard]] virtual std::uint64_t globalMax(std::uint64_t value) = 0;
+  // Synchronized start: one all-level boundary exchange; returns the remote
+  // neighbour patch descriptors (cross-rank 2:1 validation, regrid planner).
+  [[nodiscard]] virtual std::span<const PatchDescriptor> prepare(double t_begin) = 0;
+  // Before the level-`level` sweep at t_begin: exchanges the CURRENT boundary
+  // states of levels {level, finer_level} (finer_level < 0: none). With
+  // capture_start the remote level-`level` cells are retained as the start
+  // of the level interval [t_begin, t_end]. Returns the remote sources for
+  // the sweep: current same/finer-level patches (state_time_code = t_begin)
+  // plus coarser_level patches linearly interpolated in conserved variables
+  // to t_begin from their retained interval (coarser_level < 0: none).
+  [[nodiscard]] virtual std::span<const DistributedAmrRemotePatch> beginLevelSweep(
+      int level, int coarser_level, int finer_level, double t_begin, double t_end, bool capture_start) = 0;
+  // After the sweep: routes outbound remote register halves to the coarse
+  // owners and merges inbound halves into the canonical pending store with
+  // the SAME level options (identical interval tags on every rank).
+  virtual void exchangeLevelFluxRegisters(core::SimulationState& state,
+                                          std::span<const FluxRegisterEntry> outbound,
+                                          const ProductionAmrHydroOptions& level_options) = 0;
+  // After the level-`level` sweep (finer level exists): retains the END
+  // states of remote level-`level` cells (exchange of {level, finer_level}).
+  virtual void captureLevelEnd(int level, int finer_level, double t_end) = 0;
+  // Drops the retained remote interval of `level` (local operation).
+  virtual void retireLevel(int level) noexcept = 0;
+};
+
+// G1.1: distributed recursive Berger-Oliger subcycling. Same time-ownership
+// and reflux contract as advanceProductionAmrHydroRecursive, with:
+//  * the GLOBAL populated-level set (ranks with no cells on a level still
+//    traverse it and enter every collective);
+//  * 2:1 face balance validated between local patches and the remote
+//    neighbour descriptors (every cross-rank pair is checked by both sides);
+//  * same-level/finer ghosts exchanged at each level clock, coarser remote
+//    ghosts temporally interpolated from exchanged start/end states;
+//  * remote fine-side flux registers merged into the coarse owner's pending
+//    store after every sweep and applied once the level interval completes;
+//  * every local failure reduced before the next collective.
+[[nodiscard]] ProductionAmrHydroDiagnostics advanceDistributedProductionAmrHydroRecursive(
+    core::SimulationState& state,
+    std::span<const std::uint32_t> active_cell_rows,
+    const hydro::HydroUpdateContext& coarse_update,
+    const hydro::HydroSourceContext& global_source_context,
+    const hydro::HydroCoreSolver& solver,
+    const hydro::HydroRiemannSolver& riemann_solver,
+    std::span<const hydro::HydroSourceTerm* const> source_terms,
+    const ProductionAmrHydroOptions& options,
+    int local_rank,
+    std::uint64_t ghost_hydro_epoch,
+    RecursiveAmrDistributedHooks& hooks);
+
 // CHUI Part 3 Milestone I: recursive Berger-Oliger subcycling over every
 // level present (>= 2, no upper limit). Level L advances r^(L - L_min) times
 // per coarse step with dt_L = dt / r^(L - L_min); coarse-to-fine ghosts use
 // the parent level's nested temporal history; fine-to-coarse ghosts use the
 // synchronized fine state; the (L, L+1) reflux is applied once level L+1 has
 // completed all substeps of the level-L interval. Single-rank (local
-// hierarchy); a distributed recursive sweep is refused (see handoff).
+// hierarchy); the distributed form is advanceDistributedProductionAmrHydroRecursive.
 [[nodiscard]] ProductionAmrHydroDiagnostics advanceProductionAmrHydroRecursive(
     core::SimulationState& state,
     std::span<const std::uint32_t> active_cell_rows,
