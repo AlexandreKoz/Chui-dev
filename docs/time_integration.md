@@ -9,11 +9,19 @@ The authoritative per-step stage order is:
 1. `gravity_kick_pre`
 2. `drift`
 3. `force_refresh`
-4. `hydro_update`
-5. `source_terms`
-6. `gravity_kick_post`
-7. `analysis_hooks`
-8. `output_check`
+4. `source_terms` (`kStrangPreHalf`)
+5. `hydro_update`
+6. `source_terms` (`kStrangPostHalf`)
+7. `gravity_kick_post`
+8. `analysis_hooks`
+9. `output_check`
+
+The two source dispatches define the deterministic reference
+`S(dt/2) H(dt) S(dt/2)`. Smooth thermochemistry/dust/SGS/diffusion operators
+run for their half intervals at the physical quarter/three-quarter epochs.
+Star births, stellar returns, SN/wind feedback and BH transactions run exactly
+once in the post dispatch at the absolute accepted-interval endpoint. Direct
+low-level source dispatch retains an explicit unsplit compatibility phase.
 
 The scheduler (`StageScheduler`) owns this ordering and solver modules interact via stage-bound `IntegrationCallback` implementations. Each callback must declare its exact `integrationStages()` set during registration; `StepOrchestrator` stores handlers in per-stage buckets and dispatches only the bucket for the active stage in stable registration order. Production callbacks must treat any off-stage direct invocation as a contract violation rather than silently self-filtering. This keeps gravity/hydro/source/output sequencing explicit and auditable, prevents solvers from receiving irrelevant stages, and avoids per-stage broadcast scans in the hot path.
 
@@ -388,7 +396,7 @@ or dense particle map is added. Rung-zero uses its existing uniform physical
 representation when the hierarchy is disabled. Compact DMO species/ownership/
 drift metadata remain scalar; the optional one-byte bin lane is a mirror.
 
-Each fine tick audits all eight canonical stages. Pre-kick uses the current
+Each fine tick audits all nine canonical dispatches. Pre-kick uses the current
 scheduler subset and exact cached Tree force from that endpoint. Drift advances
 **all owned DMO sources**, updates the common drift epoch, and advances source
 generation once. Scheduler subsets then select closing force targets. Their

@@ -1261,15 +1261,13 @@ class SourceRuntimeImpl final : public SourceRuntime {
       throw std::logic_error("source runtime received a non-source stage");
     }
 
-    // SourceTerms executes after drift/hydro on the step-end state while the
-    // committed IntegratorState remains at the step beginning until commitStep().
-    // Make the physical evaluation epoch explicit so every source model sees
-    // the state and cosmological conversion from the same instant.
-    const double source_evaluation_scale_factor = m_is_cosmological
-        ? context.timeline_step.scale_factor_end
-        : 1.0;
-    if (!std::isfinite(source_evaluation_scale_factor) ||
-        source_evaluation_scale_factor <= 0.0) {
+    // Smooth source operators form the two halves of the deterministic
+    // Strang reference. Each half is evaluated at its physical midpoint;
+    // direct compatibility callers retain the historical end-of-step epoch.
+    const double smooth_source_evaluation_scale_factor =
+        sourceEvaluationScaleFactor(context);
+    if (!std::isfinite(smooth_source_evaluation_scale_factor) ||
+        smooth_source_evaluation_scale_factor <= 0.0) {
       throw std::runtime_error(
           "source runtime requires a finite positive source-stage scale factor");
     }
@@ -1282,11 +1280,25 @@ class SourceRuntimeImpl final : public SourceRuntime {
       ~GrowthSchedulerReset() { slot = nullptr; }
     } growth_scheduler_reset{m_growth_scheduler};
 
-    // CHUI Part 2 operator order inside the accepted interval (Lie split,
-    // hydro already done): thermochemistry -> star formation -> stellar
-    // evolution/feedback -> metal diffusion -> BH. Each source term has one
-    // owner; cooling is never also applied inside the hydro solver.
-    executeThermochemistry(context, source_evaluation_scale_factor);
+    // Smooth deterministic operators execute in both Strang halves. All
+    // stochastic/discrete transactions remain in the post half and therefore
+    // see one absolute end-of-interval event surface.
+    executeThermochemistry(context, smooth_source_evaluation_scale_factor);
+    const double smooth_source_dt_code =
+        context.source_split_phase == core::SourceSplitPhase::kUnsplitCompatibility
+        ? context.integrator_state.dt_time_code
+        : 0.5 * context.integrator_state.dt_time_code;
+    if (context.source_split_phase == core::SourceSplitPhase::kStrangPreHalf) {
+      executeMetalDiffusion(
+          context, smooth_source_evaluation_scale_factor, smooth_source_dt_code);
+      return;
+    }
+
+    // Discrete transactions remain tied to the absolute accepted interval
+    // endpoint even though the post smooth half is evaluated at 3/4 dt.
+    const double source_evaluation_scale_factor = m_is_cosmological
+        ? context.timeline_step.scale_factor_end
+        : 1.0;
 
     const std::size_t cell_count = context.state.cells.size();
     const bool local_has_mutable_gravity_sources =
@@ -1564,7 +1576,8 @@ class SourceRuntimeImpl final : public SourceRuntime {
     } else {
       executeStellarEvolutionAndEnrichment(context, source_evaluation_scale_factor);
     }
-    executeMetalDiffusion(context, source_evaluation_scale_factor);
+    executeMetalDiffusion(
+        context, smooth_source_evaluation_scale_factor, smooth_source_dt_code);
 
     physics::BlackHoleAgnStepReport black_hole_report{};
     if (m_bh_enabled) {
@@ -1648,14 +1661,87 @@ class SourceRuntimeImpl final : public SourceRuntime {
   }
 
  private:
+  [[nodiscard]] double scaleFactorAtPhysicalFraction(
+      const core::StepContext& context, double fraction) const {
+    if (!m_is_cosmological) return 1.0;
+    if (!(fraction >= 0.0 && fraction <= 1.0)) {
+      throw std::invalid_argument("source physical-time fraction must lie in [0,1]");
+    }
+    const double begin = context.timeline_step.scale_factor_begin;
+    const double end = context.timeline_step.scale_factor_end;
+    if (!(std::isfinite(begin) && std::isfinite(end) && begin > 0.0 && end >= begin)) {
+      throw std::runtime_error("source interval has invalid cosmological scale-factor bounds");
+    }
+    if (fraction == 0.0 || begin == end) return begin;
+    if (fraction == 1.0) return end;
+    if (context.cosmology_background == nullptr) {
+      return begin + fraction * (end - begin);
+    }
+    const double total_seconds =
+        context.cosmology_background->cosmicTimeIntervalSi(begin, end);
+    if (!(std::isfinite(total_seconds) && total_seconds >= 0.0)) {
+      throw std::runtime_error("source interval has invalid cosmological elapsed time");
+    }
+    const double target_seconds = fraction * total_seconds;
+    double lower = begin;
+    double upper = end;
+    // Fixed-iteration inversion of the same background integral used by the
+    // source interval keeps the physical-time split deterministic on all ranks.
+    for (std::uint32_t iteration = 0U; iteration < 64U; ++iteration) {
+      const double midpoint = lower + 0.5 * (upper - lower);
+      const double elapsed =
+          context.cosmology_background->cosmicTimeIntervalSi(begin, midpoint);
+      if (elapsed < target_seconds) {
+        lower = midpoint;
+      } else {
+        upper = midpoint;
+      }
+    }
+    return lower + 0.5 * (upper - lower);
+  }
+
+  [[nodiscard]] double sourceEvaluationScaleFactor(
+      const core::StepContext& context) const {
+    switch (context.source_split_phase) {
+      case core::SourceSplitPhase::kStrangPreHalf:
+        return scaleFactorAtPhysicalFraction(context, 0.25);
+      case core::SourceSplitPhase::kStrangPostHalf:
+        return scaleFactorAtPhysicalFraction(context, 0.75);
+      case core::SourceSplitPhase::kUnsplitCompatibility:
+        return m_is_cosmological ? context.timeline_step.scale_factor_end : 1.0;
+    }
+    throw std::logic_error("unknown source split phase");
+  }
+
   [[nodiscard]] physics::SourceInterval makeSourceInterval(
       const core::StepContext& context, double source_evaluation_scale_factor) const {
     physics::SourceInterval interval;
-    interval.time_begin_code = context.timeline_step.time_begin_code;
-    interval.time_end_code = context.timeline_step.time_end_code;
-    interval.scale_factor_begin = m_is_cosmological ? context.timeline_step.scale_factor_begin : 1.0;
-    interval.scale_factor_end = m_is_cosmological ? context.timeline_step.scale_factor_end : 1.0;
-    interval.physical_seconds = elapsedStellarEvolutionYears(context) * physics::k_seconds_per_year;
+    const bool pre_half =
+        context.source_split_phase == core::SourceSplitPhase::kStrangPreHalf;
+    const bool post_half =
+        context.source_split_phase == core::SourceSplitPhase::kStrangPostHalf;
+    const double fraction_begin = post_half ? 0.5 : 0.0;
+    const double fraction_end = pre_half ? 0.5 : 1.0;
+    const double code_begin = context.timeline_step.time_begin_code;
+    const double code_end = context.timeline_step.time_end_code;
+    interval.time_begin_code = code_begin + fraction_begin * (code_end - code_begin);
+    interval.time_end_code = code_begin + fraction_end * (code_end - code_begin);
+    interval.scale_factor_begin = scaleFactorAtPhysicalFraction(context, fraction_begin);
+    interval.scale_factor_end = scaleFactorAtPhysicalFraction(context, fraction_end);
+    if (m_is_cosmological && context.cosmology_background != nullptr) {
+      interval.physical_seconds = context.cosmology_background->cosmicTimeIntervalSi(
+          interval.scale_factor_begin, interval.scale_factor_end);
+    } else {
+      interval.physical_seconds =
+          (interval.time_end_code - interval.time_begin_code) * m_units.timeSiPerCode();
+      if (!(interval.physical_seconds > 0.0)) {
+        const double full_seconds =
+            elapsedStellarEvolutionYears(context) * physics::k_seconds_per_year;
+        interval.physical_seconds = (pre_half || post_half)
+            ? 0.5 * full_seconds
+            : full_seconds;
+      }
+    }
     interval.evaluation_scale_factor = source_evaluation_scale_factor;
     interval.evaluation_redshift = m_is_cosmological
         ? std::max(0.0, 1.0 / source_evaluation_scale_factor - 1.0)
@@ -1732,7 +1818,12 @@ class SourceRuntimeImpl final : public SourceRuntime {
     const physics::ChemistryShadowReport current_shadow =
         local_work ? m_last_shadow_report : physics::ChemistryShadowReport{};
     if (!local_work) m_last_shadow_report = current_shadow;
-    updateGlobalChemistryControl(context, current_shadow);
+    // The persistent controller advances once per accepted interval. The pre
+    // half may sample shadow chemistry, but must not feed a new bias into the
+    // post half of the same Strang composition.
+    if (context.source_split_phase != core::SourceSplitPhase::kStrangPreHalf) {
+      updateGlobalChemistryControl(context, current_shadow);
+    }
     if (!touched.empty()) {
       context.state.notifyGasThermodynamicMutation();
       std::unique_ptr<physics::EffectiveIsmThermodynamicClosure> closure;
@@ -2913,9 +3004,14 @@ class SourceRuntimeImpl final : public SourceRuntime {
 
   void executeMetalDiffusion(
       core::StepContext& context,
-      double source_evaluation_scale_factor) {
+      double source_evaluation_scale_factor,
+      double source_dt_code) {
     if (!m_metal_diffusion.config().enabled) {
       return;
+    }
+    if (!(std::isfinite(source_dt_code) && source_dt_code > 0.0)) {
+      throw std::invalid_argument(
+          "metal diffusion requires a finite positive source subinterval");
     }
     // G2.1: on more than one rank every rank enters every collective of the
     // distributed element-resolved operator, including ranks without gas.
@@ -3161,7 +3257,7 @@ class SourceRuntimeImpl final : public SourceRuntime {
           }
           element_report = physics::advanceElementResolvedDiffusion(
               context.state.gas_composition, m_diffusion_faces, m_diffusion_rho_kappa_code,
-              context.integrator_state.dt_time_code, m_metal_diffusion.config().parabolic_cfl,
+              source_dt_code, m_metal_diffusion.config().parabolic_cfl,
               m_metal_diffusion.config().max_subcycles, m_element_diffusion_workspace,
               coupling.has_value() ? &*coupling : nullptr);
         } catch (...) {
@@ -3192,7 +3288,7 @@ class SourceRuntimeImpl final : public SourceRuntime {
                 .rho_kappa_code = m_diffusion_rho_kappa_code,
             },
             m_diffusion_faces,
-            context.integrator_state.dt_time_code,
+            source_dt_code,
             m_diffusion_workspace);
     if (m_memory_governor != nullptr &&
         replacement_phase_reservation.committed()) {

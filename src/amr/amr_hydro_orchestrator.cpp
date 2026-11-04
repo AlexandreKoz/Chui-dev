@@ -230,7 +230,11 @@ constexpr double k_geometry_tol = 1.0e-10;
 }
 
 [[nodiscard]] bool intervalsOverlap(double a0, double a1, double b0, double b1) {
-  return std::max(a0, b0) < std::min(a1, b1) + k_geometry_tol;
+  const double overlap = std::min(a1, b1) - std::max(a0, b0);
+  const double scale = std::max({1.0, std::abs(a0), std::abs(a1), std::abs(b0), std::abs(b1)});
+  // A face neighbour must share positive transverse area. Edge/corner-only
+  // contact is not a hydro face and must not create ghosts or flux registers.
+  return overlap > k_geometry_tol * scale;
 }
 
 [[nodiscard]] bool touchesOnSide(
@@ -2003,8 +2007,22 @@ std::size_t mergeFluxRegistersIntoPendingStore(
       ++created_count;
     } else {
       validatePendingCompatible(*pending, entry);
-      pending->expected_fine_substeps = std::max(
-          pending->expected_fine_substeps, refluxIntervalForEntry(entry, options).substeps_per_interval);
+      const AmrLevelRefluxInterval interval = refluxIntervalForEntry(entry, options);
+      const double incoming_start = interval.interval_start_code;
+      const double incoming_dt = interval.coarse_dt_code > 0.0
+          ? interval.coarse_dt_code : entry.dt_code;
+      const double incoming_end = interval.interval_end_code > incoming_start
+          ? interval.interval_end_code : incoming_start + incoming_dt;
+      const double time_scale = std::max({1.0, std::abs(pending->interval_start_code),
+          std::abs(pending->interval_end_code), std::abs(incoming_start), std::abs(incoming_end)});
+      if (std::abs(pending->interval_start_code - incoming_start) > 1.0e-12 * time_scale ||
+          std::abs(pending->interval_end_code - incoming_end) > 1.0e-12 * time_scale ||
+          std::abs(pending->coarse_dt_code - incoming_dt) > 1.0e-12 * time_scale ||
+          pending->expected_fine_substeps !=
+              std::max<std::uint32_t>(1U, interval.substeps_per_interval)) {
+        throw std::runtime_error(
+            "pending AMR flux register key was reused across incompatible temporal intervals");
+      }
       pending->expected_area_comov = std::max({pending->expected_area_comov, entry.face_area_comov, entry.coarse_area_comov, entry.fine_area_comov});
     }
 
@@ -2024,7 +2042,6 @@ std::size_t mergeFluxRegistersIntoPendingStore(
     }
     if (entry.fine_face_count > 0U && entry.fine_area_comov > 0.0) {
       pending->fine_face_count += entry.fine_face_count;
-      pending->fine_area_accumulated_comov = std::max(pending->fine_area_accumulated_comov, entry.fine_area_comov);
       addFluxIntegral(
           pending->fine_mass_flux_integral_code,
           pending->fine_momentum_x_flux_integral_code,
@@ -2043,9 +2060,16 @@ std::size_t mergeFluxRegistersIntoPendingStore(
         if ((pending->fine_substep_coverage_mask & bit) == 0U) {
           pending->fine_substep_coverage_mask |= bit;
           pending->completed_fine_substeps += 1U;
+          // Area is a spatial coverage for one temporal substep, not a sum
+          // across time. Start the new substep, then add any other rank's
+          // disjoint portion when it arrives with the same coverage bit.
+          pending->fine_area_accumulated_comov = entry.fine_area_comov;
+        } else {
+          pending->fine_area_accumulated_comov += entry.fine_area_comov;
         }
       } else {
         pending->completed_fine_substeps += 1U;
+        pending->fine_area_accumulated_comov = entry.fine_area_comov;
       }
     }
   }
@@ -2267,10 +2291,6 @@ struct AmrSynchronizedSweepWorkspace {
     const DistributedAmrHydroExchange* distributed_exchange) {
   if (!hasProductionAmrHydroCoverage(state)) {
     throw std::runtime_error("advanceProductionAmrHydro requires complete AMR patch coverage in SimulationState");
-  }
-  if (distributed_exchange != nullptr && options.persist_incomplete_flux_registers) {
-    throw std::runtime_error(
-        "distributed AMR pending flux-register accumulation is gated off; synchronized remote reflux must complete in-step");
   }
   ProductionAmrHydroDiagnostics diagnostics;
   // The recursive driver calls this sweep repeatedly. Its own descriptor

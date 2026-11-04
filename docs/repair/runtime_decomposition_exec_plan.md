@@ -52,7 +52,8 @@ semantics and restart schema v21 remain unchanged.
 | startup, construction, loop and finalization | lines 7218-8008 | composition root plus `TimeCoordinator` |
 
 The canonical stage order is
-`gravity_kick_pre`, `drift`, `force_refresh`, `hydro_update`, `source_terms`,
+`gravity_kick_pre`, `drift`, `force_refresh`, `source_terms` (Strang pre),
+`hydro_update`, `source_terms` (Strang post),
 `gravity_kick_post`, `analysis_hooks`, `output_check`. The current registration
 order is stage audit, drift, gravity, hydro, star formation, black hole,
 diagnostics, output. Both orders are behavior-preservation invariants.

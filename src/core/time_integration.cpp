@@ -18,10 +18,15 @@
 namespace cosmosim::core {
 namespace {
 
-constexpr std::array<IntegrationStage, 8> k_kick_drift_kick_order = {
+// KDK remains the particle/gravity authority.  The two source dispatches are
+// the deterministic Strang reference S(dt/2) H(dt) S(dt/2).  SourceRuntime
+// keeps stochastic/discrete events out of the pre half-step and applies them
+// exactly once at their absolute end-of-interval epoch in the post half-step.
+constexpr std::array<IntegrationStage, 9> k_kick_drift_kick_order = {
     IntegrationStage::kGravityKickPre,
     IntegrationStage::kDrift,
     IntegrationStage::kForceRefresh,
+    IntegrationStage::kSourceTerms,
     IntegrationStage::kHydroUpdate,
     IntegrationStage::kSourceTerms,
     IntegrationStage::kGravityKickPost,
@@ -1157,11 +1162,18 @@ void StepOrchestrator::executeSingleStepWithDispatcher(
     throw std::runtime_error("stage scheduler order deviates from canonical kick-drift-kick contract");
   }
 
+  std::uint32_t source_dispatch_index = 0U;
   for (const auto stage : ordered_stages) {
     if (stage == IntegrationStage::kOutputCheck) {
       continue;
     }
     context.stage = stage;
+    context.source_split_phase = SourceSplitPhase::kUnsplitCompatibility;
+    if (stage == IntegrationStage::kSourceTerms) {
+      context.source_split_phase = source_dispatch_index++ == 0U
+          ? SourceSplitPhase::kStrangPreHalf
+          : SourceSplitPhase::kStrangPostHalf;
+    }
     context.boundary = boundary;
     context.pm_refresh_directive = {};
     context.has_active_gravity_particles = false;
@@ -1553,12 +1565,18 @@ void StepOrchestrator::executeHierarchicalBlockWithDispatcher(
           integrator.pm_source_generation = state.gravitySourceGeneration();
         }
         context.pm_refresh_directive = {};
-        context.stage = IntegrationStage::kHydroUpdate;
+        context.stage = IntegrationStage::kSourceTerms;
+        context.source_split_phase = SourceSplitPhase::kStrangPreHalf;
       });
       dispatcher(context, false);
+      context.stage = IntegrationStage::kHydroUpdate;
+      context.source_split_phase = SourceSplitPhase::kUnsplitCompatibility;
+      dispatcher(context, false);
       context.stage = IntegrationStage::kSourceTerms;
+      context.source_split_phase = SourceSplitPhase::kStrangPostHalf;
       dispatcher(context, false);
       context.stage = IntegrationStage::kGravityKickPost;
+      context.source_split_phase = SourceSplitPhase::kUnsplitCompatibility;
       dispatcher(context, false);
       prepare("hierarchical synchronization commit", [&] {
         context.stage = IntegrationStage::kAnalysisHooks;

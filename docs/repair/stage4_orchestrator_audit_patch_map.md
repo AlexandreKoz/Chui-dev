@@ -7,7 +7,7 @@ Scope: audit-only infrastructure repair note for the Stage 4 orchestrator refact
 
 - The production workflow loop is `ReferenceWorkflowRunner::runImpl`: it builds scheduler active elements, splits them into particle and cell vectors, latches pending snapshot/restart intent for the completed step, calls `StepOrchestrator::executeSchedulerSubstep`, updates adaptive bins, closes the scheduler substep, syncs time-bin mirrors, then writes snapshot/restart artifacts only after the step has completed.
 - `StepOrchestrator::executeSingleStep` is the only production broadcast dispatch site. It validates active-set freshness, classifies the step boundary, prepares KDK/cosmological factors, schedules the canonical stages, and broadcasts every stage to every registered callback. Each callback self-filters by `context.stage`.
-- The canonical stage order is currently `kGravityKickPre`, `kDrift`, `kForceRefresh`, `kHydroUpdate`, `kSourceTerms`, `kGravityKickPost`, `kAnalysisHooks`, `kOutputCheck`.
+- The canonical stage order is currently `kGravityKickPre`, `kDrift`, `kForceRefresh`, `kSourceTerms` (Strang pre), `kHydroUpdate`, `kSourceTerms` (Strang post), `kGravityKickPost`, `kAnalysisHooks`, `kOutputCheck`.
 - Active-set authority is scheduler/state-owned. `HierarchicalTimeBinScheduler::beginSubstep` creates active scheduler elements, the workflow maps those elements to particle/cell vectors, and `makeSchedulerActiveSetDescriptor` stamps state generations and scheduler tick provenance before callbacks run.
 
 ## Broadcast/self-filter dispatch sites and filters

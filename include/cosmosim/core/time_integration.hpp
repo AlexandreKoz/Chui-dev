@@ -97,6 +97,17 @@ enum class TimeStepScheme : std::uint8_t {
   kKickDriftKick = 0,
 };
 
+// Deterministic source coupling around the hydro update.  Discrete source
+// events (star birth, stellar returns/feedback and BH transactions) execute
+// only in kStrangPostHalf; smooth deterministic operators execute in both
+// half steps.  kUnsplitCompatibility is retained for direct low-level callers
+// that dispatch a source stage outside the canonical scheduler.
+enum class SourceSplitPhase : std::uint8_t {
+  kUnsplitCompatibility = 0,
+  kStrangPreHalf = 1,
+  kStrangPostHalf = 2,
+};
+
 // Explicit integration-boundary classes distinguish local active-bin work from
 // globally coherent restart/output points and legal PM-refresh surfaces.
 enum class StepBoundaryKind : std::uint8_t {
@@ -402,6 +413,7 @@ struct StepContext {
   StepBoundaryState boundary;
   PmRefreshDirective pm_refresh_directive;
   IntegrationStage stage = IntegrationStage::kGravityKickPre;
+  SourceSplitPhase source_split_phase = SourceSplitPhase::kUnsplitCompatibility;
   // Transient integrator-issued block KDK directive. Rung/bin authority stays
   // in HierarchicalTimeBinScheduler; these factors describe one kick surface.
   // Forces use scale-free A, velocities store p/a at the common position epoch.

@@ -345,6 +345,7 @@ ProductionAmrRegridPlan planProductionAmrRegrid(
       if (mandatory) ++plan.mandatory_refine_requests; else ++plan.optional_refine_requests;
     }
     std::stable_partition(candidates.begin(), candidates.end(), [](const auto& c) { return c.first; });
+    std::size_t admitted_optional_operations = 0U;
     for (const auto& [mandatory, patch_ptr] : candidates) {
       const PatchDescriptor& patch = *patch_ptr;
       ++plan.refine_requests;
@@ -356,9 +357,9 @@ ProductionAmrRegridPlan planProductionAmrRegrid(
         ++plan.blocked_by_balance;
         continue;
       }
-      if (plan.operations.size() >= policy.max_operations) {
+      if (!mandatory && admitted_optional_operations >= policy.max_operations) {
         ++plan.truncated_by_budget;
-        if (mandatory) ++plan.mandatory_truncated_by_budget; else ++plan.optional_truncated_by_budget;
+        ++plan.optional_truncated_by_budget;
         continue;
       }
       if (policy.gravity_softening_code > 0.0 && 0.5 * minCellWidth(patch) < policy.gravity_softening_code) {
@@ -368,6 +369,7 @@ ProductionAmrRegridPlan planProductionAmrRegrid(
       plan.operations.push_back(ProductionAmrRegridOperation{
           .kind = AmrRegridOperationKind::kRefine, .patch = patch,
           .new_patch_ids = 8U, .new_gas_cell_ids = cells});
+      if (!mandatory) ++admitted_optional_operations;
     }
   } else {
     // Group local leaves by parent id (deterministic: std::map ordered by id).

@@ -652,13 +652,15 @@ struct AuthoritativeGravityNumericalResult {
   return state;
 }
 
-[[nodiscard]] bool stagePrecedes(
+[[nodiscard]] bool stageIsBracketedBy(
     const cosmosim::workflows::ReferenceWorkflowReport& report,
-    std::string_view earlier,
-    std::string_view later) {
-  const auto first = std::find(report.stage_sequence.begin(), report.stage_sequence.end(), earlier);
-  const auto second = std::find(report.stage_sequence.begin(), report.stage_sequence.end(), later);
-  return first != report.stage_sequence.end() && second != report.stage_sequence.end() && first < second;
+    std::string_view middle,
+    std::string_view bracket) {
+  const auto first = std::find(report.stage_sequence.begin(), report.stage_sequence.end(), bracket);
+  const auto center = std::find(report.stage_sequence.begin(), report.stage_sequence.end(), middle);
+  const auto last = std::find(report.stage_sequence.rbegin(), report.stage_sequence.rend(), bracket);
+  return first != report.stage_sequence.end() && center != report.stage_sequence.end() &&
+      last != report.stage_sequence.rend() && first < center && center < last.base() - 1;
 }
 
 [[nodiscard]] cosmosim::workflows::ReferenceWorkflowReport runEffectiveHierarchyCase(
@@ -891,9 +893,9 @@ int main() {
   // single-level representations produce exactly one birth.
   assert(level0_report.local_particle_count == 2);
   assert(level1_report.local_particle_count == 2);
-  // The production integration order keeps hydro/AMR synchronization ahead of
-  // the source stage, so covered coarse and fine representations are not both used.
-  assert(stagePrecedes(hierarchy_report, "hydro_update", "source_terms"));
+  // Smooth sources bracket hydro in the deterministic Strang reference; star
+  // formation remains a once-only endpoint transaction in the post half.
+  assert(stageIsBracketedBy(hierarchy_report, "hydro_update", "source_terms"));
 
 
   // M2C source-phase ownership must be visible in the same persisted memory

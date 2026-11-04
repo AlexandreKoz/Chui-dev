@@ -15,6 +15,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -2374,6 +2375,18 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
         // Deterministic merge order: source rank, then wire order.
         std::stable_sort(mine.begin(), mine.end(),
                          [](const auto& l, const auto& r) { return l.first < r.first; });
+        std::vector<std::pair<std::uint64_t, int>> received_keys;
+        received_keys.reserve(mine.size());
+        for (const auto& [rank, g] : mine) {
+          received_keys.emplace_back(global[g].register_key, rank);
+        }
+        std::sort(received_keys.begin(), received_keys.end());
+        for (std::size_t key = 1U; key < received_keys.size(); ++key) {
+          if (received_keys[key - 1U] == received_keys[key]) {
+            throw std::runtime_error(
+                "distributed recursive AMR received a duplicate reflux register key from one source rank");
+          }
+        }
         std::vector<amr::FluxRegisterEntry> inbound;
         inbound.reserve(mine.size());
         for (const auto& [rank, g] : mine) inbound.push_back(fluxRegisterEntryFromPayload(global[g]));
@@ -3360,12 +3373,32 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
         global_max_patch, global_max_cell, m_mpi_context.worldRank(),
         std::max(1, m_mpi_context.worldSize()), patch_window, cell_window);
     amr::ProductionAmrRegridSummary summary;
+    core::MemoryReservation regrid_transaction_reservation;
+    std::optional<core::SimulationState> regrid_candidate;
     try {
-      summary = amr::applyProductionAmrRegridPlan(context.state, plan, window, amr_options);
+      // One collective topology transaction. The admitted candidate contains
+      // every old authoritative lane while its patch operations construct the
+      // new hierarchy. No rank publishes until every rank has prepared its
+      // complete candidate successfully.
+      if (m_memory_governor != nullptr) {
+        regrid_transaction_reservation = m_memory_governor->reserve(
+            core::MemoryClass::kPhaseResident,
+            core::memoryReportBaselineOwnedBytes(
+                core::collectSimulationMemoryReport(context.state)),
+            "hydro.amr_regrid.collective_candidate");
+        regrid_transaction_reservation.commit();
+      }
+      regrid_candidate.emplace(context.state);
+      summary = amr::applyProductionAmrRegridPlan(
+          *regrid_candidate, plan, window, amr_options);
     } catch (...) {
       failure = std::current_exception();
     }
-    m_mpi_context.rethrowCollectivePreparationFailure(failure, "automatic AMR regrid application");
+    m_mpi_context.rethrowCollectivePreparationFailure(
+        failure, "automatic AMR regrid candidate preparation");
+    static_assert(std::is_nothrow_move_assignable_v<core::SimulationState>,
+                  "collective AMR publication requires a no-throw state move");
+    context.state = std::move(*regrid_candidate);
     m_last_regrid_summary = summary;
     if (context.profiler_session != nullptr) {
       context.profiler_session->recordEvent(core::RuntimeEvent{

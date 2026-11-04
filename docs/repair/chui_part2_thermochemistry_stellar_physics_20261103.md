@@ -359,6 +359,8 @@ and `src/`-relative includes in tests (`target_include_directories` added).
 ```
 mode dispatch (four modes unchanged)
  -> TimeCoordinator accepted interval [t_begin, t_end], timeline a_begin/a_end
+ -> SourceRuntime (Strang pre half, smooth sources only, physical midpoint dt/4)
+      thermochemistry/dust/SGS + metal diffusion for dt/2
  -> HydroAmrRuntime (hydro stage)
       ensureGasCompositionInitialized (fresh init / restart restore by gas_cell_id)
       HydroCoreSolver transport (+ effective relaxation; + legacy cooling ONLY
@@ -366,7 +368,7 @@ mode dispatch (four modes unchanged)
       HydroFaceMassFluxSink -> CompositionFluxAccumulator (composition advection)
       fixed grid: StageTransaction (hydro + composition commit together)
       AMR: prepare/commit right after the (non-transactional, Part 3) sweep
- -> SourceRuntime (source stage, Lie split, evaluated at a_end):
+ -> SourceRuntime (Strang post half; smooth midpoint 3dt/4, events at a_end):
       1. ISM regime manager (sync point)            [ism_regime_model]
       2. local chemistry fidelity selection         [chemistry_adaptive_selection]
       3. thermochemistry StageTransaction (one MPI vote) -> commit e, species, mu
@@ -376,7 +378,7 @@ mode dispatch (four modes unchanged)
          population record, birth time = t_end)
       7. stellar populations: Part 2 SSP + events + mechanical feedback
          (StageTransaction)  XOR  legacy table evolution + legacy deposition
-      8. metal diffusion, BH (unchanged)
+      8. metal diffusion for dt/2; BH once at t_end
  -> CFL guard of the next step reads refreshed caches
  -> restart: composition packed into module block chui_gas_composition_v1;
     stellar records in particle-indexed chui_stellar_population_v1

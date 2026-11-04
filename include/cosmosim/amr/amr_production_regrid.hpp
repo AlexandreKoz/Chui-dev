@@ -31,8 +31,9 @@
 //    at level > child level (else blocked). Octets split across ranks are
 //    skipped (`skipped_remote_sibling`) — migration consolidation is the
 //    balance runtime's job.
-//  * Operations are ordered by ascending patch id and truncated at
-//    `max_operations` (deterministic budget).
+//  * Refinements are ordered by ascending patch id. `max_operations` is the
+//    deterministic OPTIONAL-refinement budget; mandatory accuracy requests
+//    bypass it. Derefinement continues to use it as its operation budget.
 //
 // Indicators (typed, A03 seam): cell mass, normalized density/pressure jump
 // (contact and shock), comoving Truelove-Jeans resolution
@@ -98,6 +99,8 @@ struct ProductionAmrRegridPolicy {
   RefinementCriteria criteria{};
   PhysicsRefinementIndicators physics{};
   std::uint8_t max_level = 10;
+  // Optional-refinement budget (refine pass); total operation budget for the
+  // derefine pass. Mandatory accuracy refinements are never charged here.
   std::size_t max_operations = 64;
   AmrRegridPassKind pass = AmrRegridPassKind::kRefineOnly;
   double scale_factor = 1.0;

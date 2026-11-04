@@ -37,7 +37,9 @@ struct SourceInterval {
   double scale_factor_end = 1.0;
   // Physical elapsed time of the interval in seconds (> 0 for a real step).
   double physical_seconds = 0.0;
-  // Epoch at which densities/radiation are evaluated (Lie split: step end).
+  // Epoch at which densities/radiation are evaluated.  The canonical runtime
+  // uses the physical midpoint of each Strang half interval; compatibility
+  // callers that dispatch an unsplit source stage use the step-end epoch.
   double evaluation_scale_factor = 1.0;
   double evaluation_redshift = 0.0;
   bool cosmological = false;
