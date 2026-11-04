@@ -448,6 +448,14 @@ struct NumericsConfig {
   double amr_refine_jump_threshold = 0.0;
   double amr_refine_jeans_cells = 4.0;
   double amr_derefine_hysteresis = 0.5;
+  // R1 (A03) physics-aware indicators; 0 disables each. MANDATORY: cooling
+  // length in cells (legacy in-solver cooling only). OPTIONAL (budgeted):
+  // metallicity-interface jump, species-interface jump (composition network
+  // backends only), vorticity |curl v| dx / c_s.
+  double amr_refine_cooling_length_cells = 0.0;
+  double amr_refine_metallicity_jump = 0.0;
+  double amr_refine_species_jump = 0.0;
+  double amr_refine_vorticity = 0.0;
   double gravity_softening_kpc_comoving = 1.0;
   double gravity_softening_gas_kpc_comoving = -1.0;
   double gravity_softening_dark_matter_kpc_comoving = -1.0;

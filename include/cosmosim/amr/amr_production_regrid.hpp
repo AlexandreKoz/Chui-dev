@@ -61,8 +61,42 @@ enum class AmrRegridPassKind : std::uint8_t {
   kDerefineOnly = 1,
 };
 
+// R1 (A03): physics-aware indicators. MANDATORY criteria (accuracy): the
+// existing Jeans and cell-mass criteria and the cooling length. A cell that
+// violates a mandatory criterion is refined first and is never derefined
+// (hysteresis), independent of any resource budget. OPTIONAL criteria
+// (structure tracking, resource-prioritized): the jump indicator, metallicity
+// and species interfaces and vorticity; their refinements are scheduled only
+// after every mandatory one and are the first to be dropped by the budget.
+// All stencils are in-patch face neighbours (one-sided at patch faces), so
+// the decision of a patch depends only on that patch's own cells: it is
+// identical on any MPI decomposition (patches are never split across ranks)
+// and needs no ghost exchange; interfaces between patches are resolved by the
+// 2:1 balance rule.
+struct PhysicsRefinementIndicators {
+  // MANDATORY: refine when the cooling length c_s t_cool spans fewer than
+  // cooling_length_cells cells (physical lengths: c_s and t_cool are physical
+  // code units, dx_phys = a dx_com). cooling_time_code: one value per dense
+  // gas row, |e / (de/dt)_cool| in code time; +inf (or non-positive) = no net
+  // cooling. Derefine only if c_s t_cool >= cooling_length_cells dx / hysteresis.
+  double cooling_length_cells = 0.0;
+  std::span<const double> cooling_time_code{};
+  // OPTIONAL: max_faces |Z_a - Z_b| / max(Z_a, Z_b, metallicity_floor), Z =
+  // metal mass fraction (dimensionless; 0 disables).
+  double metallicity_jump = 0.0;
+  double metallicity_floor = 1.0e-6;
+  // OPTIONAL: max over species lanes and faces of |x_a - x_b|, x = species
+  // mass fraction of the composition gas mass (needs the composition
+  // sidecar; 0 disables).
+  double species_jump = 0.0;
+  // OPTIONAL: |curl v| dx / c_s with comoving gradients and widths (scale-free:
+  // equals the physical |omega| dx_phys / c_s). 0 disables.
+  double vorticity = 0.0;
+};
+
 struct ProductionAmrRegridPolicy {
   RefinementCriteria criteria{};
+  PhysicsRefinementIndicators physics{};
   std::uint8_t max_level = 10;
   std::size_t max_operations = 64;
   AmrRegridPassKind pass = AmrRegridPassKind::kRefineOnly;
@@ -103,6 +137,11 @@ struct ProductionAmrRegridPlan {
   std::size_t skipped_remote_sibling = 0;
   std::size_t truncated_by_budget = 0;
   std::size_t refined_below_gravity_softening = 0;
+  // R1: classification of refinement requests and budget outcome.
+  std::size_t mandatory_refine_requests = 0;
+  std::size_t optional_refine_requests = 0;
+  std::size_t mandatory_truncated_by_budget = 0;  // resolution requirement NOT met this pass (reported)
+  std::size_t optional_truncated_by_budget = 0;
   std::size_t required_patch_ids = 0;
   std::size_t required_gas_cell_ids = 0;
 };

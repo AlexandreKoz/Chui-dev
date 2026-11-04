@@ -848,6 +848,21 @@ with every key at its default (exact restart projection).
 | `amr_refine_jump_threshold` | double >= 0 | `0.0` | Refine when `max(|drho|/rho_min, |dP|/P_min)` over in-patch face neighbours exceeds it (contact/shock indicator; 0 disables). |
 | `amr_refine_jeans_cells` | double >= 0 | `4.0` | Truelove criterion on the comoving Jeans length `c_s sqrt(pi a/(G rho_com))` (0 disables). |
 | `amr_derefine_hysteresis` | (0, 1] | `0.5` | Derefinement requires every criterion to be below `hysteresis x threshold` (Jeans: above `threshold / hysteresis`). |
+| `amr_refine_cooling_length_cells` | double >= 0 | `0.0` | **Mandatory** (2026-11-04). Refine when the cooling length `c_s t_cool` spans fewer than N cells (physical lengths). `t_cool = e / (Lambda_net n_H^2 / rho)` comes from the legacy in-solver cooling-rate provider; net heating imposes no constraint. Requires `enable_cooling = true` and `thermochemistry_backend = legacy_cooling`; any other combination is refused (Part 2 backends do not publish cooling times). |
+| `amr_refine_metallicity_jump` | double >= 0 | `0.0` | Optional. Refine when `max |Z_a - Z_b| / max(Z_a, Z_b, 1e-6)` over in-patch face neighbours exceeds it. |
+| `amr_refine_species_jump` | double >= 0 | `0.0` | Optional. Refine when the maximum absolute jump of a species mass fraction (composition gas mass) over in-patch face neighbours exceeds it. Requires `fixed_hybrid` or `fixed_detailed`. |
+| `amr_refine_vorticity` | double >= 0 | `0.0` | Optional. Refine when `|curl v| dx / c_s` (comoving gradients and widths, so the value is scale-free) exceeds it. |
+
+**Mandatory versus optional (R1).**
+- Mandatory criteria: Jeans, cell mass and cooling length. They are
+  scheduled before any optional request. A cell inside their hysteresis band
+  is never derefined.
+- Optional criteria: the jump indicator, metallicity, species and vorticity.
+  The per-pass budget truncates these first.
+- A truncated mandatory request is reported in the
+  `hydro.amr_automatic_regrid` event as `mandatory_truncated_by_budget`.
+- Every stencil uses in-patch neighbours, so decisions are identical on any
+  MPI decomposition.
 
 `automatic` requires at least one non-zero criterion and `amr_max_level` in
 [1, 30]. Regrid transfers mass, momentum, total energy and every composition

@@ -605,6 +605,12 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
       // 1 erg/g = 1e-4 J/kg = 1e-4 m^2/s^2.
       const double specific_energy_rate_cgs_to_code =
           1.0e-4 * m_units.timeSiPerCode() / velocity_sq_si;
+      // R1: the same rate provider evaluates per-cell cooling times for the
+      // mandatory cooling-length refinement criterion (read-only copy).
+      m_cooling_rate_provider.emplace(provider);
+      m_cooling_specific_rate_cgs_to_code = specific_energy_rate_cgs_to_code;
+      m_cooling_temperature_per_energy_k = cooling_config.temperature_per_internal_energy_k;
+      m_cooling_helium_mass_fraction = cooling_config.primordial_helium_mass_fraction;
       m_cooling_source = std::make_unique<physics::CoolingHeatingSource>(
           std::move(provider),
           physics::CoolingSourceIntegrator(
@@ -3169,6 +3175,58 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
     policy.criteria.derefine_hysteresis = m_config.numerics.amr_derefine_hysteresis;
     policy.criteria.gravitational_constant_code = core::newtonGravitationalConstantCode(core::makeUnitSystem(
         m_config.units.length_unit, m_config.units.mass_unit, m_config.units.velocity_unit));
+    // R1 physics-aware indicators (thresholds from typed config).
+    policy.physics.cooling_length_cells = m_config.numerics.amr_refine_cooling_length_cells;
+    policy.physics.metallicity_jump = m_config.numerics.amr_refine_metallicity_jump;
+    policy.physics.species_jump = m_config.numerics.amr_refine_species_jump;
+    policy.physics.vorticity = m_config.numerics.amr_refine_vorticity;
+    core::MemoryReservation cooling_time_reservation;  // declared before the buffer it covers
+    std::vector<double> cooling_time_code;
+    if (policy.physics.cooling_length_cells > 0.0 && m_memory_governor != nullptr) {
+      std::exception_ptr admission_failure;
+      try {
+        cooling_time_reservation = m_memory_governor->reserve(
+            core::MemoryClass::kPhaseResident,
+            static_cast<std::uint64_t>(core::checkedSizeMultiply(context.state.cells.size(), sizeof(double),
+                                                                 "regrid cooling times")),
+            "hydro.amr_regrid.cooling_times");
+        cooling_time_reservation.commit();
+      } catch (...) {
+        admission_failure = std::current_exception();
+      }
+      m_mpi_context.rethrowCollectivePreparationFailure(admission_failure, "regrid cooling-time admission");
+    }
+    if (policy.physics.cooling_length_cells > 0.0) {
+      if (!m_cooling_rate_provider.has_value()) {
+        throw std::logic_error("cooling-length refinement requested without the legacy cooling-rate provider");
+      }
+      // t_cool = e / (Lambda_net n_H^2 / rho) with physical density; net
+      // heating (Lambda_net <= 0) imposes no cooling-length constraint (+inf).
+      constexpr double k_proton_mass_g = 1.67262192369e-24;
+      const double a = std::max(context.integrator_state.current_scale_factor, 1.0e-12);
+      const bool comoving = m_config.units.coordinate_frame == core::CoordinateFrame::kComoving;
+      const double redshift = m_mode_policy.cosmological_comoving_frame ? std::max(0.0, 1.0 / a - 1.0) : 0.0;
+      cooling_time_code.assign(context.state.cells.size(), std::numeric_limits<double>::infinity());
+      for (std::uint32_t row = 0; row < context.state.cells.size(); ++row) {
+        const double e = context.state.gas_cells.internal_energy_code[row];
+        const double rho_code = context.state.gas_cells.density_code[row] * (comoving ? 1.0 / (a * a * a) : 1.0);
+        const double rho_cgs = m_units.densityCodeToCgs(rho_code);
+        if (!(e > 0.0) || !(rho_cgs > 0.0)) continue;
+        const double mass = context.state.cells.mass_code[row];
+        const double z = mass > 0.0 ? std::clamp(context.state.gas_cells.metal_mass_code[row] / mass, 0.0, 1.0) : 0.0;
+        const double n_h = (1.0 - m_cooling_helium_mass_fraction - z) * rho_cgs / k_proton_mass_g;
+        const physics::CoolingRateResult rates = m_cooling_rate_provider->lookupRates(physics::CoolingRateQuery{
+            .temperature_k = e * m_cooling_temperature_per_energy_k,
+            .hydrogen_number_density_cgs = n_h,
+            .metallicity_mass_fraction = z,
+            .redshift = redshift});
+        const double net = rates.netCoolingRateErgCm3S();
+        if (!(net > 0.0)) continue;
+        const double rate_code = net * n_h * n_h / rho_cgs * m_cooling_specific_rate_cgs_to_code;
+        if (rate_code > 0.0) cooling_time_code[row] = e / rate_code;
+      }
+      policy.physics.cooling_time_code = cooling_time_code;
+    }
     policy.max_level = static_cast<std::uint8_t>(std::clamp(m_config.numerics.amr_max_level, 0, 255));
     policy.max_operations = static_cast<std::size_t>(m_config.numerics.amr_regrid_max_operations);
     // Alternating passes keep the 2:1 balance without exchanging decisions.
@@ -3265,6 +3323,10 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
                       {"blocked_by_max_level", std::to_string(plan.blocked_by_max_level)},
                       {"skipped_remote_sibling", std::to_string(plan.skipped_remote_sibling)},
                       {"truncated_by_budget", std::to_string(plan.truncated_by_budget)},
+                      {"mandatory_refine_requests", std::to_string(plan.mandatory_refine_requests)},
+                      {"optional_refine_requests", std::to_string(plan.optional_refine_requests)},
+                      {"mandatory_truncated_by_budget", std::to_string(plan.mandatory_truncated_by_budget)},
+                      {"optional_truncated_by_budget", std::to_string(plan.optional_truncated_by_budget)},
                       {"refined_below_gravity_softening_unqualified",
                        std::to_string(plan.refined_below_gravity_softening)},
                       {"skipped_not_quiescent", plan.skipped_not_quiescent ? "true" : "false"},
@@ -3560,6 +3622,10 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
   std::unique_ptr<hydro::HydroReconstruction> m_reconstruction;
   std::unique_ptr<hydro::HydroRiemannSolver> m_riemann_solver;
   std::unique_ptr<physics::CoolingHeatingSource> m_cooling_source;
+  std::optional<physics::CoolingRateProvider> m_cooling_rate_provider;
+  double m_cooling_specific_rate_cgs_to_code = 0.0;
+  double m_cooling_temperature_per_energy_k = 0.0;
+  double m_cooling_helium_mass_fraction = 0.24;
   physics::CompositionTransportCommitReport m_last_composition_transport{};
   std::unique_ptr<physics::EffectiveIsmThermodynamicClosure> m_effective_ism_closure;
   std::unique_ptr<physics::EffectiveIsmEnergyRelaxationSource> m_effective_ism_energy_source;

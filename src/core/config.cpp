@@ -1440,6 +1440,10 @@ struct ConfigKeySpec {
       {"numerics.amr_refine_jump_threshold", "0.0"},
       {"numerics.amr_refine_jeans_cells", "4.0"},
       {"numerics.amr_derefine_hysteresis", "0.5"},
+      {"numerics.amr_refine_cooling_length_cells", "0.0"},
+      {"numerics.amr_refine_metallicity_jump", "0.0"},
+      {"numerics.amr_refine_species_jump", "0.0"},
+      {"numerics.amr_refine_vorticity", "0.0"},
       {"numerics.gravity_softening", "1.0 kpc"},
       {"numerics.gravity_softening_gas", ""},
       {"numerics.gravity_softening_dark_matter", ""},
@@ -2135,13 +2139,37 @@ void validateConfig(const SimulationConfig& config) {
       !std::isfinite(config.numerics.amr_refine_jeans_cells) || config.numerics.amr_refine_jeans_cells < 0.0) {
     throw ConfigError("numerics.amr_refine_* criteria must be finite and >= 0 (0 disables a criterion)");
   }
+  for (const double value : {config.numerics.amr_refine_cooling_length_cells, config.numerics.amr_refine_metallicity_jump,
+                             config.numerics.amr_refine_species_jump, config.numerics.amr_refine_vorticity}) {
+    if (!std::isfinite(value) || value < 0.0) {
+      throw ConfigError("numerics.amr_refine_{cooling_length_cells,metallicity_jump,species_jump,vorticity} must be "
+                        "finite and >= 0 (0 disables)");
+    }
+  }
+  if (config.numerics.amr_refine_cooling_length_cells > 0.0 &&
+      (!config.physics.enable_cooling ||
+       config.physics.thermochemistry_backend != ThermochemistryBackendMode::kLegacyCooling)) {
+    // Explicit refusal, not a silent no-op: the cooling time is evaluated from
+    // the in-solver legacy cooling-rate provider. Part 2 backends own cooling
+    // in the SourceRuntime and do not yet publish per-cell cooling times.
+    throw ConfigError("numerics.amr_refine_cooling_length_cells > 0 requires physics.enable_cooling = true with "
+                      "thermochemistry_backend = legacy_cooling (Part 2 backends do not publish cooling times)");
+  }
+  if (config.numerics.amr_refine_species_jump > 0.0 &&
+      config.physics.thermochemistry_backend != ThermochemistryBackendMode::kFixedHybrid &&
+      config.physics.thermochemistry_backend != ThermochemistryBackendMode::kFixedDetailed) {
+    throw ConfigError("numerics.amr_refine_species_jump > 0 requires a composition network backend "
+                      "(thermochemistry_backend = fixed_hybrid or fixed_detailed)");
+  }
   if (!std::isfinite(config.numerics.amr_derefine_hysteresis) || config.numerics.amr_derefine_hysteresis <= 0.0 ||
       config.numerics.amr_derefine_hysteresis > 1.0) {
     throw ConfigError("numerics.amr_derefine_hysteresis must be in (0, 1]");
   }
   if (config.numerics.amr_regrid_mode == AmrRegridConfigMode::kAutomatic) {
     if (config.numerics.amr_refine_cell_mass_code == 0.0 && config.numerics.amr_refine_jump_threshold == 0.0 &&
-        config.numerics.amr_refine_jeans_cells == 0.0) {
+        config.numerics.amr_refine_jeans_cells == 0.0 && config.numerics.amr_refine_cooling_length_cells == 0.0 &&
+        config.numerics.amr_refine_metallicity_jump == 0.0 && config.numerics.amr_refine_species_jump == 0.0 &&
+        config.numerics.amr_refine_vorticity == 0.0) {
       throw ConfigError("numerics.amr_regrid_mode = automatic requires at least one non-zero amr_refine_* criterion");
     }
     if (config.numerics.amr_max_level < 1 || config.numerics.amr_max_level > 30) {
@@ -3052,6 +3080,10 @@ class NormalizedConfigStream {
   stream << "amr_refine_jump_threshold = " << frozen.config.numerics.amr_refine_jump_threshold << '\n';
   stream << "amr_refine_jeans_cells = " << frozen.config.numerics.amr_refine_jeans_cells << '\n';
   stream << "amr_derefine_hysteresis = " << frozen.config.numerics.amr_derefine_hysteresis << '\n';
+  stream << "amr_refine_cooling_length_cells = " << frozen.config.numerics.amr_refine_cooling_length_cells << '\n';
+  stream << "amr_refine_metallicity_jump = " << frozen.config.numerics.amr_refine_metallicity_jump << '\n';
+  stream << "amr_refine_species_jump = " << frozen.config.numerics.amr_refine_species_jump << '\n';
+  stream << "amr_refine_vorticity = " << frozen.config.numerics.amr_refine_vorticity << '\n';
   stream << "gravity_softening = " << frozen.config.numerics.gravity_softening_kpc_comoving << " kpc\n";
   auto emitOptionalSoftening = [&](std::string_view key, double value_kpc_comoving) {
     stream << key << " = ";
@@ -3846,6 +3878,13 @@ class NormalizedConfigStream {
   frozen.config.numerics.amr_derefine_hysteresis = parseFloating(
       requireString(entries, consumed, "numerics.amr_derefine_hysteresis",
                     defaultFor("numerics.amr_derefine_hysteresis")), "numerics.amr_derefine_hysteresis");
+  for (auto [key, target] : std::initializer_list<std::pair<const char*, double*>>{
+           {"numerics.amr_refine_cooling_length_cells", &frozen.config.numerics.amr_refine_cooling_length_cells},
+           {"numerics.amr_refine_metallicity_jump", &frozen.config.numerics.amr_refine_metallicity_jump},
+           {"numerics.amr_refine_species_jump", &frozen.config.numerics.amr_refine_species_jump},
+           {"numerics.amr_refine_vorticity", &frozen.config.numerics.amr_refine_vorticity}}) {
+    *target = parseFloating(requireString(entries, consumed, key, defaultFor(key)), key);
+  }
   frozen.config.numerics.gravity_softening_kpc_comoving = parseLengthKpc(
       requireString(entries, consumed, "numerics.gravity_softening", "1.0 kpc"),
       frozen.config.units.length_unit,
