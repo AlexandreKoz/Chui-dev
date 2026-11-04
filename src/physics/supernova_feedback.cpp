@@ -478,6 +478,8 @@ std::vector<std::uint32_t> MechanicalFeedbackDeposition::commit(core::Simulation
     state.cells.mass_code[row] = m_new;
     if (composition) {
       auto& sidecar = state.gas_composition;
+      const bool detailed_row_was_explicit =
+          !sidecar.sparseStorageEnabled() || sidecar.hasExplicitSparseRow(row);
       for (std::size_t e = 0; e < k_chemical_element_count; ++e) {
         sidecar.addValue(layout->elementLane(static_cast<ChemicalElement>(e)), row, d.elements[e]);
       }
@@ -490,7 +492,7 @@ std::vector<std::uint32_t> MechanicalFeedbackDeposition::commit(core::Simulation
         sidecar.addValue(layout->speciesLane(static_cast<std::size_t>(ChemicalSpecies::kHI)), row, d.elements[0]);
         sidecar.addValue(layout->speciesLane(static_cast<std::size_t>(ChemicalSpecies::kHeI)), row, d.elements[1]);
       }
-      if (species >= k_detailed_species_count) {
+      if (species >= k_detailed_species_count && detailed_row_was_explicit) {
         sidecar.addValue(layout->speciesLane(static_cast<std::size_t>(ChemicalSpecies::kCII)), row,
                          d.elements[static_cast<std::size_t>(ChemicalElement::kC)]);
       }

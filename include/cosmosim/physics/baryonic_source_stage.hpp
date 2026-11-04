@@ -70,6 +70,9 @@ class BaryonicSourceStage {
   void discard() noexcept;
 
   [[nodiscard]] bool prepared() const noexcept { return m_prepared; }
+  [[nodiscard]] std::size_t sparseRowsToActivate() const noexcept {
+    return m_sparse_rows_to_activate;
+  }
   // Published only by commit(); unchanged by a rejected interval.
   [[nodiscard]] const BaryonicSourceStageReport& lastCommittedReport() const noexcept { return m_committed; }
 
@@ -98,6 +101,7 @@ class BaryonicSourceStage {
   std::vector<StagedMeta> m_meta;
   std::vector<double> m_lanes;  // row-major: staged row x lane
   std::size_t m_lane_count = 0;
+  std::size_t m_sparse_rows_to_activate = 0U;
   BaryonicSourceStageReport m_pending{};
   BaryonicSourceStageReport m_committed{};
   bool m_prepared = false;

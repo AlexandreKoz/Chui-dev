@@ -272,9 +272,8 @@ void CompositionFluxAccumulator::validatePrepared(const core::SimulationState& s
   const std::size_t lanes = sidecar.laneCount();
   const std::size_t rows = sidecar.rowCount();
   for (std::size_t l = 0; l < lanes; ++l) {
-    const auto values = sidecar.lane(l);
     for (std::size_t row = 0; row < rows; ++row) {
-      const double updated = values[row] + m_delta[l * rows + row];
+      const double updated = sidecar.value(l, row) + m_delta[l * rows + row];
       const double scale = std::max(state.cells.mass_code[row], 1.0e-300);
       if (updated < -1.0e-12 * scale || !std::isfinite(updated)) {
         throw std::runtime_error(
@@ -284,6 +283,34 @@ void CompositionFluxAccumulator::validatePrepared(const core::SimulationState& s
     }
   }
   m_prepared = true;
+}
+
+std::size_t CompositionFluxAccumulator::sparseRowsToActivate(
+    const core::SimulationState& state) const {
+  const auto& sidecar = state.gas_composition;
+  if (!m_prepared || !sidecar.sparseStorageEnabled()) return 0U;
+  const std::size_t rows = sidecar.rowCount();
+  std::size_t count = 0U;
+  for (std::size_t row = 0; row < rows; ++row) {
+    if (sidecar.hasExplicitSparseRow(row)) continue;
+    bool needs_explicit = false;
+    for (std::size_t lane = sidecar.sparseLaneBegin();
+         lane < static_cast<std::size_t>(sidecar.sparseLaneBegin()) + sidecar.sparseLaneCount();
+         ++lane) {
+      const double transported = sidecar.value(lane, row) + m_delta[lane * rows + row];
+      const std::uint32_t source = sidecar.sparseDefaultSourceLane(lane);
+      const double implicit_after = source == core::GasCompositionLayoutDescriptor::k_no_lane
+          ? 0.0
+          : sidecar.value(source, row) +
+              m_delta[static_cast<std::size_t>(source) * rows + row];
+      if (transported != implicit_after) {
+        needs_explicit = true;
+        break;
+      }
+    }
+    if (needs_explicit) ++count;
+  }
+  return count;
 }
 
 void CompositionFluxAccumulator::prepareDeferred(const core::SimulationState& state) {
@@ -308,10 +335,34 @@ CompositionTransportCommitReport CompositionFluxAccumulator::commit(core::Simula
   }
   const auto& d = sidecar.descriptor();
   const std::size_t rows = sidecar.rowCount();
-  for (std::size_t l = 0; l < sidecar.laneCount(); ++l) {
-    auto values = sidecar.lane(l);
+  if (sidecar.sparseStorageEnabled()) {
     for (std::size_t row = 0; row < rows; ++row) {
-      values[row] = std::max(values[row] + m_delta[l * rows + row], 0.0);
+      if (sidecar.hasExplicitSparseRow(row)) continue;
+      bool needs_explicit = false;
+      for (std::size_t lane = sidecar.sparseLaneBegin();
+           lane < static_cast<std::size_t>(sidecar.sparseLaneBegin()) + sidecar.sparseLaneCount();
+           ++lane) {
+        const double transported = sidecar.value(lane, row) + m_delta[lane * rows + row];
+        const std::uint32_t source = sidecar.sparseDefaultSourceLane(lane);
+        const double implicit_after = source == core::GasCompositionLayoutDescriptor::k_no_lane
+            ? 0.0
+            : sidecar.value(source, row) +
+                m_delta[static_cast<std::size_t>(source) * rows + row];
+        needs_explicit = needs_explicit || transported != implicit_after;
+      }
+      if (needs_explicit) sidecar.activateSparseRow(row);
+    }
+  }
+  for (std::size_t l = 0; l < sidecar.laneCount(); ++l) {
+    for (std::size_t row = 0; row < rows; ++row) {
+      // A still-implicit sparse row was proven above to equal its updated
+      // dense projection. Re-reading it after the dense source lane changed
+      // and adding the old delta again would double-count the transport.
+      if (!sidecar.laneStoredDensely(l) && !sidecar.hasExplicitSparseRow(row)) {
+        continue;
+      }
+      sidecar.setValue(l, row,
+                       std::max(sidecar.value(l, row) + m_delta[l * rows + row], 0.0));
     }
   }
   // Reconcile with the hydro cell mass. Differences arise only from the
@@ -327,7 +378,7 @@ CompositionTransportCommitReport CompositionFluxAccumulator::commit(core::Simula
     report.max_relative_mismatch = std::max(report.max_relative_mismatch, rel);
     if (rel > 0.0) {
       const double factor = mass / comp;
-      for (std::size_t l = 0; l < sidecar.laneCount(); ++l) sidecar.lane(l)[row] *= factor;
+      sidecar.scaleRow(row, factor);
       report.reconciled_mass_code += mass - comp;
       if (rel > 1.0e-10) ++report.reconciled_rows;
     }

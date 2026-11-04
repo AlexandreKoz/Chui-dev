@@ -38,6 +38,8 @@ CompositionLayoutRequest compositionLayoutRequestFromConfig(const core::PhysicsC
       ? CompositionDustKind::kTwoReservoirV1
       : CompositionDustKind::kNone;
   request.sgs_energy = physics.sgs_turbulence_model == core::SgsTurbulenceModelConfig::kBudgetedV1;
+  request.adaptive_sparse_detailed =
+      physics.chemistry_adaptive_selection == core::ChemistryAdaptiveSelectionConfig::kLocalV1;
   return request;
 }
 

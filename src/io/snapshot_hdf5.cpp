@@ -1444,7 +1444,7 @@ void writeScienceSnapshotHdf5(
       add_double("Pressure");
     }
     // CHUI Part 3 Checkpoint G: science-state export of the composition
-    // sidecar (schema CHUI_CompositionSchemaVersion = 2, see
+    // sidecar (schema CHUI_CompositionSchemaVersion = 3, see
     // docs/output_schema.md). Present iff the run carries a composition
     // sidecar (identical decision on every rank: the layout is part of the
     // configuration); absent datasets mean "physics disabled", never zero.
@@ -1473,6 +1473,11 @@ void writeScienceSnapshotHdf5(
       writeScalarStringAttribute(type_group.get(), "CHUI_CompositionLayoutName", composition_descriptor.layout_name);
       writeScalarStringAttribute(type_group.get(), "CHUI_CompositionFractionBasis",
                                  "lane_mass / (sum(element lanes) + sum(dust lanes))");
+      writeScalarStringAttribute(
+          type_group.get(), "CHUI_DetailedChemistryStorage",
+          state.gas_composition.sparseStorageEnabled()
+              ? "adaptive_sparse_by_gas_cell_id"
+              : "dense_reference");
       writeScalarStringAttribute(type_group.get(), "CHUI_ElementNames",
                                  names(composition_descriptor.element_lane_begin, composition_descriptor.element_lane_count));
       composition_elements_ds.emplace(createStreamingDataset(
@@ -1495,6 +1500,7 @@ void writeScienceSnapshotHdf5(
       if (composition_sgs) add_double("CHUI_SgsSpecificEnergy");
       add_double("CHUI_MeanMolecularWeight");
       add_u8("CHUI_ChemistryModelTag");
+      add_u8("CHUI_DetailedChemistryStateMaterialized");
       add_u8("CHUI_IsmRegimeTag");
       add_double("CHUI_ChemistryModelDwellYears");
       add_double("CHUI_IsmRegimeDwellYears");
@@ -1709,6 +1715,11 @@ void writeScienceSnapshotHdf5(
           write_u8_extra("CHUI_ChemistryModelTag", u80.data(), offset, count);
           write_u8_extra("CHUI_IsmRegimeTag", u81.data(), offset, count);
           for (std::size_t j = 0; j < count; ++j) {
+            u80[j] = sidecar.hasExplicitSparseRow(offset + j) ? 1U : 0U;
+          }
+          write_u8_extra(
+              "CHUI_DetailedChemistryStateMaterialized", u80.data(), offset, count);
+          for (std::size_t j = 0; j < count; ++j) {
             const std::size_t row = offset + j;
             d0[j] = sidecar.chemistry_last_temperature_k[row];
             d1[j] = sidecar.chemistry_last_cooling_time_seconds[row];
@@ -1728,7 +1739,7 @@ void writeScienceSnapshotHdf5(
         }
         const std::uint64_t staging_bytes = static_cast<std::uint64_t>(
             count * (6U * sizeof(double) + sizeof(double) + sizeof(std::uint64_t) +
-                     17U * sizeof(double) + 3U * sizeof(std::uint64_t) + 2U * sizeof(std::uint8_t)));
+                     17U * sizeof(double) + 3U * sizeof(std::uint64_t) + 3U * sizeof(std::uint8_t)));
         const std::uint64_t logical_bytes = staging_bytes;
         write_metrics.observe(staging_bytes, logical_bytes);
       }

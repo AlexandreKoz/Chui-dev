@@ -17,6 +17,7 @@ void BaryonicSourceStage::discard() noexcept {
   m_meta.clear();
   m_lanes.clear();
   m_pending = BaryonicSourceStageReport{};
+  m_sparse_rows_to_activate = 0U;
   m_prepared = false;
 }
 
@@ -36,7 +37,9 @@ void BaryonicSourceStage::prepare(const core::SimulationState& state, const Sour
   const std::size_t row_count = rows.empty() ? state.cells.size() : rows.size();
   m_meta.reserve(row_count);
   m_lanes.reserve(row_count * m_lane_count);
-  core::GasCompositionSidecar scratch = sidecar.emptyLike(1U);  // one row of private scratch
+  // The private row is deliberately dense: it is transient staging, has no
+  // stable gas-cell identity and must never grow retained sparse storage.
+  core::GasCompositionSidecar scratch = sidecar.emptyLike(1U, false);
   const double a = interval.evaluation_scale_factor;
   const double time_code_s = units.length_code_to_cm / units.velocity_code_to_cm_s;
   const double dt_code_time = interval.physical_seconds / time_code_s;
@@ -156,6 +159,10 @@ void BaryonicSourceStage::prepare(const core::SimulationState& state, const Sour
         meta.refresh = true;
       }
     }
+    if (sidecar.sparseStorageEnabled() && meta.chemistry_tag == k_chemistry_tag_detailed &&
+        !sidecar.hasExplicitSparseRow(row)) {
+      ++m_sparse_rows_to_activate;
+    }
     m_meta.push_back(meta);
     for (std::size_t l = 0; l < m_lane_count; ++l) m_lanes.push_back(scratch.value(l, 0));
   }
@@ -178,6 +185,9 @@ std::vector<std::uint32_t> BaryonicSourceStage::commit(core::SimulationState& st
   rows.reserve(m_meta.size());
   for (std::size_t i = 0; i < m_meta.size(); ++i) {
     const StagedMeta& meta = m_meta[i];
+    if (sidecar.sparseStorageEnabled() && meta.chemistry_tag == k_chemistry_tag_detailed) {
+      sidecar.activateSparseRow(meta.row);
+    }
     for (std::size_t l = 0; l < m_lane_count; ++l) sidecar.setValue(l, meta.row, m_lanes[i * m_lane_count + l]);
     state.gas_cells.internal_energy_code[meta.row] = meta.internal_energy_code;
     sidecar.mean_molecular_weight[meta.row] = meta.mean_molecular_weight;
@@ -205,6 +215,7 @@ std::vector<std::uint32_t> BaryonicSourceStage::commit(core::SimulationState& st
   m_meta.clear();
   m_lanes.clear();
   m_pending = BaryonicSourceStageReport{};
+  m_sparse_rows_to_activate = 0U;
   m_prepared = false;
   return refresh;
 }

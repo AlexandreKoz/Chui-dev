@@ -1,5 +1,6 @@
 #include "cosmosim/core/simulation_state.hpp"
 #include "cosmosim/core/checked_arithmetic.hpp"
+#include "cosmosim/core/retained_capacity_transaction.hpp"
 
 #include <array>
 #include <algorithm>
@@ -8,11 +9,37 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 
 namespace cosmosim::core {
 namespace {
+
+[[nodiscard]] bool migrationPayloadHasExplicitSparseRow(
+    const GasCellMigrationFields& fields,
+    const GasCompositionSidecar& composition) {
+  if (!composition.sparseStorageEnabled()) return false;
+  if (fields.composition_payload.size() != composition.packedRowWidth()) {
+    throw std::runtime_error(
+        "gas-cell migration composition payload width cannot preserve sparse chemistry history");
+  }
+  return fields.composition_payload.back() != 0.0;
+}
+
+void prepareAdmittedSparseCompositionCandidate(
+    GasCompositionSidecar& composition,
+    std::size_t active_rows,
+    std::string_view owner) {
+  if (!composition.sparseStorageEnabled()) return;
+  RetainedCapacityTransaction capacity(
+      [&composition] { return composition.ownedCapacityBytes(); });
+  composition.planSparseRowCapacity(capacity, active_rows);
+  // Migration/rebuild callers have already admitted the complete candidate
+  // live set. This transaction enforces exact capacities without charging a
+  // second overlapping reservation.
+  capacity.execute(nullptr, MemoryClass::kCanonicalPersistent, owner);
+}
 
 [[nodiscard]] std::size_t findRequiredSidecarRow(
     std::span<const std::uint32_t> particle_indices,
@@ -1215,6 +1242,14 @@ void SimulationState::commitParticleMigration(const ParticleMigrationCommit& com
     rebuilt_cells.resize(final_gas_fields.size());
     rebuilt_gas_cells.resize(final_gas_fields.size());
     rebuilt_composition = gas_composition.emptyLike(final_gas_fields.size());
+    std::size_t active_sparse_rows = 0U;
+    for (const auto& fields : final_gas_fields) {
+      active_sparse_rows +=
+          migrationPayloadHasExplicitSparseRow(fields, rebuilt_composition) ? 1U : 0U;
+    }
+    prepareAdmittedSparseCompositionCandidate(
+        rebuilt_composition, active_sparse_rows,
+        "particle_migration.adaptive_chemistry_rows");
     for (std::uint32_t row = 0; row < final_gas_fields.size(); ++row) {
       writeGasCellFieldsToRow(final_gas_fields[row], row, rebuilt_cells, rebuilt_gas_cells, rebuilt_composition);
     }
@@ -1676,6 +1711,21 @@ void SimulationState::commitGasCellMigration(const GasCellMigrationCommit& commi
   rebuilt_cells.resize(final_count);
   rebuilt_gas_cells.resize(final_count);
   GasCompositionSidecar rebuilt_composition = gas_composition.emptyLike(final_count);
+  std::size_t active_sparse_rows = 0U;
+  if (gas_composition.sparseStorageEnabled()) {
+    for (std::size_t row = 0; row < cells.size(); ++row) {
+      if (remove_mask[row] == 0U && gas_composition.hasExplicitSparseRow(row)) {
+        ++active_sparse_rows;
+      }
+    }
+    for (const auto& inbound : commit.inbound_records) {
+      active_sparse_rows += migrationPayloadHasExplicitSparseRow(
+          inbound.fields, rebuilt_composition) ? 1U : 0U;
+    }
+  }
+  prepareAdmittedSparseCompositionCandidate(
+      rebuilt_composition, active_sparse_rows,
+      "gas_cell_migration.adaptive_chemistry_rows");
 
   std::size_t write_row = 0U;
   for (std::uint32_t row = 0; row < cells.size(); ++row) {
@@ -2014,6 +2064,18 @@ void SimulationState::commitAmrPatchMigration(const AmrPatchMigrationCommit& com
   rebuilt_cells.resize(total_cell_count);
   rebuilt_gas_cells.resize(total_cell_count);
   GasCompositionSidecar rebuilt_composition = gas_composition.emptyLike(total_cell_count);
+  std::size_t active_sparse_rows = 0U;
+  if (rebuilt_composition.sparseStorageEnabled()) {
+    for (const auto& patch_cells : final_cells_by_patch) {
+      for (const auto& fields : patch_cells) {
+        active_sparse_rows += migrationPayloadHasExplicitSparseRow(
+            fields, rebuilt_composition) ? 1U : 0U;
+      }
+    }
+  }
+  prepareAdmittedSparseCompositionCandidate(
+      rebuilt_composition, active_sparse_rows,
+      "amr_patch_migration.adaptive_chemistry_rows");
 
   std::uint32_t write_cell = 0;
   for (std::size_t patch_row = 0; patch_row < final_patches.size(); ++patch_row) {

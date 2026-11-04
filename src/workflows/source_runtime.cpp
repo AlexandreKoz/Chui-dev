@@ -27,6 +27,7 @@
 #include "cosmosim/core/governed_scratch_arena.hpp"
 #include "cosmosim/core/memory_accounting.hpp"
 #include "cosmosim/core/profiling.hpp"
+#include "cosmosim/core/retained_capacity_transaction.hpp"
 #include "cosmosim/core/time_scheduler.hpp"
 #include "cosmosim/hydro/gas_thermodynamic_refresh.hpp"
 #include "cosmosim/physics/black_hole_agn.hpp"
@@ -1977,7 +1978,20 @@ class SourceRuntimeImpl final : public SourceRuntime {
                               "sources.baryonic_stage.staged_rows");
     const bool local_work = row_count > 0U && interval.valid();
     if (local_work) {
-      (void)transaction.prepare([&] { stage.prepare(context.state, interval, rows); });
+      (void)transaction.prepare([&] {
+        stage.prepare(context.state, interval, rows);
+        auto& composition = context.state.gas_composition;
+        core::RetainedCapacityTransaction sparse_capacity(
+            [&composition] { return composition.ownedCapacityBytes(); });
+        composition.planSparseRowCapacity(
+            sparse_capacity,
+            core::checkedSizeAdd(composition.sparseActiveRowCount(),
+                                 stage.sparseRowsToActivate(),
+                                 "adaptive chemistry sparse row capacity"));
+        sparse_capacity.execute(
+            m_memory_governor, core::MemoryClass::kCanonicalPersistent,
+            "sources.baryonic_stage.adaptive_chemistry_rows");
+      });
     } else {
       (void)transaction.prepare([] {});
     }
@@ -3610,7 +3624,7 @@ class SourceRuntimeImpl final : public SourceRuntime {
               context.state.gas_composition, m_diffusion_faces, m_diffusion_rho_kappa_code,
               source_dt_code, m_metal_diffusion.config().parabolic_cfl,
               m_metal_diffusion.config().max_subcycles, m_element_diffusion_workspace,
-              coupling.has_value() ? &*coupling : nullptr);
+              coupling.has_value() ? &*coupling : nullptr, m_memory_governor);
         } catch (...) {
           element_failure = std::current_exception();
         }

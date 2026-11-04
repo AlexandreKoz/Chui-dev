@@ -29,6 +29,7 @@
 #include "cosmosim/core/memory_accounting.hpp"
 #include "cosmosim/core/memory_governor.hpp"
 #include "cosmosim/core/profiling.hpp"
+#include "cosmosim/core/retained_capacity_transaction.hpp"
 #include "cosmosim/core/units.hpp"
 #include "cosmosim/physics/cooling_heating.hpp"
 #include "cosmosim/physics/stellar_population.hpp"
@@ -59,6 +60,23 @@ namespace cosmosim::workflows {
 namespace {
 
 constexpr double k_gamma_adiabatic = 5.0 / 3.0;
+
+void admitCompositionSparseActivation(
+    core::SimulationState& state,
+    const physics::CompositionFluxAccumulator& transport,
+    core::MemoryGovernor* governor,
+    std::string_view owner) {
+  auto& sidecar = state.gas_composition;
+  if (!sidecar.sparseStorageEnabled()) return;
+  core::RetainedCapacityTransaction capacity(
+      [&sidecar] { return sidecar.ownedCapacityBytes(); });
+  sidecar.planSparseRowCapacity(
+      capacity,
+      core::checkedSizeAdd(sidecar.sparseActiveRowCount(),
+                           transport.sparseRowsToActivate(state),
+                           "composition transport sparse row capacity"));
+  capacity.execute(governor, core::MemoryClass::kCanonicalPersistent, owner);
+}
 
 class RecursiveAmrLevelSourceAdapter final
     : public amr::RecursiveAmrLevelSourceOperator {
@@ -1245,6 +1263,13 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
       // post-hydro mass only for reconciliation inside commit().
       try {
         composition_flux->prepare(context.state);
+        admitCompositionSparseActivation(
+            context.state, *composition_flux, m_memory_governor,
+            "hydro.fixed_grid.adaptive_chemistry_rows");
+      } catch (const core::MemoryAdmissionError& error) {
+        staged_admissible = false;
+        staged_failure = std::string("composition sparse capacity: ") + error.what();
+        hydro_transaction.reject(core::StageRejectionKind::kResourceRefused, staged_failure);
       } catch (const std::exception& error) {
         staged_admissible = false;
         staged_failure = std::string("composition transport: ") + error.what();
@@ -2999,6 +3024,9 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
       // Single rank: the composition update is prepared (may throw = hard
       // stage failure) and committed immediately after the hydro sweep.
       composition_flux->prepare(context.state);
+      admitCompositionSparseActivation(
+          context.state, *composition_flux, m_memory_governor,
+          "hydro.amr.adaptive_chemistry_rows");
       m_last_composition_transport = composition_flux->commit(context.state);
       (void)physics::synchronizeMetalMirrorFromComposition(context.state, std::span<const std::uint32_t>{});
     }
@@ -3197,7 +3225,12 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
             context.state, record.gas_cell_id,
             std::span<const double>(record.lane_delta_code.data(), record.lane_count));
       }
-      if (composition_flux != nullptr) composition_flux->validatePrepared(context.state);
+      if (composition_flux != nullptr) {
+        composition_flux->validatePrepared(context.state);
+        admitCompositionSparseActivation(
+            context.state, *composition_flux, m_memory_governor,
+            "hydro.distributed_amr.adaptive_chemistry_rows");
+      }
     } catch (...) { failure = std::current_exception(); }
     m_mpi_context.rethrowCollectivePreparationFailure(failure, "distributed composition validation");
     if (composition_flux != nullptr) {

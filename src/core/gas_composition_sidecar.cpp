@@ -1,8 +1,12 @@
 #include "cosmosim/core/gas_composition_sidecar.hpp"
 
+#include <algorithm>
 #include <cmath>
+#include <limits>
 #include <stdexcept>
 #include <string_view>
+
+#include "cosmosim/core/retained_capacity_transaction.hpp"
 
 namespace cosmosim::core {
 
@@ -35,7 +39,10 @@ bool GasCompositionLayoutDescriptor::operator==(
 }
 
 void GasCompositionSidecar::configure(
-    const GasCompositionLayoutDescriptor& descriptor, std::size_t row_count) {
+    const GasCompositionLayoutDescriptor& descriptor,
+    std::size_t row_count,
+    std::uint32_t sparse_lane_begin,
+    std::span<const std::uint32_t> sparse_default_source_lanes) {
   if (!descriptor.isConsistent()) {
     throw std::invalid_argument(
         "GasCompositionSidecar::configure: inconsistent layout descriptor '" +
@@ -45,8 +52,31 @@ void GasCompositionSidecar::configure(
   if (!descriptor.enabled()) {
     return;
   }
+  if (sparse_lane_begin == GasCompositionLayoutDescriptor::k_no_lane) {
+    if (!sparse_default_source_lanes.empty()) {
+      throw std::invalid_argument(
+          "GasCompositionSidecar::configure: sparse defaults supplied without sparse lanes");
+    }
+  } else {
+    if (sparse_lane_begin >= descriptor.lane_count || sparse_default_source_lanes.empty() ||
+        sparse_default_source_lanes.size() > descriptor.lane_count - sparse_lane_begin) {
+      throw std::invalid_argument(
+          "GasCompositionSidecar::configure: invalid contiguous sparse lane range");
+    }
+    for (const std::uint32_t source : sparse_default_source_lanes) {
+      if (source != GasCompositionLayoutDescriptor::k_no_lane &&
+          (source >= sparse_lane_begin || source >= descriptor.lane_count)) {
+        throw std::invalid_argument(
+            "GasCompositionSidecar::configure: sparse implicit source must be an earlier dense lane");
+      }
+    }
+  }
   m_descriptor = descriptor;
   m_lanes.resize(descriptor.lane_count);
+  m_sparse_lane_begin = sparse_lane_begin;
+  m_sparse_lane_count = static_cast<std::uint32_t>(sparse_default_source_lanes.size());
+  m_sparse_default_source_lanes.assign(
+      sparse_default_source_lanes.begin(), sparse_default_source_lanes.end());
   resizeRows(row_count);
 }
 
@@ -54,6 +84,12 @@ void GasCompositionSidecar::clear() noexcept {
   m_descriptor = GasCompositionLayoutDescriptor{};
   m_lanes.clear();
   m_lanes.shrink_to_fit();
+  m_sparse_lane_begin = GasCompositionLayoutDescriptor::k_no_lane;
+  m_sparse_lane_count = 0U;
+  m_sparse_default_source_lanes.clear();
+  m_sparse_default_source_lanes.shrink_to_fit();
+  m_sparse_gas_cell_id = {};
+  m_sparse_values = {};
   gas_cell_id = {};
   chemistry_model_tag = {};
   ism_regime_tag = {};
@@ -76,8 +112,27 @@ void GasCompositionSidecar::resizeRows(std::size_t row_count) {
     }
     return;
   }
-  for (auto& values : m_lanes) {
-    values.resize(row_count, 0.0);
+  if (row_count < gas_cell_id.size() && sparseStorageEnabled()) {
+    std::size_t entry = 0U;
+    while (entry < m_sparse_gas_cell_id.size()) {
+      const std::uint64_t id = m_sparse_gas_cell_id[entry];
+      const bool retained = std::find(gas_cell_id.begin(), gas_cell_id.begin() + row_count, id) !=
+          gas_cell_id.begin() + row_count;
+      if (retained) {
+        ++entry;
+        continue;
+      }
+      m_sparse_gas_cell_id.erase(m_sparse_gas_cell_id.begin() + entry);
+      const auto first = m_sparse_values.begin() + entry * m_sparse_lane_count;
+      m_sparse_values.erase(first, first + m_sparse_lane_count);
+    }
+  }
+  for (std::size_t lane_index = 0; lane_index < m_lanes.size(); ++lane_index) {
+    if (isSparseLane(lane_index)) {
+      m_lanes[lane_index].clear();
+    } else {
+      m_lanes[lane_index].resize(row_count, 0.0);
+    }
   }
   gas_cell_id.resize(row_count, 0U);
   chemistry_model_tag.resize(row_count, 0U);
@@ -98,6 +153,10 @@ std::span<double> GasCompositionSidecar::lane(std::size_t lane_index) {
   if (lane_index >= m_lanes.size()) {
     throw std::out_of_range("GasCompositionSidecar::lane index out of range");
   }
+  if (isSparseLane(lane_index)) {
+    throw std::logic_error(
+        "GasCompositionSidecar::lane cannot expose a non-contiguous sparse lane; use value/setValue");
+  }
   return m_lanes[lane_index];
 }
 
@@ -105,19 +164,131 @@ std::span<const double> GasCompositionSidecar::lane(std::size_t lane_index) cons
   if (lane_index >= m_lanes.size()) {
     throw std::out_of_range("GasCompositionSidecar::lane index out of range");
   }
+  if (isSparseLane(lane_index)) {
+    throw std::logic_error(
+        "GasCompositionSidecar::lane cannot expose a non-contiguous sparse lane; use value/setValue");
+  }
   return m_lanes[lane_index];
 }
 
+bool GasCompositionSidecar::isSparseLane(std::size_t lane_index) const noexcept {
+  return sparseStorageEnabled() && lane_index >= m_sparse_lane_begin &&
+      lane_index < static_cast<std::size_t>(m_sparse_lane_begin) + m_sparse_lane_count;
+}
+
+bool GasCompositionSidecar::laneStoredDensely(std::size_t lane_index) const noexcept {
+  return lane_index < m_lanes.size() && !isSparseLane(lane_index);
+}
+
+std::size_t GasCompositionSidecar::requireRow(std::size_t row) const {
+  if (row >= rowCount()) {
+    throw std::out_of_range("GasCompositionSidecar row out of range");
+  }
+  return row;
+}
+
+std::size_t GasCompositionSidecar::sparseEntryForId(std::uint64_t id) const noexcept {
+  const auto it = std::lower_bound(m_sparse_gas_cell_id.begin(), m_sparse_gas_cell_id.end(), id);
+  return it != m_sparse_gas_cell_id.end() && *it == id
+      ? static_cast<std::size_t>(it - m_sparse_gas_cell_id.begin())
+      : m_sparse_gas_cell_id.size();
+}
+
+bool GasCompositionSidecar::hasExplicitSparseRow(std::size_t row) const {
+  requireRow(row);
+  return sparseStorageEnabled() &&
+      sparseEntryForId(gas_cell_id[row]) != m_sparse_gas_cell_id.size();
+}
+
+double GasCompositionSidecar::implicitSparseValue(
+    std::size_t lane_index, std::size_t row) const {
+  requireRow(row);
+  if (!isSparseLane(lane_index)) {
+    throw std::invalid_argument("GasCompositionSidecar::implicitSparseValue requires a sparse lane");
+  }
+  const std::uint32_t source =
+      m_sparse_default_source_lanes[lane_index - m_sparse_lane_begin];
+  return source == GasCompositionLayoutDescriptor::k_no_lane ? 0.0 : m_lanes[source][row];
+}
+
+std::uint32_t GasCompositionSidecar::sparseDefaultSourceLane(
+    std::size_t lane_index) const {
+  if (!isSparseLane(lane_index)) {
+    throw std::invalid_argument(
+        "GasCompositionSidecar::sparseDefaultSourceLane requires a sparse lane");
+  }
+  return m_sparse_default_source_lanes[lane_index - m_sparse_lane_begin];
+}
+
 double GasCompositionSidecar::value(std::size_t lane_index, std::size_t row) const {
-  return lane(lane_index)[row];
+  requireRow(row);
+  if (lane_index >= m_lanes.size()) {
+    throw std::out_of_range("GasCompositionSidecar::value lane out of range");
+  }
+  if (!isSparseLane(lane_index)) return m_lanes[lane_index][row];
+  const std::size_t entry = sparseEntryForId(gas_cell_id[row]);
+  return entry == m_sparse_gas_cell_id.size()
+      ? implicitSparseValue(lane_index, row)
+      : m_sparse_values[entry * m_sparse_lane_count + lane_index - m_sparse_lane_begin];
 }
 
 void GasCompositionSidecar::setValue(std::size_t lane_index, std::size_t row, double value) {
-  lane(lane_index)[row] = value;
+  requireRow(row);
+  if (lane_index >= m_lanes.size()) {
+    throw std::out_of_range("GasCompositionSidecar::setValue lane out of range");
+  }
+  if (!isSparseLane(lane_index)) {
+    m_lanes[lane_index][row] = value;
+    return;
+  }
+  std::size_t entry = sparseEntryForId(gas_cell_id[row]);
+  if (entry == m_sparse_gas_cell_id.size()) {
+    if (value == implicitSparseValue(lane_index, row)) return;
+    activateSparseRow(row);
+    entry = sparseEntryForId(gas_cell_id[row]);
+  }
+  m_sparse_values[entry * m_sparse_lane_count + lane_index - m_sparse_lane_begin] = value;
 }
 
 void GasCompositionSidecar::addValue(std::size_t lane_index, std::size_t row, double delta) {
-  lane(lane_index)[row] += delta;
+  setValue(lane_index, row, value(lane_index, row) + delta);
+}
+
+void GasCompositionSidecar::activateSparseRow(std::size_t row) {
+  requireRow(row);
+  if (!sparseStorageEnabled() || hasExplicitSparseRow(row)) return;
+  if (m_sparse_gas_cell_id.size() == m_sparse_gas_cell_id.capacity() ||
+      m_sparse_values.capacity() < m_sparse_lane_count ||
+      m_sparse_values.size() > m_sparse_values.capacity() - m_sparse_lane_count) {
+    throw std::logic_error(
+        "GasCompositionSidecar sparse activation exceeds pre-admitted capacity");
+  }
+  const std::uint64_t id = gas_cell_id[row];
+  if (id == 0U) {
+    throw std::logic_error(
+        "GasCompositionSidecar cannot activate sparse chemistry without a stable gas_cell_id");
+  }
+  const auto id_it = std::lower_bound(m_sparse_gas_cell_id.begin(), m_sparse_gas_cell_id.end(), id);
+  const std::size_t entry = static_cast<std::size_t>(id_it - m_sparse_gas_cell_id.begin());
+  m_sparse_gas_cell_id.insert(id_it, id);
+  m_sparse_values.insert(
+      m_sparse_values.begin() + entry * m_sparse_lane_count,
+      m_sparse_lane_count, 0.0);
+  for (std::size_t sparse = 0; sparse < m_sparse_lane_count; ++sparse) {
+    m_sparse_values[entry * m_sparse_lane_count + sparse] =
+        implicitSparseValue(m_sparse_lane_begin + sparse, row);
+  }
+}
+
+void GasCompositionSidecar::planSparseRowCapacity(
+    RetainedCapacityTransaction& plan, std::size_t target_rows) {
+  if (!sparseStorageEnabled() || target_rows <= sparseRowCapacity()) return;
+  if (target_rows > m_sparse_gas_cell_id.max_size() ||
+      target_rows > m_sparse_values.max_size() / m_sparse_lane_count) {
+    throw std::length_error("GasCompositionSidecar sparse capacity target is too large");
+  }
+  plan.add(m_sparse_gas_cell_id, target_rows);
+  plan.add(m_sparse_values, target_rows * m_sparse_lane_count);
 }
 
 double GasCompositionSidecar::elementMassSum(std::size_t row) const {
@@ -132,8 +303,16 @@ void GasCompositionSidecar::scaleRow(std::size_t row, double factor) {
   if (!(factor >= 0.0) || factor > 1.0 || !std::isfinite(factor)) {
     throw std::invalid_argument("GasCompositionSidecar::scaleRow factor must be in [0, 1]");
   }
-  for (auto& values : m_lanes) {
-    values[row] *= factor;
+  for (std::size_t lane_index = 0; lane_index < m_lanes.size(); ++lane_index) {
+    if (!isSparseLane(lane_index)) m_lanes[lane_index][row] *= factor;
+  }
+  if (sparseStorageEnabled()) {
+    const std::size_t entry = sparseEntryForId(gas_cell_id[row]);
+    if (entry != m_sparse_gas_cell_id.size()) {
+      for (std::size_t sparse = 0; sparse < m_sparse_lane_count; ++sparse) {
+        m_sparse_values[entry * m_sparse_lane_count + sparse] *= factor;
+      }
+    }
   }
 }
 
@@ -146,8 +325,8 @@ std::vector<double> GasCompositionSidecar::packRow(std::size_t row) const {
     throw std::out_of_range("GasCompositionSidecar::packRow row out of range");
   }
   payload.reserve(packedRowWidth());
-  for (const auto& values : m_lanes) {
-    payload.push_back(values[row]);
+  for (std::size_t lane_index = 0; lane_index < m_lanes.size(); ++lane_index) {
+    payload.push_back(value(lane_index, row));
   }
   payload.push_back(static_cast<double>(chemistry_model_tag[row]));
   payload.push_back(static_cast<double>(ism_regime_tag[row]));
@@ -160,6 +339,7 @@ std::vector<double> GasCompositionSidecar::packRow(std::size_t row) const {
   payload.push_back(chemistry_last_charge_residual[row]);
   payload.push_back(chemistry_cumulative_radiative_loss_erg[row]);
   payload.push_back(chemistry_cumulative_heating_gain_erg[row]);
+  payload.push_back(hasExplicitSparseRow(row) ? 1.0 : 0.0);
   return payload;
 }
 
@@ -182,10 +362,10 @@ void GasCompositionSidecar::unpackRow(
   if (row >= rowCount()) {
     throw std::out_of_range("GasCompositionSidecar::unpackRow row out of range");
   }
-  for (std::size_t l = 0; l < m_lanes.size(); ++l) {
-    m_lanes[l][row] = payload[l];
-  }
+  gas_cell_id[row] = gas_cell_id_value;
   const std::size_t meta = m_lanes.size();
+  if (sparseStorageEnabled() && payload[meta + 11U] != 0.0) activateSparseRow(row);
+  for (std::size_t l = 0; l < m_lanes.size(); ++l) setValue(l, row, payload[l]);
   chemistry_model_tag[row] = static_cast<std::uint8_t>(payload[meta]);
   ism_regime_tag[row] = static_cast<std::uint8_t>(payload[meta + 1U]);
   model_dwell_years[row] = payload[meta + 2U];
@@ -198,13 +378,18 @@ void GasCompositionSidecar::unpackRow(
   chemistry_cumulative_radiative_loss_erg[row] = payload[meta + 9U];
   chemistry_cumulative_heating_gain_erg[row] = payload[meta + 10U];
   mean_molecular_weight[row] = std::numeric_limits<double>::quiet_NaN();
-  gas_cell_id[row] = gas_cell_id_value;
 }
 
-GasCompositionSidecar GasCompositionSidecar::emptyLike(std::size_t row_count) const {
+GasCompositionSidecar GasCompositionSidecar::emptyLike(
+    std::size_t row_count, bool preserve_sparse_storage) const {
   GasCompositionSidecar result;
   if (enabled()) {
-    result.configure(m_descriptor, row_count);
+    result.configure(
+        m_descriptor, row_count,
+        preserve_sparse_storage ? m_sparse_lane_begin : GasCompositionLayoutDescriptor::k_no_lane,
+        preserve_sparse_storage
+            ? std::span<const std::uint32_t>(m_sparse_default_source_lanes)
+            : std::span<const std::uint32_t>{});
   }
   return result;
 }
@@ -248,9 +433,25 @@ bool GasCompositionSidecar::isConsistent(std::size_t expected_rows) const noexce
       mean_molecular_weight.size() != expected_rows) {
     return false;
   }
-  for (const auto& values : m_lanes) {
-    if (values.size() != expected_rows) return false;
+  for (std::size_t lane_index = 0; lane_index < m_lanes.size(); ++lane_index) {
+    const auto& values = m_lanes[lane_index];
+    if (values.size() != (isSparseLane(lane_index) ? 0U : expected_rows)) return false;
     for (const double v : values) {
+      if (!std::isfinite(v) || v < 0.0) return false;
+    }
+  }
+  if (m_sparse_default_source_lanes.size() != m_sparse_lane_count ||
+      m_sparse_values.size() != m_sparse_gas_cell_id.size() * m_sparse_lane_count ||
+      !std::is_sorted(m_sparse_gas_cell_id.begin(), m_sparse_gas_cell_id.end()) ||
+      std::adjacent_find(m_sparse_gas_cell_id.begin(), m_sparse_gas_cell_id.end()) !=
+          m_sparse_gas_cell_id.end()) {
+    return false;
+  }
+  for (std::size_t entry = 0; entry < m_sparse_gas_cell_id.size(); ++entry) {
+    if (std::find(gas_cell_id.begin(), gas_cell_id.end(), m_sparse_gas_cell_id[entry]) ==
+        gas_cell_id.end()) return false;
+    for (std::size_t sparse = 0; sparse < m_sparse_lane_count; ++sparse) {
+      const double v = m_sparse_values[entry * m_sparse_lane_count + sparse];
       if (!std::isfinite(v) || v < 0.0) return false;
     }
   }
@@ -274,6 +475,9 @@ bool GasCompositionSidecar::isConsistent(std::size_t expected_rows) const noexce
 std::uint64_t GasCompositionSidecar::ownedCapacityBytes() const noexcept {
   std::uint64_t bytes = 0U;
   for (const auto& values : m_lanes) bytes += values.capacity() * sizeof(double);
+  bytes += m_sparse_default_source_lanes.capacity() * sizeof(std::uint32_t);
+  bytes += m_sparse_gas_cell_id.capacity() * sizeof(std::uint64_t);
+  bytes += m_sparse_values.capacity() * sizeof(double);
   bytes += gas_cell_id.capacity() * sizeof(std::uint64_t);
   bytes += chemistry_model_tag.capacity() + ism_regime_tag.capacity();
   bytes += (model_dwell_years.capacity() + ism_regime_dwell_years.capacity() +
@@ -291,6 +495,9 @@ std::uint64_t GasCompositionSidecar::ownedCapacityBytes() const noexcept {
 std::uint64_t GasCompositionSidecar::currentSizeBytes() const noexcept {
   std::uint64_t bytes = 0U;
   for (const auto& values : m_lanes) bytes += values.size() * sizeof(double);
+  bytes += m_sparse_default_source_lanes.size() * sizeof(std::uint32_t);
+  bytes += m_sparse_gas_cell_id.size() * sizeof(std::uint64_t);
+  bytes += m_sparse_values.size() * sizeof(double);
   bytes += gas_cell_id.size() * sizeof(std::uint64_t);
   bytes += chemistry_model_tag.size() + ism_regime_tag.size();
   bytes += (model_dwell_years.size() + ism_regime_dwell_years.size() +

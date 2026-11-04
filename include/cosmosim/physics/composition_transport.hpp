@@ -100,6 +100,9 @@ class CompositionFluxAccumulator final : public hydro::HydroFaceMassFluxSink {
   void addInboundCorrection(const core::SimulationState& state, std::uint64_t gas_cell_id,
                             std::span<const double> lane_delta_code);
   void validatePrepared(const core::SimulationState& state);
+  // Exact number of currently implicit sparse rows whose transported state
+  // must become explicit at commit. Valid after validatePrepared().
+  [[nodiscard]] std::size_t sparseRowsToActivate(const core::SimulationState& state) const;
   CompositionTransportCommitReport commit(core::SimulationState& state) noexcept;
 
   [[nodiscard]] std::size_t recordCount() const noexcept { return m_records.size(); }

@@ -204,6 +204,8 @@ double condensableDustMass(const core::GasCompositionSidecar& sidecar, const Com
 void transferGasToDust(core::GasCompositionSidecar& sidecar, const CompositionLayout& layout, std::size_t row,
                        std::size_t d, double dust_mass_delta) {
   // dust_mass_delta > 0: gas -> dust; < 0: dust -> gas. Stoichiometric.
+  const bool detailed_row_was_explicit =
+      !sidecar.sparseStorageEnabled() || sidecar.hasExplicitSparseRow(row);
   const auto& fractions = dustElementMassFractions(static_cast<DustReservoir>(d));
   for (std::size_t e = 0; e < k_chemical_element_count; ++e) {
     if (fractions[e] <= 0.0) continue;
@@ -216,7 +218,8 @@ void transferGasToDust(core::GasCompositionSidecar& sidecar, const CompositionLa
   // transfers except carbon: C+ (and CO) track gas-phase carbon in the
   // detailed network, so the carbon removed/returned is applied to C+.
   if (fractions[static_cast<std::size_t>(ChemicalElement::kC)] > 0.0 &&
-      sidecar.descriptor().species_lane_count >= k_detailed_species_count) {
+      sidecar.descriptor().species_lane_count >= k_detailed_species_count &&
+      detailed_row_was_explicit) {
     const std::uint32_t cii = layout.speciesLane(static_cast<std::size_t>(ChemicalSpecies::kCII));
     const double delta_c = fractions[static_cast<std::size_t>(ChemicalElement::kC)] * dust_mass_delta;
     sidecar.setValue(cii, row, std::max(sidecar.value(cii, row) - delta_c, 0.0));

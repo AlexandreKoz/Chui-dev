@@ -483,9 +483,9 @@ configuration (identical on every rank, required for collective single-file
 HDF5); an absent dataset means the physics is disabled, never zero.
 
 `/PartType0` (when the run carries a composition sidecar; attribute
-`CHUI_CompositionSchemaVersion = 2`, `CHUI_CompositionLayoutName`,
+`CHUI_CompositionSchemaVersion = 3`, `CHUI_CompositionLayoutName`,
 `CHUI_ElementNames`, `CHUI_SpeciesNames`, `CHUI_DustNames`,
-`CHUI_CompositionFractionBasis`):
+`CHUI_CompositionFractionBasis`, `CHUI_DetailedChemistryStorage`):
 
 | Dataset | Shape | Meaning |
 |---|---|---|
@@ -495,6 +495,7 @@ HDF5); an absent dataset means the physics is disabled, never zero.
 | `CHUI_SgsSpecificEnergy` | [N] | SGS energy / gas mass (code units), when the SGS lane exists |
 | `CHUI_MeanMolecularWeight` | [N] | cached mu (amu); NaN = unknown (rebuilt by chemistry) |
 | `CHUI_ChemistryModelTag`, `CHUI_IsmRegimeTag` | [N] u8 | adaptive chemistry fidelity / ISM regime tags |
+| `CHUI_DetailedChemistryStateMaterialized` | [N] u8 | 1 when the adaptive C+/CO history has an explicit stable-ID sparse row; 0 means the documented implicit C+=element-C, CO=0 projection (or dense-reference storage selected by the group attribute) |
 | `CHUI_ChemistryModelDwellYears`, `CHUI_IsmRegimeDwellYears` | [N] | hysteresis dwell |
 | `CHUI_ChemistryLastTemperatureK`, `CHUI_ChemistryLastCoolingTimeSeconds` | [N] | last accepted local thermal/timescale history; 0 means unavailable/no finite cooling time |
 | `CHUI_ChemistryLastErrorEstimate`, `CHUI_ChemistryLastElementFractionResidual`, `CHUI_ChemistryLastChargeResidual` | [N] | last accepted normalized integration error and dimensionless conservation residuals used by C03 selection |

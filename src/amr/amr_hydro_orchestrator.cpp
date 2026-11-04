@@ -7,6 +7,7 @@
 #include "amr/internal/amr_periodic_topology.hpp"
 #include "cosmosim/core/memory_accounting.hpp"
 #include "cosmosim/core/governed_scratch_arena.hpp"
+#include "cosmosim/core/retained_capacity_transaction.hpp"
 
 #include <algorithm>
 #include <array>
@@ -846,18 +847,47 @@ struct CompositionRegridPlan {
 };
 
 [[nodiscard]] std::uint64_t compositionCandidateBytes(
-    const core::SimulationState& state, std::size_t candidate_rows, std::size_t plan_entries) {
+    const core::SimulationState& state, std::size_t candidate_rows,
+    std::size_t sparse_candidate_rows, std::size_t plan_entries) {
   if (!state.gas_composition.enabled()) {
     return 0U;
   }
+  const std::size_t dense_lanes = state.gas_composition.laneCount() -
+      state.gas_composition.sparseLaneCount();
   const std::size_t per_row = core::checkedSizeAdd(
-      core::checkedSizeMultiply(state.gas_composition.laneCount(), sizeof(double), "composition lanes"),
+      core::checkedSizeMultiply(dense_lanes, sizeof(double), "dense composition lanes"),
       sizeof(std::uint64_t) + 2U * sizeof(std::uint8_t) + 10U * sizeof(double),
       "composition row bytes");
-  return core::checkedMemoryBytesAdd(
+  const std::uint64_t dense_bytes = core::checkedMemoryBytesAdd(
       static_cast<std::uint64_t>(core::checkedSizeMultiply(candidate_rows, per_row, "composition candidate bytes")),
       CompositionRegridPlan::workspaceBytes(candidate_rows, plan_entries),
       "composition regrid bytes");
+  const std::size_t sparse_row_bytes = core::checkedSizeAdd(
+      sizeof(std::uint64_t),
+      core::checkedSizeMultiply(state.gas_composition.sparseLaneCount(), sizeof(double),
+                                "sparse composition values"),
+      "sparse composition row bytes");
+  return core::checkedMemoryBytesAdd(
+      dense_bytes,
+      static_cast<std::uint64_t>(core::checkedSizeMultiply(
+          sparse_candidate_rows, sparse_row_bytes, "sparse composition candidate bytes")),
+      "composition regrid sparse bytes");
+}
+
+[[nodiscard]] std::size_t sparseRowsForRegridPlan(
+    const core::GasCompositionSidecar& old,
+    const CompositionRegridPlan& plan) {
+  if (!old.sparseStorageEnabled()) return 0U;
+  std::size_t count = 0U;
+  for (std::size_t row = 0; row < plan.rowCount(); ++row) {
+    for (std::uint32_t entry = plan.offsets[row]; entry < plan.offsets[row + 1U]; ++entry) {
+      if (old.hasExplicitSparseRow(plan.source_rows[entry])) {
+        ++count;
+        break;
+      }
+    }
+  }
+  return count;
 }
 
 // Build the candidate composition sidecar aligned to candidate rows.
@@ -881,11 +911,19 @@ struct CompositionRegridPlan {
   }
   old.requireAlignedWith(old_state.gas_cells.gas_cell_id, "composition regrid source");
   core::GasCompositionSidecar result = old.emptyLike(candidate.cells.size());
+  if (result.sparseStorageEnabled()) {
+    core::RetainedCapacityTransaction sparse_capacity(
+        [&result] { return result.ownedCapacityBytes(); });
+    result.planSparseRowCapacity(sparse_capacity, sparseRowsForRegridPlan(old, plan));
+    sparse_capacity.execute(nullptr, core::MemoryClass::kCanonicalPersistent,
+                            "amr.regrid.adaptive_chemistry_rows");
+  }
   const std::size_t lanes = old.laneCount();
   std::vector<double> before(lanes, 0.0);
   std::vector<double> scale(lanes, 0.0);
   for (std::size_t lane = 0; lane < lanes; ++lane) {
-    for (const double value : old.lane(lane)) {
+    for (std::size_t row = 0; row < old.rowCount(); ++row) {
+      const double value = old.value(lane, row);
       before[lane] += value;
       scale[lane] += std::abs(value);
     }
@@ -897,6 +935,12 @@ struct CompositionRegridPlan {
       throw std::logic_error("composition regrid plan row has no source");
     }
     result.gas_cell_id[row] = candidate.gas_cells.gas_cell_id[row];
+    for (std::uint32_t entry = begin; entry < end; ++entry) {
+      if (old.hasExplicitSparseRow(plan.source_rows[entry])) {
+        result.activateSparseRow(row);
+        break;
+      }
+    }
     for (std::size_t lane = 0; lane < lanes; ++lane) {
       double value = 0.0;
       for (std::uint32_t entry = begin; entry < end; ++entry) {
@@ -931,7 +975,7 @@ struct CompositionRegridPlan {
       result.mean_molecular_weight[row] = old.mean_molecular_weight[src];
       continue;
     }
-    std::uint8_t tag = 0U;
+    std::uint8_t tag = old.chemistry_model_tag[plan.source_rows[begin]];
     double dwell = std::numeric_limits<double>::infinity();
     double regime_dwell = std::numeric_limits<double>::infinity();
     double minimum_cooling_time = std::numeric_limits<double>::infinity();
@@ -943,7 +987,9 @@ struct CompositionRegridPlan {
     std::uint32_t heaviest = plan.source_rows[begin];
     for (std::uint32_t entry = begin; entry < end; ++entry) {
       const std::uint32_t src = plan.source_rows[entry];
-      tag = std::max(tag, old.chemistry_model_tag[src]);
+      // Tag 0 is detailed and tag 1 is hybrid: restriction retains the most
+      // detailed source so an explicit molecular history is never hidden.
+      tag = std::min(tag, old.chemistry_model_tag[src]);
       dwell = std::min(dwell, old.model_dwell_years[src]);
       regime_dwell = std::min(regime_dwell, old.ism_regime_dwell_years[src]);
       const double cooling_time = old.chemistry_last_cooling_time_seconds[src];
@@ -985,7 +1031,8 @@ struct CompositionRegridPlan {
   }
   for (std::size_t lane = 0; lane < lanes; ++lane) {
     double after = 0.0;
-    for (const double value : result.lane(lane)) {
+    for (std::size_t row = 0; row < result.rowCount(); ++row) {
+      const double value = result.value(lane, row);
       if (value < 0.0 || !std::isfinite(value)) {
         throw std::runtime_error("composition regrid produced a negative or non-finite lane value");
       }
@@ -3892,7 +3939,12 @@ ProductionAmrRegridDiagnostics refineProductionPatchInSimulationState(
           "production AMR refine diagnostic row scratch bytes"),
       "production AMR refine row scratch bytes");
   const std::uint64_t refine_composition_bytes =
-      compositionCandidateBytes(state, new_cell_count, new_cell_count);
+      compositionCandidateBytes(
+          state, new_cell_count,
+          std::min(new_cell_count,
+                   core::checkedSizeMultiply(state.gas_composition.sparseActiveRowCount(), 8U,
+                                             "refine sparse composition row bound")),
+          new_cell_count);
   ProductionAmrRegridAdmission admission = admitProductionAmrRegrid(
       state, options,
       productionAmrCandidateReservationBytes(new_cell_count, new_patch_count,
@@ -4106,7 +4158,10 @@ ProductionAmrRegridDiagnostics derefineProductionPatchInSimulationState(
   const std::size_t derefine_plan_entries = core::checkedSizeAdd(
       kept_cell_count, child_cell_count, "production AMR derefine composition entries");
   const std::uint64_t derefine_composition_bytes =
-      compositionCandidateBytes(state, kept_cell_count, derefine_plan_entries);
+      compositionCandidateBytes(
+          state, kept_cell_count,
+          std::min(kept_cell_count, state.gas_composition.sparseActiveRowCount()),
+          derefine_plan_entries);
   ProductionAmrRegridAdmission admission = admitProductionAmrRegrid(
       state, options,
       productionAmrCandidateReservationBytes(kept_cell_count, kept_patch_count,
