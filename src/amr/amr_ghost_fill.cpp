@@ -1,5 +1,6 @@
 #include "cosmosim/amr/amr_ghost_fill.hpp"
 #include "amr/internal/amr_retained_state_admission.hpp"
+#include "amr/internal/amr_periodic_topology.hpp"
 
 #include <algorithm>
 #include <array>
@@ -155,12 +156,24 @@ struct CellSelection {
                       (ijk[1] + static_cast<std::size_t>(patch.cell_dims[1]) * ijk[2]);
 }
 
+[[nodiscard]] internal::AmrPeriodicFrame frameForTarget(const AmrHydroGhostFillPatch& target) {
+  const auto& extent = target.periodic_box_extent_comoving;
+  return internal::makeAmrPeriodicFrame(
+      extent[0] > 0.0 || extent[1] > 0.0 || extent[2] > 0.0, extent);
+}
+
+// Probe point of a ghost at distance `layer` cell widths from its owner along
+// the outward normal, canonicalized into the periodic box (Part 3: wrapped
+// neighbours across the box boundary resolve to their real patch).
 [[nodiscard]] std::array<double, 3> ghostProbePoint(
     const AmrHydroPatchGeometry& patch_geometry,
-    const hydro::HydroGhostCell& ghost) {
+    const hydro::HydroGhostCell& ghost,
+    std::uint8_t layer,
+    const internal::AmrPeriodicFrame& frame) {
   std::array<double, 3> point = cellCenter(patch_geometry.patch, ghost.owner_real_cell);
-  point[axisIndex(ghost.axis)] += sideSign(ghost.side) * cellWidth(patch_geometry.geometry, ghost.axis);
-  return point;
+  point[axisIndex(ghost.axis)] += sideSign(ghost.side) * static_cast<double>(std::max<std::uint8_t>(layer, 1U)) *
+      cellWidth(patch_geometry.geometry, ghost.axis);
+  return internal::wrapPoint(frame, point);
 }
 
 
@@ -196,15 +209,22 @@ struct CellSelection {
 
 [[nodiscard]] std::array<std::array<double, 3>, 2> ghostCellBounds(
     const PatchDescriptor& target_patch,
-    const hydro::HydroGhostCell& ghost) {
+    const hydro::HydroGhostCell& ghost,
+    std::uint8_t layer,
+    const internal::AmrPeriodicFrame& frame) {
   auto center = cellCenter(target_patch, ghost.owner_real_cell);
   const auto target_widths = patchCellWidths(target_patch);
-  center[axisIndex(ghost.axis)] +=
-      sideSign(ghost.side) * target_widths[axisIndex(ghost.axis)];
+  center[axisIndex(ghost.axis)] += sideSign(ghost.side) *
+      static_cast<double>(std::max<std::uint8_t>(layer, 1U)) * target_widths[axisIndex(ghost.axis)];
   std::array<std::array<double, 3>, 2> bounds{};
   for (std::size_t axis = 0; axis < 3U; ++axis) {
     bounds[0][axis] = center[axis] - 0.5 * target_widths[axis];
     bounds[1][axis] = center[axis] + 0.5 * target_widths[axis];
+    // A ghost volume beyond a periodic box face is the wrapped volume of the
+    // neighbour on the opposite side (one rigid shift by +-L).
+    const double shift = internal::intervalWrapShift(frame, axis, bounds[0][axis], bounds[1][axis]);
+    bounds[0][axis] += shift;
+    bounds[1][axis] += shift;
   }
   return bounds;
 }
@@ -213,11 +233,13 @@ template <class TVisit>
 void forEachFineSourceCellIntersectingGhost(
     const PatchDescriptor& target_patch,
     const hydro::HydroGhostCell& ghost,
+    std::uint8_t layer,
+    const internal::AmrPeriodicFrame& frame,
     const PatchDescriptor& source_patch, TVisit&& visit) {
   if (source_patch.level <= target_patch.level) {
     return;
   }
-  const auto bounds = ghostCellBounds(target_patch, ghost);
+  const auto bounds = ghostCellBounds(target_patch, ghost, layer, frame);
   const auto source_widths = patchCellWidths(source_patch);
   std::array<std::size_t, 3> begin{};
   std::array<std::size_t, 3> end{};
@@ -257,6 +279,8 @@ void forEachFineSourceCellIntersectingGhost(
 void validateAndOrderFineSourceCoverage(
     const PatchDescriptor& target_patch,
     const hydro::HydroGhostCell& ghost,
+    std::uint8_t layer,
+    const internal::AmrPeriodicFrame& frame,
     CellSelection& selection) {
   if (selection.cells.empty()) {
     return;
@@ -288,7 +312,7 @@ void validateAndOrderFineSourceCoverage(
   const std::size_t expected_count = core::checkedSizeProduct3(
       refinement_ratio[0], refinement_ratio[1], refinement_ratio[2],
       "fillAmrHydroGhostCells complete fine-source stencil size");
-  const auto bounds = ghostCellBounds(target_patch, ghost);
+  const auto bounds = ghostCellBounds(target_patch, ghost, layer, frame);
 
   for (SelectedSourceCell& selected : selection.cells) {
     const PatchDescriptor& source = sourcePatch(selected);
@@ -401,11 +425,16 @@ void requireSourceCellAvailable(
 [[nodiscard]] CellSelection selectSourceCells(
     const AmrHydroGhostFillPatch& target,
     const hydro::HydroGhostCell& ghost,
+    std::uint8_t layer,
     AmrHydroBoundaryClass boundary_class,
     std::span<AmrHydroGhostFillPatch> patches,
     std::span<const AmrHydroSparseGhostSource> remote_sources,
     CellSelection& selection) {
-  const auto probe = ghostProbePoint(*target.geometry, ghost);
+  const internal::AmrPeriodicFrame frame = frameForTarget(target);
+  const auto probe = ghostProbePoint(*target.geometry, ghost, layer, frame);
+  // Deep stencil-only layers (layer > 1) may cross into a patch of another
+  // level than the face-adjacent layer; any legal level relation is accepted.
+  const bool any_relation = layer > 1U;
   const PatchDescriptor& target_patch = target.geometry->patch;
   selection.cells.clear();
 
@@ -423,10 +452,10 @@ void requireSourceCellAvailable(
     }
     const bool same_level =
         source_patch.level == target_patch.level &&
-        boundary_class == AmrHydroBoundaryClass::kSameLevel;
+        (any_relation || boundary_class == AmrHydroBoundaryClass::kSameLevel);
     const bool coarse_to_fine =
         source_patch.level < target_patch.level &&
-        boundary_class == AmrHydroBoundaryClass::kCoarseFine;
+        (any_relation || boundary_class == AmrHydroBoundaryClass::kCoarseFine);
     if (!same_level && !coarse_to_fine) {
       continue;
     }
@@ -449,10 +478,10 @@ void requireSourceCellAvailable(
     }
     const bool same_level =
         source_patch.level == target_patch.level &&
-        boundary_class == AmrHydroBoundaryClass::kSameLevel;
+        (any_relation || boundary_class == AmrHydroBoundaryClass::kSameLevel);
     const bool coarse_to_fine =
         source_patch.level < target_patch.level &&
-        boundary_class == AmrHydroBoundaryClass::kCoarseFine;
+        (any_relation || boundary_class == AmrHydroBoundaryClass::kCoarseFine);
     if (!same_level && !coarse_to_fine) {
       continue;
     }
@@ -467,7 +496,7 @@ void requireSourceCellAvailable(
     return selection;
   }
 
-  if (boundary_class != AmrHydroBoundaryClass::kCoarseFine) {
+  if (!any_relation && boundary_class != AmrHydroBoundaryClass::kCoarseFine) {
     return selection;
   }
 
@@ -481,7 +510,7 @@ void requireSourceCellAvailable(
       continue;
     }
     forEachFineSourceCellIntersectingGhost(
-        target_patch, ghost, source_patch, [&](std::size_t cell) {
+        target_patch, ghost, layer, frame, source_patch, [&](std::size_t cell) {
       requireSourceCellAvailable(candidate, cell);
       selection.cells.push_back(SelectedSourceCell{
           .patch = &candidate,
@@ -499,7 +528,7 @@ void requireSourceCellAvailable(
       continue;
     }
     forEachFineSourceCellIntersectingGhost(
-        target_patch, ghost, source_patch, [&](std::size_t cell) {
+        target_patch, ghost, layer, frame, source_patch, [&](std::size_t cell) {
       if (findSparseRemoteCell(candidate, cell) == nullptr) {
         throw std::runtime_error(
             "fillAmrHydroGhostCells: sparse remote fine-to-coarse payload is missing a required source cell");
@@ -510,7 +539,7 @@ void requireSourceCellAvailable(
     });
   }
 
-  validateAndOrderFineSourceCoverage(target_patch, ghost, selection);
+  validateAndOrderFineSourceCoverage(target_patch, ghost, layer, frame, selection);
   return selection;
 }
 
@@ -697,7 +726,29 @@ void fillAmrGhost(
     CellSelection& selection) {
   const hydro::HydroGhostCell& ghost =
       target.geometry->geometry.ghost_cells.at(descriptor.ghost_slot);
-  selectSourceCells(target, ghost, descriptor.boundary_class, patches, remote_sources, selection);
+  selectSourceCells(target, ghost, descriptor.ghost_layer, descriptor.boundary_class,
+                    patches, remote_sources, selection);
+  if (selection.cells.empty() && descriptor.ghost_layer > 1U) {
+    // Deep stencil-only layer whose probe leaves every patch (non-periodic
+    // domain edge behind a thin neighbour patch): zero-gradient continuation
+    // of the previous layer of the same column, i.e. an explicit, counted
+    // first-order reduction of that reconstruction stencil. Never used for
+    // a face-adjacent ghost (those must resolve or fail closed below).
+    for (const AmrHydroGhostDescriptor& previous : target.geometry->ghosts) {
+      if (previous.ghost_layer + 1U != descriptor.ghost_layer) continue;
+      const hydro::HydroGhostCell& previous_ghost =
+          target.geometry->geometry.ghost_cells.at(previous.ghost_slot);
+      if (previous_ghost.owner_real_cell != ghost.owner_real_cell ||
+          previous_ghost.axis != ghost.axis || previous_ghost.side != ghost.side) {
+        continue;
+      }
+      target.conserved->storeCell(descriptor.ghost_cell,
+                                  target.conserved->loadCell(previous.ghost_cell));
+      descriptor.fill_status = AmrHydroGhostFillStatus::kFilledDeepLayerExtrapolated;
+      ++diagnostics.deep_layer_extrapolated_ghosts;
+      return;
+    }
+  }
   if (selection.cells.empty()) {
     descriptor.fill_status = AmrHydroGhostFillStatus::kMissingSource;
     ++diagnostics.missing_source_records;

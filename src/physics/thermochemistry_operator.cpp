@@ -170,6 +170,21 @@ ThermochemistryRowResult ThermochemistryOperator::advanceRow(const core::Simulat
   return result;
 }
 
+void ThermochemistryOperator::setGlobalPromotionBias(double bias) {
+  if (!std::isfinite(bias) || bias < 0.0) {
+    throw std::invalid_argument("chemistry promotion bias must be finite and >= 0");
+  }
+  m_promotion_bias = bias;
+}
+
+double nextChemistryPromotionBias(double bias, double global_max_shadow_difference,
+                                  std::uint64_t global_samples) noexcept {
+  if (global_samples == 0U || !std::isfinite(global_max_shadow_difference)) return bias;
+  if (global_max_shadow_difference > 0.1) return std::min(bias + 0.5, 4.0);
+  if (global_max_shadow_difference < 0.01) return std::max(bias - 0.25, 0.0);
+  return bias;
+}
+
 ChemistryFidelityDecision ThermochemistryOperator::decideChemistryFidelity(
     const core::SimulationState& state, const SourceInterval& interval, std::uint32_t row) const {
   const auto& sidecar = state.gas_composition;
@@ -177,7 +192,14 @@ ChemistryFidelityDecision ThermochemistryOperator::decideChemistryFidelity(
   decision.tag = sidecar.chemistry_model_tag[row];
   decision.dwell_years = sidecar.model_dwell_years[row];
   if (!m_config.adaptive.enabled) return decision;
-  const ChemistryAdaptiveConfig& c = m_config.adaptive;
+  ChemistryAdaptiveConfig c = m_config.adaptive;
+  {
+    const double s = 1.0 + m_promotion_bias;
+    c.cold_temperature_k *= s;
+    c.dense_n_h_cm3 /= s;
+    c.molecular_fraction_threshold /= s;
+    c.co_carbon_fraction_threshold /= s;
+  }
   const double h = c.hysteresis_fraction;
   const ThermochemistryCellInput input = cellInput(state, row, interval);
   const double n_h = input.gas_element_mass_fraction[0] * input.mass_density_cgs /

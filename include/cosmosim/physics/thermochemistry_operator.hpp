@@ -148,6 +148,17 @@ class ThermochemistryOperator {
                                                                   const SourceInterval& interval,
                                                                   std::uint32_t row) const;
 
+  // CHUI Part 3 (C03/C04 RESEARCH, EXPERIMENTAL/UNQUALIFIED): globally
+  // synchronized, error-aware widening of the detailed-chemistry region.
+  // promotion_bias b >= 0 scales the promotion thresholds by s = 1 + b
+  // (cold: T < T_cold s, dense: n_H > n_dense / s, molecular / CO fractions
+  // divided by s) and the demotion thresholds identically, so hysteresis is
+  // preserved. The runtime derives b from the GLOBAL (MPI-max) sampled
+  // shadow disagreement of the previous accepted step, identically on every
+  // rank, and persists it (restart-reproducible). b = 0 is the Part 2 model.
+  void setGlobalPromotionBias(double bias);
+  [[nodiscard]] double globalPromotionBias() const noexcept { return m_promotion_bias; }
+
   [[nodiscard]] const ThermochemistrySolver& solver() const noexcept { return m_solver; }
   [[nodiscard]] const CompositionLayout& layout() const noexcept { return m_layout; }
   [[nodiscard]] const ThermochemistryOperatorConfig& config() const noexcept { return m_config; }
@@ -162,6 +173,14 @@ class ThermochemistryOperator {
   ThermochemistrySolver m_solver;
   std::unique_ptr<ThermochemistrySolver> m_hybrid_solver;     // adaptive demoted rows
   std::unique_ptr<ThermochemistrySolver> m_reference_solver;  // shadow reference
+  double m_promotion_bias = 0.0;
 };
+
+// Deterministic control law of the global promotion bias from the global
+// maximum relative shadow species difference (exposed for tests):
+//   d > 0.1  -> b + 0.5 (capped at 4),  d < 0.01 -> b - 0.25 (floored at 0),
+//   otherwise unchanged; no samples -> unchanged.
+[[nodiscard]] double nextChemistryPromotionBias(double bias, double global_max_shadow_difference,
+                                                std::uint64_t global_samples) noexcept;
 
 }  // namespace cosmosim::physics

@@ -702,6 +702,21 @@ parseInitialConditionMissingFieldPolicy(
                     "' (expected off or thermal_fraction)");
 }
 
+[[nodiscard]] SspWindModelConfig parseSspWindModelConfig(const std::string& value) {
+  const std::string lower = toLower(trim(value));
+  if (lower == "none") return SspWindModelConfig::kNone;
+  if (lower == "table_v1") return SspWindModelConfig::kTableV1;
+  throw ConfigError("key 'physics.ssp_wind_model': invalid value '" + value + "' (expected none or table_v1)");
+}
+
+[[nodiscard]] AmrRegridConfigMode parseAmrRegridConfigMode(const std::string& value) {
+  const std::string lower = toLower(trim(value));
+  if (lower == "off") return AmrRegridConfigMode::kOff;
+  if (lower == "automatic") return AmrRegridConfigMode::kAutomatic;
+  throw ConfigError("key 'numerics.amr_regrid_mode': invalid value '" + value +
+                    "' (expected off or automatic)");
+}
+
 [[nodiscard]] NodeMemoryAdmissionMode parseNodeMemoryAdmissionMode(const std::string& value) {
   const std::string lower = toLower(trim(value));
   if (lower == "off") return NodeMemoryAdmissionMode::kOff;
@@ -1407,6 +1422,15 @@ struct ConfigKeySpec {
       {"numerics.hierarchical_encounter_timestep_enabled", "true"},
       {"numerics.gravity_timestep_eta", "0.2"},
       {"numerics.amr_max_level", "10"},
+      {"numerics.amr_regrid_mode", "off"},
+      {"numerics.global_step_max_retries", "0"},
+      {"numerics.amr_predictive_feedback_age_years", "0.0"},
+      {"numerics.amr_regrid_interval_steps", "1"},
+      {"numerics.amr_regrid_max_operations", "64"},
+      {"numerics.amr_refine_cell_mass_code", "0.0"},
+      {"numerics.amr_refine_jump_threshold", "0.0"},
+      {"numerics.amr_refine_jeans_cells", "4.0"},
+      {"numerics.amr_derefine_hysteresis", "0.5"},
       {"numerics.gravity_softening", "1.0 kpc"},
       {"numerics.gravity_softening_gas", ""},
       {"numerics.gravity_softening_dark_matter", ""},
@@ -1601,6 +1625,11 @@ struct ConfigKeySpec {
       {"physics.thermochemistry_allow_unqualified_rates", "false"},
       {"physics.ssp_stochastic_sn_events", "true"},
       {"physics.ssp_clustered_associations", "false"},
+      {"physics.ssp_association_radius_code", "0.0"},
+      {"physics.ssp_association_time_window_years", "3.0e6"},
+      {"physics.ssp_wind_model", "none"},
+      {"physics.ssp_wind_table_path", ""},
+      {"physics.ssp_wind_table_sha256", ""},
       {"output.run_name", "cosmosim_run"},
       {"output.output_directory", "outputs"},
       {"output.output_stem", "snapshot"},
@@ -1722,12 +1751,10 @@ void validatePart2BaryonicPhysics(const SimulationConfig& config) {
         "docs/chemistry_rate_provenance.md). Set physics.thermochemistry_allow_unqualified_rates = true to run it "
         "as an explicitly unqualified research model");
   }
-  if (part2 && p.enable_metal_diffusion) {
-    throw ConfigError(
-        "physics.enable_metal_diffusion diffuses total Z only; with element-resolved composition the Z mirror is "
-        "derived from element lanes, so element-resolved diffusion is required and is not implemented yet "
-        "(refused instead of silently discarding the diffusion)");
-  }
+  // CHUI Part 3: with an element-resolved composition sidecar,
+  // physics.enable_metal_diffusion selects the element-resolved mixing
+  // operator (physics/element_diffusion.hpp); the total-Z mirror is derived
+  // from the mixed lanes. The Part 2 refusal is lifted.
   if (part2 && !p.enable_cooling) {
     throw ConfigError("a Part 2 thermochemistry_backend requires physics.enable_cooling=true");
   }
@@ -1873,10 +1900,29 @@ void validatePart2BaryonicPhysics(const SimulationConfig& config) {
         "a Part 2 stellar_population_model deposits element/dust-resolved ejecta through "
         "fb_supernova_model=mechanical_resolved_unresolved (the legacy deposition cannot carry them)");
   }
-  if (p.ssp_clustered_associations) {
+  // CHUI Part 3: correlated associations (RESEARCH, EXPERIMENTAL/UNQUALIFIED).
+  if (!std::isfinite(p.ssp_association_radius_code) || p.ssp_association_radius_code < 0.0 ||
+      !std::isfinite(p.ssp_association_time_window_years) || !(p.ssp_association_time_window_years > 0.0)) {
+    throw ConfigError("physics.ssp_association_radius_code must be >= 0 and ssp_association_time_window_years > 0");
+  }
+  if (p.ssp_clustered_associations &&
+      (p.ssp_association_radius_code == 0.0 || p.stellar_population_model == StellarPopulationModelConfig::kLegacyTable)) {
     throw ConfigError(
-        "physics.ssp_clustered_associations=true is not implemented (it would have no effect); "
-        "refused instead of silently ignoring the request");
+        "physics.ssp_clustered_associations=true requires ssp_association_radius_code > 0 and a Part 2 "
+        "stellar_population_model (associations group SSP feedback sources)");
+  }
+  if (p.ssp_wind_model == SspWindModelConfig::kTableV1) {
+    require_checksum(p.ssp_wind_table_path, p.ssp_wind_table_sha256, "ssp_wind_table");
+    if (p.ssp_wind_table_path.empty() || p.stellar_population_model == StellarPopulationModelConfig::kLegacyTable) {
+      throw ConfigError("physics.ssp_wind_model=table_v1 requires ssp_wind_table_path (+ sha256) and a Part 2 "
+                        "stellar_population_model");
+    }
+    if (p.fb_presn_wind_momentum_lsun_per_c > 0.0) {
+      throw ConfigError("physics.ssp_wind_model=table_v1 and fb_presn_wind_momentum_lsun_per_c > 0 would count "
+                        "pre-SN momentum twice; select one channel");
+    }
+  } else if (!p.ssp_wind_table_path.empty()) {
+    throw ConfigError("physics.ssp_wind_table_path is set but ssp_wind_model = none (it would have no effect)");
   }
   if (p.fb_supernova_model == SupernovaFeedbackModelConfig::kMechanicalResolvedUnresolved &&
       p.stellar_population_model == StellarPopulationModelConfig::kLegacyTable) {
@@ -2057,6 +2103,41 @@ void validateConfig(const SimulationConfig& config) {
       config.numerics.hydro_dual_energy_eta <= 0.0 ||
       config.numerics.hydro_dual_energy_eta >= 1.0) {
     throw ConfigError("numerics.hydro_dual_energy_eta must be finite and in (0, 1)");
+  }
+  if (!std::isfinite(config.numerics.amr_predictive_feedback_age_years) ||
+      config.numerics.amr_predictive_feedback_age_years < 0.0 ||
+      (config.numerics.amr_predictive_feedback_age_years > 0.0 &&
+       config.numerics.amr_regrid_mode != AmrRegridConfigMode::kAutomatic)) {
+    throw ConfigError("numerics.amr_predictive_feedback_age_years must be >= 0 and requires amr_regrid_mode = automatic");
+  }
+  if (config.numerics.global_step_max_retries < 0 || config.numerics.global_step_max_retries > 32) {
+    throw ConfigError("numerics.global_step_max_retries must be in [0, 32]");
+  }
+  if (config.numerics.global_step_max_retries > 0 && config.numerics.hierarchical_max_rung > 0) {
+    throw ConfigError("numerics.global_step_max_retries > 0 is implemented for the rung-zero (global KDK) driver "
+                      "only; hierarchical runs use the multirate PM cycle transaction");
+  }
+  // CHUI Part 3 automatic AMR regrid.
+  if (config.numerics.amr_regrid_interval_steps < 1 || config.numerics.amr_regrid_max_operations < 1) {
+    throw ConfigError("numerics.amr_regrid_interval_steps and numerics.amr_regrid_max_operations must be >= 1");
+  }
+  if (!std::isfinite(config.numerics.amr_refine_cell_mass_code) || config.numerics.amr_refine_cell_mass_code < 0.0 ||
+      !std::isfinite(config.numerics.amr_refine_jump_threshold) || config.numerics.amr_refine_jump_threshold < 0.0 ||
+      !std::isfinite(config.numerics.amr_refine_jeans_cells) || config.numerics.amr_refine_jeans_cells < 0.0) {
+    throw ConfigError("numerics.amr_refine_* criteria must be finite and >= 0 (0 disables a criterion)");
+  }
+  if (!std::isfinite(config.numerics.amr_derefine_hysteresis) || config.numerics.amr_derefine_hysteresis <= 0.0 ||
+      config.numerics.amr_derefine_hysteresis > 1.0) {
+    throw ConfigError("numerics.amr_derefine_hysteresis must be in (0, 1]");
+  }
+  if (config.numerics.amr_regrid_mode == AmrRegridConfigMode::kAutomatic) {
+    if (config.numerics.amr_refine_cell_mass_code == 0.0 && config.numerics.amr_refine_jump_threshold == 0.0 &&
+        config.numerics.amr_refine_jeans_cells == 0.0) {
+      throw ConfigError("numerics.amr_regrid_mode = automatic requires at least one non-zero amr_refine_* criterion");
+    }
+    if (config.numerics.amr_max_level < 1 || config.numerics.amr_max_level > 30) {
+      throw ConfigError("numerics.amr_regrid_mode = automatic requires numerics.amr_max_level in [1, 30]");
+    }
   }
   if (config.parallel.node_memory_admission == NodeMemoryAdmissionMode::kOff &&
       (config.parallel.node_memory_budget_bytes != 0U ||
@@ -2952,6 +3033,15 @@ class NormalizedConfigStream {
          << (frozen.config.numerics.hierarchical_encounter_timestep_enabled ? "true" : "false") << '\n';
   stream << "gravity_timestep_eta = " << frozen.config.numerics.gravity_timestep_eta << '\n';
   stream << "amr_max_level = " << frozen.config.numerics.amr_max_level << '\n';
+  stream << "amr_regrid_mode = " << amrRegridConfigModeToString(frozen.config.numerics.amr_regrid_mode) << '\n';
+  stream << "global_step_max_retries = " << frozen.config.numerics.global_step_max_retries << '\n';
+  stream << "amr_predictive_feedback_age_years = " << frozen.config.numerics.amr_predictive_feedback_age_years << '\n';
+  stream << "amr_regrid_interval_steps = " << frozen.config.numerics.amr_regrid_interval_steps << '\n';
+  stream << "amr_regrid_max_operations = " << frozen.config.numerics.amr_regrid_max_operations << '\n';
+  stream << "amr_refine_cell_mass_code = " << frozen.config.numerics.amr_refine_cell_mass_code << '\n';
+  stream << "amr_refine_jump_threshold = " << frozen.config.numerics.amr_refine_jump_threshold << '\n';
+  stream << "amr_refine_jeans_cells = " << frozen.config.numerics.amr_refine_jeans_cells << '\n';
+  stream << "amr_derefine_hysteresis = " << frozen.config.numerics.amr_derefine_hysteresis << '\n';
   stream << "gravity_softening = " << frozen.config.numerics.gravity_softening_kpc_comoving << " kpc\n";
   auto emitOptionalSoftening = [&](std::string_view key, double value_kpc_comoving) {
     stream << key << " = ";
@@ -3216,6 +3306,11 @@ class NormalizedConfigStream {
   stream << "thermochemistry_allow_unqualified_rates = " << (frozen.config.physics.thermochemistry_allow_unqualified_rates ? "true" : "false") << '\n';
   stream << "ssp_stochastic_sn_events = " << (frozen.config.physics.ssp_stochastic_sn_events ? "true" : "false") << '\n';
   stream << "ssp_clustered_associations = " << (frozen.config.physics.ssp_clustered_associations ? "true" : "false") << '\n';
+  stream << "ssp_association_radius_code = " << frozen.config.physics.ssp_association_radius_code << '\n';
+  stream << "ssp_association_time_window_years = " << frozen.config.physics.ssp_association_time_window_years << '\n';
+  stream << "ssp_wind_model = " << sspWindModelConfigToString(frozen.config.physics.ssp_wind_model) << '\n';
+  stream << "ssp_wind_table_path = " << frozen.config.physics.ssp_wind_table_path << '\n';
+  stream << "ssp_wind_table_sha256 = " << frozen.config.physics.ssp_wind_table_sha256 << '\n';
   stream << "\n[output]\n";
   stream << "run_name = " << frozen.config.output.run_name << '\n';
   stream << "output_directory = " << frozen.config.output.output_directory << '\n';
@@ -3713,6 +3808,32 @@ class NormalizedConfigStream {
       "numerics.gravity_timestep_eta");
   frozen.config.numerics.amr_max_level = parseNumber<int>(
       requireString(entries, consumed, "numerics.amr_max_level", "10"), "numerics.amr_max_level");
+  frozen.config.numerics.amr_regrid_mode = parseAmrRegridConfigMode(requireString(
+      entries, consumed, "numerics.amr_regrid_mode", defaultFor("numerics.amr_regrid_mode")));
+  frozen.config.numerics.amr_predictive_feedback_age_years = parseFloating(
+      requireString(entries, consumed, "numerics.amr_predictive_feedback_age_years",
+                    defaultFor("numerics.amr_predictive_feedback_age_years")), "numerics.amr_predictive_feedback_age_years");
+  frozen.config.numerics.global_step_max_retries = parseNumber<int>(
+      requireString(entries, consumed, "numerics.global_step_max_retries",
+                    defaultFor("numerics.global_step_max_retries")), "numerics.global_step_max_retries");
+  frozen.config.numerics.amr_regrid_interval_steps = parseNumber<int>(
+      requireString(entries, consumed, "numerics.amr_regrid_interval_steps",
+                    defaultFor("numerics.amr_regrid_interval_steps")), "numerics.amr_regrid_interval_steps");
+  frozen.config.numerics.amr_regrid_max_operations = parseNumber<int>(
+      requireString(entries, consumed, "numerics.amr_regrid_max_operations",
+                    defaultFor("numerics.amr_regrid_max_operations")), "numerics.amr_regrid_max_operations");
+  frozen.config.numerics.amr_refine_cell_mass_code = parseFloating(
+      requireString(entries, consumed, "numerics.amr_refine_cell_mass_code",
+                    defaultFor("numerics.amr_refine_cell_mass_code")), "numerics.amr_refine_cell_mass_code");
+  frozen.config.numerics.amr_refine_jump_threshold = parseFloating(
+      requireString(entries, consumed, "numerics.amr_refine_jump_threshold",
+                    defaultFor("numerics.amr_refine_jump_threshold")), "numerics.amr_refine_jump_threshold");
+  frozen.config.numerics.amr_refine_jeans_cells = parseFloating(
+      requireString(entries, consumed, "numerics.amr_refine_jeans_cells",
+                    defaultFor("numerics.amr_refine_jeans_cells")), "numerics.amr_refine_jeans_cells");
+  frozen.config.numerics.amr_derefine_hysteresis = parseFloating(
+      requireString(entries, consumed, "numerics.amr_derefine_hysteresis",
+                    defaultFor("numerics.amr_derefine_hysteresis")), "numerics.amr_derefine_hysteresis");
   frozen.config.numerics.gravity_softening_kpc_comoving = parseLengthKpc(
       requireString(entries, consumed, "numerics.gravity_softening", "1.0 kpc"),
       frozen.config.units.length_unit,
@@ -4276,6 +4397,17 @@ class NormalizedConfigStream {
       requireString(entries, consumed, "physics.ssp_stochastic_sn_events", "true"), "physics.ssp_stochastic_sn_events");
   frozen.config.physics.ssp_clustered_associations = parseBool(
       requireString(entries, consumed, "physics.ssp_clustered_associations", "false"), "physics.ssp_clustered_associations");
+  frozen.config.physics.ssp_association_radius_code = parseFloating(
+      requireString(entries, consumed, "physics.ssp_association_radius_code", "0.0"), "physics.ssp_association_radius_code");
+  frozen.config.physics.ssp_association_time_window_years = parseFloating(
+      requireString(entries, consumed, "physics.ssp_association_time_window_years", "3.0e6"),
+      "physics.ssp_association_time_window_years");
+  frozen.config.physics.ssp_wind_model = parseSspWindModelConfig(
+      requireString(entries, consumed, "physics.ssp_wind_model", "none"));
+  frozen.config.physics.ssp_wind_table_path =
+      requireString(entries, consumed, "physics.ssp_wind_table_path", "");
+  frozen.config.physics.ssp_wind_table_sha256 =
+      requireString(entries, consumed, "physics.ssp_wind_table_sha256", "");
 
   frozen.config.output.run_name =
       requireString(entries, consumed, "output.run_name", frozen.config.output.run_name);
@@ -4879,6 +5011,22 @@ std::string hydroDualEnergyConfigModeToString(HydroDualEnergyConfigMode mode) {
     case HydroDualEnergyConfigMode::kThermalFraction: return "thermal_fraction";
   }
   throw ConfigError("unhandled HydroDualEnergyConfigMode enum value during serialization");
+}
+
+std::string sspWindModelConfigToString(SspWindModelConfig mode) {
+  switch (mode) {
+    case SspWindModelConfig::kNone: return "none";
+    case SspWindModelConfig::kTableV1: return "table_v1";
+  }
+  throw ConfigError("unhandled SspWindModelConfig enum value during serialization");
+}
+
+std::string amrRegridConfigModeToString(AmrRegridConfigMode mode) {
+  switch (mode) {
+    case AmrRegridConfigMode::kOff: return "off";
+    case AmrRegridConfigMode::kAutomatic: return "automatic";
+  }
+  throw ConfigError("unhandled AmrRegridConfigMode enum value during serialization");
 }
 
 std::string nodeMemoryAdmissionModeToString(NodeMemoryAdmissionMode mode) {

@@ -21,6 +21,9 @@
 #include <vector>
 
 #include "cosmosim/amr/amr_hydro_orchestrator.hpp"
+#include "cosmosim/amr/amr_production_regrid.hpp"
+#include "cosmosim/amr/amr_patch_indexing.hpp"
+#include "cosmosim/parallel/composition_exchange.hpp"
 #include "cosmosim/core/checked_arithmetic.hpp"
 #include "cosmosim/core/memory_accounting.hpp"
 #include "cosmosim/core/memory_governor.hpp"
@@ -1921,19 +1924,23 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
     std::size_t remote_flux_register_count = 0;
     std::size_t inbound_flux_register_count = 0;
     parallel::DirectedAmrExchangeDiagnostics directed_amr_diagnostics{};
+    // Interface metadata of remote neighbour patches (CHUI Part 3 regrid
+    // balance checks); filled by the distributed exchange below.
+    std::vector<amr::PatchDescriptor> regrid_remote_neighbors;
     // CHUI Part 2 composition transport on the production AMR path. The
     // distributed path would need remote composition ghosts and composition
     // reflux payloads, which are Part 3 deliverables: refuse collectively
     // BEFORE any patch advances instead of silently dropping species.
     std::unique_ptr<physics::CompositionFluxAccumulator> composition_flux;
+    // CHUI Part 3: distributed composition transport is supported through the
+    // donor-fraction / remote-correction exchanges (Part 2 refused it here).
+    bool distributed_composition = false;
+    std::vector<std::pair<std::uint64_t, int>> remote_cell_owner;
     {
       const std::uint64_t composition_ranks = m_mpi_context.allreduceSumUint64(
           context.state.gas_composition.enabled() ? 1ULL : 0ULL);
-      if (composition_ranks > 0U && m_mpi_context.isEnabled() && m_mpi_context.worldSize() > 1) {
-        throw std::runtime_error(
-            "distributed production AMR hydro with an enabled CHUI composition sidecar is not supported "
-            "until Part 3 adds remote composition ghosts and composition reflux payloads (fail closed)");
-      }
+      distributed_composition =
+          composition_ranks > 0U && m_mpi_context.isEnabled() && m_mpi_context.worldSize() > 1;
       if (context.state.gas_composition.enabled()) {
         composition_flux = std::make_unique<physics::CompositionFluxAccumulator>(context.state);
         source_context.face_mass_flux_sink = composition_flux.get();
@@ -2154,7 +2161,13 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
           sparse_consumer,
           sparse_admission,
           transport_round_limit_bytes,
-          context.integrator_state.step_index);
+          context.integrator_state.step_index,
+          parallel::AmrInterfaceTopologyOptions{
+              .periodic_box_extent_comoving =
+                  amr_options.physical_boundary_kind == hydro::HydroBoundaryKind::kPeriodic
+                      ? amr_options.periodic_box_extent_comoving
+                      : std::array<double, 3>{0.0, 0.0, 0.0},
+              .ghost_layers = amr::productionAmrHydroGhostLayers(amr_options)});
       directed_amr_diagnostics = directed_amr_exchange.diagnostics;
 
       std::unordered_map<std::uint64_t, int> owner_rank_by_patch_id;
@@ -2223,6 +2236,16 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
       m_last_communication_traffic_bytes =
           directed_amr_diagnostics.patch_cell_payload_bytes;
       remote_patch_count = remote_patches.size();
+      regrid_remote_neighbors.reserve(remote_patches.size());
+      for (const amr::DistributedAmrRemotePatch& remote : remote_patches) {
+        regrid_remote_neighbors.push_back(remote.patch);
+        if (distributed_composition) {
+          for (const amr::AmrHydroSparseRemoteCell& cell : remote.boundary_cells) {
+            remote_cell_owner.emplace_back(cell.gas_cell_id, remote.owner_rank);
+          }
+        }
+      }
+      std::sort(remote_cell_owner.begin(), remote_cell_owner.end());
       std::vector<amr::FluxRegisterEntry> outbound_remote_entries;
       if (amr::hasProductionAmrHydroCoverage(context.state)) {
         amr_diagnostics = amr::advanceDistributedProductionAmrHydro(
@@ -2380,10 +2403,11 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
           amr_options);
     }
     m_last_amr_hydro_diagnostics = amr_diagnostics;
-    if (composition_flux != nullptr) {
-      // AMR is not transactional yet (Part 3): patches already scattered, so
-      // the composition update is prepared (may throw = hard stage failure)
-      // and committed immediately after the hydro sweep.
+    if (distributed_composition) {
+      completeDistributedCompositionTransport(context, composition_flux.get(), remote_cell_owner);
+    } else if (composition_flux != nullptr) {
+      // Single rank: the composition update is prepared (may throw = hard
+      // stage failure) and committed immediately after the hydro sweep.
       composition_flux->prepare(context.state);
       m_last_composition_transport = composition_flux->commit(context.state);
       (void)physics::synchronizeMetalMirrorFromComposition(context.state, std::span<const std::uint32_t>{});
@@ -2402,6 +2426,7 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
         m_current_world_rank,
         "production AMR hydro parent compatibility mirror");
     m_last_directed_amr_diagnostics = directed_amr_diagnostics;
+    runAutomaticAmrRegrid(context, amr_options, regrid_remote_neighbors);
     if (context.profiler_session != nullptr) {
       context.profiler_session->recordEvent(core::RuntimeEvent{
           .event_kind = "hydro.amr_production_stage",
@@ -2474,6 +2499,253 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
                       {"directed_amr_remote_interface_count", std::to_string(directed_amr_diagnostics.remote_interface_count)},
                       {"directed_amr_inbound_reflux_count", std::to_string(directed_amr_diagnostics.inbound_reflux_count)},
                       {"directed_amr_outbound_reflux_count", std::to_string(directed_amr_diagnostics.outbound_reflux_count)}}});
+    }
+  }
+
+  // CHUI Part 3 Checkpoint B: distributed composition transport. Every rank
+  // participates in the three collective exchanges (possibly with empty
+  // streams). Order: donor requests -> donor fractions (owner step-start
+  // sidecar; no rank has committed composition yet) -> deferred prepare ->
+  // remote corrections to owners -> validation -> commit. Any failure is
+  // made collective before the commit, so no rank mutates composition alone.
+  void completeDistributedCompositionTransport(
+      core::StepContext& context,
+      physics::CompositionFluxAccumulator* composition_flux,
+      std::span<const std::pair<std::uint64_t, int>> remote_cell_owner) {
+    const int rank = m_mpi_context.worldRank();
+    const auto ownerOf = [&](std::uint64_t id) {
+      const auto it = std::lower_bound(remote_cell_owner.begin(), remote_cell_owner.end(),
+                                       std::pair<std::uint64_t, int>{id, std::numeric_limits<int>::min()});
+      if (it == remote_cell_owner.end() || it->first != id) {
+        throw std::runtime_error("distributed composition: remote cell " + std::to_string(id) +
+                                 " has no known owner rank (fail closed)");
+      }
+      return it->second;
+    };
+    const std::uint64_t sequence = context.integrator_state.step_index;
+    std::exception_ptr failure;
+    std::vector<parallel::CompositionDonorRequestRecord> requests;
+    try {
+      if (composition_flux != nullptr) {
+        for (const std::uint64_t id : composition_flux->requiredRemoteDonorIds()) {
+          requests.push_back(parallel::CompositionDonorRequestRecord{
+              .gas_cell_id = id, .requester_rank = rank, .owner_rank = ownerOf(id)});
+        }
+      }
+    } catch (...) { failure = std::current_exception(); }
+    m_mpi_context.rethrowCollectivePreparationFailure(failure, "distributed composition donor requests");
+    const auto inbound_requests = parallel::exchangeCompositionDonorRequests(m_mpi_context, requests, sequence);
+    std::vector<parallel::CompositionDonorFractionRecord> responses;
+    try {
+      const auto& sidecar = context.state.gas_composition;
+      if (!inbound_requests.empty() && !sidecar.enabled()) {
+        throw std::runtime_error("distributed composition: donor requested from a rank without composition");
+      }
+      const std::size_t lanes = sidecar.enabled() ? sidecar.laneCount() : 0U;
+      if (lanes > parallel::k_max_composition_lanes) {
+        throw std::runtime_error("distributed composition: lane count exceeds the wire record capacity");
+      }
+      const auto& d = sidecar.descriptor();
+      for (const auto& request : inbound_requests) {
+        const auto row = context.state.rowForGasCellId(request.gas_cell_id);
+        if (!row.has_value()) {
+          throw std::runtime_error("distributed composition: donor request for a cell this rank does not own");
+        }
+        double gas_mass = 0.0;
+        for (std::uint32_t l = 0; l < d.element_lane_count; ++l) gas_mass += sidecar.value(d.element_lane_begin + l, *row);
+        for (std::uint32_t l = 0; l < d.dust_lane_count; ++l) gas_mass += sidecar.value(d.dust_lane_begin + l, *row);
+        if (!(gas_mass > 0.0)) {
+          throw std::runtime_error("distributed composition: requested donor has no composition mass");
+        }
+        parallel::CompositionDonorFractionRecord response{
+            .gas_cell_id = request.gas_cell_id, .owner_rank = rank, .requester_rank = request.requester_rank,
+            .lane_count = static_cast<std::uint32_t>(lanes)};
+        for (std::size_t l = 0; l < lanes; ++l) response.fraction[l] = sidecar.value(l, *row) / gas_mass;
+        responses.push_back(response);
+      }
+    } catch (...) { failure = std::current_exception(); }
+    m_mpi_context.rethrowCollectivePreparationFailure(failure, "distributed composition donor responses");
+    auto fractions = parallel::exchangeCompositionDonorFractions(m_mpi_context, responses, sequence);
+    std::vector<parallel::CompositionCorrectionRecord> corrections;
+    try {
+      if (composition_flux != nullptr) {
+        std::sort(fractions.begin(), fractions.end(),
+                  [](const auto& l, const auto& r) { return l.gas_cell_id < r.gas_cell_id; });
+        const std::size_t lanes = context.state.gas_composition.laneCount();
+        std::vector<std::uint64_t> ids;
+        std::vector<double> values;
+        for (const auto& record : fractions) {
+          if (record.lane_count != lanes) throw std::runtime_error("distributed composition: donor lane mismatch");
+          ids.push_back(record.gas_cell_id);
+          values.insert(values.end(), record.fraction.begin(), record.fraction.begin() + lanes);
+        }
+        composition_flux->setRemoteDonorFractions(ids, values, lanes);
+        composition_flux->prepareDeferred(context.state);
+        for (const auto& outbound : composition_flux->outboundRemoteCorrections()) {
+          parallel::CompositionCorrectionRecord record{
+              .gas_cell_id = outbound.gas_cell_id, .source_rank = rank, .owner_rank = ownerOf(outbound.gas_cell_id),
+              .lane_count = static_cast<std::uint32_t>(outbound.lane_delta_code.size())};
+          std::copy(outbound.lane_delta_code.begin(), outbound.lane_delta_code.end(), record.lane_delta_code.begin());
+          corrections.push_back(record);
+        }
+      }
+    } catch (...) { failure = std::current_exception(); }
+    m_mpi_context.rethrowCollectivePreparationFailure(failure, "distributed composition deferred prepare");
+    auto inbound_corrections = parallel::exchangeCompositionCorrections(m_mpi_context, corrections, sequence);
+    try {
+      // Deterministic application order independent of arrival order.
+      std::stable_sort(inbound_corrections.begin(), inbound_corrections.end(), [](const auto& l, const auto& r) {
+        return l.gas_cell_id != r.gas_cell_id ? l.gas_cell_id < r.gas_cell_id : l.source_rank < r.source_rank;
+      });
+      if (!inbound_corrections.empty() && composition_flux == nullptr) {
+        throw std::runtime_error("distributed composition: correction delivered to a rank without composition");
+      }
+      for (const auto& record : inbound_corrections) {
+        composition_flux->addInboundCorrection(
+            context.state, record.gas_cell_id,
+            std::span<const double>(record.lane_delta_code.data(), record.lane_count));
+      }
+      if (composition_flux != nullptr) composition_flux->validatePrepared(context.state);
+    } catch (...) { failure = std::current_exception(); }
+    m_mpi_context.rethrowCollectivePreparationFailure(failure, "distributed composition validation");
+    if (composition_flux != nullptr) {
+      m_last_composition_transport = composition_flux->commit(context.state);
+      (void)physics::synchronizeMetalMirrorFromComposition(context.state, std::span<const std::uint32_t>{});
+    }
+  }
+
+  // CHUI Part 3 Checkpoint B: automatic production refine/derefine (F6).
+  // Runs after the AMR hydro sweep, its reflux and composition commit, i.e.
+  // at a synchronized hierarchy boundary of the accepted interval; the
+  // planner itself refuses (empty plan) when temporal histories or pending
+  // flux registers exist. Every rank calls the collective id-window
+  // reductions whether or not it has work, so MPI never deadlocks; a local
+  // failure is turned into a collective error before any later stage.
+  void runAutomaticAmrRegrid(
+      core::StepContext& context,
+      const amr::ProductionAmrHydroOptions& amr_options,
+      std::span<const amr::PatchDescriptor> remote_neighbors) {
+    if (m_config.numerics.amr_regrid_mode != core::AmrRegridConfigMode::kAutomatic) {
+      return;
+    }
+    const std::uint64_t interval = static_cast<std::uint64_t>(m_config.numerics.amr_regrid_interval_steps);
+    const std::uint64_t step = context.integrator_state.step_index + 1U;
+    if (step % interval != 0U) {
+      return;
+    }
+    const std::uint64_t epoch = step / interval;
+    amr::ProductionAmrRegridPolicy policy;
+    policy.criteria.use_mass_threshold = m_config.numerics.amr_refine_cell_mass_code > 0.0;
+    policy.criteria.mass_threshold_code = m_config.numerics.amr_refine_cell_mass_code;
+    policy.criteria.use_gradient_indicator = m_config.numerics.amr_refine_jump_threshold > 0.0;
+    policy.criteria.gradient_threshold = m_config.numerics.amr_refine_jump_threshold;
+    policy.criteria.use_jeans_condition = m_config.numerics.amr_refine_jeans_cells > 0.0;
+    policy.criteria.jeans_resolution_cells = m_config.numerics.amr_refine_jeans_cells;
+    policy.criteria.use_particle_count = false;
+    policy.criteria.derefine_hysteresis = m_config.numerics.amr_derefine_hysteresis;
+    policy.criteria.gravitational_constant_code = core::newtonGravitationalConstantCode(core::makeUnitSystem(
+        m_config.units.length_unit, m_config.units.mass_unit, m_config.units.velocity_unit));
+    policy.max_level = static_cast<std::uint8_t>(std::clamp(m_config.numerics.amr_max_level, 0, 255));
+    policy.max_operations = static_cast<std::size_t>(m_config.numerics.amr_regrid_max_operations);
+    // Alternating passes keep the 2:1 balance without exchanging decisions.
+    policy.pass = (epoch % 2U == 1U) ? amr::AmrRegridPassKind::kRefineOnly : amr::AmrRegridPassKind::kDerefineOnly;
+    policy.scale_factor = context.integrator_state.current_scale_factor > 0.0
+        ? context.integrator_state.current_scale_factor : 1.0;
+    policy.periodic = amr_options.physical_boundary_kind == hydro::HydroBoundaryKind::kPeriodic;
+    policy.periodic_box_extent_comoving = amr_options.periodic_box_extent_comoving;
+    {
+      const double softening_kpc = m_config.numerics.gravity_softening_gas_kpc_comoving > 0.0
+          ? m_config.numerics.gravity_softening_gas_kpc_comoving
+          : m_config.numerics.gravity_softening_kpc_comoving;
+      const core::UnitSystem units = core::makeUnitSystem(
+          m_config.units.length_unit, m_config.units.mass_unit, m_config.units.velocity_unit);
+      constexpr double k_kpc_m = 3.0856775814913673e19;
+      policy.gravity_softening_code = softening_kpc > 0.0 ? softening_kpc * k_kpc_m / units.length_si_per_code : 0.0;
+    }
+
+    // A04 predictive event-aware refinement: cells hosting young stars
+    // (pending CC SN / wind events) are refined BEFORE their deposition.
+    // Deterministic (host cell = leaf cell containing the star), bounded by
+    // the star count; the physical event budgets are unchanged.
+    std::vector<std::uint32_t> forced_rows;
+    const double predictive_age = m_config.numerics.amr_predictive_feedback_age_years;
+    if (predictive_age > 0.0 && context.state.star_particles.size() > 0U) {
+      const auto descriptors = amr::buildProductionAmrPatchDescriptors(context.state);
+      for (std::size_t s = 0; s < context.state.star_particles.size(); ++s) {
+        if (!(context.state.star_particles.stellar_age_years_last[s] < predictive_age)) continue;
+        const std::uint32_t p = context.state.star_particles.particle_index[s];
+        const std::array<double, 3> position{context.state.particles.position_x_comoving[p],
+                                             context.state.particles.position_y_comoving[p],
+                                             context.state.particles.position_z_comoving[p]};
+        for (const amr::PatchDescriptor& patch : descriptors) {
+          bool inside = true;
+          for (std::size_t c = 0; c < 3U && inside; ++c) {
+            inside = position[c] >= patch.origin_comov[c] && position[c] < patch.origin_comov[c] + patch.extent_comov[c];
+          }
+          if (!inside) continue;
+          const auto cell = amr::patchLocalCellForPoint(patch, position, "predictive refinement host cell");
+          const auto rows = amr::rowsForPatchLocalCellOrder(context.state, patch, "predictive refinement");
+          if (cell.linear_index < rows.size()) forced_rows.push_back(rows[cell.linear_index]);
+          break;
+        }
+      }
+      std::sort(forced_rows.begin(), forced_rows.end());
+      forced_rows.erase(std::unique(forced_rows.begin(), forced_rows.end()), forced_rows.end());
+      policy.forced_refine_rows = forced_rows;
+    }
+    std::exception_ptr failure;
+    amr::ProductionAmrRegridPlan plan;
+    try {
+      plan = amr::planProductionAmrRegrid(context.state, remote_neighbors, policy);
+    } catch (...) {
+      failure = std::current_exception();
+    }
+    m_mpi_context.rethrowCollectivePreparationFailure(failure, "automatic AMR regrid planning");
+    std::uint64_t local_max_patch = 0U;
+    for (const std::uint64_t id : context.state.patches.patch_id) local_max_patch = std::max(local_max_patch, id);
+    std::uint64_t local_max_cell = 0U;
+    for (const std::uint64_t id : context.state.gas_cells.gas_cell_id) local_max_cell = std::max(local_max_cell, id);
+    const std::uint64_t global_max_patch = m_mpi_context.allreduceMaxUint64(local_max_patch);
+    const std::uint64_t global_max_cell = m_mpi_context.allreduceMaxUint64(local_max_cell);
+    const std::uint64_t patch_window = m_mpi_context.allreduceMaxUint64(plan.required_patch_ids);
+    const std::uint64_t cell_window = m_mpi_context.allreduceMaxUint64(plan.required_gas_cell_ids);
+    if (patch_window == 0U && cell_window == 0U) {
+      return;
+    }
+    const amr::ProductionAmrRegridIdWindow window = amr::rankStripedAmrRegridIdWindow(
+        global_max_patch, global_max_cell, m_mpi_context.worldRank(),
+        std::max(1, m_mpi_context.worldSize()), patch_window, cell_window);
+    amr::ProductionAmrRegridSummary summary;
+    try {
+      summary = amr::applyProductionAmrRegridPlan(context.state, plan, window, amr_options);
+    } catch (...) {
+      failure = std::current_exception();
+    }
+    m_mpi_context.rethrowCollectivePreparationFailure(failure, "automatic AMR regrid application");
+    m_last_regrid_summary = summary;
+    if (context.profiler_session != nullptr) {
+      context.profiler_session->recordEvent(core::RuntimeEvent{
+          .event_kind = "hydro.amr_automatic_regrid",
+          .severity = core::RuntimeEventSeverity::kInfo,
+          .subsystem = "hydro.amr",
+          .step_index = context.integrator_state.step_index,
+          .simulation_time_code = context.integrator_state.current_time_code,
+          .scale_factor = context.integrator_state.current_scale_factor,
+          .message = "automatic conservative AMR regrid at synchronized hierarchy boundary",
+          .payload = {{"pass", policy.pass == amr::AmrRegridPassKind::kRefineOnly ? "refine" : "derefine"},
+                      {"refinements", std::to_string(summary.applied_refinements)},
+                      {"derefinements", std::to_string(summary.applied_derefinements)},
+                      {"created_gas_cells", std::to_string(summary.created_gas_cells)},
+                      {"retired_gas_cells", std::to_string(summary.retired_gas_cells)},
+                      {"blocked_by_balance", std::to_string(plan.blocked_by_balance)},
+                      {"blocked_by_max_level", std::to_string(plan.blocked_by_max_level)},
+                      {"skipped_remote_sibling", std::to_string(plan.skipped_remote_sibling)},
+                      {"truncated_by_budget", std::to_string(plan.truncated_by_budget)},
+                      {"refined_below_gravity_softening_unqualified",
+                       std::to_string(plan.refined_below_gravity_softening)},
+                      {"skipped_not_quiescent", plan.skipped_not_quiescent ? "true" : "false"},
+                      {"mass_change_code", std::to_string(summary.mass_change_code)},
+                      {"total_energy_change_code", std::to_string(summary.total_energy_change_code)}}});
     }
   }
 
@@ -2779,6 +3051,7 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
   HydroRemoteGhostBoundaryReport m_last_remote_ghost_boundary_report{};
   parallel::DirectedAmrExchangeDiagnostics m_last_directed_amr_diagnostics{};
   amr::ProductionAmrHydroDiagnostics m_last_amr_hydro_diagnostics{};
+  amr::ProductionAmrRegridSummary m_last_regrid_summary{};
   std::uint64_t m_communication_high_water_bytes = 0U;
   std::uint64_t m_last_communication_traffic_bytes = 0U;
   std::uint64_t m_remote_ghost_sparse_cell_high_water = 0U;

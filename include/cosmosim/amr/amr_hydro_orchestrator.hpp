@@ -82,12 +82,18 @@ struct ProductionAmrHydroOptions {
   hydro::HydroReconstructionScheme reconstruction_scheme = hydro::HydroReconstructionScheme::kPiecewiseLinear;
   hydro::HydroSlopeLimiter slope_limiter = hydro::HydroSlopeLimiter::kMonotonizedCentral;
   // Periodic box extent in the patch coordinate frame (comoving), required
-  // when physical_boundary_kind == kPeriodic. A patch face on the box boundary
-  // is supported when the patch spans the box along that axis (in-patch
-  // periodic wrap); periodic neighbours in OTHER patches across the wrap are
-  // refused (std::runtime_error) until periodic-aware patch topology lands
-  // (Part 3) instead of silently closing the box.
+  // when physical_boundary_kind == kPeriodic (box [0, L) per axis). CHUI
+  // Part 3: a patch spanning the box along an axis wraps in-patch; any other
+  // patch face on a periodic box face is an ordinary same-level or
+  // coarse/fine interface with its wrapped neighbour (local or remote; the
+  // minimum-image face test and wrapped ghost probes/volumes/register keys).
+  // Only a hierarchy that leaves a periodic box face without any wrapped
+  // neighbour is refused (std::runtime_error).
   std::array<double, 3> periodic_box_extent_comoving{0.0, 0.0, 0.0};
+  // Ghost layers per boundary face: 0 = derived from reconstruction_scheme
+  // (PCM 1, PLM 2, PPM 3) so reconstruction keeps full order across patch,
+  // coarse/fine and rank interfaces. A non-zero value overrides (tests).
+  std::uint8_t ghost_layers = 0;
   AmrThermodynamicCachePolicy thermodynamic_cache{};
 };
 
@@ -169,6 +175,11 @@ struct ProductionAmrRegridDiagnostics {
 
 [[nodiscard]] bool hasProductionAmrHydroCoverage(const core::SimulationState& state);
 
+// Ghost layers the production sweep builds per boundary face (see
+// ProductionAmrHydroOptions::ghost_layers). The distributed exchange planner
+// must request the same depth (parallel::AmrInterfaceTopologyOptions).
+[[nodiscard]] std::uint8_t productionAmrHydroGhostLayers(const ProductionAmrHydroOptions& options);
+
 [[nodiscard]] bool patchStateRowHasExplicitGeometry(
     const core::SimulationState& state,
     std::size_t patch_index);
@@ -188,6 +199,13 @@ void writePatchDescriptorToStateRow(
 void populateAmrHydroFluxRegisterFaces(
     AmrHydroPatchGeometry& patch_geometry,
     std::span<const PatchDescriptor> all_patches);
+
+// Periodic-aware overload (CHUI Part 3): a non-zero extent enables wrapped
+// source-patch resolution for coarse/fine register keys across the box face.
+void populateAmrHydroFluxRegisterFaces(
+    AmrHydroPatchGeometry& patch_geometry,
+    std::span<const PatchDescriptor> all_patches,
+    const std::array<double, 3>& periodic_box_extent_comoving);
 
 void scatterAmrHydroConservedState(
     core::SimulationState& state,

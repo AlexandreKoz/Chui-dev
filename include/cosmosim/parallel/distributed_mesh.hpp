@@ -313,10 +313,24 @@ void validateHydroConservativeFluxCorrectionRecord(const HydroConservativeFluxCo
     std::span<const AmrPatchCellPayloadRecord> local_records,
     std::uint64_t exchange_sequence = 0);
 
+// CHUI Part 3 interface topology for directed AMR exchange planning.
+// periodic_box_extent_comoving: zero = non-periodic axis; a positive extent
+// makes the peer envelope and the patch face mask use the minimum image, so
+// patches meeting only across the periodic box wrap exchange boundary cells.
+// ghost_layers: number of target ghost layers (deep stencil-only layers for
+// PLM/PPM); the requested source depth scales with it (clamped to the source
+// patch dimension; the next patch along the normal sends deeper cells).
+// Defaults reproduce the historical non-periodic one-layer plan exactly.
+struct AmrInterfaceTopologyOptions {
+  std::array<double, 3> periodic_box_extent_comoving{0.0, 0.0, 0.0};
+  std::uint16_t ghost_layers = 1;
+};
+
 [[nodiscard]] std::vector<AmrPatchBoundaryCellRequest>
 planDirectedAmrPatchBoundaryCellRequests(
     std::span<const AmrPatchPayloadRecord> local_patch_records,
-    std::span<const AmrPatchPayloadRecord> remote_patch_records);
+    std::span<const AmrPatchPayloadRecord> remote_patch_records,
+    const AmrInterfaceTopologyOptions& topology = {});
 
 [[nodiscard]] DirectedAmrPatchPayloadExchange executeBlockingDirectedAmrPatchPayloadExchange(
     const MpiContext& mpi_context,
@@ -325,7 +339,8 @@ planDirectedAmrPatchBoundaryCellRequests(
     const DirectedAmrPatchCellPayloadConsumer& cell_payload_consumer,
     const DirectedAmrPatchCellAdmission& cell_payload_admission = {},
     std::size_t transport_round_limit_bytes = 0U,
-    std::uint64_t exchange_sequence = 0);
+    std::uint64_t exchange_sequence = 0,
+    const AmrInterfaceTopologyOptions& topology = {});
 
 [[nodiscard]] DirectedAmrPatchCellTransferPlan planDirectedAmrPatchCellTransfer(
     std::uint64_t logical_record_count,

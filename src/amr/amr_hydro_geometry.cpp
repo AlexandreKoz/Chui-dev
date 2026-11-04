@@ -10,6 +10,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <utility>
 
 namespace cosmosim::amr {
@@ -303,9 +304,169 @@ void appendAxisBoundaryGhosts(
   return std::max(state.cells.mass_code.at(row) / volume, 1.0e-14);
 }
 
+
+// ---------------------------------------------------------------------------
+// CHUI Part 3 Checkpoint A: deep (stencil-only) ghost layers.
+//
+// The one-layer shell produced by appendAxisBoundaryGhosts gives every boundary
+// face its neighbour ghost (layer 1). Layers 2..N are appended AFTER the
+// standard shell, so the standard slot formula used by the hydro stencil
+// helpers is untouched. Deep ghosts own no face: they are read by
+// reconstruction only, never advanced and never deposit flux.
+//
+// Source cell of a deep PHYSICAL ghost (filled by
+// hydro::fillHydroBoundaryGhostCells):
+//   open        -> the boundary owner cell (zero-gradient extrapolation),
+//   reflective  -> mirror cell at depth d-1 inside the patch (normal velocity
+//                  reflected by the filler); omitted when the patch is
+//                  narrower than d cells along the axis (counted reduction),
+//   periodic    -> never created (the stencil already wraps to real cells).
+// Deep NON-PHYSICAL ghosts (same-level, coarse/fine, remote) are filled by the
+// AMR ghost filler from the source patch cell containing the probe at
+// owner_center + d * width * outward_normal (wrapped into the periodic box).
+// ---------------------------------------------------------------------------
+struct DeepGhostLayerInfo {
+  std::size_t standard_slot = hydro::k_invalid_ghost_cell_slot;
+  std::uint8_t layer = 1;
+};
+
+[[nodiscard]] std::size_t axisDimension(const hydro::HydroPatchGeometry& geometry, hydro::HydroFaceAxis axis) {
+  switch (axis) {
+    case hydro::HydroFaceAxis::kX: return geometry.nx;
+    case hydro::HydroFaceAxis::kY: return geometry.ny;
+    case hydro::HydroFaceAxis::kZ: return geometry.nz;
+  }
+  return 0U;
+}
+
+[[nodiscard]] std::size_t mirrorCellAtDepth(
+    const hydro::HydroPatchGeometry& geometry,
+    std::size_t owner,
+    hydro::HydroFaceAxis axis,
+    hydro::HydroFaceSide side,
+    std::size_t depth) {
+  const std::array<std::size_t, 3> ijk = geometry.cellIjk(owner);
+  std::array<std::size_t, 3> mirrored = ijk;
+  const std::size_t axis_index = axis == hydro::HydroFaceAxis::kX ? 0U : (axis == hydro::HydroFaceAxis::kY ? 1U : 2U);
+  const std::size_t n = axisDimension(geometry, axis);
+  if (depth == 0U || depth > n) {
+    return hydro::k_invalid_cell_index;
+  }
+  mirrored[axis_index] = side == hydro::HydroFaceSide::kLower ? depth - 1U : n - depth;
+  return geometry.linearCellIndex(mirrored[0], mirrored[1], mirrored[2]);
+}
+
+void appendDeepGhostLayers(
+    AmrHydroPatchGeometry& patch_geometry,
+    const AmrHydroGeometryOptions& options,
+    std::vector<DeepGhostLayerInfo>& layer_info) {
+  auto& geometry = patch_geometry.geometry;
+  const std::size_t standard_count = geometry.ghost_cells.size();
+  layer_info.assign(standard_count, DeepGhostLayerInfo{});
+  for (std::size_t slot = 0; slot < standard_count; ++slot) {
+    layer_info[slot] = DeepGhostLayerInfo{.standard_slot = slot, .layer = 1U};
+  }
+  if (options.ghost_layers <= 1U) {
+    return;
+  }
+  for (std::size_t standard_slot = 0; standard_slot < standard_count; ++standard_slot) {
+    const hydro::HydroGhostCell standard = geometry.ghost_cells[standard_slot];
+    const AmrHydroGhostDescriptor standard_descriptor = patch_geometry.ghosts.at(standard_slot);
+    const bool physical = standard_descriptor.boundary_class == AmrHydroBoundaryClass::kPhysical;
+    if (physical && options.physical_boundary_kind == hydro::HydroBoundaryKind::kPeriodic) {
+      continue;
+    }
+    for (std::uint8_t layer = 2U; layer <= options.ghost_layers; ++layer) {
+      std::size_t source = standard.owner_real_cell;
+      if (physical && options.physical_boundary_kind == hydro::HydroBoundaryKind::kReflective) {
+        source = mirrorCellAtDepth(geometry, standard.owner_real_cell, standard.axis, standard.side, layer);
+        if (source == hydro::k_invalid_cell_index) {
+          break;
+        }
+      }
+      const std::size_t ghost_slot = geometry.ghost_cells.size();
+      const std::size_t ghost_cell = geometry.cellCount() + ghost_slot;
+      hydro::HydroGhostCell deep = standard;
+      deep.source_real_cell = source;
+      deep.ghost_cell = ghost_cell;
+      deep.ghost_slot = ghost_slot;
+      geometry.ghost_cells.push_back(deep);
+      AmrHydroGhostDescriptor descriptor = standard_descriptor;
+      descriptor.ghost_slot = ghost_slot;
+      descriptor.ghost_cell = ghost_cell;
+      descriptor.ghost_layer = layer;
+      descriptor.source_patch_id = 0U;
+      descriptor.source_gas_cell_id = physical ? patch_geometry.gas_cell_ids.at(source) : 0U;
+      patch_geometry.ghosts.push_back(descriptor);
+      layer_info.push_back(DeepGhostLayerInfo{.standard_slot = standard_slot, .layer = layer});
+    }
+  }
+}
+
+// Fill still-unavailable stencil entries that step outward from a ghost onto
+// the next deeper layer of the same standard ghost column.
+void linkDeepGhostStencils(
+    AmrHydroPatchGeometry& patch_geometry,
+    const std::vector<DeepGhostLayerInfo>& layer_info) {
+  auto& geometry = patch_geometry.geometry;
+  const std::size_t real_cells = geometry.cellCount();
+  if (std::all_of(layer_info.begin(), layer_info.end(),
+                  [](const DeepGhostLayerInfo& info) { return info.layer == 1U; })) {
+    return;
+  }
+  std::unordered_map<std::uint64_t, std::size_t> deeper;
+  deeper.reserve(layer_info.size());
+  for (std::size_t slot = 0; slot < layer_info.size(); ++slot) {
+    deeper.emplace((static_cast<std::uint64_t>(layer_info[slot].standard_slot) << 8U) |
+                       static_cast<std::uint64_t>(layer_info[slot].layer),
+                   real_cells + slot);
+  }
+  const auto outward = [&](std::size_t cell, hydro::HydroFaceAxis axis, int dir) -> std::size_t {
+    if (cell == hydro::k_invalid_cell_index || cell < real_cells) {
+      return hydro::k_invalid_cell_index;
+    }
+    const std::size_t slot = cell - real_cells;
+    if (slot >= geometry.ghost_cells.size()) {
+      return hydro::k_invalid_cell_index;
+    }
+    const hydro::HydroGhostCell& ghost = geometry.ghost_cells[slot];
+    if (ghost.axis != axis) {
+      return hydro::k_invalid_cell_index;
+    }
+    const bool moving_away = (ghost.side == hydro::HydroFaceSide::kUpper) == (dir > 0);
+    if (!moving_away) {
+      return hydro::k_invalid_cell_index;
+    }
+    const DeepGhostLayerInfo& info = layer_info.at(slot);
+    const auto it = deeper.find((static_cast<std::uint64_t>(info.standard_slot) << 8U) |
+                                (static_cast<std::uint64_t>(info.layer) + 1U));
+    return it == deeper.end() ? hydro::k_invalid_cell_index : it->second;
+  };
+  const auto normalSign = [](const hydro::HydroFace& face) {
+    switch (face.axis) {
+      case hydro::HydroFaceAxis::kX: return face.normal_x >= 0.0 ? 1 : -1;
+      case hydro::HydroFaceAxis::kY: return face.normal_y >= 0.0 ? 1 : -1;
+      case hydro::HydroFaceAxis::kZ: return face.normal_z >= 0.0 ? 1 : -1;
+    }
+    return 1;
+  };
+  for (hydro::HydroFace& face : geometry.faces) {
+    const int along = normalSign(face);
+    if (face.owner_minus2_cell == hydro::k_invalid_cell_index) {
+      face.owner_minus2_cell = outward(face.owner_minus_cell, face.axis, -along);
+    }
+    if (face.neighbor_plus_cell == hydro::k_invalid_cell_index) {
+      face.neighbor_plus_cell = outward(face.neighbor_cell, face.axis, along);
+    }
+    if (face.neighbor_plus2_cell == hydro::k_invalid_cell_index) {
+      face.neighbor_plus2_cell = outward(face.neighbor_plus_cell, face.axis, along);
+    }
+  }
+}
+
 }  // namespace
 
-AmrHydroGeometryCapacity amrHydroGeometryCapacity(const PatchDescriptor& patch) {
+AmrHydroGeometryCapacity amrHydroGeometryCapacity(const PatchDescriptor& patch, std::uint8_t ghost_layers) {
   const std::size_t nx = patch.cell_dims[0];
   const std::size_t ny = patch.cell_dims[1];
   const std::size_t nz = patch.cell_dims[2];
@@ -317,10 +478,11 @@ AmrHydroGeometryCapacity amrHydroGeometryCapacity(const PatchDescriptor& patch) 
     return core::checkedSizeAdd(a, b, "AMR geometry topology");
   };
   const std::size_t surface = add(add(mul(nx, ny), mul(nx, nz)), mul(ny, nz));
-  const std::size_t ghosts = mul(2U, surface);
+  const std::size_t face_ghosts = mul(2U, surface);
+  const std::size_t ghosts = mul(face_ghosts, std::max<std::size_t>(1U, ghost_layers));
   const std::size_t internal = add(add(mul(nx - 1U, mul(ny, nz)),
       mul(ny - 1U, mul(nx, nz))), mul(nz - 1U, mul(nx, ny)));
-  const std::size_t faces = add(internal, ghosts);
+  const std::size_t faces = add(internal, face_ghosts);
   const auto bytes = [](std::size_t count, std::size_t width) {
     return static_cast<std::uint64_t>(core::checkedSizeMultiply(
         count, width, "AMR geometry storage"));
@@ -418,7 +580,7 @@ AmrHydroPatchGeometry buildAmrHydroPatchGeometry(
       result.geometry.cell_width_y_comoving *
       result.geometry.cell_width_z_comoving;
 
-  const auto capacity = amrHydroGeometryCapacity(patch);
+  const auto capacity = amrHydroGeometryCapacity(patch, options.ghost_layers);
   result.geometry.faces.reserve(capacity.faces);
   result.geometry.ghost_cells.reserve(capacity.ghost_cells);
   result.geometry.flux_register_faces.reserve(capacity.faces);
@@ -508,10 +670,15 @@ AmrHydroPatchGeometry buildAmrHydroPatchGeometry(
   appendAxisBoundaryGhosts(result, options, hydro::HydroFaceAxis::kX);
   appendAxisBoundaryGhosts(result, options, hydro::HydroFaceAxis::kY);
   appendAxisBoundaryGhosts(result, options, hydro::HydroFaceAxis::kZ);
-  // Reconstruction stencils through the one-layer ghost shell (PLM full
-  // order at patch boundaries except the ghost side of boundary faces; PPM
-  // full order except the last two layers); periodic wraps stay in-patch.
+  // Reconstruction stencils through the standard one-layer shell (periodic
+  // wraps stay in-patch), then the deep stencil-only layers (Part 3) give
+  // full PLM/PPM order across patch/rank/coarse-fine/open/reflective faces.
   (void)hydro::completeReconstructionStencils(result.geometry);
+  {
+    std::vector<DeepGhostLayerInfo> layer_info;
+    appendDeepGhostLayers(result, options, layer_info);
+    linkDeepGhostStencils(result, layer_info);
+  }
 
   result.faces.reserve(result.geometry.faces.size());
   for (std::size_t face_index = 0; face_index < result.geometry.faces.size(); ++face_index) {
@@ -549,7 +716,7 @@ AmrHydroPatchGeometry buildRemoteAmrHydroPatchGeometry(
       result.geometry.cell_width_x_comoving *
       result.geometry.cell_width_y_comoving *
       result.geometry.cell_width_z_comoving;
-  const auto capacity = amrHydroGeometryCapacity(patch);
+  const auto capacity = amrHydroGeometryCapacity(patch, options.ghost_layers);
   result.geometry.faces.reserve(capacity.faces);
   result.geometry.ghost_cells.reserve(capacity.ghost_cells);
   result.geometry.flux_register_faces.reserve(capacity.faces);
@@ -635,10 +802,15 @@ AmrHydroPatchGeometry buildRemoteAmrHydroPatchGeometry(
   appendAxisBoundaryGhosts(result, options, hydro::HydroFaceAxis::kX);
   appendAxisBoundaryGhosts(result, options, hydro::HydroFaceAxis::kY);
   appendAxisBoundaryGhosts(result, options, hydro::HydroFaceAxis::kZ);
-  // Reconstruction stencils through the one-layer ghost shell (PLM full
-  // order at patch boundaries except the ghost side of boundary faces; PPM
-  // full order except the last two layers); periodic wraps stay in-patch.
+  // Reconstruction stencils through the standard one-layer shell (periodic
+  // wraps stay in-patch), then the deep stencil-only layers (Part 3) give
+  // full PLM/PPM order across patch/rank/coarse-fine/open/reflective faces.
   (void)hydro::completeReconstructionStencils(result.geometry);
+  {
+    std::vector<DeepGhostLayerInfo> layer_info;
+    appendDeepGhostLayers(result, options, layer_info);
+    linkDeepGhostStencils(result, layer_info);
+  }
   result.faces.reserve(result.geometry.faces.size());
   for (std::size_t face_index = 0; face_index < result.geometry.faces.size(); ++face_index) {
     result.faces.push_back(makeFaceDescriptor(result, face_index));

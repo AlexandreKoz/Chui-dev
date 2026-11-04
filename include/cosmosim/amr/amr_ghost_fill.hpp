@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <span>
@@ -33,6 +34,12 @@ struct AmrHydroGhostFillPatch {
   std::span<const std::uint8_t> available_real_cells;
   bool enable_temporal_coarse_to_fine = false;
   bool requires_ghost_fill = true;
+  // CHUI Part 3: periodic box extent of the patch coordinate frame. All zero
+  // (default) = non-periodic. When set, ghost probe points and fine-to-coarse
+  // ghost volumes of THIS target are canonicalized into [0, L) so neighbours
+  // across the periodic box boundary resolve to their real (local or remote)
+  // patch instead of being treated as missing.
+  std::array<double, 3> periodic_box_extent_comoving{0.0, 0.0, 0.0};
 };
 
 struct AmrHydroSparseRemoteCell {
@@ -68,6 +75,9 @@ struct AmrHydroGhostFillDiagnostics {
   std::size_t temporal_identity_mismatch_rejections = 0;
   std::size_t missing_source_records = 0;
   std::size_t unresolved_ghosts = 0;
+  // Deep stencil-only layers continued by zero gradient (domain edge behind a
+  // thin neighbour patch): counted reconstruction-order reductions.
+  std::size_t deep_layer_extrapolated_ghosts = 0;
 };
 
 [[nodiscard]] std::uint64_t amrPatchGeometryFingerprint(const PatchDescriptor& patch);

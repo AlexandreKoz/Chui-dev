@@ -565,7 +565,8 @@ add_library(cosmosim_amr STATIC
   src/amr/amr_framework.cpp
   src/amr/amr_hydro_geometry.cpp
   src/amr/amr_ghost_fill.cpp
-  src/amr/amr_hydro_orchestrator.cpp)
+  src/amr/amr_hydro_orchestrator.cpp
+  src/amr/amr_production_regrid.cpp)
 add_library(cosmosim_physics STATIC
   src/physics/cooling_heating.cpp
   src/physics/effective_multiphase_ism.cpp
@@ -574,6 +575,8 @@ add_library(cosmosim_physics STATIC
   src/physics/stellar_evolution.cpp
   src/physics/stellar_feedback.cpp
   src/physics/metal_diffusion.cpp
+  src/physics/element_diffusion.cpp
+  src/physics/stellar_wind.cpp
   src/physics/tracer_support.cpp
   src/physics/baryon_composition.cpp
   src/physics/composition_transport.cpp
@@ -613,7 +616,8 @@ add_library(cosmosim_io STATIC
   src/io/restart_checkpoint.cpp)
 add_library(cosmosim_analysis STATIC
   src/analysis/diagnostics.cpp
-  src/analysis/halo_workflow.cpp)
+  src/analysis/halo_workflow.cpp
+  src/analysis/zoom_contamination.cpp)
 add_library(cosmosim_parallel STATIC
   src/parallel/distributed_memory.cpp
   src/parallel/distributed_memory_transport.cpp
@@ -624,6 +628,7 @@ add_library(cosmosim_parallel STATIC
   src/parallel/distributed_memory_mpi.cpp
   src/parallel/distributed_memory_tree_pm.cpp
   src/parallel/distributed_memory_amr.cpp
+  src/parallel/composition_exchange.cpp
   src/parallel/distributed_memory_hydro.cpp
   src/parallel/distributed_memory_device.cpp
   src/parallel/node_memory_pool.cpp)
@@ -1147,6 +1152,26 @@ if(COSMOSIM_ENABLE_TESTS)
     add_executable(test_unit_${chui_part1_test} tests/unit/test_${chui_part1_test}.cpp)
     target_link_libraries(test_unit_${chui_part1_test} PRIVATE cosmosim_all)
     add_test(NAME unit_${chui_part1_test} COMMAND test_unit_${chui_part1_test})
+  endforeach()
+
+  # CHUI Part 3 (periodic/distributed AMR, regrid, remote sources, multirate,
+  # gravity/zoom, adaptive research, science output, four-mode sources).
+  # Authored without execution: NOT RUN — USER-RESERVED.
+  set(CHUI_PART3_UNIT_TESTS
+      amr_periodic_cross_patch
+      amr_production_regrid
+      chui_part3_remote_sources
+      config_chui_part3
+      treepm_amr_force_resolution
+      zoom_contamination
+      chui_part3_adaptive_and_decks)
+  foreach(chui_part3_test IN LISTS CHUI_PART3_UNIT_TESTS)
+    add_executable(test_unit_${chui_part3_test} tests/unit/test_${chui_part3_test}.cpp)
+    target_include_directories(test_unit_${chui_part3_test} PRIVATE ${PROJECT_SOURCE_DIR}/src)
+    target_compile_definitions(test_unit_${chui_part3_test} PRIVATE COSMOSIM_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
+    target_link_libraries(test_unit_${chui_part3_test} PRIVATE cosmosim_all)
+    add_test(NAME unit_${chui_part3_test} COMMAND test_unit_${chui_part3_test})
+    set_tests_properties(unit_${chui_part3_test} PROPERTIES SKIP_RETURN_CODE 77 LABELS "chui_part3;unit")
   endforeach()
 
 
@@ -2035,6 +2060,11 @@ if(COSMOSIM_ENABLE_TESTS)
   add_executable(test_integration_snapshot_hdf5_roundtrip tests/integration/test_snapshot_hdf5_roundtrip.cpp)
   target_link_libraries(test_integration_snapshot_hdf5_roundtrip PRIVATE cosmosim_all)
   add_test(NAME integration_snapshot_hdf5_roundtrip COMMAND test_integration_snapshot_hdf5_roundtrip)
+  # CHUI Part 3 Checkpoint G (NOT RUN — USER-RESERVED).
+  add_executable(test_integration_chui_part3_science_snapshot tests/integration/test_chui_part3_science_snapshot.cpp)
+  target_link_libraries(test_integration_chui_part3_science_snapshot PRIVATE cosmosim_all)
+  add_test(NAME integration_chui_part3_science_snapshot COMMAND test_integration_chui_part3_science_snapshot)
+  set_tests_properties(integration_chui_part3_science_snapshot PROPERTIES SKIP_RETURN_CODE 77 LABELS "chui_part3;snapshot;hdf5")
   cosmosim_mark_runtime_truth_test(integration_snapshot_hdf5_roundtrip snapshot sidecar)
   endif()
   add_executable(test_integration_tracer_advection tests/integration/test_tracer_advection.cpp)
@@ -2626,6 +2656,9 @@ if(COSMOSIM_ENABLE_BENCHMARKS)
   target_link_libraries(bench_hydro_kernels PRIVATE cosmosim_hydro)
   target_include_directories(bench_hydro_kernels PRIVATE ${PROJECT_SOURCE_DIR})
 
+  # CHUI Part 3 kernel microbenchmarks (NOT RUN — USER-RESERVED).
+  add_executable(bench_chui_part3_kernels bench/chui_part3/bench_chui_part3_kernels.cpp)
+  target_link_libraries(bench_chui_part3_kernels PRIVATE cosmosim_all)
   add_executable(bench_hydro_method_matrix bench/hydro/bench_hydro_method_matrix.cpp)
   target_link_libraries(bench_hydro_method_matrix PRIVATE cosmosim_hydro)
   target_include_directories(bench_hydro_method_matrix PRIVATE ${PROJECT_SOURCE_DIR})

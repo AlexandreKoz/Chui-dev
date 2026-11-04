@@ -155,16 +155,43 @@ struct AmrRankEnvelopeRecord {
   return (amin - reach) <= bmax && (bmin - reach) <= amax;
 }
 
+// CHUI Part 3: periodic image overlap. On a periodic axis the peer interval
+// is also tested shifted by +-L, so ranks that meet only through the box wrap
+// are discovered as peers.
+[[nodiscard]] bool amrIntervalsOverlapPeriodic(
+    double amin, double amax, double bmin, double bmax, double reach, double length) noexcept {
+  if (amrIntervalsOverlap(amin, amax, bmin, bmax, reach)) {
+    return true;
+  }
+  if (!(length > 0.0)) {
+    return false;
+  }
+  return amrIntervalsOverlap(amin, amax, bmin + length, bmax + length, reach) ||
+      amrIntervalsOverlap(amin, amax, bmin - length, bmax - length, reach);
+}
+
+[[nodiscard]] double topologyAxisLength(const AmrInterfaceTopologyOptions& topology, std::size_t axis) noexcept {
+  const double length = topology.periodic_box_extent_comoving[axis];
+  return (length > 0.0 && std::isfinite(length)) ? length : 0.0;
+}
+
+// Reach in cells: deep ghost layers need up to ghost_layers source widths.
+[[nodiscard]] double topologyReachScale(const AmrInterfaceTopologyOptions& topology) noexcept {
+  return static_cast<double>(std::max<std::uint16_t>(topology.ghost_layers, 1U));
+}
+
 [[nodiscard, maybe_unused]] bool amrEnvelopeMayNeedPeer(
     const AmrRankEnvelopeRecord& local,
-    const AmrRankEnvelopeRecord& peer) noexcept {
+    const AmrRankEnvelopeRecord& peer,
+    const AmrInterfaceTopologyOptions& topology = {}) noexcept {
   if (local.has_patches == 0U || peer.has_patches == 0U || local.rank == peer.rank) {
     return false;
   }
-  const double reach = std::max(local.max_cell_width_comoving, peer.max_cell_width_comoving);
-  return amrIntervalsOverlap(local.min_x_comoving, local.max_x_comoving, peer.min_x_comoving, peer.max_x_comoving, reach) &&
-      amrIntervalsOverlap(local.min_y_comoving, local.max_y_comoving, peer.min_y_comoving, peer.max_y_comoving, reach) &&
-      amrIntervalsOverlap(local.min_z_comoving, local.max_z_comoving, peer.min_z_comoving, peer.max_z_comoving, reach);
+  const double reach = topologyReachScale(topology) *
+      std::max(local.max_cell_width_comoving, peer.max_cell_width_comoving);
+  return amrIntervalsOverlapPeriodic(local.min_x_comoving, local.max_x_comoving, peer.min_x_comoving, peer.max_x_comoving, reach, topologyAxisLength(topology, 0U)) &&
+      amrIntervalsOverlapPeriodic(local.min_y_comoving, local.max_y_comoving, peer.min_y_comoving, peer.max_y_comoving, reach, topologyAxisLength(topology, 1U)) &&
+      amrIntervalsOverlapPeriodic(local.min_z_comoving, local.max_z_comoving, peer.min_z_comoving, peer.max_z_comoving, reach, topologyAxisLength(topology, 2U));
 }
 
 [[nodiscard]] bool amrPatchesMayShareInterface(
@@ -179,10 +206,12 @@ struct AmrRankEnvelopeRecord {
 [[nodiscard, maybe_unused]] std::vector<int> discoverCandidateAmrPeers(
     const MpiContext& mpi_context,
     std::span<const AmrPatchPayloadRecord> local_patch_records,
-    DirectedAmrExchangeDiagnostics* diagnostics) {
+    DirectedAmrExchangeDiagnostics* diagnostics,
+    const AmrInterfaceTopologyOptions& topology) {
   const int world_size = mpi_context.worldSize();
 #if !defined(COSMOSIM_ENABLE_MPI) || !COSMOSIM_ENABLE_MPI
   (void)local_patch_records;
+  (void)topology;
 #endif
   if (!mpi_context.isEnabled() || world_size <= 1) {
     if (diagnostics != nullptr) {
@@ -211,7 +240,7 @@ struct AmrRankEnvelopeRecord {
     if (envelope.rank < 0 || envelope.rank >= world_size) {
       throw std::runtime_error("directed AMR control-plane envelope returned invalid rank metadata");
     }
-    if (amrEnvelopeMayNeedPeer(local_envelope, envelope)) {
+    if (amrEnvelopeMayNeedPeer(local_envelope, envelope, topology)) {
       peers.push_back(envelope.rank);
     }
   }
@@ -654,7 +683,8 @@ void exchangeAmrPatchCellRecordStreamWithPeer(
 
 [[nodiscard]] std::uint8_t amrPatchBoundaryMaskForPeer(
     const AmrPatchPayloadRecord& local,
-    const AmrPatchPayloadRecord& remote) noexcept {
+    const AmrPatchPayloadRecord& remote,
+    const AmrInterfaceTopologyOptions& topology = {}) noexcept {
   if (local.owner_rank == remote.owner_rank) {
     return 0U;
   }
@@ -679,11 +709,21 @@ void exchangeAmrPatchCellRecordStreamWithPeer(
             remote_min[transverse_b], remote_max[transverse_b], tolerance)) {
       continue;
     }
-    if (std::abs(local_min[axis] - remote_max[axis]) <= tolerance) {
+    // Minimum-image normal gap on periodic axes (CHUI Part 3): a lower box
+    // face at 0 meets a remote upper face at L across the wrap.
+    const double length = topologyAxisLength(topology, axis);
+    const auto gap = [length](double a, double b) {
+      double delta = a - b;
+      if (length > 0.0) {
+        delta -= length * std::round(delta / length);
+      }
+      return std::abs(delta);
+    };
+    if (gap(local_min[axis], remote_max[axis]) <= tolerance) {
       mask |= amrBoundaryFaceBit(axis == 0U ? AmrPatchBoundaryFace::kXLower :
           (axis == 1U ? AmrPatchBoundaryFace::kYLower : AmrPatchBoundaryFace::kZLower));
     }
-    if (std::abs(local_max[axis] - remote_min[axis]) <= tolerance) {
+    if (gap(local_max[axis], remote_min[axis]) <= tolerance) {
       mask |= amrBoundaryFaceBit(axis == 0U ? AmrPatchBoundaryFace::kXUpper :
           (axis == 1U ? AmrPatchBoundaryFace::kYUpper : AmrPatchBoundaryFace::kZUpper));
     }
@@ -743,7 +783,8 @@ void exchangeAmrPatchCellRecordStreamWithPeer(
 [[nodiscard]] std::uint16_t requiredSourceBoundaryDepth(
     const AmrPatchPayloadRecord& source,
     const AmrPatchPayloadRecord& target,
-    std::size_t axis) {
+    std::size_t axis,
+    std::uint16_t ghost_layers) {
   const std::uint16_t source_dim = amrPatchDimension(source, axis);
   const std::uint16_t target_dim = amrPatchDimension(target, axis);
   if (source_dim == 0U || target_dim == 0U) {
@@ -758,8 +799,16 @@ void exchangeAmrPatchCellRecordStreamWithPeer(
 
   const double ratio = target_width / source_width;
   const double ratio_tolerance = 1.0e-10 * std::max(1.0, std::abs(ratio));
+  const std::size_t layers = std::max<std::uint16_t>(ghost_layers, 1U);
+  // Deep stencil-only ghost layers (CHUI Part 3) sit up to `layers` target
+  // widths from the face; deeper source cells beyond this patch belong to the
+  // next patch along the normal, which sends its own request.
+  const auto clampDeep = [source_dim](double cells) {
+    const double rounded_up = std::ceil(cells - 1.0e-9);
+    return static_cast<std::uint16_t>(std::clamp<double>(rounded_up, 1.0, static_cast<double>(source_dim)));
+  };
   if (ratio <= 1.0 + ratio_tolerance) {
-    return 1U;
+    return layers == 1U ? 1U : clampDeep(static_cast<double>(layers) * ratio);
   }
   const double rounded = std::round(ratio);
   if (std::abs(ratio - rounded) > ratio_tolerance || rounded < 1.0 ||
@@ -772,15 +821,16 @@ void exchangeAmrPatchCellRecordStreamWithPeer(
     throw std::runtime_error(
         "directed AMR fine-to-coarse boundary depth exceeds source patch dimension");
   }
-  return depth;
+  return layers == 1U ? depth : clampDeep(static_cast<double>(layers) * rounded);
 }
 
 [[nodiscard]] AmrPatchBoundaryCellRequest amrPatchBoundaryRequestForPeer(
     const AmrPatchPayloadRecord& source,
-    const AmrPatchPayloadRecord& target) {
+    const AmrPatchPayloadRecord& target,
+    const AmrInterfaceTopologyOptions& topology) {
   AmrPatchBoundaryCellRequest request;
   request.patch_id = source.patch_id;
-  request.boundary_face_mask = amrPatchBoundaryMaskForPeer(source, target);
+  request.boundary_face_mask = amrPatchBoundaryMaskForPeer(source, target, topology);
   constexpr std::array<AmrPatchBoundaryFace, 6> k_faces{
       AmrPatchBoundaryFace::kXLower,
       AmrPatchBoundaryFace::kXUpper,
@@ -793,7 +843,7 @@ void exchangeAmrPatchCellRecordStreamWithPeer(
       continue;
     }
     request.boundary_face_depths[amrBoundaryFaceIndex(face)] =
-        requiredSourceBoundaryDepth(source, target, amrBoundaryFaceAxis(face));
+        requiredSourceBoundaryDepth(source, target, amrBoundaryFaceAxis(face), topology.ghost_layers);
   }
   return request;
 }
@@ -960,7 +1010,8 @@ requestByPatchId(std::span<const AmrPatchBoundaryCellRequest> requests) {
 
 std::vector<AmrPatchBoundaryCellRequest> planDirectedAmrPatchBoundaryCellRequests(
     std::span<const AmrPatchPayloadRecord> local_patch_records,
-    std::span<const AmrPatchPayloadRecord> remote_patch_records) {
+    std::span<const AmrPatchPayloadRecord> remote_patch_records,
+    const AmrInterfaceTopologyOptions& topology) {
   std::vector<AmrPatchBoundaryCellRequest> requests;
   requests.reserve(local_patch_records.size());
   for (const AmrPatchPayloadRecord& local_record : local_patch_records) {
@@ -970,7 +1021,7 @@ std::vector<AmrPatchBoundaryCellRequest> planDirectedAmrPatchBoundaryCellRequest
     for (const AmrPatchPayloadRecord& remote_record : remote_patch_records) {
       validateAmrPatchPayloadRecord(remote_record);
       const AmrPatchBoundaryCellRequest one =
-          amrPatchBoundaryRequestForPeer(local_record, remote_record);
+          amrPatchBoundaryRequestForPeer(local_record, remote_record, topology);
       if (one.boundary_face_mask != 0U) {
         mergeBoundaryRequest(combined, one);
       }
@@ -1010,9 +1061,11 @@ DirectedAmrPatchPayloadExchange executeBlockingDirectedAmrPatchPayloadExchange(
     const DirectedAmrPatchCellPayloadConsumer& cell_payload_consumer,
     const DirectedAmrPatchCellAdmission& cell_payload_admission,
     std::size_t transport_round_limit_bytes,
-    std::uint64_t exchange_sequence) {
+    std::uint64_t exchange_sequence,
+    const AmrInterfaceTopologyOptions& topology) {
 #if !defined(COSMOSIM_ENABLE_MPI) || !COSMOSIM_ENABLE_MPI
   (void)exchange_sequence;
+  (void)topology;
 #endif
   const int world_rank = mpi_context.worldRank();
   std::unordered_map<std::uint64_t, AmrPatchPayloadRecord> local_patch_by_id;
@@ -1043,7 +1096,7 @@ DirectedAmrPatchPayloadExchange executeBlockingDirectedAmrPatchPayloadExchange(
   constexpr int k_cell_count_tag_base = 10910;
   constexpr int k_cell_payload_tag_base = 11910;
   const std::vector<int> candidate_peers = discoverCandidateAmrPeers(
-      mpi_context, local_patch_records, &result.diagnostics);
+      mpi_context, local_patch_records, &result.diagnostics, topology);
   for (const int peer_rank : candidate_peers) {
     std::vector<AmrPatchPayloadRecord> remote_patches = exchangePodRecordsWithPeer(
         mpi_context,
@@ -1071,9 +1124,9 @@ DirectedAmrPatchPayloadExchange executeBlockingDirectedAmrPatchPayloadExchange(
         "directed AMR accumulated patch descriptor traffic");
 
     const std::vector<AmrPatchBoundaryCellRequest> local_requests =
-        planDirectedAmrPatchBoundaryCellRequests(local_patch_records, remote_patches);
+        planDirectedAmrPatchBoundaryCellRequests(local_patch_records, remote_patches, topology);
     const std::vector<AmrPatchBoundaryCellRequest> remote_requests =
-        planDirectedAmrPatchBoundaryCellRequests(remote_patches, local_patch_records);
+        planDirectedAmrPatchBoundaryCellRequests(remote_patches, local_patch_records, topology);
     if (local_requests.empty() && remote_requests.empty()) {
       continue;
     }
@@ -1084,7 +1137,7 @@ DirectedAmrPatchPayloadExchange executeBlockingDirectedAmrPatchPayloadExchange(
     std::uint64_t peer_interface_count = 0U;
     for (const AmrPatchPayloadRecord& local_record : local_patch_records) {
       for (const AmrPatchPayloadRecord& remote_record : remote_patches) {
-        if (amrPatchBoundaryMaskForPeer(local_record, remote_record) != 0U) {
+        if (amrPatchBoundaryMaskForPeer(local_record, remote_record, topology) != 0U) {
           peer_interface_count = checkedU64AddLocal(
               peer_interface_count, 1U, "directed AMR peer interface count");
         }

@@ -3364,6 +3364,16 @@ namespace {
       physics.ssp_stochastic_sn_events == defaults.ssp_stochastic_sn_events &&
       physics.ssp_clustered_associations == defaults.ssp_clustered_associations;
 }
+
+// CHUI Part 3 physics keys at defaults (pre-Part-3 checkpoints).
+[[nodiscard]] bool part3PhysicsKeysAtDefaults(const core::PhysicsConfig& physics) {
+  const core::PhysicsConfig defaults{};
+  return physics.ssp_association_radius_code == defaults.ssp_association_radius_code &&
+      physics.ssp_association_time_window_years == defaults.ssp_association_time_window_years &&
+      physics.ssp_wind_model == defaults.ssp_wind_model &&
+      physics.ssp_wind_table_path == defaults.ssp_wind_table_path &&
+      physics.ssp_wind_table_sha256 == defaults.ssp_wind_table_sha256;
+}
 }  // namespace
 
 std::string restartConfigurationCompatibilityRecord(
@@ -3427,6 +3437,17 @@ std::string restartConfigurationCompatibilityRecord(
       current.config.parallel.node_memory_reserve_bytes != 0U ||
       // CHUI Part 2 keys must hold their (physics-disabled) defaults.
       !part2PhysicsKeysAtDefaults(current.config.physics) ||
+      !part3PhysicsKeysAtDefaults(current.config.physics) ||
+      // CHUI Part 3 regrid keys must hold their (static-hierarchy) defaults.
+      current.config.numerics.amr_regrid_mode != core::AmrRegridConfigMode::kOff ||
+      current.config.numerics.global_step_max_retries != 0 ||
+      current.config.numerics.amr_predictive_feedback_age_years != 0.0 ||
+      current.config.numerics.amr_regrid_interval_steps != 1 ||
+      current.config.numerics.amr_regrid_max_operations != 64 ||
+      current.config.numerics.amr_refine_cell_mass_code != 0.0 ||
+      current.config.numerics.amr_refine_jump_threshold != 0.0 ||
+      current.config.numerics.amr_refine_jeans_cells != 4.0 ||
+      current.config.numerics.amr_derefine_hysteresis != 0.5 ||
       current.config.schema_version != 1 ||
       current.provenance.config_hash_hex != core::stableConfigHashHex(current.normalized_text)) {
     fail("new options must retain legacy defaults and global KDK must remain selected");
@@ -3545,6 +3566,20 @@ std::string restartConfigurationCompatibilityRecord(
       fail("Part 2 checkpoint predates metal_cooling_accept_uv_background_mismatch; only its default is accepted");
     }
     removeKeyLines({"metal_cooling_accept_uv_background_mismatch"});
+  }
+  // CHUI Part 3 regrid group: removed only when the checkpoint predates it
+  // (all values verified at their defaults above).
+  if (projected.find("\namr_regrid_mode = ") != std::string::npos &&
+      restart.normalized_config_text.find("\namr_regrid_mode = ") == std::string::npos) {
+    removeKeyLines({"amr_regrid_mode", "global_step_max_retries", "amr_predictive_feedback_age_years",
+        "amr_regrid_interval_steps", "amr_regrid_max_operations",
+        "amr_refine_cell_mass_code", "amr_refine_jump_threshold", "amr_refine_jeans_cells",
+        "amr_derefine_hysteresis"});
+  }
+  if (projected.find("\nssp_wind_model = ") != std::string::npos &&
+      restart.normalized_config_text.find("\nssp_wind_model = ") == std::string::npos) {
+    removeKeyLines({"ssp_association_radius_code", "ssp_association_time_window_years", "ssp_wind_model",
+        "ssp_wind_table_path", "ssp_wind_table_sha256"});
   }
   if (projected.find("\nhydro_reconstruction = ") != std::string::npos &&
       restart.normalized_config_text.find("\nhydro_reconstruction = ") == std::string::npos) {

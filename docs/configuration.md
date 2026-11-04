@@ -832,3 +832,39 @@ Handoff: `docs/repair/chui_part2_thermochemistry_stellar_physics_20261103.md`.
 
 Additional rule: `enable_metal_diffusion = true` is refused with a Part 2
 backend (element-resolved diffusion not implemented).
+
+## CHUI Part 3 — automatic AMR regrid (`numerics.*`)
+
+Source only; NOT RUN — USER-RESERVED. All keys are typed, validated and
+emitted in the normalized dump. Checkpoints written before Part 3 resume only
+with every key at its default (exact restart projection).
+
+| Key | Type / range | Default | Meaning |
+|---|---|---|---|
+| `amr_regrid_mode` | `off` \| `automatic` | `off` | `automatic` refines/derefines production AMR at synchronized hierarchy boundaries (after hydro sweep, reflux and composition commit). `off` keeps the static hierarchy. |
+| `amr_regrid_interval_steps` | int >= 1 | `1` | Regrid every N accepted steps. Passes alternate refine-only / derefine-only (2:1 face balance without exchanging decisions across ranks). |
+| `amr_regrid_max_operations` | int >= 1 | `64` | Deterministic per-pass budget (ascending patch id). |
+| `amr_refine_cell_mass_code` | double >= 0 | `0.0` | Refine when the comoving cell mass `rho_com dx^3` exceeds it (0 disables). |
+| `amr_refine_jump_threshold` | double >= 0 | `0.0` | Refine when `max(|drho|/rho_min, |dP|/P_min)` over in-patch face neighbours exceeds it (contact/shock indicator; 0 disables). |
+| `amr_refine_jeans_cells` | double >= 0 | `4.0` | Truelove criterion on the comoving Jeans length `c_s sqrt(pi a/(G rho_com))` (0 disables). |
+| `amr_derefine_hysteresis` | (0, 1] | `0.5` | Derefinement requires every criterion to be below `hysteresis x threshold` (Jeans: above `threshold / hysteresis`). |
+
+`automatic` requires at least one non-zero criterion and `amr_max_level` in
+[1, 30]. Regrid transfers mass, momentum, total energy and every composition
+lane (elements, species, dust, SGS energy) conservatively; a refused memory
+admission leaves the hierarchy untouched.
+
+## CHUI Part 3 — stellar winds and associations (`physics.*`)
+
+| Key | Type / range | Default | Meaning |
+|---|---|---|---|
+| `ssp_wind_model` | `none` \| `table_v1` | `none` | `table_v1`: age/metallicity-dependent wind/pre-SN mechanical energy and momentum from a `chui_ssp_wind_table_v1` file (no mass: wind mass is in the SSP CC continuous return). Refused together with `fb_presn_wind_momentum_lsun_per_c > 0` (double count). |
+| `ssp_wind_table_path` / `ssp_wind_table_sha256` | path / 64-hex | empty | Required for `table_v1`; checksum verified at load. BLOCKED BY DATA: no table is bundled. |
+| `ssp_clustered_associations` | bool | `false` | RESEARCH (EXPERIMENTAL/UNQUALIFIED): merge feedback sources born in the same association lattice cell and time window into one deposition source (budgets unchanged). |
+| `ssp_association_radius_code` | double >= 0 | `0.0` | Comoving lattice size; must be > 0 when associations are enabled. |
+| `ssp_association_time_window_years` | double > 0 | `3.0e6` | Birth-time window of one association. |
+
+`physics.enable_metal_diffusion` with an element-resolved composition sidecar
+now selects the element-resolved mixing operator (Part 2 refused it).
+Multi-rank metal diffusion remains refused (named blocker: no per-subcycle
+remote interface exchange).

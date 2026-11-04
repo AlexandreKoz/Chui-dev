@@ -57,6 +57,20 @@ enum class HydroDualEnergyConfigMode {
   kThermalFraction,
 };
 
+// CHUI Part 3: stellar wind / pre-SN mechanical channel.
+enum class SspWindModelConfig {
+  kNone,
+  kTableV1,
+};
+
+// CHUI Part 3: production AMR regrid. kOff keeps the historical static
+// hierarchy; kAutomatic refines/derefines at synchronized hierarchy
+// boundaries every amr_regrid_interval_steps accepted steps.
+enum class AmrRegridConfigMode {
+  kOff,
+  kAutomatic,
+};
+
 // Node-level memory admission policy. kOff preserves historical semantics:
 // only parallel.process_memory_budget_bytes (0 = unlimited) bounds a rank.
 enum class NodeMemoryAdmissionMode {
@@ -409,6 +423,21 @@ struct NumericsConfig {
   // 0.2 is the historical hardcoded compatibility value.
   double gravity_timestep_eta = 0.2;
   int amr_max_level = 10;
+  // CHUI Part 3 automatic AMR regrid (see docs/configuration.md). A criterion
+  // value of 0 disables that criterion; kAutomatic requires at least one.
+  AmrRegridConfigMode amr_regrid_mode = AmrRegridConfigMode::kOff;
+  // CHUI Part 3 collective global-step rollback (rung zero): 0 disables.
+  int global_step_max_retries = 0;
+  // CHUI Part 3 (A04 RESEARCH): predictive event-aware refinement of cells
+  // hosting stars younger than this age (pending CC SN / wind feedback);
+  // 0 disables. Requires amr_regrid_mode = automatic.
+  double amr_predictive_feedback_age_years = 0.0;
+  int amr_regrid_interval_steps = 1;
+  int amr_regrid_max_operations = 64;
+  double amr_refine_cell_mass_code = 0.0;
+  double amr_refine_jump_threshold = 0.0;
+  double amr_refine_jeans_cells = 4.0;
+  double amr_derefine_hysteresis = 0.5;
   double gravity_softening_kpc_comoving = 1.0;
   double gravity_softening_gas_kpc_comoving = -1.0;
   double gravity_softening_dark_matter_kpc_comoving = -1.0;
@@ -637,6 +666,13 @@ struct PhysicsConfig {
   bool metal_cooling_accept_uv_background_mismatch = false;
   bool ssp_stochastic_sn_events = true;
   bool ssp_clustered_associations = false;
+  // CHUI Part 3 (docs/configuration.md): correlated associations (RESEARCH)
+  // and the table-driven wind/pre-SN mechanical channel.
+  double ssp_association_radius_code = 0.0;
+  double ssp_association_time_window_years = 3.0e6;
+  SspWindModelConfig ssp_wind_model = SspWindModelConfig::kNone;
+  std::string ssp_wind_table_path;
+  std::string ssp_wind_table_sha256;
 };
 
 enum class ScienceSnapshotLayout : std::uint8_t {
@@ -967,6 +1003,8 @@ void writeNormalizedConfigSnapshot(
 [[nodiscard]] std::string hydroIntegrationModeToString(HydroIntegrationMode mode);
 [[nodiscard]] std::string hydroRiemannSolverModeToString(HydroRiemannSolverMode mode);
 [[nodiscard]] std::string hydroDualEnergyConfigModeToString(HydroDualEnergyConfigMode mode);
+[[nodiscard]] std::string amrRegridConfigModeToString(AmrRegridConfigMode mode);
+[[nodiscard]] std::string sspWindModelConfigToString(SspWindModelConfig mode);
 [[nodiscard]] std::string nodeMemoryAdmissionModeToString(NodeMemoryAdmissionMode mode);
 [[nodiscard]] std::string coordinateFrameToString(CoordinateFrame frame);
 [[nodiscard]] std::string initialConditionConventionToString(
