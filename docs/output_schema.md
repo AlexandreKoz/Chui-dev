@@ -483,7 +483,7 @@ configuration (identical on every rank, required for collective single-file
 HDF5); an absent dataset means the physics is disabled, never zero.
 
 `/PartType0` (when the run carries a composition sidecar; attribute
-`CHUI_CompositionSchemaVersion = 1`, `CHUI_CompositionLayoutName`,
+`CHUI_CompositionSchemaVersion = 2`, `CHUI_CompositionLayoutName`,
 `CHUI_ElementNames`, `CHUI_SpeciesNames`, `CHUI_DustNames`,
 `CHUI_CompositionFractionBasis`):
 
@@ -496,6 +496,9 @@ HDF5); an absent dataset means the physics is disabled, never zero.
 | `CHUI_MeanMolecularWeight` | [N] | cached mu (amu); NaN = unknown (rebuilt by chemistry) |
 | `CHUI_ChemistryModelTag`, `CHUI_IsmRegimeTag` | [N] u8 | adaptive chemistry fidelity / ISM regime tags |
 | `CHUI_ChemistryModelDwellYears`, `CHUI_IsmRegimeDwellYears` | [N] | hysteresis dwell |
+| `CHUI_ChemistryLastTemperatureK`, `CHUI_ChemistryLastCoolingTimeSeconds` | [N] | last accepted local thermal/timescale history; 0 means unavailable/no finite cooling time |
+| `CHUI_ChemistryLastErrorEstimate`, `CHUI_ChemistryLastElementFractionResidual`, `CHUI_ChemistryLastChargeResidual` | [N] | last accepted normalized integration error and dimensionless conservation residuals used by C03 selection |
+| `CHUI_ChemistryCumulativeRadiativeLossErg`, `CHUI_ChemistryCumulativeHeatingGainErg` | [N] | cumulative accepted per-cell radiative/heating ledger; extensive under AMR regrid |
 
 Per cell, sum(`CHUI_ElementMassFractions`) + sum(`CHUI_DustMassFractions`) = 1;
 `Metallicity` remains the derived total-metal mirror (gas + dust metals).

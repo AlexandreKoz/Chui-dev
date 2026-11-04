@@ -1614,6 +1614,8 @@ struct ConfigKeySpec {
       {"physics.chemistry_adaptive_min_dwell_years", "1.0e6"},
       {"physics.chemistry_adaptive_cold_temperature_k", "3.0e3"},
       {"physics.chemistry_adaptive_cooling_time_ratio", "0.0"},
+      {"physics.chemistry_adaptive_error_estimate_threshold", "0.0"},
+      {"physics.chemistry_adaptive_residual_fraction_threshold", "0.0"},
       {"physics.chemistry_adaptive_dense_nh_cm3", "1.0"},
       {"physics.chemistry_shadow_sample_fraction", "0.0"},
       {"physics.ssp_imf_mass_min_msun", "0.1"},
@@ -1868,7 +1870,9 @@ void validatePart2BaryonicPhysics(const SimulationConfig& config) {
   }
   if (!(p.chemistry_adaptive_hysteresis_fraction >= 0.0) || p.chemistry_adaptive_hysteresis_fraction >= 1.0 ||
       p.chemistry_adaptive_min_dwell_years < 0.0 || !(p.chemistry_adaptive_cold_temperature_k > 10.0) ||
-      !(p.chemistry_adaptive_dense_nh_cm3 > 0.0) || !(p.chemistry_adaptive_cooling_time_ratio >= 0.0)) {
+      !(p.chemistry_adaptive_dense_nh_cm3 > 0.0) || !(p.chemistry_adaptive_cooling_time_ratio >= 0.0) ||
+      !(p.chemistry_adaptive_error_estimate_threshold >= 0.0) ||
+      !(p.chemistry_adaptive_residual_fraction_threshold >= 0.0)) {
     throw ConfigError("invalid chemistry_adaptive_* parameters");
   }
   if (!(p.ssp_imf_mass_min_msun > 0.0) || !(p.ssp_imf_mass_max_msun > p.ssp_imf_mass_min_msun) ||
@@ -2064,6 +2068,10 @@ void validateConfig(const SimulationConfig& config) {
       {config.physics.chemistry_adaptive_min_dwell_years, "physics.chemistry_adaptive_min_dwell_years"},
       {config.physics.chemistry_adaptive_cold_temperature_k, "physics.chemistry_adaptive_cold_temperature_k"},
       {config.physics.chemistry_adaptive_cooling_time_ratio, "physics.chemistry_adaptive_cooling_time_ratio"},
+      {config.physics.chemistry_adaptive_error_estimate_threshold,
+       "physics.chemistry_adaptive_error_estimate_threshold"},
+      {config.physics.chemistry_adaptive_residual_fraction_threshold,
+       "physics.chemistry_adaptive_residual_fraction_threshold"},
       {config.physics.chemistry_adaptive_dense_nh_cm3, "physics.chemistry_adaptive_dense_nh_cm3"},
       {config.physics.chemistry_shadow_sample_fraction, "physics.chemistry_shadow_sample_fraction"},
       {config.physics.ssp_imf_mass_min_msun, "physics.ssp_imf_mass_min_msun"},
@@ -3337,6 +3345,10 @@ class NormalizedConfigStream {
   stream << "chemistry_adaptive_min_dwell_years = " << frozen.config.physics.chemistry_adaptive_min_dwell_years << '\n';
   stream << "chemistry_adaptive_cold_temperature_k = " << frozen.config.physics.chemistry_adaptive_cold_temperature_k << '\n';
   stream << "chemistry_adaptive_cooling_time_ratio = " << frozen.config.physics.chemistry_adaptive_cooling_time_ratio << '\n';
+  stream << "chemistry_adaptive_error_estimate_threshold = "
+         << frozen.config.physics.chemistry_adaptive_error_estimate_threshold << '\n';
+  stream << "chemistry_adaptive_residual_fraction_threshold = "
+         << frozen.config.physics.chemistry_adaptive_residual_fraction_threshold << '\n';
   stream << "chemistry_adaptive_dense_nh_cm3 = " << frozen.config.physics.chemistry_adaptive_dense_nh_cm3 << '\n';
   stream << "chemistry_shadow_sample_fraction = " << frozen.config.physics.chemistry_shadow_sample_fraction << '\n';
   stream << "ssp_imf_mass_min_msun = " << frozen.config.physics.ssp_imf_mass_min_msun << '\n';
@@ -4424,6 +4436,12 @@ class NormalizedConfigStream {
   frozen.config.physics.chemistry_adaptive_cooling_time_ratio = parseFloating(
       requireString(entries, consumed, "physics.chemistry_adaptive_cooling_time_ratio", "0.0"),
       "physics.chemistry_adaptive_cooling_time_ratio");
+  frozen.config.physics.chemistry_adaptive_error_estimate_threshold = parseFloating(
+      requireString(entries, consumed, "physics.chemistry_adaptive_error_estimate_threshold", "0.0"),
+      "physics.chemistry_adaptive_error_estimate_threshold");
+  frozen.config.physics.chemistry_adaptive_residual_fraction_threshold = parseFloating(
+      requireString(entries, consumed, "physics.chemistry_adaptive_residual_fraction_threshold", "0.0"),
+      "physics.chemistry_adaptive_residual_fraction_threshold");
   frozen.config.physics.chemistry_adaptive_dense_nh_cm3 = parseFloating(
       requireString(entries, consumed, "physics.chemistry_adaptive_dense_nh_cm3", "1.0"), "physics.chemistry_adaptive_dense_nh_cm3");
   frozen.config.physics.chemistry_shadow_sample_fraction = parseFloating(

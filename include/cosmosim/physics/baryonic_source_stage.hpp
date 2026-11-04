@@ -32,7 +32,7 @@ namespace cosmosim::physics {
 //   pending diagnostics/ledgers and returns the rows whose P/T/c_s must be
 //   refreshed. It is only called after the StageTransaction collective vote.
 // discard(): drops staging and pending diagnostics (rejected interval).
-// Memory: (lanes + 8) doubles per active row, admitted by the caller through
+// Memory: (lanes + 16) doubles per active row, admitted by the caller through
 // the StageTransaction before prepare(); no full-state copy.
 // Scope: this is LOCAL source-stage atomicity. A rejection after other
 // stages of the same step have committed (hydro, AMR sweep) is the global
@@ -59,7 +59,8 @@ class BaryonicSourceStage {
   BaryonicSourceStage(const ThermochemistryOperator& chemistry, BaryonicSourceStageConfig config);
 
   [[nodiscard]] static std::uint64_t stagingBytes(std::size_t rows, std::size_t lanes) noexcept {
-    return static_cast<std::uint64_t>(rows) * (static_cast<std::uint64_t>(lanes) + 8U) * sizeof(double);
+    return static_cast<std::uint64_t>(rows) *
+        (static_cast<std::uint64_t>(lanes) + 16U) * sizeof(double);
   }
 
   // rows empty => all gas rows.
@@ -83,6 +84,13 @@ class BaryonicSourceStage {
     double chemistry_dwell_years = 0.0;
     double internal_energy_code = 0.0;
     double mean_molecular_weight = 0.0;
+    double last_temperature_k = 0.0;
+    double last_cooling_time_seconds = 0.0;
+    double last_error_estimate = 0.0;
+    double last_element_fraction_residual = 0.0;
+    double last_charge_residual = 0.0;
+    double cumulative_radiative_loss_erg = 0.0;
+    double cumulative_heating_gain_erg = 0.0;
   };
 
   const ThermochemistryOperator& m_chemistry;

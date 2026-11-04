@@ -2032,6 +2032,8 @@ class SourceRuntimeImpl final : public SourceRuntime {
                       {"fidelity_demoted", std::to_string(m_last_chemistry_adaptive_report.demoted)},
                       {"fidelity_promoted_by_cooling_time",
                        std::to_string(m_last_chemistry_adaptive_report.promoted_by_cooling_time)},
+                      {"fidelity_promoted_by_error_history",
+                       std::to_string(m_last_chemistry_adaptive_report.promoted_by_error_history)},
                       {"fidelity_held_by_dwell", std::to_string(m_last_chemistry_adaptive_report.held_by_dwell)},
                       {"dust_gas_to_dust_code", std::to_string(m_last_dust_ledger.gas_to_dust_code)},
                       {"dust_dust_to_gas_code", std::to_string(m_last_dust_ledger.dust_to_gas_code)},

@@ -393,7 +393,7 @@ void packGasCompositionIntoModuleSidecar(core::SimulationState& state) {
   sidecar.requireAlignedWith(state.gas_cells.gas_cell_id, "packGasCompositionIntoModuleSidecar");
   core::ModuleSidecarBlock block;
   block.module_name = k_gas_composition_module;
-  block.schema_version = 1U;
+  block.schema_version = k_gas_composition_schema;
   const auto& d = sidecar.descriptor();
   appendPod(block.payload, d.layout_version);
   appendPod(block.payload, d.layout_signature);
@@ -409,7 +409,10 @@ void packGasCompositionIntoModuleSidecar(core::SimulationState& state) {
 bool restoreGasCompositionFromModuleSidecar(core::SimulationState& state, const CompositionLayout& layout) {
   const core::ModuleSidecarBlock* block = state.sidecars.find(k_gas_composition_module);
   if (block == nullptr) return false;
-  if (block->schema_version != 1U) throw std::runtime_error("unsupported chui_gas_composition schema version");
+  if (block->schema_version != 1U &&
+      block->schema_version != k_gas_composition_schema) {
+    throw std::runtime_error("unsupported chui_gas_composition schema version");
+  }
   std::size_t offset = 0;
   const auto version = readPod<std::uint32_t>(block->payload, offset);
   const auto signature = readPod<std::uint64_t>(block->payload, offset);
@@ -429,11 +432,17 @@ bool restoreGasCompositionFromModuleSidecar(core::SimulationState& state, const 
   std::unordered_map<std::uint64_t, std::uint32_t> row_by_id;
   row_by_id.reserve(state.cells.size());
   for (std::uint32_t r = 0; r < state.cells.size(); ++r) row_by_id.emplace(state.gas_cells.gas_cell_id[r], r);
-  std::vector<double> payload(restored.packedRowWidth());
+  const std::size_t stored_width = block->schema_version == 1U
+      ? restored.laneCount() + 4U
+      : restored.packedRowWidth();
+  std::vector<double> stored_payload(stored_width);
+  std::vector<double> payload(restored.packedRowWidth(), 0.0);
   std::vector<std::uint8_t> filled(state.cells.size(), 0U);
   for (std::uint64_t i = 0; i < rows; ++i) {
     const auto id = readPod<std::uint64_t>(block->payload, offset);
-    for (double& v : payload) v = readPod<double>(block->payload, offset);
+    for (double& v : stored_payload) v = readPod<double>(block->payload, offset);
+    std::fill(payload.begin(), payload.end(), 0.0);
+    std::copy(stored_payload.begin(), stored_payload.end(), payload.begin());
     const auto it = row_by_id.find(id);
     if (it == row_by_id.end() || filled[it->second] != 0U) {
       throw std::runtime_error("checkpointed gas composition row " + std::to_string(id) +
@@ -441,6 +450,10 @@ bool restoreGasCompositionFromModuleSidecar(core::SimulationState& state, const 
     }
     restored.unpackRow(it->second, payload, id);
     filled[it->second] = 1U;
+  }
+  if (offset != block->payload.size()) {
+    throw std::runtime_error(
+        "checkpointed gas composition block has trailing bytes for its schema");
   }
   state.gas_composition = std::move(restored);
   return true;

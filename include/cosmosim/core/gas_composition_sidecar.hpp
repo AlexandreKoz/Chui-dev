@@ -33,8 +33,9 @@ namespace cosmosim::core {
 //   permutation). A mismatch is a hard error, never a silent remap.
 // * Disabled (layout_version == 0) means ZERO allocation: DMO and plain hydro
 //   runs carry no lanes.
-// * chemistry_model_tag / ism_regime_tag / model_dwell_years are persistent
-//   history for local model switching and regime hysteresis.
+// * chemistry/ISM tags and dwell counters plus the accepted local
+//   temperature, cooling-time, integration-error, conservation-residual and
+//   radiative/heating ledgers are persistent history for model selection.
 // * mean_molecular_weight is a DERIVED cache (NaN = unknown) refreshed by the
 //   thermochemistry commit and consumed by the gas thermodynamic refresh to
 //   convert specific internal energy into kelvin. It is not restart truth;
@@ -69,8 +70,9 @@ struct GasCompositionLayoutDescriptor {
 
 class GasCompositionSidecar {
  public:
-  // Number of trailing metadata values appended by packRow().
-  static constexpr std::size_t k_packed_metadata_count = 4U;
+  // Number of trailing metadata values appended by packRow(). The first four
+  // retain the schema-1 order; schema-2 adaptive-history values follow.
+  static constexpr std::size_t k_packed_metadata_count = 11U;
 
   void configure(const GasCompositionLayoutDescriptor& descriptor, std::size_t row_count);
   void clear() noexcept;
@@ -95,7 +97,7 @@ class GasCompositionSidecar {
   // e.g. star formation or accretion). factor must be in [0, 1].
   void scaleRow(std::size_t row, double factor);
 
-  // Migration payload: lane values followed by the three metadata values
+  // Migration payload: lane values followed by metadata values
   // (chemistry_model_tag, ism_regime_tag, model_dwell_years,
   // ism_regime_dwell_years). Empty when the
   // sidecar is disabled.
@@ -124,6 +126,16 @@ class GasCompositionSidecar {
   AlignedVector<double> model_dwell_years;
   // Physical time spent in the current ISM regime (hysteresis / dwell rule).
   AlignedVector<double> ism_regime_dwell_years;
+  // C03 local, restart-authoritative solver history. Zero means unavailable
+  // for the last-* fields. Cumulative radiative/heating energies are
+  // extensive and follow conservative AMR prolongation/restriction.
+  AlignedVector<double> chemistry_last_temperature_k;
+  AlignedVector<double> chemistry_last_cooling_time_seconds;
+  AlignedVector<double> chemistry_last_error_estimate;
+  AlignedVector<double> chemistry_last_element_fraction_residual;
+  AlignedVector<double> chemistry_last_charge_residual;
+  AlignedVector<double> chemistry_cumulative_radiative_loss_erg;
+  AlignedVector<double> chemistry_cumulative_heating_gain_erg;
   AlignedVector<double> mean_molecular_weight;
 
  private:

@@ -200,6 +200,8 @@ ChemistryFidelityDecision ThermochemistryOperator::decideChemistryFidelity(
     c.molecular_fraction_threshold /= s;
     c.co_carbon_fraction_threshold /= s;
     c.cooling_time_ratio *= s;
+    c.error_estimate_threshold /= s;
+    c.residual_fraction_threshold /= s;
   }
   const double h = c.hysteresis_fraction;
   const ThermochemistryCellInput input = cellInput(state, row, interval);
@@ -225,17 +227,35 @@ ChemistryFidelityDecision ThermochemistryOperator::decideChemistryFidelity(
   const double stiff_horizon = c.cooling_time_ratio * interval.physical_seconds;
   const bool stiff = c.cooling_time_ratio > 0.0 && t_cool < stiff_horizon;
   const bool not_stiff = c.cooling_time_ratio <= 0.0 || t_cool > stiff_horizon * (1.0 + h);
+  const double previous_error = sidecar.chemistry_last_error_estimate[row];
+  const double residual_fraction = std::max(
+      sidecar.chemistry_last_element_fraction_residual[row],
+      sidecar.chemistry_last_charge_residual[row]);
+  const bool error_history =
+      c.error_estimate_threshold > 0.0 &&
+      previous_error > c.error_estimate_threshold;
+  const bool residual_history =
+      c.residual_fraction_threshold > 0.0 &&
+      residual_fraction > c.residual_fraction_threshold;
+  const bool error_history_clear =
+      (c.error_estimate_threshold <= 0.0 ||
+       previous_error < c.error_estimate_threshold * (1.0 - h)) &&
+      (c.residual_fraction_threshold <= 0.0 ||
+       residual_fraction < c.residual_fraction_threshold * (1.0 - h));
   const std::uint8_t current = decision.tag;
   std::uint8_t desired = current;
   if (current == k_chemistry_tag_hybrid) {
     const bool cold_dense = t < c.cold_temperature_k * (1.0 - h) && n_h > c.dense_n_h_cm3 * (1.0 + h);
-    if (cold_dense || stiff || f_h2 > c.molecular_fraction_threshold * (1.0 + h) ||
+    if (cold_dense || stiff || error_history || residual_history ||
+        f_h2 > c.molecular_fraction_threshold * (1.0 + h) ||
         f_co > c.co_carbon_fraction_threshold * (1.0 + h)) {
       desired = k_chemistry_tag_detailed;
       decision.cooling_time_trigger = stiff;
+      decision.error_history_trigger = error_history || residual_history;
     }
   } else {
-    const bool clear = not_stiff && t > c.cold_temperature_k * (1.0 + h) && n_h < c.dense_n_h_cm3 * (1.0 - h) &&
+    const bool clear = not_stiff && error_history_clear &&
+        t > c.cold_temperature_k * (1.0 + h) && n_h < c.dense_n_h_cm3 * (1.0 - h) &&
         f_h2 < c.molecular_fraction_threshold * (1.0 - h) && f_co < c.co_carbon_fraction_threshold * (1.0 - h);
     if (clear) desired = k_chemistry_tag_hybrid;
   }

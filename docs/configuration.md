@@ -819,6 +819,8 @@ Handoff: `docs/repair/chui_part2_thermochemistry_stellar_physics_20261103.md`.
 | `chemistry_adaptive_selection` | `off` \| `local_v1` | requires `fixed_detailed` |
 | `chemistry_adaptive_hysteresis_fraction`, `chemistry_adaptive_min_dwell_years`, `chemistry_adaptive_cold_temperature_k`, `chemistry_adaptive_dense_nh_cm3` | 0.3, 1e6, 3e3, 1 | |
 | `chemistry_adaptive_cooling_time_ratio` | 0 | R3, EXPERIMENTAL/UNQUALIFIED. Promotes a row to detailed chemistry when the network's net cooling time `u / (Lambda + chemical - Gamma)` is shorter than `ratio x interval` (stiff, rapidly cooling gas). Demotion additionally requires `t_cool > ratio x interval x (1 + h)`. The global promotion bias scales the ratio. 0 disables. Counted in the source event as `fidelity_promoted_by_cooling_time`. |
+| `chemistry_adaptive_error_estimate_threshold` | 0 | C03, EXPERIMENTAL/UNQUALIFIED. Promotes from the previous accepted normalized local solver-error estimate; demotion requires the stored value below the hysteretic lower threshold. 0 disables. |
+| `chemistry_adaptive_residual_fraction_threshold` | 0 | C03, EXPERIMENTAL/UNQUALIFIED. Promotes from the maximum of the previous dimensionless element-projection and charge residuals; demotion uses the hysteretic lower threshold. 0 disables. |
 | `chemistry_shadow_sample_fraction`, `chemistry_shadow_max_cells` | 0, 0 | bounded shadow reference sampling |
 | `stellar_population_model` | `legacy_table` \| `chabrier_reference_v1` \| `chabrier_yield_table_v1` | Part 2 SSP; table mode needs `ssp_yield_table_path` |
 | `ssp_yield_table_path`, `ssp_yield_table_sha256` | "" | `chui_ssp_yield_table_v1` |

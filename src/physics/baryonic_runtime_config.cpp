@@ -127,6 +127,10 @@ ThermochemistryOperatorConfig makeThermochemistryOperatorConfig(
   op.adaptive.hysteresis_fraction = p.chemistry_adaptive_hysteresis_fraction;
   op.adaptive.minimum_dwell_years = p.chemistry_adaptive_min_dwell_years;
   op.adaptive.cooling_time_ratio = p.chemistry_adaptive_cooling_time_ratio;
+  op.adaptive.error_estimate_threshold =
+      p.chemistry_adaptive_error_estimate_threshold;
+  op.adaptive.residual_fraction_threshold =
+      p.chemistry_adaptive_residual_fraction_threshold;
   op.shadow.sample_fraction = p.chemistry_shadow_sample_fraction;
   op.shadow.max_cells = p.chemistry_shadow_max_cells;
   return op;

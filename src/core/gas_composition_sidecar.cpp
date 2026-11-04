@@ -59,6 +59,13 @@ void GasCompositionSidecar::clear() noexcept {
   ism_regime_tag = {};
   model_dwell_years = {};
   ism_regime_dwell_years = {};
+  chemistry_last_temperature_k = {};
+  chemistry_last_cooling_time_seconds = {};
+  chemistry_last_error_estimate = {};
+  chemistry_last_element_fraction_residual = {};
+  chemistry_last_charge_residual = {};
+  chemistry_cumulative_radiative_loss_erg = {};
+  chemistry_cumulative_heating_gain_erg = {};
   mean_molecular_weight = {};
 }
 
@@ -77,6 +84,13 @@ void GasCompositionSidecar::resizeRows(std::size_t row_count) {
   ism_regime_tag.resize(row_count, 0U);
   model_dwell_years.resize(row_count, 0.0);
   ism_regime_dwell_years.resize(row_count, 0.0);
+  chemistry_last_temperature_k.resize(row_count, 0.0);
+  chemistry_last_cooling_time_seconds.resize(row_count, 0.0);
+  chemistry_last_error_estimate.resize(row_count, 0.0);
+  chemistry_last_element_fraction_residual.resize(row_count, 0.0);
+  chemistry_last_charge_residual.resize(row_count, 0.0);
+  chemistry_cumulative_radiative_loss_erg.resize(row_count, 0.0);
+  chemistry_cumulative_heating_gain_erg.resize(row_count, 0.0);
   mean_molecular_weight.resize(row_count, std::numeric_limits<double>::quiet_NaN());
 }
 
@@ -139,6 +153,13 @@ std::vector<double> GasCompositionSidecar::packRow(std::size_t row) const {
   payload.push_back(static_cast<double>(ism_regime_tag[row]));
   payload.push_back(model_dwell_years[row]);
   payload.push_back(ism_regime_dwell_years[row]);
+  payload.push_back(chemistry_last_temperature_k[row]);
+  payload.push_back(chemistry_last_cooling_time_seconds[row]);
+  payload.push_back(chemistry_last_error_estimate[row]);
+  payload.push_back(chemistry_last_element_fraction_residual[row]);
+  payload.push_back(chemistry_last_charge_residual[row]);
+  payload.push_back(chemistry_cumulative_radiative_loss_erg[row]);
+  payload.push_back(chemistry_cumulative_heating_gain_erg[row]);
   return payload;
 }
 
@@ -169,6 +190,13 @@ void GasCompositionSidecar::unpackRow(
   ism_regime_tag[row] = static_cast<std::uint8_t>(payload[meta + 1U]);
   model_dwell_years[row] = payload[meta + 2U];
   ism_regime_dwell_years[row] = payload[meta + 3U];
+  chemistry_last_temperature_k[row] = payload[meta + 4U];
+  chemistry_last_cooling_time_seconds[row] = payload[meta + 5U];
+  chemistry_last_error_estimate[row] = payload[meta + 6U];
+  chemistry_last_element_fraction_residual[row] = payload[meta + 7U];
+  chemistry_last_charge_residual[row] = payload[meta + 8U];
+  chemistry_cumulative_radiative_loss_erg[row] = payload[meta + 9U];
+  chemistry_cumulative_heating_gain_erg[row] = payload[meta + 10U];
   mean_molecular_weight[row] = std::numeric_limits<double>::quiet_NaN();
   gas_cell_id[row] = gas_cell_id_value;
 }
@@ -210,6 +238,13 @@ bool GasCompositionSidecar::isConsistent(std::size_t expected_rows) const noexce
       gas_cell_id.size() != expected_rows || chemistry_model_tag.size() != expected_rows ||
       ism_regime_tag.size() != expected_rows || model_dwell_years.size() != expected_rows ||
       ism_regime_dwell_years.size() != expected_rows ||
+      chemistry_last_temperature_k.size() != expected_rows ||
+      chemistry_last_cooling_time_seconds.size() != expected_rows ||
+      chemistry_last_error_estimate.size() != expected_rows ||
+      chemistry_last_element_fraction_residual.size() != expected_rows ||
+      chemistry_last_charge_residual.size() != expected_rows ||
+      chemistry_cumulative_radiative_loss_erg.size() != expected_rows ||
+      chemistry_cumulative_heating_gain_erg.size() != expected_rows ||
       mean_molecular_weight.size() != expected_rows) {
     return false;
   }
@@ -217,6 +252,20 @@ bool GasCompositionSidecar::isConsistent(std::size_t expected_rows) const noexce
     if (values.size() != expected_rows) return false;
     for (const double v : values) {
       if (!std::isfinite(v) || v < 0.0) return false;
+    }
+  }
+  for (const auto* values : {
+           &model_dwell_years,
+           &ism_regime_dwell_years,
+           &chemistry_last_temperature_k,
+           &chemistry_last_cooling_time_seconds,
+           &chemistry_last_error_estimate,
+           &chemistry_last_element_fraction_residual,
+           &chemistry_last_charge_residual,
+           &chemistry_cumulative_radiative_loss_erg,
+           &chemistry_cumulative_heating_gain_erg}) {
+    for (const double value : *values) {
+      if (!std::isfinite(value) || value < 0.0) return false;
     }
   }
   return true;
@@ -227,8 +276,15 @@ std::uint64_t GasCompositionSidecar::ownedCapacityBytes() const noexcept {
   for (const auto& values : m_lanes) bytes += values.capacity() * sizeof(double);
   bytes += gas_cell_id.capacity() * sizeof(std::uint64_t);
   bytes += chemistry_model_tag.capacity() + ism_regime_tag.capacity();
-  bytes += (model_dwell_years.capacity() + ism_regime_dwell_years.capacity() + mean_molecular_weight.capacity()) *
-      sizeof(double);
+  bytes += (model_dwell_years.capacity() + ism_regime_dwell_years.capacity() +
+            chemistry_last_temperature_k.capacity() +
+            chemistry_last_cooling_time_seconds.capacity() +
+            chemistry_last_error_estimate.capacity() +
+            chemistry_last_element_fraction_residual.capacity() +
+            chemistry_last_charge_residual.capacity() +
+            chemistry_cumulative_radiative_loss_erg.capacity() +
+            chemistry_cumulative_heating_gain_erg.capacity() +
+            mean_molecular_weight.capacity()) * sizeof(double);
   return bytes;
 }
 
@@ -237,7 +293,15 @@ std::uint64_t GasCompositionSidecar::currentSizeBytes() const noexcept {
   for (const auto& values : m_lanes) bytes += values.size() * sizeof(double);
   bytes += gas_cell_id.size() * sizeof(std::uint64_t);
   bytes += chemistry_model_tag.size() + ism_regime_tag.size();
-  bytes += (model_dwell_years.size() + ism_regime_dwell_years.size() + mean_molecular_weight.size()) * sizeof(double);
+  bytes += (model_dwell_years.size() + ism_regime_dwell_years.size() +
+            chemistry_last_temperature_k.size() +
+            chemistry_last_cooling_time_seconds.size() +
+            chemistry_last_error_estimate.size() +
+            chemistry_last_element_fraction_residual.size() +
+            chemistry_last_charge_residual.size() +
+            chemistry_cumulative_radiative_loss_erg.size() +
+            chemistry_cumulative_heating_gain_erg.size() +
+            mean_molecular_weight.size()) * sizeof(double);
   return bytes;
 }
 

@@ -659,6 +659,10 @@ struct PhysicsConfig {
   double chemistry_adaptive_cold_temperature_k = 3.0e3;
   // R3: promote to detailed chemistry when t_cool < ratio x interval (0 off).
   double chemistry_adaptive_cooling_time_ratio = 0.0;
+  // C03: normalized previous accepted solver error and conservation-residual
+  // fraction thresholds (0 disables each history criterion).
+  double chemistry_adaptive_error_estimate_threshold = 0.0;
+  double chemistry_adaptive_residual_fraction_threshold = 0.0;
   double chemistry_adaptive_dense_nh_cm3 = 1.0;
   double chemistry_shadow_sample_fraction = 0.0;
   double ssp_imf_mass_min_msun = 0.1;

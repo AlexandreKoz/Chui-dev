@@ -212,7 +212,7 @@ std::array<double, k_chemical_element_count> removeGasFractionFromComposition(
 
 // ---------------------------------------------------------------------------
 // Restart persistence (CHUI Part 2). The composition sidecar is checkpointed
-// as the run-persistent module block "chui_gas_composition_v1" (schema 1):
+// as the run-persistent module block "chui_gas_composition_v1" (schema 2):
 //   u32 layout_version, u64 layout_signature, u32 lane_count,
 //   u64 row_count, then per row: u64 gas_cell_id, f64 x packedRowWidth().
 // The block is refreshed immediately before each restart write (it is a
@@ -222,6 +222,7 @@ std::array<double, k_chemical_element_count> removeGasFractionFromComposition(
 // layout signature mismatch or a width mismatch is refused.
 // ---------------------------------------------------------------------------
 inline constexpr const char* k_gas_composition_module = "chui_gas_composition_v1";
+inline constexpr std::uint32_t k_gas_composition_schema = 2U;
 void packGasCompositionIntoModuleSidecar(core::SimulationState& state);
 // Returns true when the sidecar was restored from the module block.
 bool restoreGasCompositionFromModuleSidecar(core::SimulationState& state, const CompositionLayout& layout);

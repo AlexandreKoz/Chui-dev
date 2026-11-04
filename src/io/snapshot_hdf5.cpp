@@ -1444,7 +1444,7 @@ void writeScienceSnapshotHdf5(
       add_double("Pressure");
     }
     // CHUI Part 3 Checkpoint G: science-state export of the composition
-    // sidecar (schema CHUI_CompositionSchemaVersion = 1, see
+    // sidecar (schema CHUI_CompositionSchemaVersion = 2, see
     // docs/output_schema.md). Present iff the run carries a composition
     // sidecar (identical decision on every rank: the layout is part of the
     // configuration); absent datasets mean "physics disabled", never zero.
@@ -1468,7 +1468,8 @@ void writeScienceSnapshotHdf5(
         }
         return joined;
       };
-      writeScalarUint32Attribute(type_group.get(), "CHUI_CompositionSchemaVersion", 1U);
+      writeScalarUint32Attribute(type_group.get(), "CHUI_CompositionSchemaVersion",
+                                 physics::k_gas_composition_schema);
       writeScalarStringAttribute(type_group.get(), "CHUI_CompositionLayoutName", composition_descriptor.layout_name);
       writeScalarStringAttribute(type_group.get(), "CHUI_CompositionFractionBasis",
                                  "lane_mass / (sum(element lanes) + sum(dust lanes))");
@@ -1497,6 +1498,13 @@ void writeScienceSnapshotHdf5(
       add_u8("CHUI_IsmRegimeTag");
       add_double("CHUI_ChemistryModelDwellYears");
       add_double("CHUI_IsmRegimeDwellYears");
+      add_double("CHUI_ChemistryLastTemperatureK");
+      add_double("CHUI_ChemistryLastCoolingTimeSeconds");
+      add_double("CHUI_ChemistryLastErrorEstimate");
+      add_double("CHUI_ChemistryLastElementFractionResidual");
+      add_double("CHUI_ChemistryLastChargeResidual");
+      add_double("CHUI_ChemistryCumulativeRadiativeLossErg");
+      add_double("CHUI_ChemistryCumulativeHeatingGainErg");
     }
     // Stellar population science state (PartType4), present iff a Part 2
     // stellar population model is configured (rank-uniform decision).
@@ -1700,10 +1708,27 @@ void writeScienceSnapshotHdf5(
           write_double_extra("CHUI_IsmRegimeDwellYears", d3.data(), offset, count);
           write_u8_extra("CHUI_ChemistryModelTag", u80.data(), offset, count);
           write_u8_extra("CHUI_IsmRegimeTag", u81.data(), offset, count);
+          for (std::size_t j = 0; j < count; ++j) {
+            const std::size_t row = offset + j;
+            d0[j] = sidecar.chemistry_last_temperature_k[row];
+            d1[j] = sidecar.chemistry_last_cooling_time_seconds[row];
+            d2[j] = sidecar.chemistry_last_error_estimate[row];
+            d3[j] = sidecar.chemistry_last_element_fraction_residual[row];
+            d4[j] = sidecar.chemistry_last_charge_residual[row];
+            d5[j] = sidecar.chemistry_cumulative_radiative_loss_erg[row];
+            d6[j] = sidecar.chemistry_cumulative_heating_gain_erg[row];
+          }
+          write_double_extra("CHUI_ChemistryLastTemperatureK", d0.data(), offset, count);
+          write_double_extra("CHUI_ChemistryLastCoolingTimeSeconds", d1.data(), offset, count);
+          write_double_extra("CHUI_ChemistryLastErrorEstimate", d2.data(), offset, count);
+          write_double_extra("CHUI_ChemistryLastElementFractionResidual", d3.data(), offset, count);
+          write_double_extra("CHUI_ChemistryLastChargeResidual", d4.data(), offset, count);
+          write_double_extra("CHUI_ChemistryCumulativeRadiativeLossErg", d5.data(), offset, count);
+          write_double_extra("CHUI_ChemistryCumulativeHeatingGainErg", d6.data(), offset, count);
         }
         const std::uint64_t staging_bytes = static_cast<std::uint64_t>(
             count * (6U * sizeof(double) + sizeof(double) + sizeof(std::uint64_t) +
-                     10U * sizeof(double) + 3U * sizeof(std::uint64_t) + 2U * sizeof(std::uint8_t)));
+                     17U * sizeof(double) + 3U * sizeof(std::uint64_t) + 2U * sizeof(std::uint8_t)));
         const std::uint64_t logical_bytes = staging_bytes;
         write_metrics.observe(staging_bytes, logical_bytes);
       }

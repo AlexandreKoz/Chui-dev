@@ -852,7 +852,7 @@ struct CompositionRegridPlan {
   }
   const std::size_t per_row = core::checkedSizeAdd(
       core::checkedSizeMultiply(state.gas_composition.laneCount(), sizeof(double), "composition lanes"),
-      sizeof(std::uint64_t) + 2U * sizeof(std::uint8_t) + 3U * sizeof(double),
+      sizeof(std::uint64_t) + 2U * sizeof(std::uint8_t) + 10U * sizeof(double),
       "composition row bytes");
   return core::checkedMemoryBytesAdd(
       static_cast<std::uint64_t>(core::checkedSizeMultiply(candidate_rows, per_row, "composition candidate bytes")),
@@ -866,8 +866,11 @@ struct CompositionRegridPlan {
 // restriction takes the most detailed chemistry tag among the children (no
 // tracked species is ever discarded by a demotion at regrid), the ISM regime
 // of the most massive child (lowest source row on ties: deterministic), the
-// minimum dwell (hysteresis restarts conservatively) and an unknown (NaN)
-// mean molecular weight that the next chemistry/refresh rebuilds.
+// minimum dwell (hysteresis restarts conservatively), maximum accepted error
+// and residuals, minimum finite cooling time, the heaviest child's last
+// temperature, and an unknown (NaN) mean molecular weight that the next
+// chemistry/refresh rebuilds. Cumulative radiative/heating energies use the
+// same conservative weights as extensive composition lanes.
 [[nodiscard]] core::GasCompositionSidecar buildRegriddedComposition(
     const core::SimulationState& old_state,
     const core::SimulationState& candidate,
@@ -911,18 +914,53 @@ struct CompositionRegridPlan {
       result.ism_regime_tag[row] = old.ism_regime_tag[src];
       result.model_dwell_years[row] = old.model_dwell_years[src];
       result.ism_regime_dwell_years[row] = old.ism_regime_dwell_years[src];
+      result.chemistry_last_temperature_k[row] =
+          old.chemistry_last_temperature_k[src];
+      result.chemistry_last_cooling_time_seconds[row] =
+          old.chemistry_last_cooling_time_seconds[src];
+      result.chemistry_last_error_estimate[row] =
+          old.chemistry_last_error_estimate[src];
+      result.chemistry_last_element_fraction_residual[row] =
+          old.chemistry_last_element_fraction_residual[src];
+      result.chemistry_last_charge_residual[row] =
+          old.chemistry_last_charge_residual[src];
+      result.chemistry_cumulative_radiative_loss_erg[row] =
+          plan.weights[begin] * old.chemistry_cumulative_radiative_loss_erg[src];
+      result.chemistry_cumulative_heating_gain_erg[row] =
+          plan.weights[begin] * old.chemistry_cumulative_heating_gain_erg[src];
       result.mean_molecular_weight[row] = old.mean_molecular_weight[src];
       continue;
     }
     std::uint8_t tag = 0U;
     double dwell = std::numeric_limits<double>::infinity();
     double regime_dwell = std::numeric_limits<double>::infinity();
+    double minimum_cooling_time = std::numeric_limits<double>::infinity();
+    double maximum_error = 0.0;
+    double maximum_element_residual = 0.0;
+    double maximum_charge_residual = 0.0;
+    double cumulative_radiative_loss = 0.0;
+    double cumulative_heating_gain = 0.0;
     std::uint32_t heaviest = plan.source_rows[begin];
     for (std::uint32_t entry = begin; entry < end; ++entry) {
       const std::uint32_t src = plan.source_rows[entry];
       tag = std::max(tag, old.chemistry_model_tag[src]);
       dwell = std::min(dwell, old.model_dwell_years[src]);
       regime_dwell = std::min(regime_dwell, old.ism_regime_dwell_years[src]);
+      const double cooling_time = old.chemistry_last_cooling_time_seconds[src];
+      if (cooling_time > 0.0) {
+        minimum_cooling_time = std::min(minimum_cooling_time, cooling_time);
+      }
+      maximum_error = std::max(maximum_error,
+                               old.chemistry_last_error_estimate[src]);
+      maximum_element_residual = std::max(
+          maximum_element_residual,
+          old.chemistry_last_element_fraction_residual[src]);
+      maximum_charge_residual = std::max(
+          maximum_charge_residual, old.chemistry_last_charge_residual[src]);
+      cumulative_radiative_loss += plan.weights[entry] *
+          old.chemistry_cumulative_radiative_loss_erg[src];
+      cumulative_heating_gain += plan.weights[entry] *
+          old.chemistry_cumulative_heating_gain_erg[src];
       const double mass = old_state.cells.mass_code[src];
       const double best = old_state.cells.mass_code[heaviest];
       if (mass > best || (mass == best && src < heaviest)) heaviest = src;
@@ -931,6 +969,18 @@ struct CompositionRegridPlan {
     result.ism_regime_tag[row] = old.ism_regime_tag[heaviest];
     result.model_dwell_years[row] = std::isfinite(dwell) ? dwell : 0.0;
     result.ism_regime_dwell_years[row] = std::isfinite(regime_dwell) ? regime_dwell : 0.0;
+    result.chemistry_last_temperature_k[row] =
+        old.chemistry_last_temperature_k[heaviest];
+    result.chemistry_last_cooling_time_seconds[row] =
+        std::isfinite(minimum_cooling_time) ? minimum_cooling_time : 0.0;
+    result.chemistry_last_error_estimate[row] = maximum_error;
+    result.chemistry_last_element_fraction_residual[row] =
+        maximum_element_residual;
+    result.chemistry_last_charge_residual[row] = maximum_charge_residual;
+    result.chemistry_cumulative_radiative_loss_erg[row] =
+        cumulative_radiative_loss;
+    result.chemistry_cumulative_heating_gain_erg[row] =
+        cumulative_heating_gain;
     result.mean_molecular_weight[row] = std::numeric_limits<double>::quiet_NaN();
   }
   for (std::size_t lane = 0; lane < lanes; ++lane) {
