@@ -1,4 +1,5 @@
 #include "cosmosim/workflows/time_coordinator.hpp"
+#include "cosmosim/core/stage_transaction.hpp"
 
 #include <algorithm>
 #include <array>
@@ -1089,12 +1090,73 @@ void TimeCoordinator::runRungZeroSegment(
       : static_cast<std::uint64_t>(std::max(config.numerics.max_global_steps, 0));
   const std::uint64_t target_step_index = integrator_state.step_index + configured_segment_steps;
   core::TransientStepWorkspace workspace(m_services.memory_governor);
+  // CHUI Part 3 Checkpoint D: collective global-step rollback (rung zero).
+  // With numerics.global_step_max_retries > 0, the complete authoritative
+  // step-start state (SimulationState incl. composition/star/module
+  // sidecars and AMR hierarchy, integrator, both schedulers, pending output,
+  // gravity endpoint force) is captured under MemoryGovernor admission. A
+  // stage that rejects with kNumericalRetry on any rank (collective verdict)
+  // restores everything and retries the SAME physical model with half the
+  // interval (legal retry). Any other rejection kind (model downgrade,
+  // resource refusal, invalid state) is an illegal downgrade request and is
+  // rethrown on every rank. Event chronology is restored with the population
+  // sidecar, so retried events are never duplicated. Output is written only
+  // after an accepted step (the pending-output latch is restored too).
+  // Cost: one full copy of the canonical state per step while enabled (an
+  // explicit, governed reference mode; bounded delta journals are future
+  // optimization work). Default 0 keeps the historical behaviour.
+  struct GlobalStepRetryPoint {
+    std::optional<core::SimulationState> state;
+    core::IntegratorState integrator{};
+    std::optional<core::HierarchicalTimeBinScheduler> particles;
+    std::optional<core::HierarchicalTimeBinScheduler> cells;
+    internal::PendingOutputBoundary pending{};
+    TransactionalForceEndpoint force_endpoint{};
+    std::uint64_t layout_certificate = 0U;
+    core::MemoryReservation reservation;
+  };
+  const std::uint32_t global_step_max_retries =
+      static_cast<std::uint32_t>(std::max(config.numerics.global_step_max_retries, 0));
+  std::uint32_t global_step_retries = 0U;
+  double global_step_retry_dt_limit = 0.0;
+  const auto layoutCertificate = [&state]() {
+    std::uint64_t hash = 1469598103934665603ULL;
+    const auto mix = [&hash](std::uint64_t v) { hash ^= v; hash *= 1099511628211ULL; };
+    mix(state.particles.size());
+    for (const std::uint64_t id : state.particle_sidecar.particle_id) mix(id);
+    mix(state.cells.size());
+    return hash;
+  };
   while (integrator_state.step_index < target_step_index &&
          integrator_state.current_time_code < config.numerics.t_code_end) {
     const RuntimeConsoleReporter::Clock::time_point console_step_begin =
         RuntimeConsoleReporter::Clock::now();
     const std::uint64_t pm_refresh_count_before = m_gravity.longRangeRefreshCount();
     const std::uint64_t pm_reuse_count_before = m_gravity.longRangeReuseCount();
+    GlobalStepRetryPoint retry_point;
+    if (global_step_max_retries > 0U) {
+      std::exception_ptr capture_failure;
+      try {
+        if (m_services.memory_governor != nullptr) {
+          retry_point.reservation = m_services.memory_governor->reserve(
+              core::MemoryClass::kPhaseResident,
+              core::memoryReportBaselineOwnedBytes(core::collectSimulationMemoryReport(state)),
+              "time.global_step_rollback.state_copy");
+          retry_point.reservation.commit();
+        }
+        retry_point.state.emplace(state);
+        retry_point.integrator = integrator_state;
+        retry_point.particles.emplace(particle_scheduler);
+        retry_point.cells.emplace(gas_cell_scheduler);
+        retry_point.pending = pending_output;
+        retry_point.layout_certificate = layoutCertificate();
+        m_gravity.captureTransactionalForceEndpoint(state, retry_point.layout_certificate, retry_point.force_endpoint);
+        m_gravity.beginCycleTransaction();
+      } catch (...) {
+        capture_failure = std::current_exception();
+      }
+      FailureCoordinator(m_services).rethrowCollectiveFailure(capture_failure, "global step rollback capture");
+    }
     // Rung zero has one physical timestep authority. Re-evaluate all local
     // criteria before constructing KDK stage times, then agree the minimum
     // collectively so every rank advances the identical interval.
@@ -1164,6 +1226,11 @@ void TimeCoordinator::runRungZeroSegment(
     if (!std::isfinite(accepted_dt) || accepted_dt <= 0.0) {
       throw std::runtime_error("ReferenceWorkflow global timestep selection produced an invalid dt");
     }
+    if (global_step_retry_dt_limit > 0.0 && accepted_dt > global_step_retry_dt_limit) {
+      // Legal retry: same physics, shorter interval (identical on all ranks).
+      accepted_dt = global_step_retry_dt_limit;
+      profiler.counters().addCount("time.global_step_retry_shortened_intervals");
+    }
     integrator_state.dt_time_code = accepted_dt;
     const double accepted_dt_time_code_for_console = accepted_dt;
 
@@ -1230,16 +1297,63 @@ void TimeCoordinator::runRungZeroSegment(
         global_active_particle_count == global_particle_count &&
         global_active_cell_count == global_cell_count;
     m_newly_created_particle_ids.clear();
-    executeSingleStep(
-        state,
-        integrator_state,
-        active_set,
-        cosmology_background,
-        &workspace,
-        &mode_policy,
-        &profiler,
-        particle_scheduler.currentTick(),
-        requested_boundary);
+    if (global_step_max_retries == 0U) {
+      executeSingleStep(
+          state, integrator_state, active_set, cosmology_background, &workspace, &mode_policy, &profiler,
+          particle_scheduler.currentTick(), requested_boundary);
+    } else {
+      bool rejected = false;
+      std::uint64_t illegal = 0U;
+      std::string rejection_reason;
+      try {
+        executeSingleStep(
+            state, integrator_state, active_set, cosmology_background, &workspace, &mode_policy, &profiler,
+            particle_scheduler.currentTick(), requested_boundary);
+      } catch (const core::StageTransactionRejected& rejection) {
+        rejected = true;
+        rejection_reason = rejection.what();
+        illegal = (rejection.kind() == core::StageRejectionKind::kNumericalRetry ||
+                   rejection.kind() == core::StageRejectionKind::kPeerRejected) ? 0U : 1U;
+      }
+      // Stage rejections are collective by contract (StageTransaction with
+      // the MPI decision); the verdict on legality is reduced so every rank
+      // takes the same branch.
+      const std::uint64_t any_rejected = m_services.mpi_context.allreduceMaxUint64(rejected ? 1U : 0U);
+      const std::uint64_t any_illegal = m_services.mpi_context.allreduceMaxUint64(illegal);
+      if (any_rejected != 0U) {
+        if (any_illegal != 0U || global_step_retries >= global_step_max_retries) {
+          throw std::runtime_error(
+              "global step rejected and not retryable (" +
+              std::string(any_illegal != 0U ? "illegal model downgrade / resource / invalid-state rejection"
+                                             : "retry limit exhausted") +
+              "): " + rejection_reason);
+        }
+        std::exception_ptr restore_failure;
+        try {
+          const std::uint64_t generation_reached = state.gravitySourceGeneration();
+          state = std::move(*retry_point.state);
+          while (state.gravitySourceGeneration() <= generation_reached) state.bumpGravitySourceGeneration();
+          state.bumpCellIndexGeneration();
+          integrator_state = retry_point.integrator;
+          particle_scheduler = std::move(*retry_point.particles);
+          gas_cell_scheduler = std::move(*retry_point.cells);
+          pending_output = retry_point.pending;
+          m_gravity.rollbackCycleTransaction(retry_point.force_endpoint, state, retry_point.layout_certificate);
+          integrator_state.pm_source_generation = state.gravitySourceGeneration();
+          syncTimeBinsFromSchedulers(particle_scheduler, gas_cell_scheduler, state);
+        } catch (...) {
+          restore_failure = std::current_exception();
+        }
+        FailureCoordinator(m_services).rethrowCollectiveFailure(restore_failure, "global step rollback restore");
+        ++global_step_retries;
+        global_step_retry_dt_limit = 0.5 * accepted_dt;
+        profiler.counters().addCount("time.global_step_rollbacks");
+        continue;
+      }
+      if (m_gravity.cycleTransactionOpen()) m_gravity.commitCycleTransaction();
+      global_step_retries = 0U;
+      global_step_retry_dt_limit = 0.0;
+    }
     if (cosmology_background != nullptr) {
       const double a_next = integrator_state.current_scale_factor;
       if (!std::isfinite(a_next) || a_next <= 0.0 || a_next + 1.0e-14 < step_begin_scale_factor) {

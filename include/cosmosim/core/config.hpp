@@ -426,6 +426,8 @@ struct NumericsConfig {
   // CHUI Part 3 automatic AMR regrid (see docs/configuration.md). A criterion
   // value of 0 disables that criterion; kAutomatic requires at least one.
   AmrRegridConfigMode amr_regrid_mode = AmrRegridConfigMode::kOff;
+  // CHUI Part 3 collective global-step rollback (rung zero): 0 disables.
+  int global_step_max_retries = 0;
   int amr_regrid_interval_steps = 1;
   int amr_regrid_max_operations = 64;
   double amr_refine_cell_mass_code = 0.0;
