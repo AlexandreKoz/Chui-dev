@@ -22,8 +22,8 @@ is **not** declared.
 |---|---|---|
 | `kVerifiedAgainstSource` | Coefficients, exponents, temperature units and piecewise ranges compared line by line with the **primary** text (arXiv copy) | R01–R12, R14, R16, R19; R07–R09 (data contract + Rahmati); cooling C01, C03, C11 |
 | `kDerivedFromConstants` | Computed from CODATA constants | Compton (C02) |
-| `kVerifiedAgainstSecondarySource` | Primary not accessible. Checked against a peer-reviewed compilation that reproduces it | R13, R15, R17 (Abel et al. 1997); R20, R21 (Glover & Clark 2012 restating NL97); H₂ LTE cooling C04, C05 (KROME = Grassi et al. 2014, eq. 10); fine structure C10 (KROME Table B) |
-| `kUnverifiedTranscription` | Neither the primary nor a reproducing compilation was checked | R18 (Jura 1975 dust H₂ formation, 3e-17); C06 (0.4 eV per H₂ photodissociation, Black & Dalgarno 1977) |
+| `kVerifiedAgainstSecondarySource` | Primary not accessible. Checked against a peer-reviewed compilation that reproduces it | R13, R15, R17 (Abel et al. 1997); R20, R21 (Glover & Clark 2012 restating NL97); H₂ LTE cooling C04, C05 (KROME = Grassi et al. 2014, eq. 10); fine structure C10 (KROME Table B); **R18** and **C06** (D4, 2026-11-04, see §D4) |
+| `kUnverifiedTranscription` | Neither the primary nor a reproducing compilation was checked | none after D4 |
 
 The gate (`physics.thermochemistry_allow_unqualified_rates`) **remains in
 force for all three backends**:
@@ -255,3 +255,30 @@ These were computed from the published equations by a stand-alone script
   the nine elements should agree with `Total_Metals/Net_cooling` within
   the WSS09-stated accuracy.
 - A decision on lifting the gate for `equilibrium_primordial`.
+
+
+## §D4 — R18 and C06 provenance check (2026-11-04)
+
+Neither primary paper (Jura 1975 ApJ 197, 575; Black & Dalgarno 1977 ApJS
+34, 405) was read; neither is on arXiv. Both entries are now
+`kVerifiedAgainstSecondarySource`. **The thermochemistry qualification gate is
+unchanged**, because secondary verification never qualifies.
+
+- **R18 (3e-17 cm³ s⁻¹ × D/D_MW).**
+  - Le Petit et al. 2006 (Meudon PDR, astro-ph/0602150) give 3e-17 as the
+    commonly adopted Jura (1975) value from Copernicus observations; so does
+    astro-ph/0210493.
+  - Gry et al. 2002 (FUSE) find 3.1–4.5e-17. Wolfire et al. 2008
+    (arXiv:0803.0138) argue that a single value does not fit every column,
+    with about 1e-17 at low and about 3.5e-17 at high column density.
+  - No coefficient change is warranted.
+  - Limitation: there is no grain-temperature or sticking-coefficient
+    dependence, and the value is a Milky-Way-calibrated rate.
+- **C06 (0.4 eV per photodissociation).**
+  - Glover & Mac Low 2007 (astro-ph/0605120) adopt 0.4 eV per dissociation,
+    citing Black & Dalgarno 1977. Some reviews attribute the mean kinetic
+    energy to Stephens & Dalgarno 1973.
+  - A 2023 analysis finds about 0.4 eV with roughly 30% variation with
+    temperature, density and spectrum.
+  - No coefficient change is warranted.
+  - The UV-pumping heating branch is not included.

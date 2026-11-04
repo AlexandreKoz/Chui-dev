@@ -75,9 +75,37 @@ void testRefusals() {
   CHUI_REQUIRE(rejects(galaxy + "ssp_wind_model = nonsense\n"));
 }
 
+// R1 (A03): physics-aware AMR indicator keys round-trip, default to 0 and
+// refuse unsupported combinations explicitly.
+void testPhysicsIndicatorKeys() {
+  const std::string base = "[mode]\nmode = cosmo_cube\n[numerics]\namr_regrid_mode = automatic\namr_max_level = 6\n";
+  const auto frozen = co::loadFrozenConfigFromString(
+      base + "amr_refine_metallicity_jump = 0.5\namr_refine_vorticity = 0.25\namr_refine_jeans_cells = 0\n",
+      "r1_keys");
+  const auto reparsed = co::loadFrozenConfigFromString(frozen.normalized_text, "r1_keys_reparse");
+  for (const auto* c : {&frozen.config, &reparsed.config}) {
+    CHUI_REQUIRE(c->numerics.amr_refine_metallicity_jump == 0.5);
+    CHUI_REQUIRE(c->numerics.amr_refine_vorticity == 0.25);
+    CHUI_REQUIRE(c->numerics.amr_refine_cooling_length_cells == 0.0);
+    CHUI_REQUIRE(c->numerics.amr_refine_species_jump == 0.0);
+  }
+  CHUI_REQUIRE(frozen.normalized_text == reparsed.normalized_text);
+  CHUI_REQUIRE(rejects(base + "amr_refine_vorticity = -1\n"));
+  // Cooling length needs the legacy in-solver cooling provider.
+  CHUI_REQUIRE(rejects(base + "amr_refine_cooling_length_cells = 4\n[physics]\nthermochemistry_backend = fixed_hybrid\n"
+                              "thermochemistry_allow_unqualified_rates = true\nuv_background_model = none\n"));
+  CHUI_REQUIRE(rejects(base + "amr_refine_cooling_length_cells = 4\n[physics]\nenable_cooling = false\n"));
+  // Species interfaces need a composition network backend.
+  CHUI_REQUIRE(rejects(base + "amr_refine_species_jump = 0.1\n"));
+  // R2: event lookahead needs automatic regrid and a Part 2 population model.
+  CHUI_REQUIRE(rejects(base + "amr_predictive_event_lookahead_years = 1.0e7\n"));
+  CHUI_REQUIRE(rejects("[mode]\nmode = cosmo_cube\n[numerics]\namr_predictive_event_lookahead_years = 1.0e7\n"));
+}
+
 }  // namespace
 
 int main() {
+  testPhysicsIndicatorKeys();
   testDefaultsKeepHistoricalBehaviour();
   testRegridRoundTrip();
   testRefusals();

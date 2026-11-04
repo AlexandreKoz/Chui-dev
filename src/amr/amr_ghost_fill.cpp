@@ -799,6 +799,27 @@ void fillAmrGhost(
     return;
   }
 
+  if (coarse_to_fine && target.enable_temporal_coarse_to_fine && selectionIsSparseRemote(selection)) {
+    // G1.1: a sparse remote coarse source is accepted ONLY when its state is
+    // labelled with exactly the requested fill time, i.e. the distributed
+    // recursive driver already interpolated it linearly in conserved
+    // variables between the exchanged start/end states of the coarse
+    // interval (the same law as temporalStateForCell). A current (end-of-
+    // interval) remote coarse state carries its own clock and is rejected.
+    if (!selectionTimesMatch(selection, target.ghost_fill_time_code)) {
+      rejectTemporal(
+          descriptor,
+          AmrHydroGhostFillStatus::kRejectedTemporalHistoryMissing,
+          diagnostics.temporal_history_missing_rejections,
+          diagnostics,
+          "remote coarse ghost is not temporally interpolated to the fill time");
+    }
+    target.conserved->storeCell(descriptor.ghost_cell, averageSourceState(selection));
+    descriptor.fill_status = AmrHydroGhostFillStatus::kFilledCoarseToFineTemporal;
+    ++diagnostics.coarse_to_fine_ghosts_filled;
+    ++diagnostics.temporal_coarse_to_fine_ghosts_filled;
+    return;
+  }
   if (coarse_to_fine && target.enable_temporal_coarse_to_fine) {
     const AmrHydroGhostFillPatch* temporal_source = selectionLocalPatch(selection);
     if (selectionIsSparseRemote(selection) || temporal_source == nullptr ||

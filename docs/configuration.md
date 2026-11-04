@@ -818,6 +818,7 @@ Handoff: `docs/repair/chui_part2_thermochemistry_stellar_physics_20261103.md`.
 | `sgs_dissipation_coefficient`, `sgs_eddy_viscosity_coefficient`, `sgs_feedback_energy_fraction` | 1.58, 0.05, 0 | |
 | `chemistry_adaptive_selection` | `off` \| `local_v1` | requires `fixed_detailed` |
 | `chemistry_adaptive_hysteresis_fraction`, `chemistry_adaptive_min_dwell_years`, `chemistry_adaptive_cold_temperature_k`, `chemistry_adaptive_dense_nh_cm3` | 0.3, 1e6, 3e3, 1 | |
+| `chemistry_adaptive_cooling_time_ratio` | 0 | R3, EXPERIMENTAL/UNQUALIFIED. Promotes a row to detailed chemistry when the network's net cooling time `u / (Lambda + chemical - Gamma)` is shorter than `ratio x interval` (stiff, rapidly cooling gas). Demotion additionally requires `t_cool > ratio x interval x (1 + h)`. The global promotion bias scales the ratio. 0 disables. Counted in the source event as `fidelity_promoted_by_cooling_time`. |
 | `chemistry_shadow_sample_fraction`, `chemistry_shadow_max_cells` | 0, 0 | bounded shadow reference sampling |
 | `stellar_population_model` | `legacy_table` \| `chabrier_reference_v1` \| `chabrier_yield_table_v1` | Part 2 SSP; table mode needs `ssp_yield_table_path` |
 | `ssp_yield_table_path`, `ssp_yield_table_sha256` | "" | `chui_ssp_yield_table_v1` |
@@ -825,7 +826,7 @@ Handoff: `docs/repair/chui_part2_thermochemistry_stellar_physics_20261103.md`.
 | `ssp_snia_per_msun`, `ssp_snia_delay_min_years`, `ssp_snia_delay_max_years`, `ssp_energy_per_sn_erg` | 1.3e-3, 4e7, 1.37e10, 1e51 | |
 | `ssp_reference_net_metal_yield` | 0 | REFERENCE yields only |
 | `ssp_stochastic_sn_events` | true | discrete events vs expectation |
-| `ssp_clustered_associations` | false | NOT implemented; `true` is refused |
+| `ssp_clustered_associations` | false | RESEARCH; see the Part 3 associations table below (global friends-of-friends, decomposition independent since 2026-11-04) |
 | `thermochemistry_allow_unqualified_rates` | false | Required for `equilibrium_primordial`, `fixed_hybrid` and `fixed_detailed`. After Part 2.5 the equilibrium rate set is primary-verified, but numerical validation is USER-RESERVED and pending. The network manifests still contain secondary-verified (R13/R15/R17/R20/R21) and unverified (R18) entries. See `docs/chemistry_rate_provenance.md`. |
 | `fb_supernova_model` | `legacy` \| `mechanical_resolved_unresolved` | required by Part 2 populations when feedback is on |
 | `fb_presn_wind_momentum_lsun_per_c` | 0 | EXPERIMENTAL pre-SN momentum closure |
@@ -848,6 +849,22 @@ with every key at its default (exact restart projection).
 | `amr_refine_jump_threshold` | double >= 0 | `0.0` | Refine when `max(|drho|/rho_min, |dP|/P_min)` over in-patch face neighbours exceeds it (contact/shock indicator; 0 disables). |
 | `amr_refine_jeans_cells` | double >= 0 | `4.0` | Truelove criterion on the comoving Jeans length `c_s sqrt(pi a/(G rho_com))` (0 disables). |
 | `amr_derefine_hysteresis` | (0, 1] | `0.5` | Derefinement requires every criterion to be below `hysteresis x threshold` (Jeans: above `threshold / hysteresis`). |
+| `amr_refine_cooling_length_cells` | double >= 0 | `0.0` | **Mandatory** (2026-11-04). Refine when the cooling length `c_s t_cool` spans fewer than N cells (physical lengths). `t_cool = e / (Lambda_net n_H^2 / rho)` comes from the legacy in-solver cooling-rate provider; net heating imposes no constraint. Requires `enable_cooling = true` and `thermochemistry_backend = legacy_cooling`; any other combination is refused (Part 2 backends do not publish cooling times). |
+| `amr_refine_metallicity_jump` | double >= 0 | `0.0` | Optional. Refine when `max |Z_a - Z_b| / max(Z_a, Z_b, 1e-6)` over in-patch face neighbours exceeds it. |
+| `amr_refine_species_jump` | double >= 0 | `0.0` | Optional. Refine when the maximum absolute jump of a species mass fraction (composition gas mass) over in-patch face neighbours exceeds it. Requires `fixed_hybrid` or `fixed_detailed`. |
+| `amr_predictive_event_lookahead_years` | double >= 0 | `0.0` | R2 (RESEARCH). A star's host cell, both now and at its drifted position `x + v dt / a`, is refined when that star's own event chronology produces a core-collapse or Ia event within this window. The chronology is the cumulative-Poisson thresholds of its population record, evaluated on a copy; no ordinal is consumed and no budget changes. In expectation mode (no stochastic events) the criterion is at least 0.5 expected events, which is a heuristic. Requires `amr_regrid_mode = automatic` and a Part 2 population model. Forced rows are optional-priority refinements, and they also block derefinement. Limitation: a drifted host cell on another rank is not forced. |
+| `amr_refine_vorticity` | double >= 0 | `0.0` | Optional. Refine when `|curl v| dx / c_s` (comoving gradients and widths, so the value is scale-free) exceeds it. |
+
+**Mandatory versus optional (R1).**
+- Mandatory criteria: Jeans, cell mass and cooling length. They are
+  scheduled before any optional request. A cell inside their hysteresis band
+  is never derefined.
+- Optional criteria: the jump indicator, metallicity, species and vorticity.
+  The per-pass budget truncates these first.
+- A truncated mandatory request is reported in the
+  `hydro.amr_automatic_regrid` event as `mandatory_truncated_by_budget`.
+- Every stencil uses in-patch neighbours, so decisions are identical on any
+  MPI decomposition.
 
 `automatic` requires at least one non-zero criterion and `amr_max_level` in
 [1, 30]. Regrid transfers mass, momentum, total energy and every composition
@@ -860,9 +877,9 @@ admission leaves the hierarchy untouched.
 |---|---|---|---|
 | `ssp_wind_model` | `none` \| `table_v1` | `none` | `table_v1`: age/metallicity-dependent wind/pre-SN mechanical energy and momentum from a `chui_ssp_wind_table_v1` file (no mass: wind mass is in the SSP CC continuous return). Refused together with `fb_presn_wind_momentum_lsun_per_c > 0` (double count). |
 | `ssp_wind_table_path` / `ssp_wind_table_sha256` | path / 64-hex | empty | Required for `table_v1`; checksum verified at load. BLOCKED BY DATA: no table is bundled. |
-| `ssp_clustered_associations` | bool | `false` | RESEARCH (EXPERIMENTAL/UNQUALIFIED): merge feedback sources born in the same association lattice cell and time window into one deposition source (budgets unchanged). |
-| `ssp_association_radius_code` | double >= 0 | `0.0` | Comoving lattice size; must be > 0 when associations are enabled. |
-| `ssp_association_time_window_years` | double > 0 | `3.0e6` | Birth-time window of one association. |
+| `ssp_clustered_associations` | bool | `false` | RESEARCH (EXPERIMENTAL/UNQUALIFIED): merge active feedback sources into associations BEFORE the remote stencil query. Discovery is a GLOBAL friends-of-friends over all ranks (link: minimum-image comoving separation <= radius AND birth-time difference <= window); identity = minimum member source id; members merge in id order on the leader's owner rank. Mass, elements, dust, SN/wind/pre-SN budgets and vector momentum are conserved; the members' internal velocity-dispersion kinetic energy is carried as `association_dispersion_energy_code` and deposited. Independent of the MPI decomposition. **Migration (2026-11-04):** grouping changed from rank-local lattice buckets to global FoF, so results differ from earlier revisions with this key enabled. |
+| `ssp_association_radius_code` | double >= 0 | `0.0` | Comoving FoF linking length (code length); must be > 0 when associations are enabled. Semantics changed from lattice cell size to linking length (2026-11-04). |
+| `ssp_association_time_window_years` | double > 0 | `3.0e6` | Birth-time linking window. |
 
 `physics.enable_metal_diffusion` with an element-resolved composition sidecar
 now selects the element-resolved mixing operator (Part 2 refused it).
@@ -874,6 +891,17 @@ remote interface exchange).
 `synchronized` (default; every AMR level advances the coordinator interval)
 or `recursive_subcycling` (Berger-Oliger: level L advances dt / r^(L - L_min)
 with nested temporal ghost histories and per-level reflux; requires a 2:1
-balanced hierarchy; single rank only in this revision — refused on several
-ranks). The global dt is still limited by the finest-cell CFL (level-relaxed
-CFL is OPEN). Source only, NOT RUN — USER-RESERVED.
+balanced hierarchy, validated across ranks). **2026-11-04:** supported on any
+number of ranks (directed ghost exchange per level clock, remote coarse ghosts
+interpolated in time, remote register halves merged into the coarse owner's
+pending store; ranks without cells traverse every level). The hydro CFL
+candidate of a level-L cell is relaxed by r^(L - L_min,global); gravity,
+expansion, source, diffusion and chemistry candidates are NOT relaxed (those
+operators run at the coarse cadence). A level-aware accepted-step CFL guard
+runs before the sweep. Event `time.timestep_limiter` records the limiting
+criterion and level offset. Source only, NOT RUN — USER-RESERVED.
+
+Metal diffusion (`physics.enable_metal_diffusion`) is supported on several
+ranks for the element-resolved composition operator (unique-owner interface
+fluxes); the legacy total-Z scalar operator without the composition sidecar
+remains single-rank and is refused explicitly on several ranks.

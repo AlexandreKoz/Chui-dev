@@ -388,34 +388,77 @@ std::array<double, k_chemical_element_count> SspModel::ejectaElements(
 SspModel::ChannelReturn SspModel::cumulativeMassiveReturn(
     std::size_t channel, double age, const std::array<double, k_chemical_element_count>& birth_x) const {
   // Everything ejected by the channel up to `age`: stars with masses between
-  // the turnoff mass m_to(age) and the channel's upper limit. A FIXED
-  // quadrature in log m over [m_to, m_hi] makes the cumulative function a
-  // deterministic function of age, so interval returns (differences) are
-  // exactly additive under step subdivision (telescoping), up to round-off.
+  // the turnoff mass m_to(age) and the channel's upper limit.
+  //
+  // G3.2 (replaces the age-dependent-node Simpson rule, whose nodes moved
+  // with m_to and made C(age) structurally NON-monotone): the integrand
+  // f(x) = phi(m) m ln10 * ejecta(m), x = log10 m, is sampled on a FIXED
+  // grid x_0..x_K spanning the channel's whole mass range (independent of
+  // age), f >= 0 at every node (gross ejecta are clamped non-negative), and
+  // integrated as the piecewise-LINEAR interpolant of the node values:
+  //   C(age) = int_{x_to}^{x_K} f_lin(x) dx.
+  // Because f_lin >= 0 and only the lower limit depends on age, C is
+  // non-decreasing in age by construction, for the total and for every
+  // element; interval returns C(e) - C(b) telescope exactly under step
+  // subdivision. Accuracy: second order in the fixed spacing (64 intervals
+  // over the channel range, ~0.03 dex for the default 1-100 Msun IMF).
   ChannelReturn result;
   const double z = metallicityOf(birth_x);
-  double lo = turnoffMassMsun(age, z);
-  double hi = m_config.imf_mass_max_msun;
+  double channel_lo = m_config.imf_mass_min_msun;
+  double channel_hi = m_config.imf_mass_max_msun;
   if (channel == 0) {
-    hi = std::min(hi, m_config.cc_mass_min_msun);
+    channel_hi = std::min(channel_hi, m_config.cc_mass_min_msun);
   } else {
-    lo = std::max(lo, m_config.cc_mass_min_msun);
-    hi = std::min(hi, m_config.cc_mass_max_msun);
+    channel_lo = std::max(channel_lo, m_config.cc_mass_min_msun);
+    channel_hi = std::min(channel_hi, m_config.cc_mass_max_msun);
   }
-  lo = std::max(lo, m_config.imf_mass_min_msun);
-  if (!(hi > lo)) return result;
-  const int n = 32;
-  const double a = std::log10(lo), b = std::log10(hi);
-  const double h = (b - a) / n;
-  for (int i = 0; i <= n; ++i) {
-    const double x = a + i * h;
+  if (!(channel_hi > channel_lo)) return result;
+  const double m_to = turnoffMassMsun(age, z);
+  if (!(m_to < channel_hi)) return result;  // nothing of this channel has evolved yet
+  constexpr int k_intervals = 64;
+  const double a = std::log10(channel_lo);
+  const double b = std::log10(channel_hi);
+  const double h = (b - a) / k_intervals;
+  const double x_to = std::log10(std::max(m_to, channel_lo));
+  // First node at or above x_to (clamped into [0, K]).
+  int j0 = static_cast<int>(std::floor((x_to - a) / h));
+  j0 = std::clamp(j0, 0, k_intervals);
+  const auto node = [&](int j, double& mass_value, std::array<double, k_chemical_element_count>& elements) {
+    const double x = (j == k_intervals) ? b : a + j * h;
     const double m = std::pow(10.0, x);
-    const double w = (i == 0 || i == n) ? 1.0 : (i % 2 == 1 ? 4.0 : 2.0);
-    const double weight = w * h / 3.0 * phi(m) * m * k_ln10;  // dN = phi dm
+    const double weight = phi(m) * m * k_ln10;  // dN/dx
     double ejecta = 0.0;
-    const auto elements = ejectaElements(channel, m, z, birth_x, ejecta);
-    result.mass_fraction += weight * ejecta;
-    for (std::size_t e = 0; e < k_chemical_element_count; ++e) result.element_fraction[e] += weight * elements[e];
+    elements = ejectaElements(channel, m, z, birth_x, ejecta);
+    mass_value = weight * ejecta;
+    for (double& e : elements) e *= weight;
+  };
+  double f_hi = 0.0;
+  std::array<double, k_chemical_element_count> e_hi{};
+  node(k_intervals, f_hi, e_hi);
+  // Sum full intervals from the top down (fixed order), then the partial one.
+  for (int j = k_intervals - 1; j >= j0; --j) {
+    double f_lo = 0.0;
+    std::array<double, k_chemical_element_count> e_lo{};
+    node(j, f_lo, e_lo);
+    const double x_lo = (j == 0) ? a : a + j * h;
+    const double x_up = (j + 1 == k_intervals) ? b : a + (j + 1) * h;
+    if (x_to <= x_lo) {
+      const double width = x_up - x_lo;
+      result.mass_fraction += 0.5 * width * (f_lo + f_hi);
+      for (std::size_t e = 0; e < k_chemical_element_count; ++e) {
+        result.element_fraction[e] += 0.5 * width * (e_lo[e] + e_hi[e]);
+      }
+    } else if (x_to < x_up) {
+      // Partial interval [x_to, x_up] of the non-negative linear interpolant.
+      const double t = (x_to - x_lo) / (x_up - x_lo);
+      const double width = x_up - x_to;
+      result.mass_fraction += 0.5 * width * ((f_lo + t * (f_hi - f_lo)) + f_hi);
+      for (std::size_t e = 0; e < k_chemical_element_count; ++e) {
+        result.element_fraction[e] += 0.5 * width * ((e_lo[e] + t * (e_hi[e] - e_lo[e])) + e_hi[e]);
+      }
+    }
+    f_hi = f_lo;
+    e_hi = e_lo;
   }
   return result;
 }
@@ -426,15 +469,12 @@ SspModel::ChannelReturn SspModel::massiveReturn(std::size_t channel, double age_
   if (!(age_end > age_begin)) return result;
   const ChannelReturn end = cumulativeMassiveReturn(channel, age_end, birth_x);
   const ChannelReturn begin = cumulativeMassiveReturn(channel, age_begin, birth_x);
-  // The exact cumulative return is non-decreasing in age for the total and
-  // for every element (pointwise non-negative gross ejecta over a growing
-  // mass range). The fixed-node quadrature with an age-dependent lower limit
-  // can still produce a tiny negative difference (round-off, or table kinks
-  // between nodes). Part 2.5: such a difference is clamped to zero AND
-  // counted, and the returned mass is then re-derived as the sum of the
-  // clamped element returns so element closure (sum_e element = mass) is
-  // preserved; previously mass and elements were clamped independently and
-  // silently. Without a negative difference the result is unchanged.
+  // G3.2: the cumulative return is non-decreasing in age BY CONSTRUCTION
+  // (fixed-node non-negative linear interpolant, see cumulativeMassiveReturn).
+  // The clamp below is only a round-off guard (last-ulp differences of two
+  // nearly equal partial-interval evaluations); any trigger is counted and
+  // the mass is re-derived from the clamped elements so element closure
+  // holds. It is a diagnostic, not part of the numerical method.
   bool nonmonotone = end.mass_fraction < begin.mass_fraction;
   double element_sum = 0.0;
   for (std::size_t e = 0; e < k_chemical_element_count; ++e) {
@@ -566,6 +606,24 @@ void StellarPopulationStore::store(core::SimulationState& state) const {
     block.payload.insert(block.payload.end(), bytes, bytes + sizeof(StellarPopulationRecord));
   }
   state.sidecars.upsert(std::move(block));
+}
+
+bool forecastStellarEvent(const SspModel& model, const StellarPopulationRecord& record, double age_years,
+                          double lookahead_years, double birth_mass_msun, bool stochastic, double expected_threshold) {
+  if (record.initialized == 0U || !(lookahead_years > 0.0) || !(birth_mass_msun > 0.0)) return false;
+  double z = 0.0;
+  for (std::size_t e = 2; e < k_chemical_element_count; ++e) z += record.birth_element_mass_fraction[e];
+  const double age_now = std::max(age_years, 0.0);
+  const double age_end = age_now + lookahead_years;
+  const double cc_end = model.ccCumulativeNumber(age_end, z) * birth_mass_msun;
+  const double ia_end = model.iaCumulativeNumber(age_end) * birth_mass_msun;
+  if (stochastic) {
+    StellarPopulationRecord copy = record;
+    return realizeEvents(copy, 0U, cc_end).count + realizeEvents(copy, 1U, ia_end).count > 0U;
+  }
+  const double expected = (cc_end - model.ccCumulativeNumber(age_now, z) * birth_mass_msun) +
+      (ia_end - model.iaCumulativeNumber(age_now) * birth_mass_msun);
+  return expected >= expected_threshold;
 }
 
 }  // namespace cosmosim::physics

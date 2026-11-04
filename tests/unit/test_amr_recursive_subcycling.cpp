@@ -27,6 +27,10 @@
 #include <cstdint>
 #include <cstring>
 #include <optional>
+#include <array>
+#include <exception>
+#include <span>
+#include <string>
 #include <stdexcept>
 #include <utility>
 #include <vector>
@@ -310,6 +314,169 @@ void testCoverageRejectsOverlapAndMissingRows() {
   CHUI_REQUIRE(!amr::hasProductionAmrHydroCoverage(state));
 }
 
+// G1.1: single-process LOOPBACK hooks (no remote rank). They let the
+// distributed driver run its full collective protocol in one process and
+// record every hook call. Invariants:
+//  * with no remote data the distributed driver is BITWISE identical to the
+//    local driver (the restructuring changed no arithmetic);
+//  * the hook sequence follows the level clocks: begin(L) -> registers(L)
+//    -> [captureEnd(L) -> children -> retire(L)];
+//  * a globally populated level that holds no local cell (union bit from a
+//    peer) is still traversed (substeps counted, every collective entered).
+struct LoopbackHooks final : amr::RecursiveAmrDistributedHooks {
+  std::vector<std::string> log;
+  std::uint64_t extra_level_bits = 0U;
+  std::string fail_at_stage;
+  void reduceFailure(std::exception_ptr failure, const char* stage) override {
+    if (!fail_at_stage.empty() && fail_at_stage == stage && failure == nullptr) {
+      throw std::runtime_error(std::string("peer failure injected at ") + stage);
+    }
+    if (failure != nullptr) std::rethrow_exception(failure);
+  }
+  void globalLevelUnion(std::array<std::uint64_t, 4>& bits) override {
+    bits[0] |= extra_level_bits;
+    log.push_back("union");
+  }
+  std::uint64_t globalMax(std::uint64_t value) override { return value; }
+  std::span<const amr::PatchDescriptor> prepare(double) override {
+    log.push_back("prepare");
+    return {};
+  }
+  std::span<const amr::DistributedAmrRemotePatch> beginLevelSweep(int level, int coarser, int finer, double, double,
+                                                                  bool capture) override {
+    log.push_back("begin" + std::to_string(level) + "c" + std::to_string(coarser) + "f" + std::to_string(finer) +
+                  (capture ? "s" : ""));
+    return {};
+  }
+  void exchangeLevelFluxRegisters(core::SimulationState&, std::span<const amr::FluxRegisterEntry> outbound,
+                                  const amr::ProductionAmrHydroOptions&) override {
+    CHUI_REQUIRE(outbound.empty());  // no remote coarse patch exists
+    log.push_back("flux");
+  }
+  void captureLevelEnd(int level, int finer, double) override {
+    log.push_back("end" + std::to_string(level) + "f" + std::to_string(finer));
+  }
+  void retireLevel(int level) noexcept override { log.push_back("retire" + std::to_string(level)); }
+};
+
+amr::ProductionAmrHydroDiagnostics distributedStep(core::SimulationState& state, LoopbackHooks& hooks, double dt) {
+  core::MemoryGovernor governor;
+  auto options = baseOptions(state, governor);
+  const hy::HydroCoreSolver solver(k_gamma);
+  hy::HllcRiemannSolver riemann;
+  const hy::HydroUpdateContext update{.dt_code = dt, .time_begin_code = 0.0, .time_end_code = dt,
+                                      .scale_factor = 1.0, .hubble_rate_code = 0.0};
+  const hy::HydroSourceContext source_context{.update = update};
+  return amr::advanceDistributedProductionAmrHydroRecursive(
+      state, {}, update, source_context, solver, riemann, {}, options, 0, state.gasCellIdentityGeneration(), hooks);
+}
+
+void testDistributedDriverLoopbackEqualsLocalDriver() {
+  core::SimulationState local = makeThreeLevels(true);
+  core::SimulationState distributed = makeThreeLevels(true);
+  (void)step(local, true, 0.02);
+  LoopbackHooks hooks;
+  const auto diagnostics = distributedStep(distributed, hooks, 0.02);
+  CHUI_REQUIRE(diagnostics.substeps_by_level.size() == 3U && diagnostics.substeps_by_level[2] == 4U);
+  for (std::size_t row = 0; row < local.cells.size(); ++row) {
+    CHUI_REQUIRE(local.gas_cells.density_code[row] == distributed.gas_cells.density_code[row]);
+    CHUI_REQUIRE(local.gas_cells.velocity_x_peculiar[row] == distributed.gas_cells.velocity_x_peculiar[row]);
+    CHUI_REQUIRE(local.gas_cells.pressure_code[row] == distributed.gas_cells.pressure_code[row]);
+  }
+  // Protocol shape for levels {0, 1, 2}, ratio 2.
+  const std::vector<std::string> expected{
+      "union", "prepare",
+      "begin0c-1f1s", "flux", "end0f1",
+      "begin1c0f2s", "flux", "end1f2", "begin2c1f-1", "flux", "begin2c1f-1", "flux", "retire1",
+      "begin1c0f2s", "flux", "end1f2", "begin2c1f-1", "flux", "begin2c1f-1", "flux", "retire1",
+      "retire0"};
+  CHUI_REQUIRE(hooks.log == expected);
+  CHUI_REQUIRE(distributed.pending_flux_registers.empty() && distributed.amr_temporal_boundary_history.empty());
+}
+
+void testDistributedDriverTraversesPeerOnlyLevel() {
+  core::SimulationState local = makeThreeLevels(true);
+  core::SimulationState distributed = makeThreeLevels(true);
+  (void)step(local, true, 0.02);
+  LoopbackHooks hooks;
+  hooks.extra_level_bits = 1ULL << 3U;  // a peer owns level-3 cells
+  const auto diagnostics = distributedStep(distributed, hooks, 0.02);
+  CHUI_REQUIRE(diagnostics.substeps_by_level.size() == 4U);
+  CHUI_REQUIRE(diagnostics.substeps_by_level[3] == 8U);
+  CHUI_REQUIRE(std::count(hooks.log.begin(), hooks.log.end(), std::string("begin3c2f-1")) == 8);
+  // No local level-3 cell: the local solution is unchanged by the extra clock.
+  for (std::size_t row = 0; row < local.cells.size(); ++row) {
+    CHUI_REQUIRE(local.gas_cells.density_code[row] == distributed.gas_cells.density_code[row]);
+  }
+  CHUI_REQUIRE(distributed.pending_flux_registers.empty() && distributed.amr_temporal_boundary_history.empty());
+}
+
+void testDistributedDriverPeerRefusalBeforeMutation() {
+  core::SimulationState state = makeThreeLevels(true);
+  const core::SimulationState before = state;
+  LoopbackHooks hooks;
+  hooks.fail_at_stage = "recursive AMR driver admission";  // a peer refused its working set
+  bool refused = false;
+  try {
+    (void)distributedStep(state, hooks, 0.02);
+  } catch (const std::runtime_error&) {
+    refused = true;
+  }
+  CHUI_REQUIRE(refused);
+  for (std::size_t row = 0; row < state.cells.size(); ++row) {
+    CHUI_REQUIRE(state.gas_cells.density_code[row] == before.gas_cells.density_code[row]);
+  }
+  CHUI_REQUIRE(state.pending_flux_registers.empty() && state.amr_temporal_boundary_history.empty());
+  CHUI_REQUIRE(std::find(hooks.log.begin(), hooks.log.end(), std::string("prepare")) == hooks.log.end());
+}
+
+// G2.3: register halves of a split interface merge into one complete entry
+// with summed areas/counts and area-weighted fluxes.
+void testSplitInterfaceRegisterHalvesMerge() {
+  amr::FluxRegisterEntry coarse;
+  coarse.register_key = 77U;
+  coarse.coarse_patch_id = 5U;
+  coarse.coarse_gas_cell_id = 500U;
+  coarse.coarse_cell_index = 3U;
+  coarse.level = 1U;
+  coarse.dt_code = 0.1;
+  coarse.coarse_face_count = 1U;
+  coarse.coarse_area_comov = 1.0;
+  coarse.face_area_comov = 1.0;
+  coarse.coarse_face_flux_code.mass_code = 2.0;
+  amr::FluxRegisterEntry fine_a = coarse;
+  fine_a.coarse_face_count = 0U;
+  fine_a.coarse_area_comov = 0.0;
+  fine_a.coarse_face_flux_code = {};
+  fine_a.coarse_gas_cell_id = 0U;
+  fine_a.fine_face_count = 2U;
+  fine_a.fine_area_comov = 0.5;
+  fine_a.fine_face_flux_code.mass_code = 1.0;
+  amr::FluxRegisterEntry fine_b = fine_a;
+  fine_b.fine_face_flux_code.mass_code = 3.0;
+  amr::FluxRegisterEntry other = coarse;
+  other.register_key = 78U;
+  CHUI_REQUIRE(!coarse.isComplete() && !fine_a.isComplete());
+  const std::vector<amr::FluxRegisterEntry> halves{coarse, other, fine_a, fine_b};
+  const auto merged = amr::mergeFluxRegisterEntriesByKey(halves);
+  CHUI_REQUIRE(merged.size() == 2U);
+  const auto& m = merged[0];
+  CHUI_REQUIRE(m.register_key == 77U && m.isComplete());
+  CHUI_REQUIRE(m.coarse_face_count == 1U && m.fine_face_count == 4U);
+  CHUI_REQUIRE(std::abs(m.fine_area_comov - 1.0) < 1.0e-15 && m.coarse_gas_cell_id == 500U);
+  CHUI_REQUIRE(std::abs(m.fine_face_flux_code.mass_code - 2.0) < 1.0e-15);  // (1*0.5 + 3*0.5) / 1
+  CHUI_REQUIRE(std::abs(m.coarse_face_flux_code.mass_code - 2.0) < 1.0e-15);
+  amr::FluxRegisterEntry bad = fine_a;
+  bad.axis = cosmosim::hydro::HydroFaceAxis::kY;
+  bool refused = false;
+  try {
+    (void)amr::mergeFluxRegisterEntriesByKey(std::vector<amr::FluxRegisterEntry>{coarse, bad});
+  } catch (const std::runtime_error&) {
+    refused = true;
+  }
+  CHUI_REQUIRE(refused);
+}
+
 }  // namespace
 
 int main() {
@@ -320,5 +487,9 @@ int main() {
   testIllegalMidCycleStartRefused();
   testUnbalancedHierarchyRefused();
   testSingleLevelEqualsSynchronizedReference();
+  testDistributedDriverLoopbackEqualsLocalDriver();
+  testDistributedDriverTraversesPeerOnlyLevel();
+  testDistributedDriverPeerRefusalBeforeMutation();
+  testSplitInterfaceRegisterHalvesMerge();
   return 0;
 }

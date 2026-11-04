@@ -442,12 +442,24 @@ struct NumericsConfig {
   // hosting stars younger than this age (pending CC SN / wind feedback);
   // 0 disables. Requires amr_regrid_mode = automatic.
   double amr_predictive_feedback_age_years = 0.0;
+  // R2 (A04, RESEARCH/HEURISTIC in expectation mode): refine host cells of
+  // stars whose canonical event chronology yields a CC/Ia event within this
+  // lookahead (also at the drifted position). 0 disables.
+  double amr_predictive_event_lookahead_years = 0.0;
   int amr_regrid_interval_steps = 1;
   int amr_regrid_max_operations = 64;
   double amr_refine_cell_mass_code = 0.0;
   double amr_refine_jump_threshold = 0.0;
   double amr_refine_jeans_cells = 4.0;
   double amr_derefine_hysteresis = 0.5;
+  // R1 (A03) physics-aware indicators; 0 disables each. MANDATORY: cooling
+  // length in cells (legacy in-solver cooling only). OPTIONAL (budgeted):
+  // metallicity-interface jump, species-interface jump (composition network
+  // backends only), vorticity |curl v| dx / c_s.
+  double amr_refine_cooling_length_cells = 0.0;
+  double amr_refine_metallicity_jump = 0.0;
+  double amr_refine_species_jump = 0.0;
+  double amr_refine_vorticity = 0.0;
   double gravity_softening_kpc_comoving = 1.0;
   double gravity_softening_gas_kpc_comoving = -1.0;
   double gravity_softening_dark_matter_kpc_comoving = -1.0;
@@ -645,6 +657,8 @@ struct PhysicsConfig {
   double chemistry_adaptive_hysteresis_fraction = 0.3;
   double chemistry_adaptive_min_dwell_years = 1.0e6;
   double chemistry_adaptive_cold_temperature_k = 3.0e3;
+  // R3: promote to detailed chemistry when t_cool < ratio x interval (0 off).
+  double chemistry_adaptive_cooling_time_ratio = 0.0;
   double chemistry_adaptive_dense_nh_cm3 = 1.0;
   double chemistry_shadow_sample_fraction = 0.0;
   double ssp_imf_mass_min_msun = 0.1;

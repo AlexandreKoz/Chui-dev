@@ -240,11 +240,13 @@ MechanicalFeedbackDeposition::RowDelta& MechanicalFeedbackDeposition::delta(std:
 void MechanicalFeedbackDeposition::stage(const core::SimulationState& state, const FeedbackSourceBudget& source) {
   if (!(source.ejecta_mass_code >= 0.0) || !(source.supernova_energy_erg >= 0.0) ||
       !(source.supernova_count >= 0.0) || !(source.presn_momentum_code >= 0.0) ||
-      !(source.wind_energy_erg >= 0.0) || !(source.wind_momentum_code >= 0.0)) {
+      !(source.wind_energy_erg >= 0.0) || !(source.wind_momentum_code >= 0.0) ||
+      !(source.association_dispersion_energy_code >= 0.0)) {
     throw std::invalid_argument("feedback source budget must be non-negative");
   }
   if (source.ejecta_mass_code == 0.0 && source.supernova_energy_erg == 0.0 && source.presn_momentum_code == 0.0 &&
-      source.wind_energy_erg == 0.0 && source.wind_momentum_code == 0.0) return;
+      source.wind_energy_erg == 0.0 && source.wind_momentum_code == 0.0 &&
+      source.association_dispersion_energy_code == 0.0) return;
   const auto neighbors = nearest(state, source.position_comoving);
   if (neighbors.empty()) {
     throw std::runtime_error("feedback source " + std::to_string(source.source_id) +
@@ -338,7 +340,10 @@ void MechanicalFeedbackDeposition::stage(const core::SimulationState& state, con
   const double v2_star = source.velocity_peculiar[0] * source.velocity_peculiar[0] +
       source.velocity_peculiar[1] * source.velocity_peculiar[1] +
       source.velocity_peculiar[2] * source.velocity_peculiar[2];
-  const double e_available = e_code + source.wind_energy_erg / erg_per_code + 0.5 * m_ej * v2_star;
+  // Lab-frame ejecta kinetic energy = 1/2 M V^2 + internal association
+  // dispersion (zero for single stars), so merged sources conserve energy.
+  const double e_available = e_code + source.wind_energy_erg / erg_per_code + 0.5 * m_ej * v2_star +
+      source.association_dispersion_energy_code;
   const auto kinetic_change = [&](double s) {
     double dke = 0.0;
     for (std::size_t i = 0; i < k; ++i) {
@@ -511,85 +516,236 @@ std::vector<std::uint32_t> MechanicalFeedbackDeposition::commit(core::Simulation
   return touched;
 }
 
+namespace {
+
+[[nodiscard]] double minimumImage(double d, bool periodic, double extent) noexcept {
+  if (periodic && extent > 0.0) d -= extent * std::round(d / extent);
+  return d;
+}
+
+}  // namespace
+
+std::vector<std::uint64_t> discoverAssociationLeaders(
+    std::span<const AssociationSourceDescriptor> sources, double radius_code, double window_years,
+    bool periodic, const std::array<double, 3>& box_extent_comoving) {
+  if (!(radius_code > 0.0) || !std::isfinite(radius_code) || !(window_years > 0.0) ||
+      !std::isfinite(window_years)) {
+    throw std::invalid_argument("discoverAssociationLeaders: radius and window must be finite and positive");
+  }
+  const std::size_t n = sources.size();
+  {
+    std::vector<std::uint64_t> ids(n);
+    for (std::size_t i = 0; i < n; ++i) ids[i] = sources[i].source_id;
+    std::sort(ids.begin(), ids.end());
+    if (std::adjacent_find(ids.begin(), ids.end()) != ids.end()) {
+      throw std::invalid_argument("discoverAssociationLeaders: duplicate source id");
+    }
+  }
+  // Uniform hash grid with cell width >= radius: linked pairs are always in
+  // the same or an adjacent cell. Periodic axes use an integer number of
+  // cells over the box so the wrap is exact.
+  std::array<std::int64_t, 3> cells_per_axis{0, 0, 0};
+  std::array<double, 3> cell_width{radius_code, radius_code, radius_code};
+  for (int c = 0; c < 3; ++c) {
+    if (periodic && box_extent_comoving[c] > 0.0) {
+      cells_per_axis[c] = std::max<std::int64_t>(
+          1, static_cast<std::int64_t>(std::floor(box_extent_comoving[c] / radius_code)));
+      cell_width[c] = box_extent_comoving[c] / static_cast<double>(cells_per_axis[c]);
+    }
+  }
+  struct Entry {
+    std::array<std::int64_t, 3> key{};
+    std::uint64_t id = 0U;
+    std::size_t index = 0U;
+  };
+  std::vector<Entry> entries(n);
+  for (std::size_t i = 0; i < n; ++i) {
+    Entry e;
+    e.id = sources[i].source_id;
+    e.index = i;
+    for (int c = 0; c < 3; ++c) {
+      double x = sources[i].position_comoving[c];
+      if (!std::isfinite(x) || !std::isfinite(sources[i].birth_years)) {
+        throw std::invalid_argument("discoverAssociationLeaders: non-finite source position or birth time");
+      }
+      if (cells_per_axis[c] > 0) {
+        x -= box_extent_comoving[c] * std::floor(x / box_extent_comoving[c]);
+        e.key[c] = std::clamp<std::int64_t>(static_cast<std::int64_t>(std::floor(x / cell_width[c])), 0,
+                                             cells_per_axis[c] - 1);
+      } else {
+        e.key[c] = static_cast<std::int64_t>(std::floor(x / cell_width[c]));
+      }
+    }
+    entries[i] = e;
+  }
+  std::sort(entries.begin(), entries.end(), [](const Entry& l, const Entry& r) {
+    return l.key != r.key ? l.key < r.key : l.id < r.id;
+  });
+  // Union-find over sorted positions; the root of every set is its minimum id
+  // (union attaches the larger-id root below the smaller), so the result is
+  // independent of the visit order.
+  std::vector<std::size_t> parent(n);
+  for (std::size_t i = 0; i < n; ++i) parent[i] = i;
+  const auto find = [&parent](std::size_t x) {
+    while (parent[x] != x) {
+      parent[x] = parent[parent[x]];
+      x = parent[x];
+    }
+    return x;
+  };
+  const auto unite = [&](std::size_t a, std::size_t b) {
+    a = find(a);
+    b = find(b);
+    if (a == b) return;
+    if (entries[a].id < entries[b].id) parent[b] = a; else parent[a] = b;
+  };
+  const double r2 = radius_code * radius_code;
+  std::vector<std::array<std::int64_t, 3>> neighbor_keys;
+  neighbor_keys.reserve(27U);
+  for (std::size_t i = 0; i < n; ++i) {
+    neighbor_keys.clear();
+    for (int dx = -1; dx <= 1; ++dx) {
+      for (int dy = -1; dy <= 1; ++dy) {
+        for (int dz = -1; dz <= 1; ++dz) {
+          std::array<std::int64_t, 3> k{entries[i].key[0] + dx, entries[i].key[1] + dy, entries[i].key[2] + dz};
+          for (int c = 0; c < 3; ++c) {
+            if (cells_per_axis[c] > 0) k[c] = ((k[c] % cells_per_axis[c]) + cells_per_axis[c]) % cells_per_axis[c];
+          }
+          neighbor_keys.push_back(k);
+        }
+      }
+    }
+    std::sort(neighbor_keys.begin(), neighbor_keys.end());
+    neighbor_keys.erase(std::unique(neighbor_keys.begin(), neighbor_keys.end()), neighbor_keys.end());
+    const AssociationSourceDescriptor& a = sources[entries[i].index];
+    for (const auto& k : neighbor_keys) {
+      auto it = std::lower_bound(entries.begin(), entries.end(), k,
+                                 [](const Entry& e, const std::array<std::int64_t, 3>& key) { return e.key < key; });
+      for (; it != entries.end() && it->key == k; ++it) {
+        const std::size_t j = static_cast<std::size_t>(it - entries.begin());
+        if (j <= i) continue;  // each unordered pair once
+        const AssociationSourceDescriptor& b = sources[it->index];
+        if (std::abs(a.birth_years - b.birth_years) > window_years) continue;
+        double d2 = 0.0;
+        for (int c = 0; c < 3; ++c) {
+          const double d = minimumImage(b.position_comoving[c] - a.position_comoving[c], periodic,
+                                        box_extent_comoving[c]);
+          d2 += d * d;
+        }
+        if (d2 <= r2) unite(i, j);
+      }
+    }
+  }
+  std::vector<std::uint64_t> leaders(n);
+  for (std::size_t i = 0; i < n; ++i) leaders[entries[i].index] = entries[find(i)].id;
+  return leaders;
+}
+
+FeedbackSourceBudget mergeAssociationMembers(
+    std::span<const FeedbackSourceBudget> members, bool periodic, const std::array<double, 3>& box_extent_comoving) {
+  if (members.empty()) throw std::invalid_argument("mergeAssociationMembers: empty association");
+  std::vector<std::size_t> order(members.size());
+  for (std::size_t i = 0; i < order.size(); ++i) order[i] = i;
+  std::sort(order.begin(), order.end(),
+            [&](std::size_t l, std::size_t r) { return members[l].source_id < members[r].source_id; });
+  for (std::size_t i = 1; i < order.size(); ++i) {
+    if (members[order[i]].source_id == members[order[i - 1U]].source_id) {
+      throw std::invalid_argument("mergeAssociationMembers: duplicate member source id");
+    }
+  }
+  const FeedbackSourceBudget& leader = members[order.front()];
+  if (order.size() == 1U) return leader;
+  FeedbackSourceBudget group = leader;
+  group.member_count = 0U;
+  group.ejecta_mass_code = 0.0;
+  group.ejecta_elements_code = {};
+  group.ejecta_dust_code = {};
+  group.supernova_count = 0.0;
+  group.supernova_energy_erg = 0.0;
+  group.presn_momentum_code = 0.0;
+  group.wind_energy_erg = 0.0;
+  group.wind_momentum_code = 0.0;
+  group.association_dispersion_energy_code = 0.0;
+  std::array<double, 3> weighted_offset{};
+  std::array<double, 3> plain_offset{};
+  std::array<double, 3> momentum{};
+  std::array<double, 3> velocity_sum{};
+  for (const std::size_t idx : order) {
+    const FeedbackSourceBudget& m = members[idx];
+    group.member_count += m.member_count;
+    group.ejecta_mass_code += m.ejecta_mass_code;
+    for (std::size_t e = 0; e < k_chemical_element_count; ++e) group.ejecta_elements_code[e] += m.ejecta_elements_code[e];
+    for (std::size_t r = 0; r < k_dust_reservoir_count; ++r) group.ejecta_dust_code[r] += m.ejecta_dust_code[r];
+    group.supernova_count += m.supernova_count;
+    group.supernova_energy_erg += m.supernova_energy_erg;
+    group.presn_momentum_code += m.presn_momentum_code;
+    group.wind_energy_erg += m.wind_energy_erg;
+    group.wind_momentum_code += m.wind_momentum_code;
+    group.association_dispersion_energy_code += m.association_dispersion_energy_code;
+    for (int c = 0; c < 3; ++c) {
+      const double d = minimumImage(m.position_comoving[c] - leader.position_comoving[c], periodic,
+                                    box_extent_comoving[c]);
+      weighted_offset[c] += m.ejecta_mass_code * d;
+      plain_offset[c] += d;
+      momentum[c] += m.ejecta_mass_code * m.velocity_peculiar[c];
+      velocity_sum[c] += m.velocity_peculiar[c];
+    }
+  }
+  const double n = static_cast<double>(order.size());
+  const double mass = group.ejecta_mass_code;
+  for (int c = 0; c < 3; ++c) {
+    double x = leader.position_comoving[c] + (mass > 0.0 ? weighted_offset[c] / mass : plain_offset[c] / n);
+    if (periodic && box_extent_comoving[c] > 0.0) {
+      x -= box_extent_comoving[c] * std::floor(x / box_extent_comoving[c]);
+    }
+    group.position_comoving[c] = x;
+    group.velocity_peculiar[c] = mass > 0.0 ? momentum[c] / mass : velocity_sum[c] / n;
+  }
+  // Internal kinetic energy in the centre-of-momentum frame (non-negative by
+  // construction; summed in id order).
+  if (mass > 0.0) {
+    for (const std::size_t idx : order) {
+      const FeedbackSourceBudget& m = members[idx];
+      double dv2 = 0.0;
+      for (int c = 0; c < 3; ++c) {
+        const double dv = m.velocity_peculiar[c] - group.velocity_peculiar[c];
+        dv2 += dv * dv;
+      }
+      group.association_dispersion_energy_code += 0.5 * m.ejecta_mass_code * dv2;
+    }
+  }
+  group.source_id = leader.source_id;
+  return group;
+}
+
 std::vector<FeedbackSourceBudget> mergeAssociationSources(
     std::span<const FeedbackSourceBudget> sources, std::span<const double> birth_years,
     double radius_code, double window_years, bool periodic, const std::array<double, 3>& box_extent_comoving) {
   if (sources.size() != birth_years.size()) {
     throw std::invalid_argument("mergeAssociationSources: birth time list does not match sources");
   }
-  if (!(radius_code > 0.0) || !(window_years > 0.0)) {
-    throw std::invalid_argument("mergeAssociationSources: radius and window must be positive");
-  }
-  struct Keyed {
-    std::array<std::int64_t, 4> key{};
-    std::size_t index = 0;
-  };
-  std::vector<Keyed> keyed;
-  keyed.reserve(sources.size());
+  std::vector<AssociationSourceDescriptor> descriptors(sources.size());
   for (std::size_t i = 0; i < sources.size(); ++i) {
-    Keyed k;
-    for (int c = 0; c < 3; ++c) {
-      double x = sources[i].position_comoving[c];
-      if (periodic && box_extent_comoving[c] > 0.0) {
-        x -= box_extent_comoving[c] * std::floor(x / box_extent_comoving[c]);
-      }
-      k.key[c] = static_cast<std::int64_t>(std::floor(x / radius_code));
-    }
-    k.key[3] = static_cast<std::int64_t>(std::floor(birth_years[i] / window_years));
-    k.index = i;
-    keyed.push_back(k);
+    descriptors[i].source_id = sources[i].source_id;
+    descriptors[i].position_comoving = sources[i].position_comoving;
+    descriptors[i].birth_years = birth_years[i];
   }
-  std::sort(keyed.begin(), keyed.end(), [&](const Keyed& l, const Keyed& r) {
-    return l.key != r.key ? l.key < r.key : sources[l.index].source_id < sources[r.index].source_id;
+  const std::vector<std::uint64_t> leaders =
+      discoverAssociationLeaders(descriptors, radius_code, window_years, periodic, box_extent_comoving);
+  std::vector<std::size_t> order(sources.size());
+  for (std::size_t i = 0; i < order.size(); ++i) order[i] = i;
+  std::sort(order.begin(), order.end(), [&](std::size_t l, std::size_t r) {
+    return leaders[l] != leaders[r] ? leaders[l] < leaders[r] : sources[l].source_id < sources[r].source_id;
   });
   std::vector<FeedbackSourceBudget> merged;
-  std::size_t begin = 0;
-  while (begin < keyed.size()) {
+  std::vector<FeedbackSourceBudget> members;
+  std::size_t begin = 0U;
+  while (begin < order.size()) {
     std::size_t end = begin + 1U;
-    while (end < keyed.size() && keyed[end].key == keyed[begin].key) ++end;
-    const FeedbackSourceBudget& first = sources[keyed[begin].index];
-    FeedbackSourceBudget group = first;
-    group.member_count = 0U;
-    group.ejecta_mass_code = 0.0;
-    group.ejecta_elements_code = {};
-    group.ejecta_dust_code = {};
-    group.supernova_count = 0.0;
-    group.supernova_energy_erg = 0.0;
-    group.presn_momentum_code = 0.0;
-    group.wind_energy_erg = 0.0;
-    group.wind_momentum_code = 0.0;
-    std::array<double, 3> offset_sum{};
-    std::array<double, 3> momentum{};
-    std::array<double, 3> velocity_sum{};
-    for (std::size_t j = begin; j < end; ++j) {
-      const FeedbackSourceBudget& m = sources[keyed[j].index];
-      group.member_count += m.member_count;
-      group.source_id = std::min(group.source_id, m.source_id);
-      group.ejecta_mass_code += m.ejecta_mass_code;
-      for (std::size_t e = 0; e < k_chemical_element_count; ++e) group.ejecta_elements_code[e] += m.ejecta_elements_code[e];
-      for (std::size_t r = 0; r < k_dust_reservoir_count; ++r) group.ejecta_dust_code[r] += m.ejecta_dust_code[r];
-      group.supernova_count += m.supernova_count;
-      group.supernova_energy_erg += m.supernova_energy_erg;
-      group.presn_momentum_code += m.presn_momentum_code;
-      group.wind_energy_erg += m.wind_energy_erg;
-      group.wind_momentum_code += m.wind_momentum_code;
-      for (int c = 0; c < 3; ++c) {
-        double d = m.position_comoving[c] - first.position_comoving[c];
-        if (periodic && box_extent_comoving[c] > 0.0) {
-          d -= box_extent_comoving[c] * std::round(d / box_extent_comoving[c]);
-        }
-        offset_sum[c] += d;
-        momentum[c] += m.ejecta_mass_code * m.velocity_peculiar[c];
-        velocity_sum[c] += m.velocity_peculiar[c];
-      }
-    }
-    const double n = static_cast<double>(end - begin);
-    for (int c = 0; c < 3; ++c) {
-      group.position_comoving[c] = first.position_comoving[c] + offset_sum[c] / n;
-      group.velocity_peculiar[c] = group.ejecta_mass_code > 0.0 ? momentum[c] / group.ejecta_mass_code
-                                                                 : velocity_sum[c] / n;
-    }
-    merged.push_back(group);
+    while (end < order.size() && leaders[order[end]] == leaders[order[begin]]) ++end;
+    members.clear();
+    for (std::size_t k = begin; k < end; ++k) members.push_back(sources[order[k]]);
+    merged.push_back(mergeAssociationMembers(members, periodic, box_extent_comoving));
     begin = end;
   }
   return merged;

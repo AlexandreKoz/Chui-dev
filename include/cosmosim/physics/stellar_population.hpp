@@ -175,6 +175,17 @@ struct RealizedEvents {
 };
 [[nodiscard]] RealizedEvents realizeEvents(StellarPopulationRecord& record, std::uint32_t channel, double lambda_end);
 
+// R2 (A04): does the population's own deterministic event chronology produce
+// a CC or Ia event in (age, age + lookahead]? Stochastic mode advances a COPY
+// of the record (nothing consumed); expectation mode returns true when at
+// least `expected_threshold` events are expected in the window (HEURISTIC).
+// Exactly the cumulative counts SourceRuntime uses (same SspModel functions,
+// same birth-mixture metallicity), so a forecast event is the event the
+// source stage will realize if the star still exists then.
+[[nodiscard]] bool forecastStellarEvent(const SspModel& model, const StellarPopulationRecord& record,
+                                        double age_years, double lookahead_years, double birth_mass_msun,
+                                        bool stochastic, double expected_threshold = 0.5);
+
 class StellarPopulationStore {
  public:
   explicit StellarPopulationStore(const core::SimulationState& state);

@@ -30,6 +30,7 @@
 #include "cosmosim/core/profiling.hpp"
 #include "cosmosim/core/units.hpp"
 #include "cosmosim/physics/cooling_heating.hpp"
+#include "cosmosim/physics/stellar_population.hpp"
 #include "cosmosim/physics/baryon_composition.hpp"
 #include "cosmosim/physics/baryonic_runtime_config.hpp"
 #include "cosmosim/physics/composition_transport.hpp"
@@ -348,6 +349,76 @@ struct HydroBoundaryCellAdvertisement {
   return side == hydro::HydroFaceSide::kLower ? 0U : 1U;
 }
 
+// Wire conversion of one flux-register half (shared by the synchronized and
+// recursive distributed paths).
+[[nodiscard]] parallel::AmrFluxRegisterPayloadRecord fluxRegisterPayloadFromEntry(
+    const amr::FluxRegisterEntry& entry, int source_rank, int owner_rank, const core::SimulationState& state) {
+    parallel::AmrFluxRegisterPayloadRecord record;
+    record.register_key = entry.register_key;
+    record.coarse_patch_id = entry.coarse_patch_id;
+    record.coarse_gas_cell_id = entry.coarse_gas_cell_id;
+    record.coarse_cell_index = static_cast<std::uint64_t>(entry.coarse_cell_index);
+    record.level = entry.level;
+    record.axis = hydroAxisCode(entry.axis);
+    record.orientation = hydroSideCode(entry.orientation);
+    record.source_rank = source_rank;
+    record.owner_rank = owner_rank;
+    record.gas_cell_identity_generation = state.gasCellIdentityGeneration();
+    record.patch_geometry_generation = state.cellIndexGeneration();
+    record.coarse_mass_flux_code = entry.coarse_face_flux_code.mass_code;
+    record.coarse_momentum_x_flux_code = entry.coarse_face_flux_code.momentum_x_code;
+    record.coarse_momentum_y_flux_code = entry.coarse_face_flux_code.momentum_y_code;
+    record.coarse_momentum_z_flux_code = entry.coarse_face_flux_code.momentum_z_code;
+    record.coarse_total_energy_flux_code = entry.coarse_face_flux_code.total_energy_code;
+    record.coarse_metal_mass_flux_code = entry.coarse_face_flux_code.metal_mass_code;
+    record.fine_mass_flux_code = entry.fine_face_flux_code.mass_code;
+    record.fine_momentum_x_flux_code = entry.fine_face_flux_code.momentum_x_code;
+    record.fine_momentum_y_flux_code = entry.fine_face_flux_code.momentum_y_code;
+    record.fine_momentum_z_flux_code = entry.fine_face_flux_code.momentum_z_code;
+    record.fine_total_energy_flux_code = entry.fine_face_flux_code.total_energy_code;
+    record.fine_metal_mass_flux_code = entry.fine_face_flux_code.metal_mass_code;
+    record.face_area_comov = entry.face_area_comov;
+    record.coarse_area_comov = entry.coarse_area_comov;
+    record.fine_area_comov = entry.fine_area_comov;
+    record.dt_code = entry.dt_code;
+    record.coarse_face_count = entry.coarse_face_count;
+    record.fine_face_count = entry.fine_face_count;
+  parallel::validateAmrFluxRegisterPayloadRecord(record);
+  return record;
+}
+
+[[nodiscard]] amr::FluxRegisterEntry fluxRegisterEntryFromPayload(
+    const parallel::AmrFluxRegisterPayloadRecord& payload) {
+  return amr::FluxRegisterEntry{
+        .register_key = payload.register_key,
+        .coarse_patch_id = payload.coarse_patch_id,
+        .coarse_gas_cell_id = payload.coarse_gas_cell_id,
+        .coarse_cell_index = static_cast<std::size_t>(payload.coarse_cell_index),
+        .level = payload.level,
+        .axis = payload.axis == 0U ? hydro::HydroFaceAxis::kX : (payload.axis == 1U ? hydro::HydroFaceAxis::kY : hydro::HydroFaceAxis::kZ),
+        .orientation = payload.orientation == 0U ? hydro::HydroFaceSide::kLower : hydro::HydroFaceSide::kUpper,
+        .coarse_face_flux_code = amr::ConservedState{
+            .mass_code = payload.coarse_mass_flux_code,
+            .momentum_x_code = payload.coarse_momentum_x_flux_code,
+            .momentum_y_code = payload.coarse_momentum_y_flux_code,
+            .momentum_z_code = payload.coarse_momentum_z_flux_code,
+            .total_energy_code = payload.coarse_total_energy_flux_code,
+            .metal_mass_code = payload.coarse_metal_mass_flux_code},
+        .fine_face_flux_code = amr::ConservedState{
+            .mass_code = payload.fine_mass_flux_code,
+            .momentum_x_code = payload.fine_momentum_x_flux_code,
+            .momentum_y_code = payload.fine_momentum_y_flux_code,
+            .momentum_z_code = payload.fine_momentum_z_flux_code,
+            .total_energy_code = payload.fine_total_energy_flux_code,
+            .metal_mass_code = payload.fine_metal_mass_flux_code},
+        .face_area_comov = payload.face_area_comov,
+        .coarse_area_comov = payload.coarse_area_comov,
+        .fine_area_comov = payload.fine_area_comov,
+        .dt_code = payload.dt_code,
+        .coarse_face_count = payload.coarse_face_count,
+        .fine_face_count = payload.fine_face_count};
+}
+
 [[nodiscard]] std::uint64_t hydroInterfaceFaceKey(
     std::uint64_t local_gas_cell_id,
     std::uint64_t remote_gas_cell_id,
@@ -535,6 +606,12 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
       // 1 erg/g = 1e-4 J/kg = 1e-4 m^2/s^2.
       const double specific_energy_rate_cgs_to_code =
           1.0e-4 * m_units.timeSiPerCode() / velocity_sq_si;
+      // R1: the same rate provider evaluates per-cell cooling times for the
+      // mandatory cooling-length refinement criterion (read-only copy).
+      m_cooling_rate_provider.emplace(provider);
+      m_cooling_specific_rate_cgs_to_code = specific_energy_rate_cgs_to_code;
+      m_cooling_temperature_per_energy_k = cooling_config.temperature_per_internal_energy_k;
+      m_cooling_helium_mass_fraction = cooling_config.primordial_helium_mass_fraction;
       m_cooling_source = std::make_unique<physics::CoolingHeatingSource>(
           std::move(provider),
           physics::CoolingSourceIntegrator(
@@ -1831,6 +1908,717 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
     return report;
   }
 
+  // Directed AMR boundary-cell exchange (sparse remote ghost sources) shared
+  // by the synchronized distributed sweep and every level clock of the
+  // distributed recursive driver. level_filter empty = all local patches.
+  // Collective; admission failures are agreed before any payload moves.
+  struct DirectedHydroGhostExchange {
+    std::vector<parallel::AmrPatchPayloadRecord> local_patch_records;
+    std::vector<amr::DistributedAmrRemotePatch> remote_patches;
+    std::unordered_map<std::uint64_t, int> owner_rank_by_patch_id;
+    parallel::DirectedAmrExchangeDiagnostics diagnostics{};
+    core::MemoryReservation transport_reservation;
+    std::vector<core::MemoryReservation> sparse_ghost_reservations;
+  };
+
+  [[nodiscard]] DirectedHydroGhostExchange exchangeDirectedHydroGhosts(
+      core::StepContext& context,
+      const amr::ProductionAmrHydroOptions& amr_options,
+      std::span<const int> level_filter,
+      std::uint64_t sequence) {
+    DirectedHydroGhostExchange result;
+    result.local_patch_records =
+        internal::buildMigrationAmrPatchPayloadRecords(
+            context.state, m_mpi_context.worldRank());
+    if (!level_filter.empty()) {
+      // G1.1: only patches whose state is current at this level clock take
+      // part (every rank applies the same rule, so requests stay matched).
+      std::erase_if(result.local_patch_records, [level_filter](const parallel::AmrPatchPayloadRecord& record) {
+        return std::find(level_filter.begin(), level_filter.end(), static_cast<int>(record.level)) ==
+            level_filter.end();
+      });
+    }
+    const auto& local_patch_records = result.local_patch_records;
+    parallel::DirectedAmrExchangeDiagnostics& directed_amr_diagnostics = result.diagnostics;
+    const std::size_t wire_record_bytes = sizeof(parallel::AmrPatchCellPayloadRecord);
+    std::size_t transport_round_limit_bytes = parallel::mpiTransportRoundLimitBytes();
+    core::MemoryReservation& transport_reservation = result.transport_reservation;
+    std::exception_ptr transport_admission_failure;
+    try {
+      if (m_memory_governor != nullptr) {
+        const std::uint64_t simultaneous_record_bytes =
+            core::checkedMemoryBytesAdd(
+                static_cast<std::uint64_t>(wire_record_bytes),
+                static_cast<std::uint64_t>(wire_record_bytes),
+                "hydro remote ghost simultaneous wire-record bytes");
+        const std::uint64_t requested_records = static_cast<std::uint64_t>(
+            transport_round_limit_bytes / wire_record_bytes);
+        const core::DeterministicBatchSizingResult sizing =
+            core::selectDeterministicBatchSize(
+                m_memory_governor->snapshot(),
+                core::DeterministicBatchSizingPolicy{
+                    .requested_max_items = std::max<std::uint64_t>(requested_records, 1U),
+                    .bytes_per_item = simultaneous_record_bytes,
+                    .fixed_reserve_bytes = 0U,
+                    .minimum_items = 1U,
+                    .alignment_items = 1U,
+                    .headroom_use_basis_points = 10000U,
+                });
+        if (sizing.selected_items == 0U) {
+          throw std::runtime_error(
+              "hydro remote ghost transport cannot admit one send/receive wire record per rank");
+        }
+        transport_round_limit_bytes = core::checkedIntegralNarrow<std::size_t>(
+            sizing.selected_items * static_cast<std::uint64_t>(wire_record_bytes),
+            "hydro remote ghost selected transport round bytes");
+        const std::uint64_t transport_reservation_bytes = sizing.selected_bytes;
+        transport_reservation = m_memory_governor->reserve(
+            core::MemoryClass::kCommunication,
+            transport_reservation_bytes,
+            "hydro.remote_ghost.transport");
+        transport_reservation.commit();
+      }
+    } catch (...) {
+      transport_admission_failure = std::current_exception();
+    }
+    m_mpi_context.rethrowCollectivePreparationFailure(
+        transport_admission_failure,
+        "hydro remote ghost transport memory admission");
+
+    std::unordered_map<std::uint64_t, amr::DistributedAmrRemotePatch> remote_patch_store;
+    std::vector<core::MemoryReservation>& sparse_ghost_reservations = result.sparse_ghost_reservations;
+    std::uint64_t sparse_ghost_capacity_bytes = 0U;
+    std::uint64_t sparse_ghost_metadata_bytes = 0U;
+
+    const auto sparse_admission =
+        [&](int peer_rank,
+            std::span<const parallel::AmrPatchPayloadRecord> remote_records,
+            std::span<const parallel::AmrPatchBoundaryCellRequest> requests,
+            std::uint64_t logical_receive_count) {
+          std::unordered_map<std::uint64_t, const parallel::AmrPatchPayloadRecord*> record_by_id;
+          record_by_id.reserve(remote_records.size());
+          for (const auto& record : remote_records) {
+            record_by_id.emplace(record.patch_id, &record);
+          }
+          std::uint64_t expected_total = 0U;
+          std::vector<std::pair<const parallel::AmrPatchPayloadRecord*, std::size_t>> planned;
+          planned.reserve(requests.size());
+          for (const auto& request : requests) {
+            const auto record_it = record_by_id.find(request.patch_id);
+            if (record_it == record_by_id.end()) {
+              throw std::runtime_error(
+                  "directed AMR sparse admission references missing remote patch metadata");
+            }
+            const auto* patch_record = record_it->second;
+            if (patch_record->owner_rank != peer_rank) {
+              throw std::runtime_error(
+                  "directed AMR sparse admission patch owner does not match peer rank");
+            }
+            const std::size_t expected = parallel::directedAmrPatchBoundaryCellCount(
+                *patch_record, request);
+            expected_total = core::checkedMemoryBytesAdd(
+                expected_total,
+                static_cast<std::uint64_t>(expected),
+                "directed AMR sparse admission expected record count");
+            planned.emplace_back(patch_record, expected);
+          }
+          if (expected_total != logical_receive_count) {
+            throw std::runtime_error(
+                "directed AMR sparse admission logical receive count mismatch");
+          }
+          const std::uint64_t requested_sparse_bytes =
+              core::checkedIntegralNarrow<std::uint64_t>(
+                  core::checkedSizeMultiply(
+                      core::checkedIntegralNarrow<std::size_t>(
+                          logical_receive_count,
+                          "hydro sparse ghost receive count"),
+                      sizeof(amr::AmrHydroSparseRemoteCell),
+                      "hydro sparse ghost requested bytes"),
+                  "hydro sparse ghost requested bytes uint64");
+          core::MemoryReservation sparse_reservation;
+          if (m_memory_governor != nullptr) {
+            sparse_reservation = m_memory_governor->reserve(
+                core::MemoryClass::kCommunication,
+                requested_sparse_bytes,
+                "hydro.remote_ghost.sparse_store");
+          }
+          std::uint64_t actual_peer_capacity_bytes = 0U;
+          for (const auto& [patch_record, expected] : planned) {
+            amr::DistributedAmrRemotePatch remote;
+            remote.patch = amr::PatchDescriptor{
+                .patch_id = patch_record->patch_id,
+                .parent_patch_id = patch_record->parent_patch_id,
+                .level = static_cast<std::uint8_t>(patch_record->level),
+                .morton_key = patch_record->morton_key,
+                .origin_comov = {patch_record->origin_x_comoving, patch_record->origin_y_comoving, patch_record->origin_z_comoving},
+                .extent_comov = {patch_record->extent_x_comoving, patch_record->extent_y_comoving, patch_record->extent_z_comoving},
+                .cell_dims = {patch_record->cell_dim_x, patch_record->cell_dim_y, patch_record->cell_dim_z}};
+            remote.owner_rank = patch_record->owner_rank;
+            remote.ghost_hydro_epoch = patch_record->decomposition_epoch;
+            remote.expected_ghost_hydro_epoch = patch_record->decomposition_epoch;
+            remote.boundary_cells.reserve(expected);
+            const std::uint64_t capacity_bytes =
+                core::checkedIntegralNarrow<std::uint64_t>(
+                    core::checkedSizeMultiply(
+                        remote.boundary_cells.capacity(),
+                        sizeof(amr::AmrHydroSparseRemoteCell),
+                        "hydro sparse remote patch capacity bytes"),
+                    "hydro sparse remote patch capacity bytes uint64");
+            sparse_ghost_capacity_bytes = core::checkedMemoryBytesAdd(
+                sparse_ghost_capacity_bytes,
+                capacity_bytes,
+                "hydro accumulated sparse ghost capacity bytes");
+            actual_peer_capacity_bytes = core::checkedMemoryBytesAdd(
+                actual_peer_capacity_bytes,
+                capacity_bytes,
+                "hydro peer sparse ghost capacity bytes");
+            const auto [it, inserted] = remote_patch_store.emplace(
+                remote.patch.patch_id, std::move(remote));
+            if (!inserted) {
+              throw std::runtime_error(
+                  "directed AMR sparse admission found duplicate remote patch metadata");
+            }
+          }
+          if (m_memory_governor != nullptr) {
+            if (actual_peer_capacity_bytes > requested_sparse_bytes) {
+              auto top_up = m_memory_governor->reserve(
+                  core::MemoryClass::kCommunication,
+                  actual_peer_capacity_bytes - requested_sparse_bytes,
+                  "hydro.remote_ghost.sparse_store_capacity_top_up");
+              top_up.commit();
+              sparse_ghost_reservations.push_back(std::move(top_up));
+            }
+            sparse_reservation.commit();
+            sparse_ghost_reservations.push_back(std::move(sparse_reservation));
+          }
+        };
+
+    const auto sparse_consumer =
+        [&](int peer_rank, std::span<const parallel::AmrPatchCellPayloadRecord> records) {
+          for (const auto& cell_record : records) {
+            auto remote_it = remote_patch_store.find(cell_record.patch_id);
+            if (remote_it == remote_patch_store.end()) {
+              throw std::runtime_error(
+                  "directed AMR sparse consumer received a cell before patch admission");
+            }
+            amr::DistributedAmrRemotePatch& remote = remote_it->second;
+            if (remote.owner_rank != peer_rank ||
+                cell_record.owner_rank != peer_rank) {
+              throw std::runtime_error(
+                  "directed AMR sparse consumer received stale remote ownership metadata");
+            }
+            if (remote.boundary_cells.size() >= remote.boundary_cells.capacity()) {
+              throw std::runtime_error(
+                  "directed AMR sparse consumer exceeded its governor-admitted boundary capacity");
+            }
+            const double metallicity_mass_fraction = cell_record.mass_code > 0.0
+                ? std::clamp(
+                      cell_record.metal_mass_code / cell_record.mass_code,
+                      0.0,
+                      1.0)
+                : 0.0;
+            remote.boundary_cells.push_back(amr::AmrHydroSparseRemoteCell{
+                .patch_local_cell = cell_record.local_cell_offset,
+                .gas_cell_id = cell_record.gas_cell_id,
+                .conserved = hydro::HydroCoreSolver::conservedFromPrimitive(
+                    hydro::HydroPrimitiveState{
+                        .rho_comoving = cell_record.density_code,
+                        .vel_x_peculiar = cell_record.velocity_x_peculiar,
+                        .vel_y_peculiar = cell_record.velocity_y_peculiar,
+                        .vel_z_peculiar = cell_record.velocity_z_peculiar,
+                        .pressure_comoving = cell_record.pressure_code,
+                        .metallicity_mass_fraction = metallicity_mass_fraction},
+                    k_gamma_adiabatic),
+                .internal_energy_code = cell_record.internal_energy_code > 0.0
+                    ? cell_record.internal_energy_code
+                    : std::numeric_limits<double>::quiet_NaN()});
+          }
+        };
+
+    const auto directed_amr_exchange = parallel::executeBlockingDirectedAmrPatchPayloadExchange(
+        m_mpi_context,
+        local_patch_records,
+        [&context, this](
+            std::span<const parallel::AmrPatchBoundaryCellRequest> requests,
+            std::uint64_t first_record,
+            std::size_t max_records,
+            std::vector<parallel::AmrPatchCellPayloadRecord>& output) {
+          internal::fillMigrationAmrPatchBoundaryCellPayloadChunk(
+              context.state,
+              m_mpi_context.worldRank(),
+              requests,
+              first_record,
+              max_records,
+              output);
+        },
+        sparse_consumer,
+        sparse_admission,
+        transport_round_limit_bytes,
+        sequence,
+        parallel::AmrInterfaceTopologyOptions{
+            .periodic_box_extent_comoving =
+                amr_options.physical_boundary_kind == hydro::HydroBoundaryKind::kPeriodic
+                    ? amr_options.periodic_box_extent_comoving
+                    : std::array<double, 3>{0.0, 0.0, 0.0},
+            .ghost_layers = amr::productionAmrHydroGhostLayers(amr_options)});
+    directed_amr_diagnostics = directed_amr_exchange.diagnostics;
+
+    std::unordered_map<std::uint64_t, int>& owner_rank_by_patch_id = result.owner_rank_by_patch_id;
+    owner_rank_by_patch_id.reserve(local_patch_records.size() + directed_amr_exchange.patch_payloads_received.size());
+    for (const auto& record : local_patch_records) {
+      const auto [it, inserted] = owner_rank_by_patch_id.emplace(record.patch_id, record.owner_rank);
+      if (!inserted && it->second != record.owner_rank) {
+        throw std::runtime_error("directed AMR hydro found conflicting local patch ownership metadata");
+      }
+    }
+
+    std::vector<amr::DistributedAmrRemotePatch>& remote_patches = result.remote_patches;
+    remote_patches.reserve(directed_amr_exchange.patch_payloads_received.size());
+    for (const auto& patch_record : directed_amr_exchange.patch_payloads_received) {
+      if (patch_record.owner_rank == m_mpi_context.worldRank()) {
+        throw std::runtime_error("directed AMR hydro imported a local patch as a remote ghost");
+      }
+      owner_rank_by_patch_id.emplace(patch_record.patch_id, patch_record.owner_rank);
+      auto remote_it = remote_patch_store.find(patch_record.patch_id);
+      if (remote_it == remote_patch_store.end()) {
+        throw std::runtime_error(
+            "directed AMR hydro remote interface patch has no sparse boundary store");
+      }
+      auto& cells = remote_it->second.boundary_cells;
+      std::sort(
+          cells.begin(), cells.end(),
+          [](const auto& lhs, const auto& rhs) {
+            return lhs.patch_local_cell < rhs.patch_local_cell;
+          });
+      for (std::size_t i = 1; i < cells.size(); ++i) {
+        if (cells[i - 1U].patch_local_cell == cells[i].patch_local_cell) {
+          throw std::runtime_error(
+              "directed AMR hydro received duplicate sparse remote boundary cell");
+        }
+      }
+      remote_patches.push_back(std::move(remote_it->second));
+    }
+    remote_patch_store.clear();
+    remote_patch_store.rehash(0U);
+    sparse_ghost_metadata_bytes = core::checkedIntegralNarrow<std::uint64_t>(
+        core::checkedSizeMultiply(
+            remote_patches.capacity(),
+            sizeof(amr::DistributedAmrRemotePatch),
+            "hydro sparse remote patch metadata bytes"),
+        "hydro sparse remote patch metadata bytes uint64");
+    const std::uint64_t remote_ghost_resident_high_water =
+        core::checkedMemoryBytesAdd(
+            core::checkedMemoryBytesAdd(
+                directed_amr_diagnostics.communication_workspace_high_water_bytes,
+                sparse_ghost_capacity_bytes,
+                "hydro remote ghost transport plus sparse cell capacity"),
+            sparse_ghost_metadata_bytes,
+            "hydro remote ghost total resident high-water");
+    m_remote_ghost_sparse_cell_high_water = std::max(
+        m_remote_ghost_sparse_cell_high_water,
+        directed_amr_diagnostics.directed_patch_cell_records_received);
+    m_remote_ghost_capacity_high_water_bytes = std::max(
+        m_remote_ghost_capacity_high_water_bytes,
+        sparse_ghost_capacity_bytes);
+    m_remote_ghost_metadata_high_water_bytes = std::max(
+        m_remote_ghost_metadata_high_water_bytes,
+        sparse_ghost_metadata_bytes);
+    m_communication_high_water_bytes = std::max(
+        m_communication_high_water_bytes,
+        remote_ghost_resident_high_water);
+    m_last_communication_traffic_bytes =
+        directed_amr_diagnostics.patch_cell_payload_bytes;
+    return result;
+  }
+
+  // G1.1: workflow-side collectives of the distributed recursive AMR driver.
+  // Retained remote coarse intervals: for each level with an open interval,
+  // the remote boundary cells (stable patch_local_cell order) at the
+  // interval start and end, exchanged at the level clock. Their storage is
+  // admitted through the MemoryGovernor ("hydro.recursive.remote_interval").
+  class DistributedRecursiveHooks final : public amr::RecursiveAmrDistributedHooks {
+   public:
+    DistributedRecursiveHooks(HydroAmrRuntimeImpl& runtime,
+                              core::StepContext& context,
+                              const amr::ProductionAmrHydroOptions& options,
+                              std::vector<amr::PatchDescriptor>& regrid_neighbours,
+                              std::vector<std::pair<std::uint64_t, int>>* remote_cell_owner)
+        : m_runtime(runtime),
+          m_context(context),
+          m_options(options),
+          m_regrid_neighbours(regrid_neighbours),
+          m_remote_cell_owner(remote_cell_owner),
+          m_sequence(context.integrator_state.step_index) {}
+
+    void reduceFailure(std::exception_ptr local_failure, const char* stage) override {
+      m_runtime.m_mpi_context.rethrowCollectivePreparationFailure(local_failure, stage);
+    }
+
+    void globalLevelUnion(std::array<std::uint64_t, 4>& level_bits) override {
+      std::array<std::uint64_t, 256> counts{};
+      for (std::size_t level = 0; level < counts.size(); ++level) {
+        counts[level] = (level_bits[level / 64U] >> (level % 64U)) & 1ULL;
+      }
+      m_runtime.m_mpi_context.allreduceSumUint64sInPlace(counts);
+      level_bits = {};
+      for (std::size_t level = 0; level < counts.size(); ++level) {
+        if (counts[level] != 0U) level_bits[level / 64U] |= 1ULL << (level % 64U);
+      }
+    }
+
+    [[nodiscard]] std::uint64_t globalMax(std::uint64_t value) override {
+      return m_runtime.m_mpi_context.allreduceMaxUint64(value);
+    }
+
+    [[nodiscard]] std::span<const amr::PatchDescriptor> prepare(double /*t_begin*/) override {
+      DirectedHydroGhostExchange exchange =
+          m_runtime.exchangeDirectedHydroGhosts(m_context, m_options, {}, nextSequence());
+      std::exception_ptr failure;
+      try {
+        absorb(exchange);
+        m_neighbours.clear();
+        m_neighbours.reserve(exchange.remote_patches.size());
+        for (const amr::DistributedAmrRemotePatch& remote : exchange.remote_patches) {
+          m_neighbours.push_back(remote.patch);
+          m_regrid_neighbours.push_back(remote.patch);
+        }
+        m_remote_patch_count = exchange.remote_patches.size();
+      } catch (...) {
+        failure = std::current_exception();
+      }
+      reduceFailure(failure, "distributed recursive AMR preparation");
+      return m_neighbours;
+    }
+
+    [[nodiscard]] std::span<const amr::DistributedAmrRemotePatch> beginLevelSweep(
+        int level, int coarser_level, int finer_level, double t_begin, double t_end, bool capture_start) override {
+      std::array<int, 2> filter{level, finer_level};
+      DirectedHydroGhostExchange exchange = m_runtime.exchangeDirectedHydroGhosts(
+          m_context, m_options, std::span<const int>(filter.data(), finer_level >= 0 ? 2U : 1U), nextSequence());
+      std::exception_ptr failure;
+      try {
+        absorb(exchange);
+        m_sweep_sources.clear();
+        m_sweep_sources.reserve(exchange.remote_patches.size() +
+                                (coarser_level >= 0 ? intervalStore(coarser_level).size() : 0U));
+        for (amr::DistributedAmrRemotePatch& remote : exchange.remote_patches) {
+          remote.state_time_code = t_begin;  // levels {level, finer}: current at t_begin
+          if (capture_start && static_cast<int>(remote.patch.level) == level) {
+            RetainedInterval interval;
+            interval.patch = remote.patch;
+            interval.owner_rank = remote.owner_rank;
+            interval.ghost_hydro_epoch = remote.ghost_hydro_epoch;
+            interval.t_start = t_begin;
+            interval.t_end = t_end;
+            interval.start = remote.boundary_cells;
+            admitRetained(interval.start.capacity());
+            intervalStore(level).push_back(std::move(interval));
+          }
+          m_sweep_sources.push_back(std::move(remote));
+        }
+        if (coarser_level >= 0) {
+          // Interpolated copies live for this sweep only; admitted per sweep.
+          std::size_t interpolated_cells = 0U;
+          for (const RetainedInterval& interval : intervalStore(coarser_level)) {
+            interpolated_cells = core::checkedSizeAdd(interpolated_cells, interval.start.size(),
+                                                      "recursive interpolated remote cells");
+          }
+          m_sweep_reservation.release();
+          if (m_runtime.m_memory_governor != nullptr && interpolated_cells != 0U) {
+            m_sweep_reservation = m_runtime.m_memory_governor->reserve(
+                core::MemoryClass::kCommunication,
+                core::checkedIntegralNarrow<std::uint64_t>(
+                    core::checkedSizeMultiply(interpolated_cells, sizeof(amr::AmrHydroSparseRemoteCell),
+                                              "recursive interpolated remote bytes"),
+                    "recursive interpolated remote bytes"),
+                "hydro.recursive.remote_interpolated");
+            m_sweep_reservation.commit();
+          }
+          for (const RetainedInterval& interval : intervalStore(coarser_level)) {
+            m_sweep_sources.push_back(interpolate(interval, t_begin));
+          }
+        }
+      } catch (...) {
+        failure = std::current_exception();
+      }
+      reduceFailure(failure, "distributed recursive AMR level ghost exchange");
+      return m_sweep_sources;
+    }
+
+    void exchangeLevelFluxRegisters(core::SimulationState& state,
+                                    std::span<const amr::FluxRegisterEntry> outbound,
+                                    const amr::ProductionAmrHydroOptions& level_options) override {
+      std::vector<parallel::AmrFluxRegisterPayloadRecord> payloads;
+      std::exception_ptr failure;
+      try {
+        payloads.reserve(outbound.size());
+        for (const amr::FluxRegisterEntry& entry : outbound) {
+          const auto owner = m_owner_rank_by_patch_id.find(entry.coarse_patch_id);
+          if (owner == m_owner_rank_by_patch_id.end()) {
+            throw std::runtime_error("distributed recursive AMR register half has an unknown coarse owner");
+          }
+          payloads.push_back(fluxRegisterPayloadFromEntry(
+              entry, m_runtime.m_mpi_context.worldRank(), owner->second, state));
+        }
+      } catch (...) {
+        failure = std::current_exception();
+      }
+      reduceFailure(failure, "distributed recursive AMR register packing");
+      const auto global = parallel::executeBlockingAmrFluxRegisterPayloadExchange(
+          m_runtime.m_mpi_context, payloads, nextSequence(), m_runtime.m_memory_governor);
+      try {
+        std::vector<std::pair<int, std::size_t>> mine;
+        for (std::size_t g = 0; g < global.size(); ++g) {
+          if (global[g].owner_rank == m_runtime.m_mpi_context.worldRank()) mine.emplace_back(global[g].source_rank, g);
+        }
+        // Deterministic merge order: source rank, then wire order.
+        std::stable_sort(mine.begin(), mine.end(),
+                         [](const auto& l, const auto& r) { return l.first < r.first; });
+        std::vector<amr::FluxRegisterEntry> inbound;
+        inbound.reserve(mine.size());
+        for (const auto& [rank, g] : mine) inbound.push_back(fluxRegisterEntryFromPayload(global[g]));
+        if (!inbound.empty()) (void)amr::mergeFluxRegistersIntoPendingStore(state, inbound, level_options);
+        m_flux_records_sent += payloads.size();
+        m_flux_records_received += inbound.size();
+      } catch (...) {
+        failure = std::current_exception();
+      }
+      reduceFailure(failure, "distributed recursive AMR register merge");
+    }
+
+    void captureLevelEnd(int level, int finer_level, double t_end) override {
+      std::array<int, 2> filter{level, finer_level};
+      DirectedHydroGhostExchange exchange = m_runtime.exchangeDirectedHydroGhosts(
+          m_context, m_options, std::span<const int>(filter.data(), finer_level >= 0 ? 2U : 1U), nextSequence());
+      std::exception_ptr failure;
+      try {
+        absorb(exchange);
+        auto& store = intervalStore(level);
+        std::size_t matched = 0U;
+        for (amr::DistributedAmrRemotePatch& remote : exchange.remote_patches) {
+          if (static_cast<int>(remote.patch.level) != level) continue;
+          const auto it = std::find_if(store.begin(), store.end(), [&remote](const RetainedInterval& interval) {
+            return interval.patch.patch_id == remote.patch.patch_id;
+          });
+          if (it == store.end()) {
+            throw std::runtime_error(
+                "distributed recursive AMR: remote coarse patch appeared at the interval end without a start state");
+          }
+          if (std::abs(it->t_end - t_end) > 1.0e-12 * std::max({1.0, std::abs(t_end), std::abs(it->t_end)})) {
+            throw std::runtime_error("distributed recursive AMR: remote coarse interval end time mismatch");
+          }
+          it->end = std::move(remote.boundary_cells);
+          admitRetained(it->end.capacity());
+          ++matched;
+        }
+        if (matched != store.size()) {
+          throw std::runtime_error(
+              "distributed recursive AMR: a remote coarse patch lost its interval end state (fail closed)");
+        }
+      } catch (...) {
+        failure = std::current_exception();
+      }
+      reduceFailure(failure, "distributed recursive AMR level end exchange");
+    }
+
+    void retireLevel(int level) noexcept override {
+      if (level >= 0 && static_cast<std::size_t>(level) < m_intervals.size()) {
+        m_intervals[static_cast<std::size_t>(level)].clear();
+      }
+    }
+
+    [[nodiscard]] const parallel::DirectedAmrExchangeDiagnostics& diagnostics() const noexcept {
+      return m_diagnostics;
+    }
+    [[nodiscard]] std::size_t remotePatchCount() const noexcept { return m_remote_patch_count; }
+    [[nodiscard]] std::uint64_t fluxRecordsSent() const noexcept { return m_flux_records_sent; }
+    [[nodiscard]] std::uint64_t fluxRecordsReceived() const noexcept { return m_flux_records_received; }
+
+   private:
+    struct RetainedInterval {
+      amr::PatchDescriptor patch{};
+      int owner_rank = 0;
+      std::uint64_t ghost_hydro_epoch = 0U;
+      double t_start = 0.0;
+      double t_end = 0.0;
+      std::vector<amr::AmrHydroSparseRemoteCell> start;
+      std::vector<amr::AmrHydroSparseRemoteCell> end;
+    };
+
+    [[nodiscard]] std::uint64_t nextSequence() noexcept { return m_sequence++; }
+
+    [[nodiscard]] std::vector<RetainedInterval>& intervalStore(int level) {
+      if (level < 0 || level >= 256) throw std::out_of_range("distributed recursive AMR level outside 0..255");
+      if (m_intervals.size() <= static_cast<std::size_t>(level)) m_intervals.resize(static_cast<std::size_t>(level) + 1U);
+      return m_intervals[static_cast<std::size_t>(level)];
+    }
+
+    void admitRetained(std::size_t cell_capacity) {
+      if (m_runtime.m_memory_governor == nullptr || cell_capacity == 0U) return;
+      core::MemoryReservation reservation = m_runtime.m_memory_governor->reserve(
+          core::MemoryClass::kCommunication,
+          core::checkedIntegralNarrow<std::uint64_t>(
+              core::checkedSizeMultiply(cell_capacity, sizeof(amr::AmrHydroSparseRemoteCell),
+                                        "recursive remote interval bytes"),
+              "recursive remote interval bytes"),
+          "hydro.recursive.remote_interval");
+      reservation.commit();
+      m_retained_reservations.push_back(std::move(reservation));
+    }
+
+    // Linear interpolation in conserved variables with the ghost filler's
+    // endpoint snapping; the result is labelled with the fill time.
+    [[nodiscard]] amr::DistributedAmrRemotePatch interpolate(const RetainedInterval& interval, double t) const {
+      if (interval.end.size() != interval.start.size()) {
+        throw std::runtime_error("distributed recursive AMR: remote coarse interval start/end cell sets differ");
+      }
+      const double duration = interval.t_end - interval.t_start;
+      if (!(duration > 0.0) || !std::isfinite(duration)) {
+        throw std::runtime_error("distributed recursive AMR: invalid remote coarse interval");
+      }
+      double alpha = (t - interval.t_start) / duration;
+      const double tol = 1.0e-12 * std::max({1.0, std::abs(interval.t_start), std::abs(interval.t_end), std::abs(t)});
+      if (alpha < -tol || alpha > 1.0 + tol) {
+        throw std::runtime_error("distributed recursive AMR: fill time outside the remote coarse interval");
+      }
+      if (alpha <= tol) alpha = 0.0;
+      if (alpha >= 1.0 - tol) alpha = 1.0;
+      amr::DistributedAmrRemotePatch out;
+      out.patch = interval.patch;
+      out.owner_rank = interval.owner_rank;
+      out.ghost_hydro_epoch = interval.ghost_hydro_epoch;
+      out.expected_ghost_hydro_epoch = interval.ghost_hydro_epoch;
+      out.state_time_code = t;
+      out.boundary_cells.reserve(interval.start.size());
+      for (std::size_t c = 0; c < interval.start.size(); ++c) {
+        const amr::AmrHydroSparseRemoteCell& a = interval.start[c];
+        const amr::AmrHydroSparseRemoteCell& b = interval.end[c];
+        if (a.patch_local_cell != b.patch_local_cell || a.gas_cell_id != b.gas_cell_id) {
+          throw std::runtime_error("distributed recursive AMR: remote coarse identity changed inside the interval");
+        }
+        amr::AmrHydroSparseRemoteCell cell = a;
+        cell.conserved = (1.0 - alpha) * a.conserved + alpha * b.conserved;
+        // Specific internal energy interpolated with the same weights (NaN
+        // stays NaN: the dual-energy lane then falls back to E - K, counted).
+        cell.internal_energy_code = (1.0 - alpha) * a.internal_energy_code + alpha * b.internal_energy_code;
+        if (!(cell.conserved.mass_density_comoving > 0.0) || !std::isfinite(cell.conserved.total_energy_density_comoving)) {
+          throw std::runtime_error("distributed recursive AMR: interpolated remote coarse state is unphysical");
+        }
+        out.boundary_cells.push_back(cell);
+      }
+      return out;
+    }
+
+    void absorb(DirectedHydroGhostExchange& exchange) {
+      for (const auto& [id, owner] : exchange.owner_rank_by_patch_id) m_owner_rank_by_patch_id.emplace(id, owner);
+      if (m_remote_cell_owner != nullptr) {
+        for (const amr::DistributedAmrRemotePatch& remote : exchange.remote_patches) {
+          for (const amr::AmrHydroSparseRemoteCell& cell : remote.boundary_cells) {
+            m_remote_cell_owner->emplace_back(cell.gas_cell_id, remote.owner_rank);
+          }
+        }
+      }
+      const auto& d = exchange.diagnostics;
+      m_diagnostics.candidate_peer_count = std::max(m_diagnostics.candidate_peer_count, d.candidate_peer_count);
+      m_diagnostics.neighbor_peer_count = std::max(m_diagnostics.neighbor_peer_count, d.neighbor_peer_count);
+      m_diagnostics.remote_interface_count = std::max(m_diagnostics.remote_interface_count, d.remote_interface_count);
+      m_diagnostics.directed_patch_descriptor_records_sent += d.directed_patch_descriptor_records_sent;
+      m_diagnostics.directed_patch_descriptor_records_received += d.directed_patch_descriptor_records_received;
+      m_diagnostics.directed_patch_cell_records_sent += d.directed_patch_cell_records_sent;
+      m_diagnostics.directed_patch_cell_records_received += d.directed_patch_cell_records_received;
+      m_diagnostics.control_plane_bytes += d.control_plane_bytes;
+      m_diagnostics.patch_descriptor_bytes += d.patch_descriptor_bytes;
+      m_diagnostics.patch_cell_payload_bytes += d.patch_cell_payload_bytes;
+      m_diagnostics.communication_workspace_high_water_bytes = std::max(
+          m_diagnostics.communication_workspace_high_water_bytes, d.communication_workspace_high_water_bytes);
+      m_diagnostics.patch_cell_send_capacity_high_water_bytes = std::max(
+          m_diagnostics.patch_cell_send_capacity_high_water_bytes, d.patch_cell_send_capacity_high_water_bytes);
+      m_diagnostics.patch_cell_receive_capacity_high_water_bytes = std::max(
+          m_diagnostics.patch_cell_receive_capacity_high_water_bytes, d.patch_cell_receive_capacity_high_water_bytes);
+      m_diagnostics.patch_cell_transport_round_count += d.patch_cell_transport_round_count;
+      m_diagnostics.remote_patch_ghost_count = std::max(m_diagnostics.remote_patch_ghost_count, d.remote_patch_ghost_count);
+    }
+
+    HydroAmrRuntimeImpl& m_runtime;
+    core::StepContext& m_context;
+    const amr::ProductionAmrHydroOptions& m_options;
+    std::vector<amr::PatchDescriptor>& m_regrid_neighbours;
+    std::vector<std::pair<std::uint64_t, int>>* m_remote_cell_owner = nullptr;
+    std::uint64_t m_sequence = 0U;
+    // Leases are declared before (destroyed after) the buffers they cover.
+    std::vector<core::MemoryReservation> m_retained_reservations;
+    core::MemoryReservation m_sweep_reservation;
+    std::vector<amr::PatchDescriptor> m_neighbours;
+    std::vector<amr::DistributedAmrRemotePatch> m_sweep_sources;
+    std::vector<std::vector<RetainedInterval>> m_intervals;
+    std::unordered_map<std::uint64_t, int> m_owner_rank_by_patch_id;
+    parallel::DirectedAmrExchangeDiagnostics m_diagnostics{};
+    std::size_t m_remote_patch_count = 0U;
+    std::uint64_t m_flux_records_sent = 0U;
+    std::uint64_t m_flux_records_received = 0U;
+  };
+
+  // G1.2: accepted-step guard for recursive subcycling, the same rule as the
+  // coordinator's level-relaxed candidate: a level-L cell must be stable for
+  // ITS substep dt / r^(L - L_min,global). Collective verdict (a violation on
+  // any rank rejects on every rank before any exchange or mutation).
+  void verifyAcceptedRecursiveAmrHydroCfl(core::StepContext& context, std::uint32_t refinement_ratio) {
+    std::uint64_t local_min_level = std::numeric_limits<std::uint64_t>::max();
+    for (std::size_t patch = 0; patch < context.state.patches.size(); ++patch) {
+      if (context.state.patches.cell_count[patch] == 0U || context.state.patches.level[patch] < 0) continue;
+      local_min_level = std::min<std::uint64_t>(local_min_level,
+                                                static_cast<std::uint64_t>(context.state.patches.level[patch]));
+    }
+    const std::uint64_t global_min_level = m_mpi_context.allreduceMinUint64(local_min_level);
+    std::exception_ptr failure;
+    try {
+      const double dt = context.integrator_state.dt_time_code;
+      if (!(dt > 0.0)) throw std::invalid_argument("recursive AMR CFL guard requires dt_time_code > 0");
+      const double cfl_scale_factor = m_config.units.coordinate_frame == core::CoordinateFrame::kComoving
+          ? std::max(context.timeline_step.scale_factor_begin, 1.0e-12) : 1.0;
+      core::HydroCflDiagnostics worst;
+      bool have_worst = false;
+      for (std::uint32_t row = 0; row < context.state.cells.size(); ++row) {
+        const std::uint32_t patch = context.state.cells.patch_index[row];
+        if (patch >= context.state.patches.size()) {
+          throw std::runtime_error("recursive AMR CFL guard: gas cell without patch ownership");
+        }
+        const auto& p = context.state.patches;
+        const std::array<double, 3> widths{
+            p.extent_x_comoving[patch] / static_cast<double>(std::max<std::uint32_t>(p.cell_dim_x[patch], 1U)),
+            p.extent_y_comoving[patch] / static_cast<double>(std::max<std::uint32_t>(p.cell_dim_y[patch], 1U)),
+            p.extent_z_comoving[patch] / static_cast<double>(std::max<std::uint32_t>(p.cell_dim_z[patch], 1U))};
+        const int offset = p.level[patch] - static_cast<int>(global_min_level);
+        if (offset < 0) throw std::runtime_error("recursive AMR CFL guard: level below the global minimum");
+        const double level_dt = dt / std::pow(static_cast<double>(refinement_ratio), static_cast<double>(offset));
+        const core::DirectionalCflTimeStepInput input{
+            .cell_width_axis_code = widths,
+            .velocity_axis_code = {context.state.gas_cells.velocity_x_peculiar[row],
+                                   context.state.gas_cells.velocity_y_peculiar[row],
+                                   context.state.gas_cells.velocity_z_peculiar[row]},
+            .sound_speed_code = std::max(context.state.gas_cells.sound_speed_code[row], 0.0),
+            .coordinate_frame = m_config.units.coordinate_frame,
+            .scale_factor = cfl_scale_factor,
+            .stability_rule = core::hydroCflStabilityRuleFor(m_config),
+            .active_axis = core::activeHydroAxes(widths, core::hydroDomainExtentCode(m_config)),
+        };
+        const core::HydroCflDiagnostics diagnostics = core::makeHydroCflDiagnostics(
+            row, input, 0.4, level_dt, context.state.gas_cells.gas_cell_id[row], p.patch_id[patch]);
+        if (!have_worst || diagnostics.safety_factor < worst.safety_factor) {
+          worst = diagnostics;
+          have_worst = true;
+        }
+      }
+      if (have_worst) {
+        m_last_hydro_cfl_diagnostics = worst;
+        core::assertHydroCflStable(worst);
+      }
+    } catch (...) {
+      failure = std::current_exception();
+    }
+    m_mpi_context.rethrowCollectivePreparationFailure(failure, "recursive AMR accepted-step CFL guard");
+  }
+
   void runProductionAmrHydroPath(core::StepContext& context) {
     // Hydro transport/source terms own the full accepted interval. Evaluate
     // background terms at its midpoint; AMR fine substeps derive their own
@@ -1900,6 +2688,9 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
     m_mpi_context.rethrowCollectivePreparationFailure(
         batch_admission_failure, "hydro active-batch memory admission");
 
+    if (m_config.numerics.amr_time_stepping == core::AmrTimeSteppingConfigMode::kRecursiveSubcycling) {
+      verifyAcceptedRecursiveAmrHydroCfl(context, amr::ProductionAmrHydroOptions{}.refinement_ratio);
+    }
     const amr::ProductionAmrHydroOptions amr_options{
         .physical_boundary_kind = hydroBoundaryKindFromModePolicy(m_mode_policy.hydro_boundary),
         .adiabatic_index = k_gamma_adiabatic,
@@ -1948,302 +2739,51 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
     }
     if (m_mpi_context.isEnabled() && m_mpi_context.worldSize() > 1 &&
         m_config.numerics.amr_time_stepping == core::AmrTimeSteppingConfigMode::kRecursiveSubcycling) {
-      // Rank-uniform (configuration) refusal before any exchange or mutation:
-      // a distributed recursive sweep needs one directed ghost/flux exchange
-      // per level substep, which is not implemented yet (Milestone I PARTIAL).
-      throw std::runtime_error(
-          "numerics.amr_time_stepping = recursive_subcycling is single-rank only in this revision; "
-          "distributed per-substep exchange is OPEN (fail closed)");
-    }
-    if (m_mpi_context.isEnabled() && m_mpi_context.worldSize() > 1) {
-      const auto local_patch_records =
-          internal::buildMigrationAmrPatchPayloadRecords(
-              context.state, m_mpi_context.worldRank());
-      const std::size_t wire_record_bytes = sizeof(parallel::AmrPatchCellPayloadRecord);
-      std::size_t transport_round_limit_bytes = parallel::mpiTransportRoundLimitBytes();
-      core::MemoryReservation transport_reservation;
-      std::exception_ptr transport_admission_failure;
-      try {
-        if (m_memory_governor != nullptr) {
-          const std::uint64_t simultaneous_record_bytes =
-              core::checkedMemoryBytesAdd(
-                  static_cast<std::uint64_t>(wire_record_bytes),
-                  static_cast<std::uint64_t>(wire_record_bytes),
-                  "hydro remote ghost simultaneous wire-record bytes");
-          const std::uint64_t requested_records = static_cast<std::uint64_t>(
-              transport_round_limit_bytes / wire_record_bytes);
-          const core::DeterministicBatchSizingResult sizing =
-              core::selectDeterministicBatchSize(
-                  m_memory_governor->snapshot(),
-                  core::DeterministicBatchSizingPolicy{
-                      .requested_max_items = std::max<std::uint64_t>(requested_records, 1U),
-                      .bytes_per_item = simultaneous_record_bytes,
-                      .fixed_reserve_bytes = 0U,
-                      .minimum_items = 1U,
-                      .alignment_items = 1U,
-                      .headroom_use_basis_points = 10000U,
-                  });
-          if (sizing.selected_items == 0U) {
-            throw std::runtime_error(
-                "hydro remote ghost transport cannot admit one send/receive wire record per rank");
-          }
-          transport_round_limit_bytes = core::checkedIntegralNarrow<std::size_t>(
-              sizing.selected_items * static_cast<std::uint64_t>(wire_record_bytes),
-              "hydro remote ghost selected transport round bytes");
-          const std::uint64_t transport_reservation_bytes = sizing.selected_bytes;
-          transport_reservation = m_memory_governor->reserve(
-              core::MemoryClass::kCommunication,
-              transport_reservation_bytes,
-              "hydro.remote_ghost.transport");
-          transport_reservation.commit();
-        }
-      } catch (...) {
-        transport_admission_failure = std::current_exception();
-      }
-      m_mpi_context.rethrowCollectivePreparationFailure(
-          transport_admission_failure,
-          "hydro remote ghost transport memory admission");
-
-      std::unordered_map<std::uint64_t, amr::DistributedAmrRemotePatch> remote_patch_store;
-      std::vector<core::MemoryReservation> sparse_ghost_reservations;
-      std::uint64_t sparse_ghost_capacity_bytes = 0U;
-      std::uint64_t sparse_ghost_metadata_bytes = 0U;
-
-      const auto sparse_admission =
-          [&](int peer_rank,
-              std::span<const parallel::AmrPatchPayloadRecord> remote_records,
-              std::span<const parallel::AmrPatchBoundaryCellRequest> requests,
-              std::uint64_t logical_receive_count) {
-            std::unordered_map<std::uint64_t, const parallel::AmrPatchPayloadRecord*> record_by_id;
-            record_by_id.reserve(remote_records.size());
-            for (const auto& record : remote_records) {
-              record_by_id.emplace(record.patch_id, &record);
-            }
-            std::uint64_t expected_total = 0U;
-            std::vector<std::pair<const parallel::AmrPatchPayloadRecord*, std::size_t>> planned;
-            planned.reserve(requests.size());
-            for (const auto& request : requests) {
-              const auto record_it = record_by_id.find(request.patch_id);
-              if (record_it == record_by_id.end()) {
-                throw std::runtime_error(
-                    "directed AMR sparse admission references missing remote patch metadata");
-              }
-              const auto* patch_record = record_it->second;
-              if (patch_record->owner_rank != peer_rank) {
-                throw std::runtime_error(
-                    "directed AMR sparse admission patch owner does not match peer rank");
-              }
-              const std::size_t expected = parallel::directedAmrPatchBoundaryCellCount(
-                  *patch_record, request);
-              expected_total = core::checkedMemoryBytesAdd(
-                  expected_total,
-                  static_cast<std::uint64_t>(expected),
-                  "directed AMR sparse admission expected record count");
-              planned.emplace_back(patch_record, expected);
-            }
-            if (expected_total != logical_receive_count) {
-              throw std::runtime_error(
-                  "directed AMR sparse admission logical receive count mismatch");
-            }
-            const std::uint64_t requested_sparse_bytes =
-                core::checkedIntegralNarrow<std::uint64_t>(
-                    core::checkedSizeMultiply(
-                        core::checkedIntegralNarrow<std::size_t>(
-                            logical_receive_count,
-                            "hydro sparse ghost receive count"),
-                        sizeof(amr::AmrHydroSparseRemoteCell),
-                        "hydro sparse ghost requested bytes"),
-                    "hydro sparse ghost requested bytes uint64");
-            core::MemoryReservation sparse_reservation;
-            if (m_memory_governor != nullptr) {
-              sparse_reservation = m_memory_governor->reserve(
-                  core::MemoryClass::kCommunication,
-                  requested_sparse_bytes,
-                  "hydro.remote_ghost.sparse_store");
-            }
-            std::uint64_t actual_peer_capacity_bytes = 0U;
-            for (const auto& [patch_record, expected] : planned) {
-              amr::DistributedAmrRemotePatch remote;
-              remote.patch = amr::PatchDescriptor{
-                  .patch_id = patch_record->patch_id,
-                  .parent_patch_id = patch_record->parent_patch_id,
-                  .level = static_cast<std::uint8_t>(patch_record->level),
-                  .morton_key = patch_record->morton_key,
-                  .origin_comov = {patch_record->origin_x_comoving, patch_record->origin_y_comoving, patch_record->origin_z_comoving},
-                  .extent_comov = {patch_record->extent_x_comoving, patch_record->extent_y_comoving, patch_record->extent_z_comoving},
-                  .cell_dims = {patch_record->cell_dim_x, patch_record->cell_dim_y, patch_record->cell_dim_z}};
-              remote.owner_rank = patch_record->owner_rank;
-              remote.ghost_hydro_epoch = patch_record->decomposition_epoch;
-              remote.expected_ghost_hydro_epoch = patch_record->decomposition_epoch;
-              remote.boundary_cells.reserve(expected);
-              const std::uint64_t capacity_bytes =
-                  core::checkedIntegralNarrow<std::uint64_t>(
-                      core::checkedSizeMultiply(
-                          remote.boundary_cells.capacity(),
-                          sizeof(amr::AmrHydroSparseRemoteCell),
-                          "hydro sparse remote patch capacity bytes"),
-                      "hydro sparse remote patch capacity bytes uint64");
-              sparse_ghost_capacity_bytes = core::checkedMemoryBytesAdd(
-                  sparse_ghost_capacity_bytes,
-                  capacity_bytes,
-                  "hydro accumulated sparse ghost capacity bytes");
-              actual_peer_capacity_bytes = core::checkedMemoryBytesAdd(
-                  actual_peer_capacity_bytes,
-                  capacity_bytes,
-                  "hydro peer sparse ghost capacity bytes");
-              const auto [it, inserted] = remote_patch_store.emplace(
-                  remote.patch.patch_id, std::move(remote));
-              if (!inserted) {
-                throw std::runtime_error(
-                    "directed AMR sparse admission found duplicate remote patch metadata");
-              }
-            }
-            if (m_memory_governor != nullptr) {
-              if (actual_peer_capacity_bytes > requested_sparse_bytes) {
-                auto top_up = m_memory_governor->reserve(
-                    core::MemoryClass::kCommunication,
-                    actual_peer_capacity_bytes - requested_sparse_bytes,
-                    "hydro.remote_ghost.sparse_store_capacity_top_up");
-                top_up.commit();
-                sparse_ghost_reservations.push_back(std::move(top_up));
-              }
-              sparse_reservation.commit();
-              sparse_ghost_reservations.push_back(std::move(sparse_reservation));
-            }
-          };
-
-      const auto sparse_consumer =
-          [&](int peer_rank, std::span<const parallel::AmrPatchCellPayloadRecord> records) {
-            for (const auto& cell_record : records) {
-              auto remote_it = remote_patch_store.find(cell_record.patch_id);
-              if (remote_it == remote_patch_store.end()) {
-                throw std::runtime_error(
-                    "directed AMR sparse consumer received a cell before patch admission");
-              }
-              amr::DistributedAmrRemotePatch& remote = remote_it->second;
-              if (remote.owner_rank != peer_rank ||
-                  cell_record.owner_rank != peer_rank) {
-                throw std::runtime_error(
-                    "directed AMR sparse consumer received stale remote ownership metadata");
-              }
-              if (remote.boundary_cells.size() >= remote.boundary_cells.capacity()) {
-                throw std::runtime_error(
-                    "directed AMR sparse consumer exceeded its governor-admitted boundary capacity");
-              }
-              const double metallicity_mass_fraction = cell_record.mass_code > 0.0
-                  ? std::clamp(
-                        cell_record.metal_mass_code / cell_record.mass_code,
-                        0.0,
-                        1.0)
-                  : 0.0;
-              remote.boundary_cells.push_back(amr::AmrHydroSparseRemoteCell{
-                  .patch_local_cell = cell_record.local_cell_offset,
-                  .gas_cell_id = cell_record.gas_cell_id,
-                  .conserved = hydro::HydroCoreSolver::conservedFromPrimitive(
-                      hydro::HydroPrimitiveState{
-                          .rho_comoving = cell_record.density_code,
-                          .vel_x_peculiar = cell_record.velocity_x_peculiar,
-                          .vel_y_peculiar = cell_record.velocity_y_peculiar,
-                          .vel_z_peculiar = cell_record.velocity_z_peculiar,
-                          .pressure_comoving = cell_record.pressure_code,
-                          .metallicity_mass_fraction = metallicity_mass_fraction},
-                      k_gamma_adiabatic)});
-            }
-          };
-
-      const auto directed_amr_exchange = parallel::executeBlockingDirectedAmrPatchPayloadExchange(
-          m_mpi_context,
-          local_patch_records,
-          [&context, this](
-              std::span<const parallel::AmrPatchBoundaryCellRequest> requests,
-              std::uint64_t first_record,
-              std::size_t max_records,
-              std::vector<parallel::AmrPatchCellPayloadRecord>& output) {
-            internal::fillMigrationAmrPatchBoundaryCellPayloadChunk(
-                context.state,
-                m_mpi_context.worldRank(),
-                requests,
-                first_record,
-                max_records,
-                output);
-          },
-          sparse_consumer,
-          sparse_admission,
-          transport_round_limit_bytes,
-          context.integrator_state.step_index,
-          parallel::AmrInterfaceTopologyOptions{
-              .periodic_box_extent_comoving =
-                  amr_options.physical_boundary_kind == hydro::HydroBoundaryKind::kPeriodic
-                      ? amr_options.periodic_box_extent_comoving
-                      : std::array<double, 3>{0.0, 0.0, 0.0},
-              .ghost_layers = amr::productionAmrHydroGhostLayers(amr_options)});
-      directed_amr_diagnostics = directed_amr_exchange.diagnostics;
-
-      std::unordered_map<std::uint64_t, int> owner_rank_by_patch_id;
-      owner_rank_by_patch_id.reserve(local_patch_records.size() + directed_amr_exchange.patch_payloads_received.size());
-      for (const auto& record : local_patch_records) {
-        const auto [it, inserted] = owner_rank_by_patch_id.emplace(record.patch_id, record.owner_rank);
-        if (!inserted && it->second != record.owner_rank) {
-          throw std::runtime_error("directed AMR hydro found conflicting local patch ownership metadata");
-        }
-      }
-
-      std::vector<amr::DistributedAmrRemotePatch> remote_patches;
-      remote_patches.reserve(directed_amr_exchange.patch_payloads_received.size());
-      for (const auto& patch_record : directed_amr_exchange.patch_payloads_received) {
-        if (patch_record.owner_rank == m_mpi_context.worldRank()) {
-          throw std::runtime_error("directed AMR hydro imported a local patch as a remote ghost");
-        }
-        owner_rank_by_patch_id.emplace(patch_record.patch_id, patch_record.owner_rank);
-        auto remote_it = remote_patch_store.find(patch_record.patch_id);
-        if (remote_it == remote_patch_store.end()) {
-          throw std::runtime_error(
-              "directed AMR hydro remote interface patch has no sparse boundary store");
-        }
-        auto& cells = remote_it->second.boundary_cells;
-        std::sort(
-            cells.begin(), cells.end(),
-            [](const auto& lhs, const auto& rhs) {
-              return lhs.patch_local_cell < rhs.patch_local_cell;
-            });
-        for (std::size_t i = 1; i < cells.size(); ++i) {
-          if (cells[i - 1U].patch_local_cell == cells[i].patch_local_cell) {
-            throw std::runtime_error(
-                "directed AMR hydro received duplicate sparse remote boundary cell");
-          }
-        }
-        remote_patches.push_back(std::move(remote_it->second));
-      }
-      remote_patch_store.clear();
-      remote_patch_store.rehash(0U);
-      sparse_ghost_metadata_bytes = core::checkedIntegralNarrow<std::uint64_t>(
-          core::checkedSizeMultiply(
-              remote_patches.capacity(),
-              sizeof(amr::DistributedAmrRemotePatch),
-              "hydro sparse remote patch metadata bytes"),
-          "hydro sparse remote patch metadata bytes uint64");
-      const std::uint64_t remote_ghost_resident_high_water =
-          core::checkedMemoryBytesAdd(
-              core::checkedMemoryBytesAdd(
-                  directed_amr_diagnostics.communication_workspace_high_water_bytes,
-                  sparse_ghost_capacity_bytes,
-                  "hydro remote ghost transport plus sparse cell capacity"),
-              sparse_ghost_metadata_bytes,
-              "hydro remote ghost total resident high-water");
-      m_remote_ghost_sparse_cell_high_water = std::max(
-          m_remote_ghost_sparse_cell_high_water,
-          directed_amr_diagnostics.directed_patch_cell_records_received);
-      m_remote_ghost_capacity_high_water_bytes = std::max(
-          m_remote_ghost_capacity_high_water_bytes,
-          sparse_ghost_capacity_bytes);
-      m_remote_ghost_metadata_high_water_bytes = std::max(
-          m_remote_ghost_metadata_high_water_bytes,
-          sparse_ghost_metadata_bytes);
+      // G1.1: distributed recursive Berger-Oliger subcycling. One directed
+      // ghost exchange per level clock (plus the interval-end exchange of
+      // levels with children), remote coarse ghosts temporally interpolated,
+      // remote register halves merged into the coarse owner's pending store
+      // after every sweep. Ranks without cells participate in every level.
+      DistributedRecursiveHooks hooks(
+          *this, context, amr_options, regrid_remote_neighbors,
+          distributed_composition ? &remote_cell_owner : nullptr);
+      amr_diagnostics = amr::advanceDistributedProductionAmrHydroRecursive(
+          context.state,
+          context.active_set.cell_indices,
+          update,
+          source_context,
+          m_solver,
+          *m_riemann_solver,
+          sources,
+          amr_options,
+          m_mpi_context.worldRank(),
+          context.state.gasCellIdentityGeneration(),
+          hooks);
+      directed_amr_diagnostics = hooks.diagnostics();
+      directed_amr_diagnostics.outbound_reflux_count = hooks.fluxRecordsSent();
+      directed_amr_diagnostics.inbound_reflux_count = hooks.fluxRecordsReceived();
+      directed_amr_diagnostics.directed_flux_records_sent = hooks.fluxRecordsSent();
+      directed_amr_diagnostics.directed_flux_records_received = hooks.fluxRecordsReceived();
+      remote_patch_count = hooks.remotePatchCount();
+      remote_flux_register_count = hooks.fluxRecordsSent();
+      inbound_flux_register_count = hooks.fluxRecordsReceived();
+      std::sort(remote_cell_owner.begin(), remote_cell_owner.end());
+      remote_cell_owner.erase(std::unique(remote_cell_owner.begin(), remote_cell_owner.end()), remote_cell_owner.end());
+      std::sort(regrid_remote_neighbors.begin(), regrid_remote_neighbors.end(),
+                [](const amr::PatchDescriptor& l, const amr::PatchDescriptor& r) { return l.patch_id < r.patch_id; });
+      regrid_remote_neighbors.erase(
+          std::unique(regrid_remote_neighbors.begin(), regrid_remote_neighbors.end(),
+                      [](const amr::PatchDescriptor& l, const amr::PatchDescriptor& r) { return l.patch_id == r.patch_id; }),
+          regrid_remote_neighbors.end());
       m_communication_high_water_bytes = std::max(
-          m_communication_high_water_bytes,
-          remote_ghost_resident_high_water);
-      m_last_communication_traffic_bytes =
-          directed_amr_diagnostics.patch_cell_payload_bytes;
+          m_communication_high_water_bytes, directed_amr_diagnostics.communication_workspace_high_water_bytes);
+      m_last_communication_traffic_bytes = directed_amr_diagnostics.patch_cell_payload_bytes;
+    } else if (m_mpi_context.isEnabled() && m_mpi_context.worldSize() > 1) {
+      DirectedHydroGhostExchange ghost_exchange =
+          exchangeDirectedHydroGhosts(context, amr_options, {}, context.integrator_state.step_index);
+      directed_amr_diagnostics = ghost_exchange.diagnostics;
+      auto& owner_rank_by_patch_id = ghost_exchange.owner_rank_by_patch_id;
+      std::vector<amr::DistributedAmrRemotePatch>& remote_patches = ghost_exchange.remote_patches;
       remote_patch_count = remote_patches.size();
       regrid_remote_neighbors.reserve(remote_patches.size());
       for (const amr::DistributedAmrRemotePatch& remote : remote_patches) {
@@ -2256,6 +2796,7 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
       }
       std::sort(remote_cell_owner.begin(), remote_cell_owner.end());
       std::vector<amr::FluxRegisterEntry> outbound_remote_entries;
+      std::vector<amr::FluxRegisterEntry> deferred_local_entries;
       if (amr::hasProductionAmrHydroCoverage(context.state)) {
         amr_diagnostics = amr::advanceDistributedProductionAmrHydro(
             context.state,
@@ -2271,7 +2812,8 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
                 .ghost_hydro_epoch = context.state.gasCellIdentityGeneration(),
                 .expected_ghost_hydro_epoch = context.state.gasCellIdentityGeneration(),
                 .remote_patches = remote_patches,
-                .outbound_remote_flux_registers = &outbound_remote_entries});
+                .outbound_remote_flux_registers = &outbound_remote_entries,
+                .deferred_local_flux_registers = &deferred_local_entries});
       } else if (context.state.cells.size() != 0U || context.state.patches.size() != 0U) {
         throw std::runtime_error(
             "distributed AMR hydro rank has partial local patch coverage; only an explicitly empty rank may skip advancement");
@@ -2283,38 +2825,8 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
         if (owner_it == owner_rank_by_patch_id.end()) {
           throw std::runtime_error("distributed AMR hydro remote reflux entry has unknown coarse patch owner");
         }
-        parallel::AmrFluxRegisterPayloadRecord record;
-        record.register_key = entry.register_key;
-        record.coarse_patch_id = entry.coarse_patch_id;
-        record.coarse_gas_cell_id = entry.coarse_gas_cell_id;
-        record.coarse_cell_index = static_cast<std::uint64_t>(entry.coarse_cell_index);
-        record.level = entry.level;
-        record.axis = hydroAxisCode(entry.axis);
-        record.orientation = hydroSideCode(entry.orientation);
-        record.source_rank = m_mpi_context.worldRank();
-        record.owner_rank = owner_it->second;
-        record.gas_cell_identity_generation = context.state.gasCellIdentityGeneration();
-        record.patch_geometry_generation = context.state.cellIndexGeneration();
-        record.coarse_mass_flux_code = entry.coarse_face_flux_code.mass_code;
-        record.coarse_momentum_x_flux_code = entry.coarse_face_flux_code.momentum_x_code;
-        record.coarse_momentum_y_flux_code = entry.coarse_face_flux_code.momentum_y_code;
-        record.coarse_momentum_z_flux_code = entry.coarse_face_flux_code.momentum_z_code;
-        record.coarse_total_energy_flux_code = entry.coarse_face_flux_code.total_energy_code;
-        record.coarse_metal_mass_flux_code = entry.coarse_face_flux_code.metal_mass_code;
-        record.fine_mass_flux_code = entry.fine_face_flux_code.mass_code;
-        record.fine_momentum_x_flux_code = entry.fine_face_flux_code.momentum_x_code;
-        record.fine_momentum_y_flux_code = entry.fine_face_flux_code.momentum_y_code;
-        record.fine_momentum_z_flux_code = entry.fine_face_flux_code.momentum_z_code;
-        record.fine_total_energy_flux_code = entry.fine_face_flux_code.total_energy_code;
-        record.fine_metal_mass_flux_code = entry.fine_face_flux_code.metal_mass_code;
-        record.face_area_comov = entry.face_area_comov;
-        record.coarse_area_comov = entry.coarse_area_comov;
-        record.fine_area_comov = entry.fine_area_comov;
-        record.dt_code = entry.dt_code;
-        record.coarse_face_count = entry.coarse_face_count;
-        record.fine_face_count = entry.fine_face_count;
-        parallel::validateAmrFluxRegisterPayloadRecord(record);
-        local_flux_payloads.push_back(record);
+        local_flux_payloads.push_back(fluxRegisterPayloadFromEntry(
+            entry, m_mpi_context.worldRank(), owner_it->second, context.state));
       }
       const auto global_flux_payloads = parallel::executeBlockingAmrFluxRegisterPayloadExchange(
           m_mpi_context, local_flux_payloads, context.integrator_state.step_index,
@@ -2327,47 +2839,26 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
           (static_cast<std::uint64_t>(local_flux_payloads.size()) + static_cast<std::uint64_t>(global_flux_payloads.size())) *
           sizeof(parallel::AmrFluxRegisterPayloadRecord);
       std::vector<amr::FluxRegisterEntry> inbound_entries;
+      std::vector<int> inbound_source_ranks;
       inbound_entries.reserve(global_flux_payloads.size());
+      inbound_source_ranks.reserve(global_flux_payloads.size());
       for (const auto& payload : global_flux_payloads) {
         if (payload.owner_rank != m_mpi_context.worldRank()) {
           continue;
         }
-        inbound_entries.push_back(amr::FluxRegisterEntry{
-            .register_key = payload.register_key,
-            .coarse_patch_id = payload.coarse_patch_id,
-            .coarse_gas_cell_id = payload.coarse_gas_cell_id,
-            .coarse_cell_index = static_cast<std::size_t>(payload.coarse_cell_index),
-            .level = payload.level,
-            .axis = payload.axis == 0U ? hydro::HydroFaceAxis::kX : (payload.axis == 1U ? hydro::HydroFaceAxis::kY : hydro::HydroFaceAxis::kZ),
-            .orientation = payload.orientation == 0U ? hydro::HydroFaceSide::kLower : hydro::HydroFaceSide::kUpper,
-            .coarse_face_flux_code = amr::ConservedState{
-                .mass_code = payload.coarse_mass_flux_code,
-                .momentum_x_code = payload.coarse_momentum_x_flux_code,
-                .momentum_y_code = payload.coarse_momentum_y_flux_code,
-                .momentum_z_code = payload.coarse_momentum_z_flux_code,
-                .total_energy_code = payload.coarse_total_energy_flux_code,
-                .metal_mass_code = payload.coarse_metal_mass_flux_code},
-            .fine_face_flux_code = amr::ConservedState{
-                .mass_code = payload.fine_mass_flux_code,
-                .momentum_x_code = payload.fine_momentum_x_flux_code,
-                .momentum_y_code = payload.fine_momentum_y_flux_code,
-                .momentum_z_code = payload.fine_momentum_z_flux_code,
-                .total_energy_code = payload.fine_total_energy_flux_code,
-                .metal_mass_code = payload.fine_metal_mass_flux_code},
-            .face_area_comov = payload.face_area_comov,
-            .coarse_area_comov = payload.coarse_area_comov,
-            .fine_area_comov = payload.fine_area_comov,
-            .dt_code = payload.dt_code,
-            .coarse_face_count = payload.coarse_face_count,
-            .fine_face_count = payload.fine_face_count});
+        inbound_entries.push_back(fluxRegisterEntryFromPayload(payload));
+        inbound_source_ranks.push_back(payload.source_rank);
       }
       // Validate duplicate keys via sorted adjacent comparison instead of
       // a population-scale hash set.
+      // One key may legitimately arrive from several source ranks (fine faces
+      // of one coarse face on different ranks); the same key twice from the
+      // same source rank is a protocol error.
       if (inbound_entries.size() > 1U) {
-        std::vector<std::uint64_t> sort_keys;
+        std::vector<std::pair<std::uint64_t, int>> sort_keys;
         sort_keys.reserve(inbound_entries.size());
-        for (const auto& entry : inbound_entries) {
-          sort_keys.push_back(entry.register_key);
+        for (std::size_t e = 0; e < inbound_entries.size(); ++e) {
+          sort_keys.emplace_back(inbound_entries[e].register_key, inbound_source_ranks[e]);
         }
         std::sort(sort_keys.begin(), sort_keys.end());
         for (std::size_t i = 1; i < sort_keys.size(); ++i) {
@@ -2378,10 +2869,28 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
       }
       inbound_flux_register_count = inbound_entries.size();
       remote_flux_register_count = local_flux_payloads.size();
-      if (!inbound_entries.empty()) {
+      // G2.3: complete every split interface once: local halves deferred by
+      // the sweep first, then inbound halves in source-rank order, merged by
+      // key. Previously each half was applied alone and skipped as incomplete,
+      // so a coarse/fine interface split across ranks was never refluxed.
+      std::vector<amr::FluxRegisterEntry> split_interface_entries;
+      split_interface_entries.reserve(deferred_local_entries.size() + inbound_entries.size());
+      split_interface_entries.insert(split_interface_entries.end(), deferred_local_entries.begin(),
+                                     deferred_local_entries.end());
+      {
+        std::vector<std::size_t> order(inbound_entries.size());
+        for (std::size_t e = 0; e < order.size(); ++e) order[e] = e;
+        std::stable_sort(order.begin(), order.end(), [&](std::size_t l, std::size_t r) {
+          return inbound_source_ranks[l] < inbound_source_ranks[r];
+        });
+        for (const std::size_t e : order) split_interface_entries.push_back(inbound_entries[e]);
+      }
+      const std::vector<amr::FluxRegisterEntry> merged_split_entries =
+          amr::mergeFluxRegisterEntriesByKey(split_interface_entries);
+      if (!merged_split_entries.empty()) {
         const auto local_descriptors = amr::buildProductionAmrPatchDescriptors(context.state);
         const amr::RefluxDiagnostics remote_reflux = amr::applyFluxRegistersToSimulationState(
-            context.state, inbound_entries, local_descriptors, k_gamma_adiabatic,
+            context.state, merged_split_entries, local_descriptors, k_gamma_adiabatic,
             amrThermodynamicCachePolicy(update.scale_factor, source_context.redshift));
         amr_diagnostics.reflux.complete_register_count += remote_reflux.complete_register_count;
         amr_diagnostics.reflux.skipped_incomplete_register_count += remote_reflux.skipped_incomplete_register_count;
@@ -2667,6 +3176,58 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
     policy.criteria.derefine_hysteresis = m_config.numerics.amr_derefine_hysteresis;
     policy.criteria.gravitational_constant_code = core::newtonGravitationalConstantCode(core::makeUnitSystem(
         m_config.units.length_unit, m_config.units.mass_unit, m_config.units.velocity_unit));
+    // R1 physics-aware indicators (thresholds from typed config).
+    policy.physics.cooling_length_cells = m_config.numerics.amr_refine_cooling_length_cells;
+    policy.physics.metallicity_jump = m_config.numerics.amr_refine_metallicity_jump;
+    policy.physics.species_jump = m_config.numerics.amr_refine_species_jump;
+    policy.physics.vorticity = m_config.numerics.amr_refine_vorticity;
+    core::MemoryReservation cooling_time_reservation;  // declared before the buffer it covers
+    std::vector<double> cooling_time_code;
+    if (policy.physics.cooling_length_cells > 0.0 && m_memory_governor != nullptr) {
+      std::exception_ptr admission_failure;
+      try {
+        cooling_time_reservation = m_memory_governor->reserve(
+            core::MemoryClass::kPhaseResident,
+            static_cast<std::uint64_t>(core::checkedSizeMultiply(context.state.cells.size(), sizeof(double),
+                                                                 "regrid cooling times")),
+            "hydro.amr_regrid.cooling_times");
+        cooling_time_reservation.commit();
+      } catch (...) {
+        admission_failure = std::current_exception();
+      }
+      m_mpi_context.rethrowCollectivePreparationFailure(admission_failure, "regrid cooling-time admission");
+    }
+    if (policy.physics.cooling_length_cells > 0.0) {
+      if (!m_cooling_rate_provider.has_value()) {
+        throw std::logic_error("cooling-length refinement requested without the legacy cooling-rate provider");
+      }
+      // t_cool = e / (Lambda_net n_H^2 / rho) with physical density; net
+      // heating (Lambda_net <= 0) imposes no cooling-length constraint (+inf).
+      constexpr double k_proton_mass_g = 1.67262192369e-24;
+      const double a = std::max(context.integrator_state.current_scale_factor, 1.0e-12);
+      const bool comoving = m_config.units.coordinate_frame == core::CoordinateFrame::kComoving;
+      const double redshift = m_mode_policy.cosmological_comoving_frame ? std::max(0.0, 1.0 / a - 1.0) : 0.0;
+      cooling_time_code.assign(context.state.cells.size(), std::numeric_limits<double>::infinity());
+      for (std::uint32_t row = 0; row < context.state.cells.size(); ++row) {
+        const double e = context.state.gas_cells.internal_energy_code[row];
+        const double rho_code = context.state.gas_cells.density_code[row] * (comoving ? 1.0 / (a * a * a) : 1.0);
+        const double rho_cgs = m_units.densityCodeToCgs(rho_code);
+        if (!(e > 0.0) || !(rho_cgs > 0.0)) continue;
+        const double mass = context.state.cells.mass_code[row];
+        const double z = mass > 0.0 ? std::clamp(context.state.gas_cells.metal_mass_code[row] / mass, 0.0, 1.0) : 0.0;
+        const double n_h = (1.0 - m_cooling_helium_mass_fraction - z) * rho_cgs / k_proton_mass_g;
+        const physics::CoolingRateResult rates = m_cooling_rate_provider->lookupRates(physics::CoolingRateQuery{
+            .temperature_k = e * m_cooling_temperature_per_energy_k,
+            .hydrogen_number_density_cgs = n_h,
+            .metallicity_mass_fraction = z,
+            .redshift = redshift});
+        const double net = rates.netCoolingRateErgCm3S();
+        if (!(net > 0.0)) continue;
+        const double rate_code = net * n_h * n_h / rho_cgs * m_cooling_specific_rate_cgs_to_code;
+        if (rate_code > 0.0) cooling_time_code[row] = e / rate_code;
+      }
+      policy.physics.cooling_time_code = cooling_time_code;
+    }
     policy.max_level = static_cast<std::uint8_t>(std::clamp(m_config.numerics.amr_max_level, 0, 255));
     policy.max_operations = static_cast<std::size_t>(m_config.numerics.amr_regrid_max_operations);
     // Alternating passes keep the 2:1 balance without exchanging decisions.
@@ -2691,14 +3252,10 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
     // the star count; the physical event budgets are unchanged.
     std::vector<std::uint32_t> forced_rows;
     const double predictive_age = m_config.numerics.amr_predictive_feedback_age_years;
-    if (predictive_age > 0.0 && context.state.star_particles.size() > 0U) {
+    const double lookahead_years = m_config.numerics.amr_predictive_event_lookahead_years;
+    if ((predictive_age > 0.0 || lookahead_years > 0.0) && context.state.star_particles.size() > 0U) {
       const auto descriptors = amr::buildProductionAmrPatchDescriptors(context.state);
-      for (std::size_t s = 0; s < context.state.star_particles.size(); ++s) {
-        if (!(context.state.star_particles.stellar_age_years_last[s] < predictive_age)) continue;
-        const std::uint32_t p = context.state.star_particles.particle_index[s];
-        const std::array<double, 3> position{context.state.particles.position_x_comoving[p],
-                                             context.state.particles.position_y_comoving[p],
-                                             context.state.particles.position_z_comoving[p]};
+      const auto host_row = [&](const std::array<double, 3>& position) {
         for (const amr::PatchDescriptor& patch : descriptors) {
           bool inside = true;
           for (std::size_t c = 0; c < 3U && inside; ++c) {
@@ -2708,12 +3265,77 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
           const auto cell = amr::patchLocalCellForPoint(patch, position, "predictive refinement host cell");
           const auto rows = amr::rowsForPatchLocalCellOrder(context.state, patch, "predictive refinement");
           if (cell.linear_index < rows.size()) forced_rows.push_back(rows[cell.linear_index]);
-          break;
+          return;
+        }
+      };
+      // R2 (A04) event-aware forecast. For every star the canonical
+      // population record (restart/rollback state) gives its deterministic
+      // event chronology; a COPY is advanced to the expected cumulative count
+      // at age + lookahead, so the forecast consumes no event ordinal and
+      // changes no budget. Expectation mode (no stochastic events) predicts
+      // an "event" when >= 0.5 expected SNe fall in the window (HEURISTIC).
+      // The host cell now and at the drifted position x + v dt / a are forced.
+      std::optional<physics::SspModel> ssp;
+      std::optional<physics::StellarPopulationStore> store;
+      if (lookahead_years > 0.0) {
+        physics::SspConfig ssp_config;
+        ssp_config.imf_mass_min_msun = m_config.physics.ssp_imf_mass_min_msun;
+        ssp_config.imf_mass_max_msun = m_config.physics.ssp_imf_mass_max_msun;
+        ssp_config.cc_mass_min_msun = m_config.physics.ssp_cc_mass_min_msun;
+        ssp_config.cc_mass_max_msun = m_config.physics.ssp_cc_mass_max_msun;
+        ssp_config.snia_per_msun = m_config.physics.ssp_snia_per_msun;
+        ssp_config.snia_delay_min_years = m_config.physics.ssp_snia_delay_min_years;
+        ssp_config.snia_delay_max_years = m_config.physics.ssp_snia_delay_max_years;
+        ssp_config.stochastic_events = m_config.physics.ssp_stochastic_sn_events;
+        ssp.emplace(ssp_config);  // event counts only (lifetimes + IMF); no yields used
+        store.emplace(context.state);
+      }
+      constexpr double k_solar_mass_kg = 1.98847e30;
+      constexpr double k_year_s = 3.15576e7;
+      const double msun_code = k_solar_mass_kg / m_units.mass_si_per_code;
+      const double a = std::max(context.integrator_state.current_scale_factor, 1.0e-12);
+      const double drift_scale = m_config.units.coordinate_frame == core::CoordinateFrame::kComoving ? 1.0 / a : 1.0;
+      const double lookahead_code = lookahead_years * k_year_s / m_units.timeSiPerCode();
+      std::uint64_t forecast_events = 0U;
+      for (std::size_t s = 0; s < context.state.star_particles.size(); ++s) {
+        const double age = context.state.star_particles.stellar_age_years_last[s];
+        const std::uint32_t p = context.state.star_particles.particle_index[s];
+        bool forced = predictive_age > 0.0 && age < predictive_age;
+        if (!forced && ssp.has_value()) {
+          const std::uint64_t pid = context.state.particle_sidecar.particle_id[p];
+          if (store->has(pid)) {
+            const physics::StellarPopulationRecord record = store->get(pid);
+            {
+              forced = physics::forecastStellarEvent(
+                  *ssp, record, age, lookahead_years, context.state.star_particles.birth_mass_code[s] / msun_code,
+                  m_config.physics.ssp_stochastic_sn_events);
+              if (forced) ++forecast_events;
+            }
+          }
+        }
+        if (!forced) continue;
+        const std::array<double, 3> position{context.state.particles.position_x_comoving[p],
+                                             context.state.particles.position_y_comoving[p],
+                                             context.state.particles.position_z_comoving[p]};
+        host_row(position);
+        if (lookahead_code > 0.0) {
+          std::array<double, 3> drifted{
+              position[0] + context.state.particles.velocity_x_peculiar[p] * lookahead_code * drift_scale,
+              position[1] + context.state.particles.velocity_y_peculiar[p] * lookahead_code * drift_scale,
+              position[2] + context.state.particles.velocity_z_peculiar[p] * lookahead_code * drift_scale};
+          if (amr_options.physical_boundary_kind == hydro::HydroBoundaryKind::kPeriodic) {
+            for (std::size_t c = 0; c < 3U; ++c) {
+              const double box = amr_options.periodic_box_extent_comoving[c];
+              if (box > 0.0) drifted[c] -= box * std::floor(drifted[c] / box);
+            }
+          }
+          host_row(drifted);  // a drifted host on another rank is not forced (documented limitation)
         }
       }
       std::sort(forced_rows.begin(), forced_rows.end());
       forced_rows.erase(std::unique(forced_rows.begin(), forced_rows.end()), forced_rows.end());
       policy.forced_refine_rows = forced_rows;
+      m_last_predictive_forecast_events = forecast_events;
     }
     std::exception_ptr failure;
     amr::ProductionAmrRegridPlan plan;
@@ -2763,6 +3385,11 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
                       {"blocked_by_max_level", std::to_string(plan.blocked_by_max_level)},
                       {"skipped_remote_sibling", std::to_string(plan.skipped_remote_sibling)},
                       {"truncated_by_budget", std::to_string(plan.truncated_by_budget)},
+                      {"mandatory_refine_requests", std::to_string(plan.mandatory_refine_requests)},
+                      {"predictive_forecast_event_stars", std::to_string(m_last_predictive_forecast_events)},
+                      {"optional_refine_requests", std::to_string(plan.optional_refine_requests)},
+                      {"mandatory_truncated_by_budget", std::to_string(plan.mandatory_truncated_by_budget)},
+                      {"optional_truncated_by_budget", std::to_string(plan.optional_truncated_by_budget)},
                       {"refined_below_gravity_softening_unqualified",
                        std::to_string(plan.refined_below_gravity_softening)},
                       {"skipped_not_quiescent", plan.skipped_not_quiescent ? "true" : "false"},
@@ -3058,6 +3685,11 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
   std::unique_ptr<hydro::HydroReconstruction> m_reconstruction;
   std::unique_ptr<hydro::HydroRiemannSolver> m_riemann_solver;
   std::unique_ptr<physics::CoolingHeatingSource> m_cooling_source;
+  std::optional<physics::CoolingRateProvider> m_cooling_rate_provider;
+  std::uint64_t m_last_predictive_forecast_events = 0U;
+  double m_cooling_specific_rate_cgs_to_code = 0.0;
+  double m_cooling_temperature_per_energy_k = 0.0;
+  double m_cooling_helium_mass_fraction = 0.24;
   physics::CompositionTransportCommitReport m_last_composition_transport{};
   std::unique_ptr<physics::EffectiveIsmThermodynamicClosure> m_effective_ism_closure;
   std::unique_ptr<physics::EffectiveIsmEnergyRelaxationSource> m_effective_ism_energy_source;

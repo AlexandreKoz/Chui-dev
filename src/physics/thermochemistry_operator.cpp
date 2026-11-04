@@ -199,6 +199,7 @@ ChemistryFidelityDecision ThermochemistryOperator::decideChemistryFidelity(
     c.dense_n_h_cm3 /= s;
     c.molecular_fraction_threshold /= s;
     c.co_carbon_fraction_threshold /= s;
+    c.cooling_time_ratio *= s;
   }
   const double h = c.hysteresis_fraction;
   const ThermochemistryCellInput input = cellInput(state, row, interval);
@@ -212,16 +213,29 @@ ChemistryFidelityDecision ThermochemistryOperator::decideChemistryFidelity(
   const double n_c = input.species_cm3[static_cast<std::size_t>(ChemicalSpecies::kCII)] +
       input.species_cm3[static_cast<std::size_t>(ChemicalSpecies::kCO)];
   const double f_co = n_c > 0.0 ? input.species_cm3[static_cast<std::size_t>(ChemicalSpecies::kCO)] / n_c : 0.0;
+  // R3: net cooling time of the row with the solver's own rate set.
+  double t_cool = std::numeric_limits<double>::infinity();
+  if (c.cooling_time_ratio > 0.0 && interval.physical_seconds > 0.0 && t > 0.0) {
+    const CoolingHeatingTerms terms = m_solver.coolingHeating(input, input.species_cm3, t);
+    const double loss = terms.radiative_cooling + terms.chemical_cooling - terms.heating;  // erg cm^-3 s^-1
+    const double u = input.mass_density_cgs * input.specific_internal_energy_erg_g;     // erg cm^-3
+    if (loss > 0.0 && u > 0.0) t_cool = u / loss;
+  }
+  decision.cooling_time_seconds = t_cool;
+  const double stiff_horizon = c.cooling_time_ratio * interval.physical_seconds;
+  const bool stiff = c.cooling_time_ratio > 0.0 && t_cool < stiff_horizon;
+  const bool not_stiff = c.cooling_time_ratio <= 0.0 || t_cool > stiff_horizon * (1.0 + h);
   const std::uint8_t current = decision.tag;
   std::uint8_t desired = current;
   if (current == k_chemistry_tag_hybrid) {
     const bool cold_dense = t < c.cold_temperature_k * (1.0 - h) && n_h > c.dense_n_h_cm3 * (1.0 + h);
-    if (cold_dense || f_h2 > c.molecular_fraction_threshold * (1.0 + h) ||
+    if (cold_dense || stiff || f_h2 > c.molecular_fraction_threshold * (1.0 + h) ||
         f_co > c.co_carbon_fraction_threshold * (1.0 + h)) {
       desired = k_chemistry_tag_detailed;
+      decision.cooling_time_trigger = stiff;
     }
   } else {
-    const bool clear = t > c.cold_temperature_k * (1.0 + h) && n_h < c.dense_n_h_cm3 * (1.0 - h) &&
+    const bool clear = not_stiff && t > c.cold_temperature_k * (1.0 + h) && n_h < c.dense_n_h_cm3 * (1.0 - h) &&
         f_h2 < c.molecular_fraction_threshold * (1.0 - h) && f_co < c.co_carbon_fraction_threshold * (1.0 - h);
     if (clear) desired = k_chemistry_tag_hybrid;
   }

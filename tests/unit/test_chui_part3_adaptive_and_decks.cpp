@@ -38,5 +38,23 @@ int main() {
     const co::FrozenConfig reparsed = co::loadFrozenConfigFromString(frozen.normalized_text, "part3_deck_reparse");
     CHUI_REQUIRE(reparsed.normalized_text == frozen.normalized_text);
   }
+  // Final-design decks (2026-11-04): recursive subcycling, data checksums
+  // present, and the WSS09+FG20 deck is the ONLY one that acknowledges the
+  // UVB mismatch. Parsing only; data files are not read by the config layer.
+  for (const char* deck_name : {"cosmo_cube_final", "zoom_in_final", "isolated_galaxy_final", "isolated_cluster_final",
+                                "cosmo_cube_wss09_experimental_final"}) {
+    const std::filesystem::path deck =
+        std::filesystem::path(COSMOSIM_SOURCE_DIR) / "configs" / "chui_final" / (std::string(deck_name) + ".param.txt");
+    const co::FrozenConfig frozen = co::loadFrozenConfigFromFile(deck);
+    CHUI_REQUIRE(frozen.config.numerics.amr_time_stepping == co::AmrTimeSteppingConfigMode::kRecursiveSubcycling);
+    const auto& physics = frozen.config.physics;
+    if (physics.stellar_population_model == co::StellarPopulationModelConfig::kChabrierYieldTableV1) {
+      CHUI_REQUIRE(physics.ssp_yield_table_sha256.size() == 64U && physics.ssp_wind_table_sha256.size() == 64U);
+    }
+    CHUI_REQUIRE(physics.metal_cooling_accept_uv_background_mismatch ==
+                 (std::string(deck_name) == "cosmo_cube_wss09_experimental_final"));
+    const co::FrozenConfig reparsed = co::loadFrozenConfigFromString(frozen.normalized_text, "final_deck_reparse");
+    CHUI_REQUIRE(reparsed.normalized_text == frozen.normalized_text);
+  }
   return 0;
 }

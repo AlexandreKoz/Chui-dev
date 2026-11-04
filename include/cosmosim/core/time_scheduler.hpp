@@ -230,6 +230,13 @@ struct TimeStepGasCellCriteriaView {
   std::span<const double> accel_x_comoving;
   std::span<const double> accel_y_comoving;
   std::span<const double> accel_z_comoving;
+  // G1.2 (recursive AMR subcycling): per-cell factor r^(L - L_min,global)
+  // by which the COARSE interval may exceed the cell's own hydro CFL bound,
+  // because a level-L cell advances with dt / r^(L - L_min). Applies to the
+  // hydro CFL candidate ONLY; gravity, expansion, source, diffusion and
+  // chemistry candidates are never relaxed (those operators run at the coarse
+  // cadence). Empty = 1 (synchronized AMR, fixed grid).
+  std::span<const double> hydro_cfl_level_relaxation;
 };
 
 struct AdaptiveTimeStepCriteriaView {

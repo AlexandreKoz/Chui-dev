@@ -1434,12 +1434,17 @@ struct ConfigKeySpec {
       {"numerics.global_step_max_retries", "0"},
       {"numerics.amr_time_stepping", "synchronized"},
       {"numerics.amr_predictive_feedback_age_years", "0.0"},
+      {"numerics.amr_predictive_event_lookahead_years", "0.0"},
       {"numerics.amr_regrid_interval_steps", "1"},
       {"numerics.amr_regrid_max_operations", "64"},
       {"numerics.amr_refine_cell_mass_code", "0.0"},
       {"numerics.amr_refine_jump_threshold", "0.0"},
       {"numerics.amr_refine_jeans_cells", "4.0"},
       {"numerics.amr_derefine_hysteresis", "0.5"},
+      {"numerics.amr_refine_cooling_length_cells", "0.0"},
+      {"numerics.amr_refine_metallicity_jump", "0.0"},
+      {"numerics.amr_refine_species_jump", "0.0"},
+      {"numerics.amr_refine_vorticity", "0.0"},
       {"numerics.gravity_softening", "1.0 kpc"},
       {"numerics.gravity_softening_gas", ""},
       {"numerics.gravity_softening_dark_matter", ""},
@@ -1608,6 +1613,7 @@ struct ConfigKeySpec {
       {"physics.chemistry_adaptive_hysteresis_fraction", "0.3"},
       {"physics.chemistry_adaptive_min_dwell_years", "1.0e6"},
       {"physics.chemistry_adaptive_cold_temperature_k", "3.0e3"},
+      {"physics.chemistry_adaptive_cooling_time_ratio", "0.0"},
       {"physics.chemistry_adaptive_dense_nh_cm3", "1.0"},
       {"physics.chemistry_shadow_sample_fraction", "0.0"},
       {"physics.ssp_imf_mass_min_msun", "0.1"},
@@ -1862,7 +1868,7 @@ void validatePart2BaryonicPhysics(const SimulationConfig& config) {
   }
   if (!(p.chemistry_adaptive_hysteresis_fraction >= 0.0) || p.chemistry_adaptive_hysteresis_fraction >= 1.0 ||
       p.chemistry_adaptive_min_dwell_years < 0.0 || !(p.chemistry_adaptive_cold_temperature_k > 10.0) ||
-      !(p.chemistry_adaptive_dense_nh_cm3 > 0.0)) {
+      !(p.chemistry_adaptive_dense_nh_cm3 > 0.0) || !(p.chemistry_adaptive_cooling_time_ratio >= 0.0)) {
     throw ConfigError("invalid chemistry_adaptive_* parameters");
   }
   if (!(p.ssp_imf_mass_min_msun > 0.0) || !(p.ssp_imf_mass_max_msun > p.ssp_imf_mass_min_msun) ||
@@ -2057,6 +2063,7 @@ void validateConfig(const SimulationConfig& config) {
       {config.physics.chemistry_adaptive_hysteresis_fraction, "physics.chemistry_adaptive_hysteresis_fraction"},
       {config.physics.chemistry_adaptive_min_dwell_years, "physics.chemistry_adaptive_min_dwell_years"},
       {config.physics.chemistry_adaptive_cold_temperature_k, "physics.chemistry_adaptive_cold_temperature_k"},
+      {config.physics.chemistry_adaptive_cooling_time_ratio, "physics.chemistry_adaptive_cooling_time_ratio"},
       {config.physics.chemistry_adaptive_dense_nh_cm3, "physics.chemistry_adaptive_dense_nh_cm3"},
       {config.physics.chemistry_shadow_sample_fraction, "physics.chemistry_shadow_sample_fraction"},
       {config.physics.ssp_imf_mass_min_msun, "physics.ssp_imf_mass_min_msun"},
@@ -2119,6 +2126,17 @@ void validateConfig(const SimulationConfig& config) {
        config.numerics.amr_regrid_mode != AmrRegridConfigMode::kAutomatic)) {
     throw ConfigError("numerics.amr_predictive_feedback_age_years must be >= 0 and requires amr_regrid_mode = automatic");
   }
+  // R2 (A04): event-aware predictive refinement from the canonical SSP event
+  // chronology; needs automatic regrid and a Part 2 population model (the
+  // legacy table has no event records, which would make the key a no-op).
+  if (!std::isfinite(config.numerics.amr_predictive_event_lookahead_years) ||
+      config.numerics.amr_predictive_event_lookahead_years < 0.0 ||
+      (config.numerics.amr_predictive_event_lookahead_years > 0.0 &&
+       (config.numerics.amr_regrid_mode != AmrRegridConfigMode::kAutomatic ||
+        config.physics.stellar_population_model == StellarPopulationModelConfig::kLegacyTable))) {
+    throw ConfigError("numerics.amr_predictive_event_lookahead_years must be >= 0; > 0 requires "
+                      "amr_regrid_mode = automatic and a Part 2 stellar_population_model");
+  }
   if (config.numerics.global_step_max_retries < 0 || config.numerics.global_step_max_retries > 32) {
     throw ConfigError("numerics.global_step_max_retries must be in [0, 32]");
   }
@@ -2135,13 +2153,37 @@ void validateConfig(const SimulationConfig& config) {
       !std::isfinite(config.numerics.amr_refine_jeans_cells) || config.numerics.amr_refine_jeans_cells < 0.0) {
     throw ConfigError("numerics.amr_refine_* criteria must be finite and >= 0 (0 disables a criterion)");
   }
+  for (const double value : {config.numerics.amr_refine_cooling_length_cells, config.numerics.amr_refine_metallicity_jump,
+                             config.numerics.amr_refine_species_jump, config.numerics.amr_refine_vorticity}) {
+    if (!std::isfinite(value) || value < 0.0) {
+      throw ConfigError("numerics.amr_refine_{cooling_length_cells,metallicity_jump,species_jump,vorticity} must be "
+                        "finite and >= 0 (0 disables)");
+    }
+  }
+  if (config.numerics.amr_refine_cooling_length_cells > 0.0 &&
+      (!config.physics.enable_cooling ||
+       config.physics.thermochemistry_backend != ThermochemistryBackendMode::kLegacyCooling)) {
+    // Explicit refusal, not a silent no-op: the cooling time is evaluated from
+    // the in-solver legacy cooling-rate provider. Part 2 backends own cooling
+    // in the SourceRuntime and do not yet publish per-cell cooling times.
+    throw ConfigError("numerics.amr_refine_cooling_length_cells > 0 requires physics.enable_cooling = true with "
+                      "thermochemistry_backend = legacy_cooling (Part 2 backends do not publish cooling times)");
+  }
+  if (config.numerics.amr_refine_species_jump > 0.0 &&
+      config.physics.thermochemistry_backend != ThermochemistryBackendMode::kFixedHybrid &&
+      config.physics.thermochemistry_backend != ThermochemistryBackendMode::kFixedDetailed) {
+    throw ConfigError("numerics.amr_refine_species_jump > 0 requires a composition network backend "
+                      "(thermochemistry_backend = fixed_hybrid or fixed_detailed)");
+  }
   if (!std::isfinite(config.numerics.amr_derefine_hysteresis) || config.numerics.amr_derefine_hysteresis <= 0.0 ||
       config.numerics.amr_derefine_hysteresis > 1.0) {
     throw ConfigError("numerics.amr_derefine_hysteresis must be in (0, 1]");
   }
   if (config.numerics.amr_regrid_mode == AmrRegridConfigMode::kAutomatic) {
     if (config.numerics.amr_refine_cell_mass_code == 0.0 && config.numerics.amr_refine_jump_threshold == 0.0 &&
-        config.numerics.amr_refine_jeans_cells == 0.0) {
+        config.numerics.amr_refine_jeans_cells == 0.0 && config.numerics.amr_refine_cooling_length_cells == 0.0 &&
+        config.numerics.amr_refine_metallicity_jump == 0.0 && config.numerics.amr_refine_species_jump == 0.0 &&
+        config.numerics.amr_refine_vorticity == 0.0) {
       throw ConfigError("numerics.amr_regrid_mode = automatic requires at least one non-zero amr_refine_* criterion");
     }
     if (config.numerics.amr_max_level < 1 || config.numerics.amr_max_level > 30) {
@@ -3046,12 +3088,17 @@ class NormalizedConfigStream {
   stream << "global_step_max_retries = " << frozen.config.numerics.global_step_max_retries << '\n';
   stream << "amr_time_stepping = " << amrTimeSteppingConfigModeToString(frozen.config.numerics.amr_time_stepping) << '\n';
   stream << "amr_predictive_feedback_age_years = " << frozen.config.numerics.amr_predictive_feedback_age_years << '\n';
+  stream << "amr_predictive_event_lookahead_years = " << frozen.config.numerics.amr_predictive_event_lookahead_years << '\n';
   stream << "amr_regrid_interval_steps = " << frozen.config.numerics.amr_regrid_interval_steps << '\n';
   stream << "amr_regrid_max_operations = " << frozen.config.numerics.amr_regrid_max_operations << '\n';
   stream << "amr_refine_cell_mass_code = " << frozen.config.numerics.amr_refine_cell_mass_code << '\n';
   stream << "amr_refine_jump_threshold = " << frozen.config.numerics.amr_refine_jump_threshold << '\n';
   stream << "amr_refine_jeans_cells = " << frozen.config.numerics.amr_refine_jeans_cells << '\n';
   stream << "amr_derefine_hysteresis = " << frozen.config.numerics.amr_derefine_hysteresis << '\n';
+  stream << "amr_refine_cooling_length_cells = " << frozen.config.numerics.amr_refine_cooling_length_cells << '\n';
+  stream << "amr_refine_metallicity_jump = " << frozen.config.numerics.amr_refine_metallicity_jump << '\n';
+  stream << "amr_refine_species_jump = " << frozen.config.numerics.amr_refine_species_jump << '\n';
+  stream << "amr_refine_vorticity = " << frozen.config.numerics.amr_refine_vorticity << '\n';
   stream << "gravity_softening = " << frozen.config.numerics.gravity_softening_kpc_comoving << " kpc\n";
   auto emitOptionalSoftening = [&](std::string_view key, double value_kpc_comoving) {
     stream << key << " = ";
@@ -3289,6 +3336,7 @@ class NormalizedConfigStream {
   stream << "chemistry_adaptive_hysteresis_fraction = " << frozen.config.physics.chemistry_adaptive_hysteresis_fraction << '\n';
   stream << "chemistry_adaptive_min_dwell_years = " << frozen.config.physics.chemistry_adaptive_min_dwell_years << '\n';
   stream << "chemistry_adaptive_cold_temperature_k = " << frozen.config.physics.chemistry_adaptive_cold_temperature_k << '\n';
+  stream << "chemistry_adaptive_cooling_time_ratio = " << frozen.config.physics.chemistry_adaptive_cooling_time_ratio << '\n';
   stream << "chemistry_adaptive_dense_nh_cm3 = " << frozen.config.physics.chemistry_adaptive_dense_nh_cm3 << '\n';
   stream << "chemistry_shadow_sample_fraction = " << frozen.config.physics.chemistry_shadow_sample_fraction << '\n';
   stream << "ssp_imf_mass_min_msun = " << frozen.config.physics.ssp_imf_mass_min_msun << '\n';
@@ -3823,6 +3871,10 @@ class NormalizedConfigStream {
   frozen.config.numerics.amr_predictive_feedback_age_years = parseFloating(
       requireString(entries, consumed, "numerics.amr_predictive_feedback_age_years",
                     defaultFor("numerics.amr_predictive_feedback_age_years")), "numerics.amr_predictive_feedback_age_years");
+  frozen.config.numerics.amr_predictive_event_lookahead_years = parseFloating(
+      requireString(entries, consumed, "numerics.amr_predictive_event_lookahead_years",
+                    defaultFor("numerics.amr_predictive_event_lookahead_years")),
+      "numerics.amr_predictive_event_lookahead_years");
   frozen.config.numerics.amr_time_stepping = parseAmrTimeSteppingConfigMode(requireString(
       entries, consumed, "numerics.amr_time_stepping", defaultFor("numerics.amr_time_stepping")));
   frozen.config.numerics.global_step_max_retries = parseNumber<int>(
@@ -3846,6 +3898,13 @@ class NormalizedConfigStream {
   frozen.config.numerics.amr_derefine_hysteresis = parseFloating(
       requireString(entries, consumed, "numerics.amr_derefine_hysteresis",
                     defaultFor("numerics.amr_derefine_hysteresis")), "numerics.amr_derefine_hysteresis");
+  for (auto [key, target] : std::initializer_list<std::pair<const char*, double*>>{
+           {"numerics.amr_refine_cooling_length_cells", &frozen.config.numerics.amr_refine_cooling_length_cells},
+           {"numerics.amr_refine_metallicity_jump", &frozen.config.numerics.amr_refine_metallicity_jump},
+           {"numerics.amr_refine_species_jump", &frozen.config.numerics.amr_refine_species_jump},
+           {"numerics.amr_refine_vorticity", &frozen.config.numerics.amr_refine_vorticity}}) {
+    *target = parseFloating(requireString(entries, consumed, key, defaultFor(key)), key);
+  }
   frozen.config.numerics.gravity_softening_kpc_comoving = parseLengthKpc(
       requireString(entries, consumed, "numerics.gravity_softening", "1.0 kpc"),
       frozen.config.units.length_unit,
@@ -4362,6 +4421,9 @@ class NormalizedConfigStream {
       requireString(entries, consumed, "physics.chemistry_adaptive_min_dwell_years", "1.0e6"), "physics.chemistry_adaptive_min_dwell_years");
   frozen.config.physics.chemistry_adaptive_cold_temperature_k = parseFloating(
       requireString(entries, consumed, "physics.chemistry_adaptive_cold_temperature_k", "3.0e3"), "physics.chemistry_adaptive_cold_temperature_k");
+  frozen.config.physics.chemistry_adaptive_cooling_time_ratio = parseFloating(
+      requireString(entries, consumed, "physics.chemistry_adaptive_cooling_time_ratio", "0.0"),
+      "physics.chemistry_adaptive_cooling_time_ratio");
   frozen.config.physics.chemistry_adaptive_dense_nh_cm3 = parseFloating(
       requireString(entries, consumed, "physics.chemistry_adaptive_dense_nh_cm3", "1.0"), "physics.chemistry_adaptive_dense_nh_cm3");
   frozen.config.physics.chemistry_shadow_sample_fraction = parseFloating(

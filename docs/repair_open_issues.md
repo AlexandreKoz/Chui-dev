@@ -1,3 +1,46 @@
+## Final data and closure, pass 2 — 2026-11-04
+
+Closed in source (NOT RUN):
+
+* A03 indicators;
+* A04 event-aware prediction;
+* C03 timescale criterion;
+* data products for D1–D3;
+* R18/C06 secondary provenance.
+
+Open, in priority order:
+
+1. T02 level-local SourceRuntime coupling (ledger §4).
+2. H01 CTU stencils at remote and coarse/fine faces.
+3. V1–V3 end-to-end MPI and retry tests.
+4. V02 memory-aware optional-refinement budget.
+5. Data: an HM01-consistent H/He photorate table, multi-Z SB99 winds and multi-Z SN Ia yields.
+
+See [`repair/chui_final_data_and_closure_20261104.md`](repair/chui_final_data_and_closure_20261104.md).
+
+## Final design closure — 2026-11-04 (supersedes the A3–A5 continuation below)
+
+Closed in source (NOT RUN):
+
+* A3: diffusion accounting;
+* A4: associations, via global FoF rather than refusal;
+* A5: chemistry rollback;
+* B1/B2: distributed recursion and level-relaxed CFL;
+* B5: source-controller checkpoint;
+* C1/C2: distributed diffusion and octet co-location;
+* the split-interface reflux defect.
+
+Open:
+
+* G3.1 CTU at remote boundaries;
+* G4.1/G4.2 indicators and predictor;
+* V01 snapshot import;
+* MPI end-to-end recursive and association tests;
+* benchmarks.
+
+Exact edit locations are in the
+[closure ledger](repair/chui_final_design_closure_20261104.md) (§2 and §10).
+
 ## Design conformance checkpoint — 2026-11-04
 
 A1 recursive-driver preallocation admission and A2 history start/end publication

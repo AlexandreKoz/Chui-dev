@@ -1345,6 +1345,57 @@ void scatterAmrHydroConservedState(
       adiabatic_index, index);
 }
 
+std::vector<FluxRegisterEntry> mergeFluxRegisterEntriesByKey(std::span<const FluxRegisterEntry> entries) {
+  std::vector<std::size_t> order(entries.size());
+  for (std::size_t i = 0; i < order.size(); ++i) order[i] = i;
+  // Stable: equal keys keep the caller's order (local first, then inbound by
+  // source rank), which fixes the summation order.
+  std::stable_sort(order.begin(), order.end(), [&](std::size_t l, std::size_t r) {
+    return entries[l].register_key < entries[r].register_key;
+  });
+  std::vector<FluxRegisterEntry> merged;
+  merged.reserve(entries.size());
+  std::size_t begin = 0U;
+  while (begin < order.size()) {
+    std::size_t end = begin + 1U;
+    while (end < order.size() && entries[order[end]].register_key == entries[order[begin]].register_key) ++end;
+    FluxRegisterEntry out = entries[order[begin]];
+    if (end - begin > 1U) {
+      ConservedState coarse_weighted{};
+      ConservedState fine_weighted{};
+      double coarse_area = 0.0;
+      double fine_area = 0.0;
+      std::uint32_t coarse_count = 0U;
+      std::uint32_t fine_count = 0U;
+      for (std::size_t k = begin; k < end; ++k) {
+        const FluxRegisterEntry& e = entries[order[k]];
+        if (e.coarse_patch_id != out.coarse_patch_id || e.coarse_cell_index != out.coarse_cell_index ||
+            e.level != out.level || e.axis != out.axis || e.orientation != out.orientation ||
+            std::abs(e.dt_code - out.dt_code) > 1.0e-12 * std::max({1.0, std::abs(e.dt_code), std::abs(out.dt_code)})) {
+          throw std::runtime_error("mergeFluxRegisterEntriesByKey: incompatible register halves share a key");
+        }
+        if (out.coarse_gas_cell_id == 0U) out.coarse_gas_cell_id = e.coarse_gas_cell_id;
+        coarse_weighted += e.coarse_face_flux_code * e.coarse_area_comov;
+        fine_weighted += e.fine_face_flux_code * e.fine_area_comov;
+        coarse_area += e.coarse_area_comov;
+        fine_area += e.fine_area_comov;
+        coarse_count += e.coarse_face_count;
+        fine_count += e.fine_face_count;
+      }
+      out.coarse_area_comov = coarse_area;
+      out.fine_area_comov = fine_area;
+      out.face_area_comov = coarse_area > 0.0 ? coarse_area : fine_area;
+      out.coarse_face_count = coarse_count;
+      out.fine_face_count = fine_count;
+      out.coarse_face_flux_code = coarse_area > 0.0 ? coarse_weighted * (1.0 / coarse_area) : ConservedState{};
+      out.fine_face_flux_code = fine_area > 0.0 ? fine_weighted * (1.0 / fine_area) : ConservedState{};
+    }
+    merged.push_back(out);
+    begin = end;
+  }
+  return merged;
+}
+
 RefluxDiagnostics applyFluxRegistersToSimulationState(
     core::SimulationState& state,
     std::span<const FluxRegisterEntry> entries,
@@ -2368,7 +2419,8 @@ struct AmrSynchronizedSweepWorkspace {
           .owner_rank = remote.owner_rank,
           .ghost_hydro_epoch = remote.ghost_hydro_epoch,
           .expected_ghost_hydro_epoch = remote.expected_ghost_hydro_epoch,
-          .source_current_state_time_code = options.state_time_code,
+          .source_current_state_time_code =
+              std::isnan(remote.state_time_code) ? options.state_time_code : remote.state_time_code,
           .cells = remote.boundary_cells});
     }
   }
@@ -2376,6 +2428,19 @@ struct AmrSynchronizedSweepWorkspace {
   refreshTraceableGhostSourceIds(geometries, periodic_frame);
   if (distributed_exchange != nullptr) {
     refreshRemoteTraceableGhostSourceIds(geometries, distributed_exchange->remote_patches, periodic_frame);
+  }
+  // H02/G3.1: remote specific internal energies by stable gas_cell_id for the
+  // dual-energy auxiliary lane of remote-sourced ghosts (sorted lookup).
+  std::vector<std::pair<std::uint64_t, double>> remote_internal_energy;
+  if (distributed_exchange != nullptr) {
+    for (const DistributedAmrRemotePatch& remote : distributed_exchange->remote_patches) {
+      for (const AmrHydroSparseRemoteCell& cell : remote.boundary_cells) {
+        if (std::isfinite(cell.internal_energy_code) && cell.internal_energy_code > 0.0) {
+          remote_internal_energy.emplace_back(cell.gas_cell_id, cell.internal_energy_code);
+        }
+      }
+    }
+    std::sort(remote_internal_energy.begin(), remote_internal_energy.end());
   }
 
   const auto patchRequiresGhostFill = [&](std::size_t patch_index) {
@@ -2682,9 +2747,10 @@ struct AmrSynchronizedSweepWorkspace {
       }
       hydro::fillHydroBoundaryGhostAuxiliaryInternalEnergy(conserved_state, patch_geometry.geometry);
       // Same-level / coarse-fine ghosts: rho_ghost * e_source from the
-      // canonical e of the local source cell. Remote or unknown sources stay
-      // NaN; their face states then use E - K and are counted, so degraded
-      // dual-energy protection at such boundaries is reported, not silent.
+      // canonical e of the local source cell, or (H02) the transported e of a
+      // remote source cell. Unknown sources stay NaN; their face states then
+      // use E - K and are counted, so degraded dual-energy protection is
+      // reported, not silent.
       for (const AmrHydroGhostDescriptor& ghost : patch_geometry.ghosts) {
         if (ghost.ghost_cell >= auxiliary.size() || std::isfinite(auxiliary[ghost.ghost_cell])) {
           continue;
@@ -2692,7 +2758,12 @@ struct AmrSynchronizedSweepWorkspace {
         const auto source_row = ghost.source_gas_cell_id != 0U
             ? state.rowForGasCellId(ghost.source_gas_cell_id)
             : std::optional<std::uint32_t>{};
-        const double source_e = source_row.has_value() ? state.gas_cells.internal_energy_code[*source_row] : 0.0;
+        double source_e = source_row.has_value() ? state.gas_cells.internal_energy_code[*source_row] : 0.0;
+        if (!source_row.has_value() && ghost.source_gas_cell_id != 0U && !remote_internal_energy.empty()) {
+          const auto it = std::lower_bound(remote_internal_energy.begin(), remote_internal_energy.end(),
+                                           std::make_pair(ghost.source_gas_cell_id, -std::numeric_limits<double>::infinity()));
+          if (it != remote_internal_energy.end() && it->first == ghost.source_gas_cell_id) source_e = it->second;
+        }
         if (source_e > 0.0) {
           auxiliary[ghost.ghost_cell] = conserved_state.loadCell(ghost.ghost_cell).mass_density_comoving * source_e;
         } else {
@@ -2914,6 +2985,21 @@ struct AmrSynchronizedSweepWorkspace {
         remote_entries.push_back(entry);
       }
     }
+    if (distributed_exchange->deferred_local_flux_registers != nullptr &&
+        !options.persist_incomplete_flux_registers) {
+      // G2.3: incomplete local halves (other side remote) are merged by the
+      // caller with the inbound remote halves; never silently skipped.
+      std::vector<FluxRegisterEntry> complete_local;
+      complete_local.reserve(local_entries.size());
+      for (const FluxRegisterEntry& entry : local_entries) {
+        if (entry.isComplete()) {
+          complete_local.push_back(entry);
+        } else {
+          distributed_exchange->deferred_local_flux_registers->push_back(entry);
+        }
+      }
+      local_entries.swap(complete_local);
+    }
     if (distributed_exchange->outbound_remote_flux_registers != nullptr) {
       distributed_exchange->outbound_remote_flux_registers->insert(
           distributed_exchange->outbound_remote_flux_registers->end(),
@@ -2991,11 +3077,13 @@ ProductionAmrHydroDiagnostics advanceDistributedProductionAmrHydro(
     std::span<const hydro::HydroSourceTerm* const> source_terms,
     const ProductionAmrHydroOptions& options,
     const DistributedAmrHydroExchange& exchange) {
-  if (options.sweep_mode == ProductionAmrHydroSweepMode::kLocalSubcycling ||
-      options.enable_temporal_coarse_to_fine) {
+  // The two-level local subcycler has no distributed form; distributed
+  // subcycling is advanceDistributedProductionAmrHydroRecursive, which calls
+  // this per level with temporally interpolated remote coarse sources.
+  if (options.sweep_mode == ProductionAmrHydroSweepMode::kLocalSubcycling) {
     throw std::runtime_error(
-        "distributed AMR hydro currently supports synchronized patch execution only; "
-        "MPI temporal subcycling is not implemented");
+        "distributed AMR hydro: the two-level local subcycler has no distributed form; use "
+        "numerics.amr_time_stepping = recursive_subcycling");
   }
   return advanceProductionAmrHydroSynchronizedImpl(
       state,
@@ -3080,7 +3168,12 @@ void addRefluxDiagnostics(ProductionAmrHydroDiagnostics& diagnostics, const Refl
 // energy, metals; composition via the face-mass sink; dual-energy auxiliary)
 // is advanced by exactly the sweep that owns its level, so each cell
 // integrates its full interval exactly once.
-ProductionAmrHydroDiagnostics advanceProductionAmrHydroRecursive(
+namespace {
+
+// Shared recursive driver. hooks == nullptr: single-rank (local hierarchy).
+// hooks != nullptr: distributed; every local failure is reduced before the
+// next collective (RecursiveAmrDistributedHooks contract).
+ProductionAmrHydroDiagnostics advanceProductionAmrHydroRecursiveImpl(
     core::SimulationState& state,
     std::span<const std::uint32_t> active_cell_rows,
     const hydro::HydroUpdateContext& coarse_update,
@@ -3088,21 +3181,41 @@ ProductionAmrHydroDiagnostics advanceProductionAmrHydroRecursive(
     const hydro::HydroCoreSolver& solver,
     const hydro::HydroRiemannSolver& riemann_solver,
     std::span<const hydro::HydroSourceTerm* const> source_terms,
-    const ProductionAmrHydroOptions& options) {
-  if (!hasProductionAmrHydroCoverage(state)) {
-    throw std::runtime_error("advanceProductionAmrHydroRecursive requires complete AMR patch coverage");
+    const ProductionAmrHydroOptions& options,
+    int local_rank,
+    std::uint64_t ghost_hydro_epoch,
+    RecursiveAmrDistributedHooks* hooks) {
+  const bool distributed = hooks != nullptr;
+  const auto reduce = [hooks](std::exception_ptr failure, const char* stage) {
+    if (hooks != nullptr) {
+      hooks->reduceFailure(failure, stage);
+    } else if (failure != nullptr) {
+      std::rethrow_exception(failure);
+    }
+  };
+  // A rank holding no gas at all is a legal participant of a distributed
+  // hierarchy (it traverses every level and enters every collective).
+  const bool empty_rank = distributed && state.cells.size() == 0U && state.patches.size() == 0U;
+  std::exception_ptr failure;
+  try {
+    if (!empty_rank && !hasProductionAmrHydroCoverage(state)) {
+      throw std::runtime_error("advanceProductionAmrHydroRecursive requires complete AMR patch coverage");
+    }
+    if (options.refinement_ratio < 2U) {
+      throw std::invalid_argument("recursive AMR subcycling requires refinement_ratio >= 2");
+    }
+    if (!std::isfinite(options.state_time_code) || !(coarse_update.dt_code > 0.0)) {
+      throw std::invalid_argument("recursive AMR subcycling requires a finite start time and dt > 0");
+    }
+    if (!state.amr_temporal_boundary_history.empty() || !state.pending_flux_registers.empty()) {
+      throw std::runtime_error(
+          "recursive AMR subcycling must start at a synchronized hierarchy boundary "
+          "(no open temporal history or pending flux register)");
+    }
+  } catch (...) {
+    failure = std::current_exception();
   }
-  if (options.refinement_ratio < 2U) {
-    throw std::invalid_argument("recursive AMR subcycling requires refinement_ratio >= 2");
-  }
-  if (!std::isfinite(options.state_time_code) || !(coarse_update.dt_code > 0.0)) {
-    throw std::invalid_argument("recursive AMR subcycling requires a finite start time and dt > 0");
-  }
-  if (!state.amr_temporal_boundary_history.empty() || !state.pending_flux_registers.empty()) {
-    throw std::runtime_error(
-        "recursive AMR subcycling must start at a synchronized hierarchy boundary "
-        "(no open temporal history or pending flux register)");
-  }
+  reduce(failure, "recursive AMR start validation");
   // All levels fit the persistent uint8 patch-level representation. Count
   // without heap storage, then admit EVERY recursive-driver allocation before
   // constructing descriptors, diagnostics or per-level row vectors. The same
@@ -3112,16 +3225,33 @@ ProductionAmrHydroDiagnostics advanceProductionAmrHydroRecursive(
   std::array<std::size_t, k_level_slots> row_counts{};
   std::size_t level_count = 0U;
   std::size_t max_level = 0U;
-  for (std::size_t patch = 0; patch < state.patches.size(); ++patch) {
-    if (state.patches.cell_count[patch] == 0U) continue;
-    const int level = state.patches.level[patch];
-    if (level < 0 || level >= static_cast<int>(k_level_slots)) {
-      throw std::invalid_argument("recursive AMR patch level exceeds persistent level representation");
+  std::array<std::uint64_t, 4> level_bits{};
+  try {
+    for (std::size_t patch = 0; patch < state.patches.size(); ++patch) {
+      if (state.patches.cell_count[patch] == 0U) continue;
+      const int level = state.patches.level[patch];
+      if (level < 0 || level >= static_cast<int>(k_level_slots)) {
+        throw std::invalid_argument("recursive AMR patch level exceeds persistent level representation");
+      }
+      level_bits[static_cast<std::size_t>(level) / 64U] |= 1ULL << (static_cast<std::size_t>(level) % 64U);
     }
-    if (!populated[static_cast<std::size_t>(level)]) ++level_count;
-    populated[static_cast<std::size_t>(level)] = true;
-    max_level = std::max(max_level, static_cast<std::size_t>(level));
+  } catch (...) {
+    failure = std::current_exception();
   }
+  reduce(failure, "recursive AMR level census");
+  // Distributed: the GLOBAL populated-level set fixes the recursion shape on
+  // every rank (identical clocks, identical collective sequence).
+  if (distributed) hooks->globalLevelUnion(level_bits);
+  for (std::size_t level = 0; level < k_level_slots; ++level) {
+    if ((level_bits[level / 64U] >> (level % 64U)) & 1ULL) {
+      populated[level] = true;
+      ++level_count;
+      max_level = level;
+    }
+  }
+  std::uint64_t driver_bytes = 0U;
+  core::MemoryReservation driver_reservation;
+  try {
   const auto countRow = [&](std::uint32_t row) {
     if (row >= state.cells.patch_index.size()) return;
     const auto patch = state.cells.patch_index[row];
@@ -3134,7 +3264,6 @@ ProductionAmrHydroDiagnostics advanceProductionAmrHydroRecursive(
   } else {
     for (const auto row : active_cell_rows) countRow(row);
   }
-  std::uint64_t driver_bytes = 0U;
   const auto addCapacity = [&](std::size_t count, std::size_t width) {
     driver_bytes = core::checkedMemoryBytesAdd(driver_bytes,
         static_cast<std::uint64_t>(core::checkedSizeMultiply(count, width, "recursive AMR driver capacity")),
@@ -3153,28 +3282,36 @@ ProductionAmrHydroDiagnostics advanceProductionAmrHydroRecursive(
   addCapacity(level_count, sizeof(std::uint32_t));  // ratio_to_next
   addCapacity(max_level + 1U, sizeof(AmrLevelRefluxInterval));
   addCapacity(max_level + 1U, sizeof(std::uint32_t));  // diagnostics substep counts
-  // Declare the reservation first: all its buffers die before the lease.
-  core::MemoryReservation driver_reservation;
+  // The reservation is declared before every buffer: all die before the lease.
   if (options.regrid_memory_governor != nullptr) {
     driver_reservation = options.regrid_memory_governor->reserve(
         core::MemoryClass::kPhaseResident, driver_bytes, "amr.recursive.driver");
     driver_reservation.commit();
   }
+  } catch (...) {
+    failure = std::current_exception();
+  }
+  // A refusal on ANY rank is agreed before any rank mutates state.
+  reduce(failure, "recursive AMR driver admission");
   const auto requireCapacity = [](const auto& buffer, std::size_t capacity) {
     if (buffer.capacity() != capacity) {
       throw std::length_error("recursive AMR allocator exceeded admitted capacity");
     }
   };
-  const std::vector<PatchDescriptor> descriptors = buildProductionAmrPatchDescriptors(state);
-  requireCapacity(descriptors, state.patches.size());
+  std::vector<PatchDescriptor> descriptors;
   std::vector<int> levels;
+  ProductionAmrHydroDiagnostics diagnostics;
+  std::vector<std::vector<std::uint32_t>> rows_by_level;
+  std::vector<std::uint32_t> ratio_to_next;
+  try {
+  descriptors = buildProductionAmrPatchDescriptors(state);
+  requireCapacity(descriptors, state.patches.size());
   levels.reserve(level_count);
   requireCapacity(levels, level_count);
   for (std::size_t level = 0; level < k_level_slots; ++level) {
     if (populated[level]) levels.push_back(static_cast<int>(level));
   }
-  ProductionAmrHydroDiagnostics diagnostics;
-  if (levels.empty()) return diagnostics;
+  if (!levels.empty()) {
   diagnostics.patch_count = descriptors.size();
   diagnostics.levels_advanced = levels.size();
   diagnostics.max_level_advanced = max_level;
@@ -3183,7 +3320,7 @@ ProductionAmrHydroDiagnostics advanceProductionAmrHydroRecursive(
 
   // Each requested row appears only in its own level list (no O(N*levels)
   // capacity envelope). All reserve/fill failures precede canonical mutation.
-  std::vector<std::vector<std::uint32_t>> rows_by_level(level_count);
+  rows_by_level.resize(level_count);
   requireCapacity(rows_by_level, level_count);
   for (std::size_t i = 0; i < level_count; ++i) {
     const auto count = row_counts[static_cast<std::size_t>(levels[i])];
@@ -3194,9 +3331,40 @@ ProductionAmrHydroDiagnostics advanceProductionAmrHydroRecursive(
       throw std::logic_error("recursive AMR row count changed during preparation");
     }
   }
+  }
+  } catch (...) {
+    failure = std::current_exception();
+  }
+  reduce(failure, "recursive AMR driver preparation");
+  if (levels.empty()) return diagnostics;
+  // Distributed: one synchronized all-level exchange provides the remote
+  // neighbour descriptors for the cross-rank balance check.
+  std::span<const PatchDescriptor> remote_neighbours;
+  if (distributed) remote_neighbours = hooks->prepare(options.state_time_code);
+  try {
   // 2:1 face balance (periodic wrap included) is required: a register of a
   // level pair (L, L+2) would be tagged with the wrong substep clock and
-  // complete before all fine substeps contributed. O(P^2) contact check.
+  // complete before all fine substeps contributed. O(P^2) contact check;
+  // local-vs-remote pairs are checked on both owning ranks.
+  {
+    const internal::AmrPeriodicFrame remote_frame = internal::makeAmrPeriodicFrame(
+        options.physical_boundary_kind == hydro::HydroBoundaryKind::kPeriodic, options.periodic_box_extent_comoving);
+    for (const PatchDescriptor& local_patch : descriptors) {
+      for (const PatchDescriptor& remote_patch : remote_neighbours) {
+        if (std::abs(static_cast<int>(local_patch.level) - static_cast<int>(remote_patch.level)) <= 1) continue;
+        for (const hydro::HydroFaceAxis axis : {hydro::HydroFaceAxis::kX, hydro::HydroFaceAxis::kY, hydro::HydroFaceAxis::kZ}) {
+          for (const hydro::HydroFaceSide side : {hydro::HydroFaceSide::kLower, hydro::HydroFaceSide::kUpper}) {
+            if (touchesOnSide(local_patch, remote_patch, axis, side, remote_frame)) {
+              throw std::runtime_error(
+                  "distributed recursive AMR requires 2:1 face balance across ranks; patches " +
+                  std::to_string(local_patch.patch_id) + " and remote " + std::to_string(remote_patch.patch_id) +
+                  " differ by more than one level across a face (fail closed)");
+            }
+          }
+        }
+      }
+    }
+  }
   {
     const internal::AmrPeriodicFrame frame = internal::makeAmrPeriodicFrame(
         options.physical_boundary_kind == hydro::HydroBoundaryKind::kPeriodic, options.periodic_box_extent_comoving);
@@ -3216,7 +3384,7 @@ ProductionAmrHydroDiagnostics advanceProductionAmrHydroRecursive(
       }
     }
   }
-  std::vector<std::uint32_t> ratio_to_next(levels.size(), 1U);
+  ratio_to_next.assign(levels.size(), 1U);
   requireCapacity(ratio_to_next, level_count);
   for (std::size_t i = 0; i + 1U < levels.size(); ++i) {
     std::uint32_t ratio = 1U;
@@ -3226,6 +3394,10 @@ ProductionAmrHydroDiagnostics advanceProductionAmrHydroRecursive(
     }
     ratio_to_next[i] = ratio;
   }
+  } catch (...) {
+    failure = std::current_exception();
+  }
+  reduce(failure, "recursive AMR balance validation");
   std::vector<AmrLevelRefluxInterval> intervals(max_level + 1U);
   requireCapacity(intervals, max_level + 1U);
 
@@ -3234,41 +3406,84 @@ ProductionAmrHydroDiagnostics advanceProductionAmrHydroRecursive(
                                  double t_begin, std::uint32_t parent_substep) -> void {
     const int level = levels[i];
     const bool has_finer = i + 1U < levels.size();
+    const int coarser_level = i > 0U ? levels[i - 1U] : -1;
+    const int finer_level = has_finer ? levels[i + 1U] : -1;
     const double t_end = t_begin + update.dt_code;
-    if (has_finer) {
-      captureAmrTemporalBoundaryHistoryStartForLevel(
-          state, descriptors, level, t_begin, options.adiabatic_index, options.regrid_memory_governor);
-      intervals[static_cast<std::size_t>(level)] = AmrLevelRefluxInterval{
-          .interval_start_code = t_begin, .interval_end_code = t_end, .coarse_dt_code = update.dt_code,
-          .substeps_per_interval = ratio_to_next[i], .substep_index = 0U, .valid = true};
-    }
-    if (i > 0U) {
-      intervals[static_cast<std::size_t>(levels[i - 1U])].substep_index = parent_substep;
-    }
-    if (!rows_by_level[i].empty()) {
-      ProductionAmrHydroOptions level_options = options;
-      level_options.sweep_mode = ProductionAmrHydroSweepMode::kSynchronized;
-      level_options.persist_incomplete_flux_registers = true;
-      level_options.reflux_intervals_by_coarse_level = intervals;
-      level_options.state_time_code = t_begin;
-      level_options.ghost_fill_time_code = t_begin;
-      level_options.enable_temporal_coarse_to_fine = i > 0U;
-      if (update.comoving_coordinates && coarse_update.scale_factor > 0.0 && update.scale_factor > 0.0) {
-        level_options.source_density_rescale =
-            options.source_density_rescale * std::pow(coarse_update.scale_factor / update.scale_factor, 3.0);
+    std::exception_ptr level_failure;
+    try {
+      if (has_finer) {
+        captureAmrTemporalBoundaryHistoryStartForLevel(
+            state, descriptors, level, t_begin, options.adiabatic_index, options.regrid_memory_governor);
+        intervals[static_cast<std::size_t>(level)] = AmrLevelRefluxInterval{
+            .interval_start_code = t_begin, .interval_end_code = t_end, .coarse_dt_code = update.dt_code,
+            .substeps_per_interval = ratio_to_next[i], .substep_index = 0U, .valid = true};
       }
-      hydro::HydroSourceContext source_context = global_source_context;
-      source_context.update = update;
-      source_context.redshift = update.scale_factor > 0.0
-          ? std::max(0.0, 1.0 / update.scale_factor - 1.0) : global_source_context.redshift;
-      accumulateDiagnostics(diagnostics, advanceProductionAmrHydro(
-          state, rows_by_level[i], update, source_context, solver, riemann_solver, source_terms, level_options));
+      if (i > 0U) {
+        intervals[static_cast<std::size_t>(levels[i - 1U])].substep_index = parent_substep;
+      }
+    } catch (...) {
+      level_failure = std::current_exception();
+    }
+    reduce(level_failure, "recursive AMR level interval open");
+    ProductionAmrHydroOptions level_options = options;
+    level_options.sweep_mode = ProductionAmrHydroSweepMode::kSynchronized;
+    level_options.persist_incomplete_flux_registers = true;
+    level_options.reflux_intervals_by_coarse_level = intervals;
+    level_options.state_time_code = t_begin;
+    level_options.ghost_fill_time_code = t_begin;
+    level_options.enable_temporal_coarse_to_fine = i > 0U;
+    if (update.comoving_coordinates && coarse_update.scale_factor > 0.0 && update.scale_factor > 0.0) {
+      level_options.source_density_rescale =
+          options.source_density_rescale * std::pow(coarse_update.scale_factor / update.scale_factor, 3.0);
+    }
+    std::span<const DistributedAmrRemotePatch> remote_patches;
+    if (distributed) {
+      // Same-level and finer ghosts at t_begin; coarser remote ghosts
+      // interpolated to t_begin; level-start remote states retained.
+      remote_patches = hooks->beginLevelSweep(level, coarser_level, finer_level, t_begin, t_end, has_finer);
+    }
+    std::vector<FluxRegisterEntry> outbound;
+    try {
+      if (!rows_by_level[i].empty()) {
+        hydro::HydroSourceContext source_context = global_source_context;
+        source_context.update = update;
+        source_context.redshift = update.scale_factor > 0.0
+            ? std::max(0.0, 1.0 / update.scale_factor - 1.0) : global_source_context.redshift;
+        if (distributed) {
+          accumulateDiagnostics(diagnostics, advanceDistributedProductionAmrHydro(
+              state, rows_by_level[i], update, source_context, solver, riemann_solver, source_terms, level_options,
+              DistributedAmrHydroExchange{
+                  .local_rank = local_rank,
+                  .ghost_hydro_epoch = ghost_hydro_epoch,
+                  .expected_ghost_hydro_epoch = ghost_hydro_epoch,
+                  .remote_patches = remote_patches,
+                  .outbound_remote_flux_registers = &outbound}));
+        } else {
+          accumulateDiagnostics(diagnostics, advanceProductionAmrHydro(
+              state, rows_by_level[i], update, source_context, solver, riemann_solver, source_terms, level_options));
+        }
+      }
+    } catch (...) {
+      level_failure = std::current_exception();
+    }
+    reduce(level_failure, "recursive AMR level sweep");
+    if (distributed) {
+      // Remote register halves of this sweep reach their coarse owners with
+      // this sweep's interval tags (exactly-once per substep via the
+      // pending store's substep coverage mask).
+      hooks->exchangeLevelFluxRegisters(state, outbound, level_options);
     }
     diagnostics.substeps_by_level[static_cast<std::size_t>(level)] += 1U;
     diagnostics.subcycled_level_step_count += 1U;
     if (!has_finer) return;
-    captureAmrTemporalBoundaryHistoryEndForLevel(
-        state, descriptors, level, t_end, options.adiabatic_index, options.regrid_memory_governor);
+    try {
+      captureAmrTemporalBoundaryHistoryEndForLevel(
+          state, descriptors, level, t_end, options.adiabatic_index, options.regrid_memory_governor);
+    } catch (...) {
+      level_failure = std::current_exception();
+    }
+    reduce(level_failure, "recursive AMR level interval close");
+    if (distributed) hooks->captureLevelEnd(level, finer_level, t_end);
     const std::uint32_t substeps = ratio_to_next[i];
     for (std::uint32_t k = 0; k < substeps; ++k) {
       const double f0 = static_cast<double>(k) / static_cast<double>(substeps);
@@ -3276,9 +3491,15 @@ ProductionAmrHydroDiagnostics advanceProductionAmrHydroRecursive(
       const hydro::HydroUpdateContext child = subintervalUpdate(update, f0, f1);
       self(self, i + 1U, child, t_begin + f0 * update.dt_code, k);
     }
-    addRefluxDiagnostics(diagnostics, applyCompletePendingFluxRegistersToSimulationState(
-        state, descriptors, options.adiabatic_index, options.thermodynamic_cache, options.regrid_memory_governor));
-    retireAmrTemporalBoundaryHistoryLevel(state, level, options.regrid_memory_governor);
+    try {
+      addRefluxDiagnostics(diagnostics, applyCompletePendingFluxRegistersToSimulationState(
+          state, descriptors, options.adiabatic_index, options.thermodynamic_cache, options.regrid_memory_governor));
+      retireAmrTemporalBoundaryHistoryLevel(state, level, options.regrid_memory_governor);
+    } catch (...) {
+      level_failure = std::current_exception();
+    }
+    if (distributed) hooks->retireLevel(level);
+    reduce(level_failure, "recursive AMR level reflux");
     intervals[static_cast<std::size_t>(level)].valid = false;
   };
   hydro::HydroUpdateContext root = coarse_update;
@@ -3287,13 +3508,52 @@ ProductionAmrHydroDiagnostics advanceProductionAmrHydroRecursive(
     root.time_end_code = options.state_time_code + coarse_update.dt_code;
   }
   advance_level(advance_level, 0U, root, options.state_time_code, 0U);
-  if (!state.pending_flux_registers.empty() || !state.amr_temporal_boundary_history.empty()) {
-    throw std::runtime_error(
-        "recursive AMR subcycling left incomplete flux registers or open temporal intervals "
-        "(interface coverage defect; the hierarchy is not synchronized)");
+  try {
+    if (!state.pending_flux_registers.empty() || !state.amr_temporal_boundary_history.empty()) {
+      throw std::runtime_error(
+          "recursive AMR subcycling left incomplete flux registers or open temporal intervals "
+          "(interface coverage defect; the hierarchy is not synchronized)");
+    }
+  } catch (...) {
+    failure = std::current_exception();
   }
+  reduce(failure, "recursive AMR synchronization check");
   return diagnostics;
 }
+
+}  // namespace
+
+ProductionAmrHydroDiagnostics advanceProductionAmrHydroRecursive(
+    core::SimulationState& state,
+    std::span<const std::uint32_t> active_cell_rows,
+    const hydro::HydroUpdateContext& coarse_update,
+    const hydro::HydroSourceContext& global_source_context,
+    const hydro::HydroCoreSolver& solver,
+    const hydro::HydroRiemannSolver& riemann_solver,
+    std::span<const hydro::HydroSourceTerm* const> source_terms,
+    const ProductionAmrHydroOptions& options) {
+  return advanceProductionAmrHydroRecursiveImpl(
+      state, active_cell_rows, coarse_update, global_source_context, solver, riemann_solver, source_terms, options,
+      0, 0U, nullptr);
+}
+
+ProductionAmrHydroDiagnostics advanceDistributedProductionAmrHydroRecursive(
+    core::SimulationState& state,
+    std::span<const std::uint32_t> active_cell_rows,
+    const hydro::HydroUpdateContext& coarse_update,
+    const hydro::HydroSourceContext& global_source_context,
+    const hydro::HydroCoreSolver& solver,
+    const hydro::HydroRiemannSolver& riemann_solver,
+    std::span<const hydro::HydroSourceTerm* const> source_terms,
+    const ProductionAmrHydroOptions& options,
+    int local_rank,
+    std::uint64_t ghost_hydro_epoch,
+    RecursiveAmrDistributedHooks& hooks) {
+  return advanceProductionAmrHydroRecursiveImpl(
+      state, active_cell_rows, coarse_update, global_source_context, solver, riemann_solver, source_terms, options,
+      local_rank, ghost_hydro_epoch, &hooks);
+}
+
 
 ProductionAmrHydroDiagnostics advanceProductionAmrHydroSubcycled(
     core::SimulationState& state,

@@ -13,8 +13,9 @@
 // masses) and min (nearest distance); `combine` implements exactly that.
 // Gas cells are not classified (they share the high-resolution region by
 // construction of the refinement criteria; contamination is a collisionless
-// statement). Status: IMPLEMENTED IN SOURCE, EXPERIMENTAL/UNQUALIFIED wiring
-// (API + test; not yet emitted by the runtime report).
+// statement). Status: IMPLEMENTED IN SOURCE; emitted at the run-health
+// cadence by AnalysisRuntime (event analysis.zoom_contamination, G3.4).
+// EXPERIMENTAL/UNQUALIFIED until owner-run zoom validation.
 
 #include <array>
 #include <cstdint>

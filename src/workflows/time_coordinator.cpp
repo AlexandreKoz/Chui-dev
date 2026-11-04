@@ -209,6 +209,7 @@ struct AdaptiveTimeStepCriteriaStorage {
   std::vector<double> cell_width_z_code;
   std::vector<double> velocity_divergence_code;
   std::vector<double> metal_diffusion_dt_code;
+  std::vector<double> hydro_cfl_level_relaxation;
 };
 
 struct LocalGasCellCflMetadata {
@@ -324,8 +325,29 @@ struct LocalGasCellCflMetadata {
     std::span<const double> cell_accel_y,
     std::span<const double> cell_accel_z,
     double scale_factor,
-    AdaptiveTimeStepCriteriaStorage& storage) {
+    AdaptiveTimeStepCriteriaStorage& storage,
+    int recursive_amr_global_min_level = -1,
+    std::uint32_t amr_refinement_ratio = 2U) {
   state.requireGasCellIdentityMapCoversDenseRows("adaptive time-bin view construction");
+  // G1.2: level relaxation of the hydro CFL candidate under recursive
+  // subcycling (global minimum level agreed by the caller on every rank).
+  storage.hydro_cfl_level_relaxation.clear();
+  if (recursive_amr_global_min_level >= 0 && state.cells.size() != 0U) {
+    storage.hydro_cfl_level_relaxation.assign(state.cells.size(), 1.0);
+    for (std::uint32_t row = 0; row < state.cells.size(); ++row) {
+      const std::uint32_t patch = row < state.cells.patch_index.size() ? state.cells.patch_index[row]
+                                                                       : std::numeric_limits<std::uint32_t>::max();
+      if (patch >= state.patches.size()) {
+        throw std::runtime_error("recursive AMR CFL relaxation: gas cell without patch ownership");
+      }
+      const int level = state.patches.level[patch];
+      if (level < recursive_amr_global_min_level) {
+        throw std::runtime_error("recursive AMR CFL relaxation: cell level below the global minimum level");
+      }
+      storage.hydro_cfl_level_relaxation[row] =
+          std::pow(static_cast<double>(amr_refinement_ratio), static_cast<double>(level - recursive_amr_global_min_level));
+    }
+  }
   // Audit F4: the gas CFL candidate reads GasCellSidecar::sound_speed_code.
   // A source stage that changed density/internal energy must have run the
   // thermodynamic refresh contract before the next timestep is selected.
@@ -448,6 +470,7 @@ struct LocalGasCellCflMetadata {
           .accel_x_comoving = cell_accel_x,
           .accel_y_comoving = cell_accel_y,
           .accel_z_comoving = cell_accel_z,
+          .hydro_cfl_level_relaxation = storage.hydro_cfl_level_relaxation,
       },
   };
 }
@@ -465,7 +488,8 @@ enum class SchedulerElementFamily {
     const physics::EffectiveMultiphaseEosTable* effective_eos_table,
     SchedulerElementFamily element_family,
     std::span<const std::uint32_t> requested_elements,
-    bool update_all_elements) {
+    bool update_all_elements,
+    TimestepLimiterRecord* limiter = nullptr) {
   if (integrator_state.dt_time_code <= 0.0) {
     throw std::invalid_argument("adaptive time-bin update requires dt_time_code > 0");
   }
@@ -655,7 +679,10 @@ enum class SchedulerElementFamily {
         1.0e-12, config.numerics.source_max_fractional_change * mass / mdot);
   };
   double local_min_dt_time_code = std::numeric_limits<double>::infinity();
-  const auto consider_dt = [&](double value) {
+  TimestepLimiterRecord local_limiter{};
+  local_limiter.dt_time_code = std::numeric_limits<double>::infinity();
+  const auto consider_dt = [&](double value, const char* criterion = "unspecified", std::uint32_t element = 0U,
+                               int amr_level = -1, double relaxation = 1.0) {
     if (std::isinf(value) && value > 0.0) {
       return;  // Explicit no-limit sentinel; another criterion or endpoint must bound the step.
     }
@@ -663,9 +690,22 @@ enum class SchedulerElementFamily {
       throw std::runtime_error(
           "adaptive timestep criterion produced an invalid value; expected finite positive or +infinity");
     }
+    if (value < local_min_dt_time_code) {
+      local_limiter = TimestepLimiterRecord{
+          .dt_time_code = value, .criterion = criterion,
+          .gas_cell = element_family == SchedulerElementFamily::kGasCells, .element = element,
+          .amr_level = amr_level, .hydro_cfl_level_relaxation = relaxation};
+    }
     local_min_dt_time_code = std::min(local_min_dt_time_code, value);
   };
-  if (cosmology_dt.has_value()) consider_dt(*cosmology_dt);
+  struct LimiterPublisher {
+    TimestepLimiterRecord* out;
+    const TimestepLimiterRecord& record;
+    ~LimiterPublisher() {
+      if (out != nullptr && record.dt_time_code < out->dt_time_code) *out = record;
+    }
+  } limiter_publisher{limiter, local_limiter};
+  if (cosmology_dt.has_value()) consider_dt(*cosmology_dt, "cosmology_expansion");
   const std::size_t expected_element_count =
       element_family == SchedulerElementFamily::kParticles ? particle_count : cell_count;
   if (scheduler.elementCount() != expected_element_count) {
@@ -712,9 +752,18 @@ enum class SchedulerElementFamily {
           .stability_rule = core::hydroCflStabilityRuleFor(config),
           .active_axis = core::activeHydroAxes(cell_widths, core::hydroDomainExtentCode(config)),
       };
+      // G1.2: under recursive subcycling the coarse interval is bounded by
+      // r^(L - L_min) times the cell's own CFL step (it is subcycled).
+      const double cfl_relaxation = view.gas_cells.hydro_cfl_level_relaxation.empty()
+          ? 1.0 : view.gas_cells.hydro_cfl_level_relaxation[cell_index];
+      if (!(cfl_relaxation >= 1.0) || !std::isfinite(cfl_relaxation)) {
+        throw std::runtime_error("hydro CFL level relaxation must be finite and >= 1");
+      }
       const double cfl_dt =
-          core::computeDirectionalCflTimeStep(hydro_cfl_input, 0.4);
-      consider_dt(cfl_dt);
+          core::computeDirectionalCflTimeStep(hydro_cfl_input, 0.4) * cfl_relaxation;
+      const int cfl_level = view.gas_cells.hydro_cfl_level_relaxation.empty()
+          ? -1 : static_cast<int>(std::lround(std::log2(cfl_relaxation)));
+      consider_dt(cfl_dt, "gas_cell_hydro_cfl", cell_index, cfl_level, cfl_relaxation);
       const double ax = (cell_index < view.gas_cells.accel_x_comoving.size()) ? view.gas_cells.accel_x_comoving[cell_index] : 0.0;
       const double ay = (cell_index < view.gas_cells.accel_y_comoving.size()) ? view.gas_cells.accel_y_comoving[cell_index] : 0.0;
       const double az = (cell_index < view.gas_cells.accel_z_comoving.size()) ? view.gas_cells.accel_z_comoving[cell_index] : 0.0;
@@ -728,7 +777,7 @@ enum class SchedulerElementFamily {
            .scale_free_acceleration_magnitude_code = amag,
            .scale_factor = gravity_scale_factor},
           config.numerics.gravity_timestep_eta);
-      consider_dt(gravity_dt);
+      consider_dt(gravity_dt, "gas_cell_gravity_acceleration", cell_index);
       scheduler.submitCandidateTimeStep(
           cell_index, cfl_dt, limits, core::TimeStepCandidateSource::kHydroCfl, "gas_cell_hydro_cfl");
       scheduler.submitCandidateTimeStep(
@@ -738,14 +787,14 @@ enum class SchedulerElementFamily {
             cell_index, *cosmology_dt, limits, core::TimeStepCandidateSource::kCosmologyExpansion, "gas_cell_cosmology_expansion");
       }
       if (const auto source_dt = star_formation_dt_for_cell(cell_index); source_dt.has_value()) {
-        consider_dt(*source_dt);
+        consider_dt(*source_dt, "gas_cell_star_formation_source", cell_index);
         scheduler.submitCandidateTimeStep(
             cell_index, *source_dt, limits, core::TimeStepCandidateSource::kSourceTerm, "gas_cell_star_formation_source");
       }
       const double diffusion_dt = view.gas_cells.metal_diffusion_dt_code[cell_index];
       if (config.physics.enable_metal_diffusion && std::isfinite(diffusion_dt) &&
           diffusion_dt > 0.0) {
-        consider_dt(diffusion_dt);
+        consider_dt(diffusion_dt, "gas_cell_metal_diffusion_parabolic", cell_index);
         scheduler.submitCandidateTimeStep(
             cell_index, diffusion_dt, limits, core::TimeStepCandidateSource::kSourceTerm,
             "gas_cell_metal_diffusion_parabolic");
@@ -772,7 +821,7 @@ enum class SchedulerElementFamily {
          .scale_free_acceleration_magnitude_code = amag,
          .scale_factor = gravity_scale_factor},
         config.numerics.gravity_timestep_eta);
-    consider_dt(gravity_dt);
+    consider_dt(gravity_dt, "particle_gravity_acceleration", particle_index);
     scheduler.submitCandidateTimeStep(
         particle_index,
         gravity_dt,
@@ -788,7 +837,7 @@ enum class SchedulerElementFamily {
           "particle_cosmology_expansion");
     }
     if (const auto source_dt = black_hole_dt_for_particle(particle_index); source_dt.has_value()) {
-      consider_dt(*source_dt);
+      consider_dt(*source_dt, "particle_black_hole_source", particle_index);
       scheduler.submitCandidateTimeStep(
           particle_index,
           *source_dt,
@@ -815,7 +864,9 @@ enum class SchedulerElementFamily {
     std::span<const double> cell_accel_z,
     std::span<const std::uint32_t> active_particle_indices,
     std::span<const std::uint32_t> active_cell_indices,
-    bool update_all_elements) {
+    bool update_all_elements,
+    int recursive_amr_global_min_level = -1,
+    TimestepLimiterRecord* limiter = nullptr) {
   AdaptiveTimeStepCriteriaStorage storage;
   const core::AdaptiveTimeStepCriteriaView view = buildAdaptiveTimeStepCriteriaView(
       state,
@@ -827,7 +878,9 @@ enum class SchedulerElementFamily {
       cell_accel_y,
       cell_accel_z,
       integrator_state.current_scale_factor,
-      storage);
+      storage,
+      recursive_amr_global_min_level,
+      amr::ProductionAmrHydroOptions{}.refinement_ratio);
   const double particle_min_dt = updateAdaptiveTimeBinsFromView(
       view,
       particle_scheduler,
@@ -836,7 +889,8 @@ enum class SchedulerElementFamily {
       effective_eos_table,
       SchedulerElementFamily::kParticles,
       active_particle_indices,
-      update_all_elements);
+      update_all_elements,
+      limiter);
   const double gas_min_dt = updateAdaptiveTimeBinsFromView(
       view,
       gas_cell_scheduler,
@@ -845,7 +899,8 @@ enum class SchedulerElementFamily {
       effective_eos_table,
       SchedulerElementFamily::kGasCells,
       active_cell_indices,
-      update_all_elements);
+      update_all_elements,
+      limiter);
   return std::min(particle_min_dt, gas_min_dt);
 }
 
@@ -1152,6 +1207,8 @@ void TimeCoordinator::runRungZeroSegment(
         retry_point.layout_certificate = layoutCertificate();
         m_gravity.captureTransactionalForceEndpoint(state, retry_point.layout_certificate, retry_point.force_endpoint);
         m_gravity.beginCycleTransaction();
+        // G1.6: source-controller state outside SimulationState.
+        m_source.captureRollbackCheckpoint();
       } catch (...) {
         capture_failure = std::current_exception();
       }
@@ -1180,6 +1237,28 @@ void TimeCoordinator::runRungZeroSegment(
     m_services.mpi_context.rethrowCollectivePreparationFailure(
         local_timestep_failure, "global timestep candidate selection");
     double accepted_dt = m_services.mpi_context.allreduceMinDouble(local_physical_dt);
+    {
+      // G1.2: record the limiting criterion and AMR level of this decision
+      // (the rank whose candidate equals the global minimum is the limiter).
+      const TimestepLimiterRecord& limiter = m_last_timestep_limiter;
+      profiler.recordEvent(core::RuntimeEvent{
+          .event_kind = "time.timestep_limiter",
+          .severity = core::RuntimeEventSeverity::kInfo,
+          .subsystem = "core.time",
+          .step_index = integrator_state.step_index,
+          .simulation_time_code = integrator_state.current_time_code,
+          .scale_factor = integrator_state.current_scale_factor,
+          .message = "local timestep limiter for the agreed global candidate",
+          .payload = {{"criterion", limiter.criterion},
+                      {"gas_cell", limiter.gas_cell ? "true" : "false"},
+                      {"element_row", std::to_string(limiter.element)},
+                      {"amr_level_offset", std::to_string(limiter.amr_level)},
+                      {"hydro_cfl_level_relaxation", formatRuntimeDouble(limiter.hydro_cfl_level_relaxation)},
+                      {"local_candidate_dt_time_code", formatRuntimeDouble(local_physical_dt)},
+                      {"global_candidate_dt_time_code", formatRuntimeDouble(accepted_dt)},
+                      {"is_global_limiter", local_physical_dt == accepted_dt ? "true" : "false"}},
+      });
+    }
     if (options.dt_time_code > 0.0) accepted_dt = std::min(accepted_dt, options.dt_time_code);
     const double step_begin_scale_factor = integrator_state.current_scale_factor;
     const double remaining_time_code =
@@ -1339,6 +1418,7 @@ void TimeCoordinator::runRungZeroSegment(
           gas_cell_scheduler = std::move(*retry_point.cells);
           pending_output = retry_point.pending;
           m_gravity.rollbackCycleTransaction(retry_point.force_endpoint, state, retry_point.layout_certificate);
+          m_source.restoreRollbackCheckpoint();
           integrator_state.pm_source_generation = state.gravitySourceGeneration();
           syncTimeBinsFromSchedulers(particle_scheduler, gas_cell_scheduler, state);
         } catch (...) {
@@ -1351,6 +1431,7 @@ void TimeCoordinator::runRungZeroSegment(
         continue;
       }
       if (m_gravity.cycleTransactionOpen()) m_gravity.commitCycleTransaction();
+      m_source.discardRollbackCheckpoint();
       global_step_retries = 0U;
       global_step_retry_dt_limit = 0.0;
     }
@@ -2842,6 +2923,24 @@ double TimeCoordinator::updateAdaptiveTimeBins(
         runtime_units,
         physics::makeEffectiveIsmReferenceCoolingProvider(config.physics));
   }
+  // G1.2: recursive subcycling relaxes the hydro CFL candidate by level.
+  // The GLOBAL minimum populated level is agreed here (every caller is a
+  // rank-uniform collective point of the rung-zero loop) so the relaxation,
+  // and hence the accepted interval, does not depend on the decomposition.
+  int recursive_amr_global_min_level = -1;
+  if (config.numerics.amr_time_stepping == core::AmrTimeSteppingConfigMode::kRecursiveSubcycling) {
+    std::uint64_t local_min_level = std::numeric_limits<std::uint64_t>::max();
+    for (std::size_t patch = 0; patch < state.patches.size(); ++patch) {
+      if (state.patches.cell_count[patch] == 0U || state.patches.level[patch] < 0) continue;
+      local_min_level = std::min<std::uint64_t>(local_min_level, static_cast<std::uint64_t>(state.patches.level[patch]));
+    }
+    const std::uint64_t global_min_level = m_services.mpi_context.allreduceMinUint64(local_min_level);
+    if (global_min_level != std::numeric_limits<std::uint64_t>::max()) {
+      recursive_amr_global_min_level = static_cast<int>(global_min_level);
+    }
+  }
+  m_last_timestep_limiter = TimestepLimiterRecord{};
+  m_last_timestep_limiter.dt_time_code = std::numeric_limits<double>::infinity();
   return updateAdaptiveTimeBinFamilies(
       state,
       particle_scheduler,
@@ -2857,7 +2956,9 @@ double TimeCoordinator::updateAdaptiveTimeBins(
       cell_accel_z,
       active_particle_indices,
       active_cell_indices,
-      update_all_elements);
+      update_all_elements,
+      recursive_amr_global_min_level,
+      &m_last_timestep_limiter);
 }
 
 void TimeCoordinator::coordinatePmRefreshDirective(core::StepContext& context) {

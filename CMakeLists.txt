@@ -643,6 +643,7 @@ add_library(cosmosim_workflows STATIC
   src/workflows/initial_condition_runtime.cpp
   src/workflows/internal/cartesian_gas_cell_layout.cpp
   src/workflows/internal/metal_diffusion_topology.cpp
+  src/workflows/internal/distributed_element_diffusion.cpp
   src/workflows/internal/gas_cell_ownership.cpp
   src/workflows/internal/migration_wire.cpp
   src/workflows/internal/gravity_force_endpoint.cpp
@@ -945,6 +946,35 @@ if(COSMOSIM_ENABLE_TESTS)
     cosmosim_mark_runtime_truth_test(
       integration_reference_workflow_distributed_isolated_pm_mpi_two_rank
       mpi distributed pm isolated_pm guard workflow integration)
+  endif()
+
+  if(COSMOSIM_ENABLE_MPI)
+    # G2.1 distributed element-resolved diffusion (NOT RUN — USER-RESERVED).
+    add_executable(
+      test_integration_distributed_element_diffusion_mpi
+      tests/integration/test_distributed_element_diffusion_mpi.cpp)
+    target_include_directories(test_integration_distributed_element_diffusion_mpi PRIVATE ${PROJECT_SOURCE_DIR}/src)
+    target_link_libraries(test_integration_distributed_element_diffusion_mpi PRIVATE cosmosim_all)
+    # G2.2 octet-family co-location of migration plans (NOT RUN — USER-RESERVED).
+    add_executable(test_integration_amr_family_colocation_mpi tests/integration/test_amr_family_colocation_mpi.cpp)
+    target_include_directories(test_integration_amr_family_colocation_mpi PRIVATE ${PROJECT_SOURCE_DIR}/src)
+    target_link_libraries(test_integration_amr_family_colocation_mpi PRIVATE cosmosim_all)
+    foreach(chui_family_np IN ITEMS 2 4)
+      add_test(
+        NAME integration_amr_family_colocation_mpi_np${chui_family_np}
+        COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} ${chui_family_np} ${MPIEXEC_PREFLAGS}
+                $<TARGET_FILE:test_integration_amr_family_colocation_mpi> ${MPIEXEC_POSTFLAGS})
+      set_tests_properties(integration_amr_family_colocation_mpi_np${chui_family_np}
+        PROPERTIES SKIP_RETURN_CODE 77 LABELS "chui_part3;mpi;distributed;amr;integration")
+    endforeach()
+    foreach(chui_diffusion_np IN ITEMS 2 4)
+      add_test(
+        NAME integration_distributed_element_diffusion_mpi_np${chui_diffusion_np}
+        COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} ${chui_diffusion_np} ${MPIEXEC_PREFLAGS}
+                $<TARGET_FILE:test_integration_distributed_element_diffusion_mpi> ${MPIEXEC_POSTFLAGS})
+      set_tests_properties(integration_distributed_element_diffusion_mpi_np${chui_diffusion_np}
+        PROPERTIES SKIP_RETURN_CODE 77 LABELS "chui_part3;mpi;distributed;integration")
+    endforeach()
   endif()
 
   if(COSMOSIM_ENABLE_MPI AND COSMOSIM_ENABLE_HDF5)
@@ -2664,6 +2694,16 @@ if(COSMOSIM_ENABLE_BENCHMARKS)
   add_executable(bench_hydro_method_matrix bench/hydro/bench_hydro_method_matrix.cpp)
   target_link_libraries(bench_hydro_method_matrix PRIVATE cosmosim_hydro)
   target_include_directories(bench_hydro_method_matrix PRIVATE ${PROJECT_SOURCE_DIR})
+
+  # CHUI final-design benchmarks (V5; NOT RUN — USER-RESERVED). Registered as
+  # executables only, never as mandatory CTest entries.
+  add_executable(bench_chui_final_kernels bench/chui_final/bench_chui_final_kernels.cpp)
+  target_link_libraries(bench_chui_final_kernels PRIVATE cosmosim_all)
+  if(COSMOSIM_ENABLE_MPI)
+    add_executable(bench_chui_final_mpi bench/chui_final/bench_chui_final_mpi.cpp)
+    target_include_directories(bench_chui_final_mpi PRIVATE ${PROJECT_SOURCE_DIR}/src)
+    target_link_libraries(bench_chui_final_mpi PRIVATE cosmosim_all)
+  endif()
 
   add_executable(bench_amr_regrid_kernel bench/amr/bench_amr_regrid_kernel.cpp)
   target_link_libraries(bench_amr_regrid_kernel PRIVATE cosmosim_amr)

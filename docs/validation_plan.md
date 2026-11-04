@@ -1,5 +1,23 @@
 # Validation plan
 
+## 2026-11-04 final-design closure — owner-run only
+
+New or extended tests (all NOT RUN):
+
+* `integration_distributed_element_diffusion_mpi_np{2,4}`: the decomposition
+  reference is matched to 1e-12, and global lane totals are conserved to 1e-13;
+* `integration_amr_family_colocation_mpi_np{2,4}`;
+* `unit_amr_recursive_subcycling`: loopback distributed driver is bitwise equal
+  to the local driver;
+* `unit_chui_part3_remote_sources`: association partition invariance and
+  energy and momentum conservation;
+* `unit_workflow_metal_diffusion_topology`;
+* `unit_stellar_population_feedback`: 200-way SSP subdivision.
+
+Thresholds are round-off bounds for explicit convex updates and id-ordered
+sums. None was widened. See
+[`repair/chui_final_design_closure_20261104.md`](repair/chui_final_design_closure_20261104.md) §8.
+
 ## 2026-11-04 AMR admission/history checkpoint — owner-run only
 
 New `unit_amr_history_atomicity` and extended `unit_amr_recursive_subcycling` /

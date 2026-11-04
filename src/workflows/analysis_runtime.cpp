@@ -1,5 +1,7 @@
 #include "cosmosim/workflows/analysis_runtime.hpp"
 
+#include <algorithm>
+#include <array>
 #include <cmath>
 #include <exception>
 #include <limits>
@@ -10,8 +12,11 @@
 #include <vector>
 
 #include "cosmosim/analysis/diagnostics.hpp"
+#include "cosmosim/analysis/zoom_contamination.hpp"
 #include "cosmosim/core/memory_governor.hpp"
 #include "cosmosim/core/profiling.hpp"
+#include "cosmosim/core/simulation_mode.hpp"
+#include "cosmosim/core/simulation_state.hpp"
 #include "cosmosim/parallel/distributed_memory.hpp"
 #include "cosmosim/workflows/runtime_services.hpp"
 #include "workflows/internal/runtime_stage_resource_access.hpp"
@@ -62,6 +67,88 @@ class AnalysisRuntimeImpl final : public AnalysisRuntime {
     m_services.profiler.counters().addCount("runtime.audited_stage_count");
     m_stage_sequence->push_back(
         std::string(core::integrationStageName(context.stage)));
+  }
+
+  // G3.4: operational zoom-contamination report at the run-health cadence
+  // (zoom_in mode). Collisionless dark-matter particles are classified by
+  // mass against the GLOBAL minimum particle mass (relative tolerance
+  // k_high_res_mass_tolerance, a mass-equality tolerance for identical IC
+  // particle masses, not a physics parameter); rank partials combine by
+  // sums and a minimum. Emitted as profiler event analysis.zoom_contamination
+  // and counters; positions/radius use the comoving code length convention of
+  // the TreePM zoom options (config values in Mpc comoving).
+  void reportZoomContamination(const core::StepContext& context, std::uint64_t step) {
+    if (m_config.mode.mode != core::SimulationMode::kZoomIn) return;
+    const double radius = m_config.mode.zoom_contamination_radius_mpc_comoving > 0.0
+        ? m_config.mode.zoom_contamination_radius_mpc_comoving
+        : m_config.mode.zoom_region_radius_mpc_comoving;
+    if (!(radius > 0.0)) return;  // rank-uniform (configuration)
+    constexpr double k_high_res_mass_tolerance = 1.0e-6;
+    const core::SimulationState& state = context.state;
+    std::vector<double> x, y, z, mass;
+    double local_min_mass = std::numeric_limits<double>::infinity();
+    std::exception_ptr failure;
+    try {
+      const bool homogeneous = state.hasHomogeneousDmoMetadata();
+      for (std::size_t p = 0; p < state.particles.size(); ++p) {
+        const bool dark_matter = homogeneous ||
+            (p < state.particle_sidecar.species_tag.size() &&
+             state.particle_sidecar.species_tag[p] == static_cast<std::uint32_t>(core::ParticleSpecies::kDarkMatter));
+        if (!dark_matter) continue;
+        x.push_back(state.particles.position_x_comoving[p]);
+        y.push_back(state.particles.position_y_comoving[p]);
+        z.push_back(state.particles.position_z_comoving[p]);
+        mass.push_back(state.particles.mass_code[p]);
+        local_min_mass = std::min(local_min_mass, state.particles.mass_code[p]);
+      }
+    } catch (...) {
+      failure = std::current_exception();
+    }
+    FailureCoordinator(m_services).rethrowCollectiveFailure(failure, "zoom contamination census");
+    const double global_min_mass = m_services.mpi_context.allreduceMinDouble(local_min_mass);
+    analysis::ZoomContaminationReport report;
+    try {
+      if (std::isfinite(global_min_mass)) {
+        report = analysis::zoomContaminationDiagnostics(
+            x, y, z, mass,
+            {m_config.mode.zoom_region_center_x_mpc_comoving, m_config.mode.zoom_region_center_y_mpc_comoving,
+             m_config.mode.zoom_region_center_z_mpc_comoving},
+            radius, global_min_mass, k_high_res_mass_tolerance, true,
+            {m_config.cosmology.box_size_x_mpc_comoving, m_config.cosmology.box_size_y_mpc_comoving,
+             m_config.cosmology.box_size_z_mpc_comoving});
+      }
+    } catch (...) {
+      failure = std::current_exception();
+    }
+    FailureCoordinator(m_services).rethrowCollectiveFailure(failure, "zoom contamination diagnostic");
+    std::array<std::uint64_t, 2> counts{report.high_res_count, report.low_res_count};
+    m_services.mpi_context.allreduceSumUint64sInPlace(counts);
+    std::array<double, 2> masses{report.high_res_mass, report.low_res_mass};
+    m_services.mpi_context.allreduceSumDoublesInPlace(masses);
+    const double nearest = m_services.mpi_context.allreduceMinDouble(report.nearest_low_res_distance);
+    analysis::ZoomContaminationReport global;
+    global.high_res_count = counts[0];
+    global.low_res_count = counts[1];
+    global.high_res_mass = masses[0];
+    global.low_res_mass = masses[1];
+    global.nearest_low_res_distance = nearest;
+    m_services.profiler.counters().setCount("analysis.zoom.low_res_count", global.low_res_count);
+    m_services.profiler.counters().setCount("analysis.zoom.high_res_count", global.high_res_count);
+    m_services.profiler.recordEvent(core::RuntimeEvent{
+        .event_kind = "analysis.zoom_contamination",
+        .severity = global.low_res_count > 0U ? core::RuntimeEventSeverity::kWarning : core::RuntimeEventSeverity::kInfo,
+        .subsystem = "analysis.zoom",
+        .step_index = step,
+        .simulation_time_code = context.integrator_state.current_time_code,
+        .scale_factor = context.timeline_step.scale_factor_end,
+        .message = "measured low-resolution contamination inside the zoom contamination sphere",
+        .payload = {{"radius_comoving", std::to_string(radius)},
+                    {"high_res_count", std::to_string(global.high_res_count)},
+                    {"low_res_count", std::to_string(global.low_res_count)},
+                    {"high_res_mass_code", std::to_string(global.high_res_mass)},
+                    {"low_res_mass_code", std::to_string(global.low_res_mass)},
+                    {"low_res_mass_fraction", std::to_string(global.lowResMassFraction())},
+                    {"nearest_low_res_distance_comoving", std::isfinite(nearest) ? std::to_string(nearest) : "inf"}}});
   }
 
   void executeDiagnostics(AnalysisStageView& view) override {
@@ -132,6 +219,7 @@ class AnalysisRuntimeImpl final : public AnalysisRuntime {
     };
     if (step % static_cast<std::uint64_t>(
                    m_config.analysis.run_health_interval_steps) == 0) {
+      reportZoomContamination(context, step);
       // Required health is never silently skipped. Its owner admission failure
       // is a controlled error, coordinated before any later collective phase.
       std::exception_ptr health_failure;

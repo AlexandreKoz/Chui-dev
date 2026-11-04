@@ -22,6 +22,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <limits>
 #include <optional>
 #include <stdexcept>
 #include <vector>
@@ -298,9 +299,91 @@ void testDistributedCompositionAccumulator() {
   }
 }
 
+// R1 (A03): physics-aware indicators in the production planner.
+//  * metallicity, species and vorticity interfaces are OPTIONAL requests;
+//  * the cooling length is MANDATORY and blocks derefinement inside the
+//    hysteresis band; a zero budget truncates and REPORTS a mandatory request;
+//  * each indicator is inactive (no request) for uniform data.
+amr::ProductionAmrRegridPolicy physicsPolicy(amr::AmrRegridPassKind pass) {
+  amr::ProductionAmrRegridPolicy policy = jumpPolicy(pass);
+  policy.criteria.use_gradient_indicator = false;
+  return policy;
+}
+
+void makeUniform(core::SimulationState& state) {
+  for (std::uint32_t row = 0; row < 8U; ++row) {
+    state.gas_cells.metal_mass_code[row] = 0.01 * state.cells.mass_code[row];
+    state.gas_cells.velocity_x_peculiar[row] = 0.0;
+  }
+}
+
+void testPhysicsIndicators() {
+  {  // metallicity interface (row-dependent Z in makeRootState)
+    core::SimulationState state = makeRootState(false);
+    auto policy = physicsPolicy(amr::AmrRegridPassKind::kRefineOnly);
+    policy.physics.metallicity_jump = 0.5;
+    const auto plan = amr::planProductionAmrRegrid(state, {}, policy);
+    CHUI_REQUIRE(plan.operations.size() == 1U && plan.optional_refine_requests == 1U &&
+                 plan.mandatory_refine_requests == 0U);
+    makeUniform(state);
+    CHUI_REQUIRE(amr::planProductionAmrRegrid(state, {}, policy).operations.empty());
+  }
+  {  // vorticity: shear v_y(x) gives curl_z = dv_y/dx
+    core::SimulationState state = makeRootState(false);
+    makeUniform(state);
+    auto policy = physicsPolicy(amr::AmrRegridPassKind::kRefineOnly);
+    policy.physics.vorticity = 0.1;
+    CHUI_REQUIRE(amr::planProductionAmrRegrid(state, {}, policy).operations.empty());
+    for (std::uint32_t row = 0; row < 8U; ++row) {
+      state.gas_cells.velocity_y_peculiar[row] = (row % 2U == 1U) ? 0.5 : 0.0;  // |w| dx / c_s ~ 0.39
+    }
+    const auto plan = amr::planProductionAmrRegrid(state, {}, policy);
+    CHUI_REQUIRE(plan.operations.size() == 1U && plan.optional_refine_requests == 1U);
+  }
+  {  // species interface on the hybrid composition sidecar
+    core::SimulationState state = makeRootState(false);
+    makeUniform(state);
+    auto policy = physicsPolicy(amr::AmrRegridPassKind::kRefineOnly);
+    // Initial species fractions differ by <~0.06 (metallicity-dependent H/He
+    // split from makeRootState); 0.15 separates that from the 0.3 jump below.
+    policy.physics.species_jump = 0.15;
+    CHUI_REQUIRE(amr::planProductionAmrRegrid(state, {}, policy).operations.empty());
+    const auto& d = state.gas_composition.descriptor();
+    CHUI_REQUIRE(d.species_lane_count > 0U);
+    double gas = 0.0;
+    for (std::uint32_t l = 0; l < d.element_lane_count; ++l) gas += state.gas_composition.value(d.element_lane_begin + l, 0U);
+    state.gas_composition.lane(d.species_lane_begin)[0] += 0.3 * gas;  // indicator only; not conservation data
+    CHUI_REQUIRE(amr::planProductionAmrRegrid(state, {}, policy).optional_refine_requests == 1U);
+  }
+  {  // cooling length (mandatory) and its derefinement guard
+    core::SimulationState state = makeRootState(false);
+    makeUniform(state);
+    std::vector<double> t_cool(8U, std::numeric_limits<double>::infinity());
+    auto policy = physicsPolicy(amr::AmrRegridPassKind::kRefineOnly);
+    policy.physics.cooling_length_cells = 4.0;
+    policy.physics.cooling_time_code = t_cool;
+    CHUI_REQUIRE(amr::planProductionAmrRegrid(state, {}, policy).operations.empty());
+    // c_s t_cool = 0.5 dx  => resolution 4 dx / (0.5 dx) = 8 > 1: refine.
+    const double cs = state.gas_cells.sound_speed_code[3];
+    t_cool[3] = 0.5 * 0.5 / cs;
+    policy.physics.cooling_time_code = t_cool;
+    const auto plan = amr::planProductionAmrRegrid(state, {}, policy);
+    CHUI_REQUIRE(plan.operations.size() == 1U && plan.mandatory_refine_requests == 1U);
+    policy.max_operations = 0U;
+    const auto starved = amr::planProductionAmrRegrid(state, {}, policy);
+    CHUI_REQUIRE(starved.operations.empty() && starved.mandatory_truncated_by_budget == 1U);
+    // Missing per-row cooling times are an error, not a silent no-op.
+    policy.physics.cooling_time_code = {};
+    bool refused = false;
+    try { (void)amr::planProductionAmrRegrid(state, {}, policy); } catch (const std::invalid_argument&) { refused = true; }
+    CHUI_REQUIRE(refused);
+  }
+}
+
 }  // namespace
 
 int main() {
+  testPhysicsIndicators();
   testRefineDerefineConservesHydroAndComposition();
   testMemoryRefusalLeavesStateUntouched();
   testBalanceAndMaxLevel();

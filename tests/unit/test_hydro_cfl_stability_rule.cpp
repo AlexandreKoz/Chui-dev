@@ -111,7 +111,7 @@ void testGuardUsesTheSameRule() {
 }
 
 void testConfigMapping() {
-  co::SimulationConfig config;
+  co::SimulationConfig config = co::makeUnvalidatedSimulationConfigForTests();
   CHUI_REQUIRE(co::hydroCflStabilityRuleFor(config) == co::HydroCflStabilityRule::kDimensionSummed);
   config.numerics.hydro_integration_scheme = co::HydroIntegrationMode::kCornerTransportUpwind;
   CHUI_REQUIRE(co::hydroCflStabilityRuleFor(config) == co::HydroCflStabilityRule::kPerAxisMaximum);

@@ -24,6 +24,7 @@
 //    momentum; unresolved cells use the KO15 terminal momentum.
 #include <algorithm>
 #include <cassert>
+#include <cstring>
 #include <cmath>
 #include <cstdint>
 #include <limits>
@@ -231,11 +232,79 @@ void testTerminalMomentumScaling() {
   assert(physics::kimOstriker2015TerminalMomentumMsunKms(1.0e51, 100.0) < p1);
 }
 
+// G3.2: fixed-node cumulative return. A 200-way subdivision of [1 Myr, 13.7
+// Gyr] (as a population crossing many steps / AMR substeps) sums to the
+// single-interval return to round-off, with NO non-monotone clamp in either
+// channel; every sub-interval return is non-negative per element.
+void testSspFixedNodeSubdivisionIsMonotone() {
+  const physics::SspModel ssp(physics::SspConfig{});
+  std::array<double, physics::k_chemical_element_count> x{};
+  x[0] = 0.72; x[1] = 0.26; x[4] = 0.012; x[2] = 0.003; x[3] = 0.001; x[6] = 0.004;
+  const std::uint64_t clamps_before = ssp.nonmonotone_return_clamps;
+  for (std::size_t channel = 0; channel < 2; ++channel) {
+    const double t0 = 1.0e6, t1 = 1.37e10;
+    const auto whole = ssp.massiveReturn(channel, t0, t1, x);
+    double sum = 0.0;
+    std::array<double, physics::k_chemical_element_count> sum_e{};
+    double previous_age = t0;
+    for (int k = 1; k <= 200; ++k) {
+      const double age = k == 200 ? t1 : t0 * std::pow(t1 / t0, static_cast<double>(k) / 200.0);
+      const auto part = ssp.massiveReturn(channel, previous_age, age, x);
+      assert(part.mass_fraction >= 0.0);
+      for (std::size_t e = 0; e < x.size(); ++e) {
+        assert(part.element_fraction[e] >= 0.0);
+        sum_e[e] += part.element_fraction[e];
+      }
+      sum += part.mass_fraction;
+      previous_age = age;
+    }
+    assert(std::abs(sum - whole.mass_fraction) <= 1.0e-11 * std::max(whole.mass_fraction, 1.0e-300));
+    for (std::size_t e = 0; e < x.size(); ++e) {
+      assert(std::abs(sum_e[e] - whole.element_fraction[e]) <= 1.0e-11 * std::max(whole.mass_fraction, 1.0e-300));
+    }
+  }
+  assert(ssp.nonmonotone_return_clamps == clamps_before);
+}
+
+// R2 (A04): the event forecast is the actual chronology. Scanning a 1000 Msun
+// population in 1 Myr steps, forecastStellarEvent(age, 1 Myr) is true exactly
+// in the steps where realizeEvents (the source-stage law) then realizes >= 1
+// event, and the forecast never mutates the record.
+void testEventForecastMatchesChronology() {
+  const physics::SspModel ssp(physics::SspConfig{});
+  std::array<double, physics::k_chemical_element_count> x{};
+  x[0] = 0.74; x[1] = 0.25; x[4] = 0.01;
+  physics::StellarPopulationRecord record = physics::makeStellarPopulationRecord(x, 0.0, 0x5eedULL);
+  const double birth = 1000.0;
+  double z = 0.0;
+  for (std::size_t e = 2; e < x.size(); ++e) z += x[e];
+  int agreements = 0;
+  for (int step = 0; step < 60; ++step) {
+    const double age = 1.0e6 * step;
+    const physics::StellarPopulationRecord before = record;
+    const bool forecast = physics::forecastStellarEvent(ssp, record, age, 1.0e6, birth, true);
+    assert(std::memcmp(&before, &record, sizeof(record)) == 0);  // nothing consumed
+    const auto cc = physics::realizeEvents(record, 0U, ssp.ccCumulativeNumber(age + 1.0e6, z) * birth);
+    const auto ia = physics::realizeEvents(record, 1U, ssp.iaCumulativeNumber(age + 1.0e6) * birth);
+    assert(forecast == (cc.count + ia.count > 0U));
+    if (forecast) ++agreements;
+  }
+  assert(agreements > 0);  // the 3-40 Myr CC window of a 1000 Msun population has events
+  // Expectation mode: >= 0.5 expected events in the window (heuristic rule).
+  physics::StellarPopulationRecord fresh = physics::makeStellarPopulationRecord(x, 0.0, 1U);
+  assert(!physics::forecastStellarEvent(ssp, fresh, 0.0, 1.0e5, birth, false));      // before the first SN
+  assert(physics::forecastStellarEvent(ssp, fresh, 5.0e6, 1.0e7, birth, false));
+  fresh.initialized = 0U;
+  assert(!physics::forecastStellarEvent(ssp, fresh, 5.0e6, 1.0e7, birth, true));     // no record => no forecast
+}
+
 }  // namespace
 
 int main() {
   testF5Chronology();
   testSspBudgets();
+  testSspFixedNodeSubdivisionIsMonotone();
+  testEventForecastMatchesChronology();
   testEventReplayIsSubdivisionAndRestartInvariant();
   testMechanicalFeedbackConservation();
   testTerminalMomentumScaling();

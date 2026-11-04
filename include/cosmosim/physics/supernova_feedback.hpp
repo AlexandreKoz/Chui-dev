@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <type_traits>
 #include <cstddef>
 #include <cstdint>
 #include <span>
@@ -75,7 +76,16 @@ struct FeedbackSourceBudget {
   double wind_momentum_code = 0.0;
   // Number of member stars merged into this source (associations); 1 = single.
   std::uint32_t member_count = 1U;
+  std::uint32_t reserved_padding = 0U;
+  // G0.3: kinetic energy of the member ejecta in the association centre-of-
+  // momentum frame, 1/2 sum_i m_i |v_i - V|^2 (code mass * code velocity^2).
+  // Depositing the merged ejecta at the single velocity V would otherwise
+  // discard it; the deposition adds it to the available energy so the merged
+  // and unmerged models inject the same total energy. Zero for single stars.
+  double association_dispersion_energy_code = 0.0;
 };
+static_assert(std::is_trivially_copyable_v<FeedbackSourceBudget>,
+              "FeedbackSourceBudget is exchanged as a byte record across ranks");
 
 struct FeedbackUnits {
   double mass_code_to_g = 1.0;
@@ -153,17 +163,46 @@ struct FeedbackLedger {
 };
 
 // CHUI Part 3 RESEARCH (EXPERIMENTAL/UNQUALIFIED): correlated stellar
-// associations / superbubbles. Sources born within the same association
-// lattice cell (comoving size `radius_code`, periodic-wrapped) and the same
-// birth-time window are merged into ONE deposition source: summed ejecta,
-// elements, dust, SN count/energy, pre-SN and wind budgets; position = member
-// mean (minimum image about the first member); velocity = ejecta-mass-weighted
-// mean (conserves the ejecta momentum). Budgets, event counts and energies
-// are therefore identical to the unmerged model; only the spatial/temporal
-// correlation of deposition changes (the research physics difference).
-// Deterministic: members ordered by stable source id. Limitation: grouping
-// is among sources owned by the same rank (cross-rank members form separate
-// groups; decomposition-dependent, documented).
+// associations / superbubbles (G0.3 decomposition-independent contract).
+//
+// Discovery: friends-of-friends over the GLOBAL set of active feedback
+// sources. Sources i and j are linked when their minimum-image comoving
+// separation is <= radius_code AND |t_birth,i - t_birth,j| <= window_years.
+// An association is a connected component; its stable identity is the
+// minimum member source_id (the "leader"). The component set depends only on
+// the global source set, never on its distribution over ranks or input order.
+//
+// Merge: members are combined in ascending source_id order (deterministic
+// floating-point summation). Summed ejecta, elements, dust, SN count/energy,
+// pre-SN and wind budgets; position = ejecta-mass-weighted minimum-image
+// centroid about the leader (arithmetic mean if the ejecta mass is zero),
+// wrapped into the periodic box; velocity V = total ejecta momentum / total
+// ejecta mass (conserves vector momentum); the internal velocity-dispersion
+// kinetic energy 1/2 sum m_i |v_i - V|^2 (plus any member's own) is carried in
+// association_dispersion_energy_code. Mass, elements, dust, energy and vector
+// momentum are therefore those of the unmerged members.
+struct AssociationSourceDescriptor {
+  std::uint64_t source_id = 0U;
+  std::array<double, 3> position_comoving{};
+  double birth_years = 0.0;
+  std::int32_t owner_rank = 0;
+  std::int32_t reserved = 0;
+};
+static_assert(std::is_trivially_copyable_v<AssociationSourceDescriptor>);
+
+// Returns, for each descriptor of `sources` (any order, unique source ids),
+// the leader source id of its association. Throws on duplicate ids or
+// non-positive radius/window.
+[[nodiscard]] std::vector<std::uint64_t> discoverAssociationLeaders(
+    std::span<const AssociationSourceDescriptor> sources, double radius_code, double window_years,
+    bool periodic, const std::array<double, 3>& box_extent_comoving);
+
+// Merges the members of ONE association (any order; sorted internally by id).
+[[nodiscard]] FeedbackSourceBudget mergeAssociationMembers(
+    std::span<const FeedbackSourceBudget> members, bool periodic, const std::array<double, 3>& box_extent_comoving);
+
+// Single-rank convenience: discovery + merge over `sources` (output ordered by
+// leader id). With all sources on one rank this equals the distributed result.
 [[nodiscard]] std::vector<FeedbackSourceBudget> mergeAssociationSources(
     std::span<const FeedbackSourceBudget> sources, std::span<const double> birth_years,
     double radius_code, double window_years, bool periodic, const std::array<double, 3>& box_extent_comoving);

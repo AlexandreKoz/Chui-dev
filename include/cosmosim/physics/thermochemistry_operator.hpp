@@ -57,12 +57,20 @@ struct ChemistryAdaptiveConfig {
   double co_carbon_fraction_threshold = 1.0e-6;
   double hysteresis_fraction = 0.3;
   double minimum_dwell_years = 1.0e6;
+  // R3 (C03): timescale/stiffness criterion. Promote when the network's own
+  // net cooling time t_cool = u / (Lambda + chem - Gamma) is shorter than
+  // cooling_time_ratio x the source interval (stiff, rapidly cooling gas in
+  // which the composition-dependent cooling of the detailed network must be
+  // followed); demotion additionally requires t_cool > ratio dt (1 + h).
+  // 0 disables. EXPERIMENTAL/UNQUALIFIED (uncalibrated).
+  double cooling_time_ratio = 0.0;
 };
 
 struct ChemistryAdaptiveReport {
   std::uint64_t promoted = 0U;
   std::uint64_t demoted = 0U;
   std::uint64_t held_by_dwell = 0U;
+  std::uint64_t promoted_by_cooling_time = 0U;  // R3: promotions where the timescale criterion fired
   std::uint64_t detailed_cells = 0U;
   std::uint64_t hybrid_cells = 0U;
 };
@@ -121,6 +129,8 @@ struct ChemistryFidelityDecision {
   bool promoted = false;
   bool demoted = false;
   bool held_by_dwell = false;
+  bool cooling_time_trigger = false;  // R3: the timescale criterion requested detailed chemistry
+  double cooling_time_seconds = 0.0;  // diagnostic (+inf when net heating)
 };
 
 // ---------------------------------------------------------------------------

@@ -1,5 +1,58 @@
 # Current repository status
 
+## Final data and closure, pass 2 — 2026-11-04
+
+**SOURCE ONLY — CHUI NOT BUILT OR RUN.**
+
+The data workflow ran (Python converters and validators only):
+
+* NuGrid/W7 yields, VALID;
+* SB99 winds (Z = 0.014);
+* the 49-redshift WSS09 element cooling, VALID;
+* FG20 TREECOOL, VALID.
+
+Added in source:
+
+* physics-aware AMR indicators with a mandatory/optional budget;
+* event-aware predictive AMR;
+* a cooling-time criterion for adaptive chemistry;
+* benchmark sources.
+
+Still PARTIAL:
+
+* T02 level-local source coupling;
+* H01 CTU interface stencils;
+* V02 coordinated controller;
+* V1–V3 end-to-end tests.
+
+See the [pass-2 ledger](docs/repair/chui_final_data_and_closure_20261104.md).
+
+## Final design v1.0 implementation closure — 2026-11-04
+
+**IMPLEMENTED IN SOURCE — NOT COMPILED, NOT RUN — USER-RESERVED.** The
+following now exist in source:
+
+* distributed recursive AMR subcycling;
+* level-relaxed hydro CFL with a recorded limiter;
+* distributed element-resolved diffusion (unique flux authority);
+* global FoF stellar associations merged before the remote stencil query;
+* sidecar-authoritative adaptive-chemistry control;
+* complete diffusion memory admission;
+* split-interface reflux fix;
+* octet-family co-location in migration;
+* source-controller rollback checkpoint;
+* structurally monotone SSP returns;
+* operational zoom-contamination reporting.
+
+Still PARTIAL:
+
+* G3.1 CTU at remote boundaries (H02 remote dual-energy is now in source);
+* G4 adaptive indicators and predictor;
+* V01 snapshot import;
+* several MPI end-to-end tests and benchmarks.
+
+See the [closure ledger and handoff](docs/repair/chui_final_design_closure_20261104.md).
+
 ## Design conformance A1/A2 checkpoint — 2026-11-04
 
 **SOURCE REPAIRED — NOT RUN — USER-RESERVED.** Recursive AMR driver rows and

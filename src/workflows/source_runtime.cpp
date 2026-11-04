@@ -6,11 +6,14 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <type_traits>
+#include <utility>
 #include <unordered_map>
 #include <exception>
 #include <limits>
 #include <memory>
 #include <numeric>
+#include <optional>
 #include <memory_resource>
 #include <span>
 #include <stdexcept>
@@ -48,6 +51,7 @@
 #include "workflows/internal/gas_cell_ownership.hpp"
 #include "workflows/internal/mpi_stage_collective_decision.hpp"
 #include "workflows/internal/particle_id_registry.hpp"
+#include "workflows/internal/distributed_element_diffusion.hpp"
 #include "workflows/internal/metal_diffusion_topology.hpp"
 #include "workflows/internal/runtime_stage_resource_access.hpp"
 #include "workflows/internal/retained_population_growth.hpp"
@@ -725,6 +729,11 @@ class DistributedParticleIdRegistry final : public physics::ParticleIdPrecommit 
 
   // Initial population validation is streamed in fixed local batches. The
   // persistent shard is O(owned hash shard), never replicated on every rank.
+  // G1.6: a rolled-back step may have occupied IDs that no longer exist in
+  // the restored state; the occupancy cache is rebuilt (collectively) from
+  // the authoritative particle IDs at its next use.
+  void invalidateOccupancyCache() noexcept { m_initialized = false; }
+
   void initializeOccupiedShard(std::span<const std::uint64_t> local_ids) {
     constexpr std::size_t k_initial_chunk = 4096U;
     const int world_size = m_mpi_context.worldSize();
@@ -899,6 +908,8 @@ class SourceRuntimeImpl final : public SourceRuntime {
         m_stellar_feedback(makeRuntimeStellarFeedbackConfig(config, units)),
         m_metal_diffusion(physics::makeMetalDiffusionConfig(config.physics)),
         m_black_hole(makeRuntimeBlackHoleAgnConfig(config.physics, units)),
+        m_physics_config(config.physics),
+        m_full_config(config),
         m_particle_id_registry(mpi_context),
         m_mpi_context(mpi_context),
         m_runtime_services(runtime_services),
@@ -936,8 +947,6 @@ class SourceRuntimeImpl final : public SourceRuntime {
     // CHUI Part 2: resolve the thermochemistry model, its data products and
     // the composition layout ONCE (never in cell loops). Missing production
     // data stops construction with SourceModelUnavailableError.
-    m_physics_config = config.physics;
-    m_full_config = config;
     m_box_extent_comoving = {config.cosmology.box_size_x_mpc_comoving, config.cosmology.box_size_y_mpc_comoving,
                              config.cosmology.box_size_z_mpc_comoving};
     if (config.physics.enable_stellar_evolution &&
@@ -980,6 +989,59 @@ class SourceRuntimeImpl final : public SourceRuntime {
           physics::CompositionLayout::make(physics::compositionLayoutRequestFromConfig(config.physics)));
     }
   }
+
+  void captureRollbackCheckpoint() override {
+    ControllerCheckpoint checkpoint;
+    if (m_ssp_model != nullptr) {
+      checkpoint.ssp_table_clamps = m_ssp_model->table_clamps;
+      checkpoint.ssp_negative_ejecta_clamps = m_ssp_model->negative_ejecta_clamps;
+      checkpoint.ssp_untracked_mass_residual_msun = m_ssp_model->untracked_mass_residual_msun;
+      checkpoint.ssp_nonmonotone_return_clamps = m_ssp_model->nonmonotone_return_clamps;
+    }
+    checkpoint.wind_metallicity_clamps = m_wind_metallicity_clamps;
+    checkpoint.sf_gradient_unavailable_cells = m_sf_gradient_unavailable_cells;
+    checkpoint.sf_gradient_coarse_fine_cells = m_sf_gradient_coarse_fine_cells;
+    checkpoint.last_thermochemistry_ledger = m_last_thermochemistry_ledger;
+    checkpoint.last_feedback_ledger = m_last_feedback_ledger;
+    checkpoint.last_ism_regime_report = m_last_ism_regime_report;
+    checkpoint.last_chemistry_adaptive_report = m_last_chemistry_adaptive_report;
+    checkpoint.last_dust_ledger = m_last_dust_ledger;
+    checkpoint.last_sgs_ledger = m_last_sgs_ledger;
+    checkpoint.last_shadow_report = m_last_shadow_report;
+    checkpoint.last_skipped_effective_rows = m_last_skipped_effective_rows;
+    checkpoint.last_element_diffusion = m_last_element_diffusion;
+    m_rollback_checkpoint = std::move(checkpoint);
+  }
+
+  void restoreRollbackCheckpoint() override {
+    if (!m_rollback_checkpoint.has_value()) {
+      throw std::logic_error("source runtime rollback restore without a captured checkpoint");
+    }
+    const ControllerCheckpoint& c = *m_rollback_checkpoint;
+    if (m_ssp_model != nullptr) {
+      m_ssp_model->table_clamps = c.ssp_table_clamps;
+      m_ssp_model->negative_ejecta_clamps = c.ssp_negative_ejecta_clamps;
+      m_ssp_model->untracked_mass_residual_msun = c.ssp_untracked_mass_residual_msun;
+      m_ssp_model->nonmonotone_return_clamps = c.ssp_nonmonotone_return_clamps;
+    }
+    m_wind_metallicity_clamps = c.wind_metallicity_clamps;
+    m_sf_gradient_unavailable_cells = c.sf_gradient_unavailable_cells;
+    m_sf_gradient_coarse_fine_cells = c.sf_gradient_coarse_fine_cells;
+    m_last_thermochemistry_ledger = c.last_thermochemistry_ledger;
+    m_last_feedback_ledger = c.last_feedback_ledger;
+    m_last_ism_regime_report = c.last_ism_regime_report;
+    m_last_chemistry_adaptive_report = c.last_chemistry_adaptive_report;
+    m_last_dust_ledger = c.last_dust_ledger;
+    m_last_sgs_ledger = c.last_sgs_ledger;
+    m_last_shadow_report = c.last_shadow_report;
+    m_last_skipped_effective_rows = c.last_skipped_effective_rows;
+    m_last_element_diffusion = c.last_element_diffusion;
+    m_particle_id_registry.invalidateOccupancyCache();
+    // The chemistry promotion bias is re-derived from the restored sidecar
+    // before the next fidelity decision (G0.4); nothing to restore here.
+  }
+
+  void discardRollbackCheckpoint() noexcept override { m_rollback_checkpoint.reset(); }
 
   [[nodiscard]] core::MemoryReport memoryReport() const override {
     core::MemoryReportBuilder builder;
@@ -1623,6 +1685,13 @@ class SourceRuntimeImpl final : public SourceRuntime {
     // from the step-start state, staged per row, and written together only
     // after the collective accept. A rejection leaves state, metadata and
     // the published diagnostics exactly as they were.
+    // G0.4: the committed promotion bias has exactly one authority, the
+    // canonical sidecar "chui_adaptive_chemistry_control_v1" carried by
+    // SimulationState (restart payload and rollback copy). The operator's
+    // cached bias is re-derived from it before EVERY fidelity decision, so a
+    // rejected/rolled-back step, a restart, or a retry cannot reuse a value
+    // that was never committed to the canonical state.
+    loadCommittedChemistryControl(context.state);
     physics::BaryonicSourceStage stage(*m_thermochemistry, m_source_stage_config);
     const internal::MpiStageCollectiveDecision decision(m_mpi_context);
     core::StageTransaction transaction("sources.baryonic_stage", m_memory_governor, &decision);
@@ -1658,7 +1727,12 @@ class SourceRuntimeImpl final : public SourceRuntime {
       m_last_shadow_report = report.shadow;
       m_last_skipped_effective_rows = report.skipped_effective_rows;
     }
-    updateGlobalChemistryControl(context);
+    // Ranks without local work contribute zero current samples (never a stale
+    // report from a previous stage) to the collective control reduction.
+    const physics::ChemistryShadowReport current_shadow =
+        local_work ? m_last_shadow_report : physics::ChemistryShadowReport{};
+    if (!local_work) m_last_shadow_report = current_shadow;
+    updateGlobalChemistryControl(context, current_shadow);
     if (!touched.empty()) {
       context.state.notifyGasThermodynamicMutation();
       std::unique_ptr<physics::EffectiveIsmThermodynamicClosure> closure;
@@ -1697,6 +1771,9 @@ class SourceRuntimeImpl final : public SourceRuntime {
                       {"regime_changes", std::to_string(m_last_ism_regime_report.changed_rows.size())},
                       {"fidelity_promoted", std::to_string(m_last_chemistry_adaptive_report.promoted)},
                       {"fidelity_demoted", std::to_string(m_last_chemistry_adaptive_report.demoted)},
+                      {"fidelity_promoted_by_cooling_time",
+                       std::to_string(m_last_chemistry_adaptive_report.promoted_by_cooling_time)},
+                      {"fidelity_held_by_dwell", std::to_string(m_last_chemistry_adaptive_report.held_by_dwell)},
                       {"dust_gas_to_dust_code", std::to_string(m_last_dust_ledger.gas_to_dust_code)},
                       {"dust_dust_to_gas_code", std::to_string(m_last_dust_ledger.dust_to_gas_code)},
                       {"sgs_dissipated_code", std::to_string(m_last_sgs_ledger.dissipated_to_heat_code)},
@@ -1722,19 +1799,40 @@ class SourceRuntimeImpl final : public SourceRuntime {
   // (sum), applies the same deterministic control law, and persists the bias
   // in module sidecar "chui_adaptive_chemistry_control_v1" so a restart
   // continues with the identical decision history.
-  void updateGlobalChemistryControl(core::StepContext& context) {
-    if (m_thermochemistry == nullptr || !m_thermochemistry->config().adaptive.enabled) return;
-    const auto* stored = context.state.sidecars.find("chui_adaptive_chemistry_control_v1");
-    if (!m_chemistry_control_restored && stored != nullptr) {
-      const std::string text(reinterpret_cast<const char*>(stored->payload.data()), stored->payload.size());
-      const auto pos = text.find("promotion_bias=");
-      if (pos != std::string::npos) m_thermochemistry->setGlobalPromotionBias(std::stod(text.substr(pos + 15)));
+  // Parses the committed controller state from the canonical sidecar. Absent
+  // sidecar => the documented initial state (bias 0). A malformed payload is
+  // an invalid-state error, never a silent reset.
+  [[nodiscard]] static double committedPromotionBias(const core::SimulationState& state) {
+    const auto* stored = state.sidecars.find("chui_adaptive_chemistry_control_v1");
+    if (stored == nullptr) return 0.0;
+    const std::string text(reinterpret_cast<const char*>(stored->payload.data()), stored->payload.size());
+    const auto pos = text.find("promotion_bias=");
+    if (pos == std::string::npos) {
+      throw std::runtime_error("chui_adaptive_chemistry_control_v1 sidecar has no promotion_bias entry");
     }
-    m_chemistry_control_restored = true;
-    const double global_max = -m_mpi_context.allreduceMinDouble(-m_last_shadow_report.max_relative_species_difference);
-    const std::uint64_t global_samples = m_mpi_context.allreduceSumUint64(m_last_shadow_report.samples);
-    const double bias = physics::nextChemistryPromotionBias(
-        m_thermochemistry->globalPromotionBias(), global_max, global_samples);
+    std::size_t consumed = 0U;
+    const double bias = std::stod(text.substr(pos + 15), &consumed);
+    if (consumed == 0U || !std::isfinite(bias) || bias < 0.0) {
+      throw std::runtime_error("chui_adaptive_chemistry_control_v1 sidecar has an invalid promotion_bias");
+    }
+    return bias;
+  }
+
+  void loadCommittedChemistryControl(const core::SimulationState& state) {
+    if (m_thermochemistry == nullptr || !m_thermochemistry->config().adaptive.enabled) return;
+    m_thermochemistry->setGlobalPromotionBias(committedPromotionBias(state));
+  }
+
+  void updateGlobalChemistryControl(core::StepContext& context,
+                                    const physics::ChemistryShadowReport& current_shadow) {
+    if (m_thermochemistry == nullptr || !m_thermochemistry->config().adaptive.enabled) return;
+    // Next value is a pure function of the COMMITTED bias and this stage's
+    // collective shadow reduction; it becomes authoritative only by being
+    // written to the canonical sidecar (restored on rollback/restart).
+    const double committed_bias = committedPromotionBias(context.state);
+    const double global_max = -m_mpi_context.allreduceMinDouble(-current_shadow.max_relative_species_difference);
+    const std::uint64_t global_samples = m_mpi_context.allreduceSumUint64(current_shadow.samples);
+    const double bias = physics::nextChemistryPromotionBias(committed_bias, global_max, global_samples);
     m_thermochemistry->setGlobalPromotionBias(bias);
     std::ostringstream text;
     text.precision(17);
@@ -1816,7 +1914,12 @@ class SourceRuntimeImpl final : public SourceRuntime {
     std::vector<Query> queries;
     std::vector<int> destinations;
     for (const auto& budget : budgets) {
-      if (budget.ejecta_mass_code == 0.0 && budget.supernova_energy_erg == 0.0 && budget.presn_momentum_code == 0.0) {
+      // Same activity predicate as MechanicalFeedbackDeposition::stage: a
+      // wind-only or dispersion-only source still deposits, so it must see the
+      // global stencil (previously skipped => rank-local stencil).
+      if (budget.ejecta_mass_code == 0.0 && budget.supernova_energy_erg == 0.0 && budget.presn_momentum_code == 0.0 &&
+          budget.wind_energy_erg == 0.0 && budget.wind_momentum_code == 0.0 &&
+          budget.association_dispersion_energy_code == 0.0) {
         continue;
       }
       const double r2 = deposition.localStencilRadius2(state, budget.position_comoving);
@@ -1868,6 +1971,163 @@ class SourceRuntimeImpl final : public SourceRuntime {
     std::vector<physics::FeedbackRemoteCandidate> remote(response_bytes.size() / sizeof(physics::FeedbackRemoteCandidate));
     if (!remote.empty()) std::memcpy(remote.data(), response_bytes.data(), response_bytes.size());
     deposition.setRemoteCandidates(state, std::move(remote));
+  }
+
+  // G0.3: decomposition-independent association discovery and merge.
+  //  1. every rank contributes compact descriptors of its ACTIVE feedback
+  //     sources (non-zero budget this interval); one bounded all-gather
+  //     gives every rank the identical global descriptor set (count reduced
+  //     and admitted first);
+  //  2. every rank runs the same deterministic friends-of-friends discovery
+  //     (physics::discoverAssociationLeaders) => identical leader ids;
+  //  3. member budgets are routed to the rank owning the leader (minimum id)
+  //     and merged there in ascending source-id order, so the merged budget
+  //     is bitwise independent of the MPI partition;
+  //  4. inactive (zero-budget) sources are dropped exactly as before.
+  // Every collective is entered by every rank (failures are reduced first).
+  std::vector<physics::FeedbackSourceBudget> mergeAssociationsDistributed(
+      const std::vector<physics::FeedbackSourceBudget>& budgets,
+      const std::vector<double>& birth_years,
+      const physics::FeedbackUnits& units,
+      bool distributed,
+      std::uint64_t sequence) {
+    if (budgets.size() != birth_years.size()) {
+      throw std::logic_error("association merge: budget/birth-time lists differ in length");
+    }
+    const auto active = [](const physics::FeedbackSourceBudget& b) {
+      return b.ejecta_mass_code != 0.0 || b.supernova_energy_erg != 0.0 || b.presn_momentum_code != 0.0 ||
+          b.wind_energy_erg != 0.0 || b.wind_momentum_code != 0.0 || b.association_dispersion_energy_code != 0.0;
+    };
+    const int rank = distributed ? m_mpi_context.worldRank() : 0;
+    std::vector<physics::AssociationSourceDescriptor> local;
+    std::vector<std::size_t> local_budget_index;
+    std::exception_ptr failure;
+    try {
+      for (std::size_t i = 0; i < budgets.size(); ++i) {
+        if (!active(budgets[i])) continue;
+        physics::AssociationSourceDescriptor d;
+        d.source_id = budgets[i].source_id;
+        d.position_comoving = budgets[i].position_comoving;
+        d.birth_years = birth_years[i];
+        d.owner_rank = rank;
+        local.push_back(d);
+        local_budget_index.push_back(i);
+      }
+    } catch (...) {
+      failure = std::current_exception();
+    }
+    if (distributed) m_mpi_context.rethrowCollectivePreparationFailure(failure, "association descriptors");
+    else if (failure != nullptr) std::rethrow_exception(failure);
+
+    std::vector<physics::AssociationSourceDescriptor> global;
+    core::MemoryReservation global_reservation;
+    if (distributed) {
+      const std::uint64_t global_count = m_mpi_context.allreduceSumUint64(local.size());
+      try {
+        if (m_memory_governor != nullptr) {
+          // Gathered bytes, decoded descriptors and discovery scratch
+          // (entries, parent, leader ids, sort keys) coexist.
+          const std::uint64_t per_source = 2U * sizeof(physics::AssociationSourceDescriptor) +
+              sizeof(std::array<std::int64_t, 3>) + 4U * sizeof(std::uint64_t) + 2U * sizeof(std::size_t);
+          global_reservation = m_memory_governor->reserve(
+              core::MemoryClass::kPhaseResident, global_count * per_source, "sources.associations.global_discovery");
+          global_reservation.commit();
+        }
+      } catch (...) {
+        failure = std::current_exception();
+      }
+      m_mpi_context.rethrowCollectivePreparationFailure(failure, "association discovery admission");
+      const auto bytes = m_mpi_context.allgatherBytesBounded(std::span<const std::uint8_t>(
+          reinterpret_cast<const std::uint8_t*>(local.data()),
+          local.size() * sizeof(physics::AssociationSourceDescriptor)));
+      if (bytes.size() != global_count * sizeof(physics::AssociationSourceDescriptor)) {
+        throw std::runtime_error("association discovery: gathered descriptor size mismatch");
+      }
+      global.resize(static_cast<std::size_t>(global_count));
+      if (!bytes.empty()) std::memcpy(global.data(), bytes.data(), bytes.size());
+    } else {
+      global = local;
+    }
+    std::vector<std::uint64_t> leaders;
+    try {
+      leaders = physics::discoverAssociationLeaders(
+          global, m_physics_config.ssp_association_radius_code,
+          m_physics_config.ssp_association_time_window_years, units.periodic, units.box_extent_comoving);
+    } catch (...) {
+      failure = std::current_exception();
+    }
+    if (distributed) m_mpi_context.rethrowCollectivePreparationFailure(failure, "association discovery");
+    else if (failure != nullptr) std::rethrow_exception(failure);
+
+    // Leader id -> owner rank (the descriptor whose id equals the leader).
+    std::vector<std::pair<std::uint64_t, int>> owner_of;
+    owner_of.reserve(global.size());
+    for (const auto& d : global) owner_of.emplace_back(d.source_id, d.owner_rank);
+    std::sort(owner_of.begin(), owner_of.end());
+    const auto owner_rank_of = [&owner_of](std::uint64_t id) {
+      const auto it = std::lower_bound(owner_of.begin(), owner_of.end(), std::make_pair(id, -1));
+      if (it == owner_of.end() || it->first != id) {
+        throw std::logic_error("association discovery: leader id has no descriptor");
+      }
+      return it->second;
+    };
+    std::vector<std::uint64_t> local_leader(local.size());
+    {
+      std::vector<std::pair<std::uint64_t, std::uint64_t>> id_to_leader(global.size());
+      for (std::size_t g = 0; g < global.size(); ++g) id_to_leader[g] = {global[g].source_id, leaders[g]};
+      std::sort(id_to_leader.begin(), id_to_leader.end());
+      for (std::size_t l = 0; l < local.size(); ++l) {
+        const auto it = std::lower_bound(id_to_leader.begin(), id_to_leader.end(),
+                                         std::make_pair(local[l].source_id, std::uint64_t{0}));
+        local_leader[l] = it->second;
+      }
+    }
+    struct MemberRecord {
+      std::uint64_t leader_id = 0U;
+      physics::FeedbackSourceBudget budget{};
+    };
+    static_assert(std::is_trivially_copyable_v<MemberRecord>);
+    std::vector<MemberRecord> outbound;
+    std::vector<int> destinations;
+    std::vector<MemberRecord> kept;
+    for (std::size_t l = 0; l < local.size(); ++l) {
+      MemberRecord rec{local_leader[l], budgets[local_budget_index[l]]};
+      const int dest = owner_rank_of(local_leader[l]);
+      if (dest == rank) {
+        kept.push_back(rec);
+      } else {
+        outbound.push_back(rec);
+        destinations.push_back(dest);
+      }
+    }
+    if (distributed) {
+      const auto bytes = parallel::executeBlockingDestinationRecordExchange(
+          m_mpi_context,
+          std::span<const std::byte>(reinterpret_cast<const std::byte*>(outbound.data()),
+                                     outbound.size() * sizeof(MemberRecord)),
+          sizeof(MemberRecord), destinations, sequence);
+      const std::size_t received = bytes.size() / sizeof(MemberRecord);
+      const std::size_t base = kept.size();
+      kept.resize(base + received);
+      if (received > 0U) std::memcpy(kept.data() + base, bytes.data(), received * sizeof(MemberRecord));
+    } else if (!outbound.empty()) {
+      throw std::logic_error("association merge: single-rank merge routed a member off-rank");
+    }
+    std::sort(kept.begin(), kept.end(), [](const MemberRecord& l, const MemberRecord& r) {
+      return l.leader_id != r.leader_id ? l.leader_id < r.leader_id : l.budget.source_id < r.budget.source_id;
+    });
+    std::vector<physics::FeedbackSourceBudget> merged;
+    std::vector<physics::FeedbackSourceBudget> members;
+    std::size_t begin = 0U;
+    while (begin < kept.size()) {
+      std::size_t end = begin + 1U;
+      while (end < kept.size() && kept[end].leader_id == kept[begin].leader_id) ++end;
+      members.clear();
+      for (std::size_t k = begin; k < end; ++k) members.push_back(kept[k].budget);
+      merged.push_back(physics::mergeAssociationMembers(members, units.periodic, units.box_extent_comoving));
+      begin = end;
+    }
+    return merged;
   }
 
   // CHUI Part 2 stellar populations: age-resolved SSP mass/element return
@@ -2093,17 +2353,21 @@ class SourceRuntimeImpl final : public SourceRuntime {
       }
       if (distributed_feedback) {
         m_mpi_context.rethrowCollectivePreparationFailure(loop_failure, "stellar population budgets");
-        importRemoteFeedbackCandidates(state, deposition, staged_budgets, context.integrator_state.step_index);
       } else if (loop_failure != nullptr) {
         std::rethrow_exception(loop_failure);
       }
       if (m_physics_config.ssp_clustered_associations) {
-        // RESEARCH: correlated associations / superbubbles. Changes only WHERE
-        // budgets are deposited (event counts, energies and ejecta are those
-        // of the member stars, unchanged).
-        staged_budgets = physics::mergeAssociationSources(
-            staged_budgets, association_birth_years, m_physics_config.ssp_association_radius_code,
-            m_physics_config.ssp_association_time_window_years, units.periodic, units.box_extent_comoving);
+        // RESEARCH: correlated associations / superbubbles. G0.3 ordering:
+        // associations are discovered GLOBALLY and merged BEFORE any remote
+        // candidate query, because merging moves the deposition point. The
+        // merged budgets conserve mass, elements, dust, energy (including the
+        // internal velocity-dispersion kinetic energy) and vector momentum.
+        staged_budgets = mergeAssociationsDistributed(
+            staged_budgets, association_birth_years, units, distributed_feedback,
+            context.integrator_state.step_index);
+      }
+      if (distributed_feedback) {
+        importRemoteFeedbackCandidates(state, deposition, staged_budgets, context.integrator_state.step_index);
       }
       std::exception_ptr stage_failure;
       try {
@@ -2650,13 +2914,28 @@ class SourceRuntimeImpl final : public SourceRuntime {
   void executeMetalDiffusion(
       core::StepContext& context,
       double source_evaluation_scale_factor) {
-    if (!m_metal_diffusion.config().enabled || context.state.cells.size() == 0U) {
+    if (!m_metal_diffusion.config().enabled) {
       return;
     }
-    if (m_mpi_context.isEnabled() && m_mpi_context.worldSize() > 1) {
-      throw std::runtime_error(
-          "metal diffusion is not permitted on multiple MPI ranks until the directed gas-cell interface exchange "
-          "and equal-and-opposite remote flux commit are available; refusing a decomposition-dependent result");
+    // G2.1: on more than one rank every rank enters every collective of the
+    // distributed element-resolved operator, including ranks without gas.
+    const bool distributed = m_mpi_context.isEnabled() && m_mpi_context.worldSize() > 1;
+    if (!distributed && context.state.cells.size() == 0U) {
+      return;
+    }
+    if (distributed) {
+      const std::uint64_t local_composition = context.state.gas_composition.enabled() ? 1U : 0U;
+      const std::uint64_t any_composition = m_mpi_context.allreduceMaxUint64(local_composition);
+      const std::uint64_t all_composition = m_mpi_context.allreduceMinUint64(local_composition);
+      if (any_composition != all_composition) {
+        throw std::runtime_error(
+            "distributed metal diffusion: composition sidecar enabled on some ranks only (invalid state)");
+      }
+      if (any_composition == 0U) {
+        throw std::runtime_error(
+            "metal diffusion on multiple MPI ranks requires the element-resolved composition sidecar; the "
+            "legacy total-Z scalar operator is single-rank only (refusing a decomposition-dependent result)");
+      }
     }
 
     const std::size_t cell_count = context.state.cells.size();
@@ -2705,13 +2984,47 @@ class SourceRuntimeImpl final : public SourceRuntime {
     const double scale_factor = m_coordinate_frame == core::CoordinateFrame::kComoving
         ? source_evaluation_scale_factor
         : 1.0;
-    internal::MetalDiffusionTopologyResult topology =
-        internal::buildMetalDiffusionTopology(
-            context.state,
-            m_owned_leaf_mask,
-            m_world_rank,
-            scale_factor,
-            m_hydro_boundary);
+    // G2.1: remote owned leaf neighbours (one ghost layer) and the global
+    // periodic envelope; collective on every rank.
+    internal::RemoteDiffusionCellGather remote_gather;
+    if (distributed) {
+      remote_gather = internal::gatherRemoteDiffusionCells(
+          context.state, m_mpi_context, m_memory_governor, scale_factor,
+          m_hydro_boundary == core::BoundaryCondition::kPeriodic, m_box_extent_comoving,
+          context.integrator_state.step_index);
+    }
+    // G0.5: admit the topology builder's complete construction working set
+    // (new faces/remote faces/strain coexisting with the retained graph, the
+    // boundary list, plane map, unique sets and directed refs) BEFORE it is
+    // allocated. Released when this stage returns.
+    core::MemoryReservation topology_reservation;
+    internal::MetalDiffusionTopologyResult topology;
+    std::exception_ptr topology_failure;
+    try {
+      if (m_memory_governor != nullptr) {
+        topology_reservation = m_memory_governor->reserve(
+            core::MemoryClass::kScratchArena,
+            internal::metalDiffusionTopologyConstructionBoundBytes(
+                context.state, m_owned_leaf_mask, m_world_rank, remote_gather.cells.size()),
+            "sources.metal_diffusion.topology_construction");
+        topology_reservation.commit();
+      }
+      topology = internal::buildMetalDiffusionTopology(
+          context.state,
+          m_owned_leaf_mask,
+          m_world_rank,
+          scale_factor,
+          m_hydro_boundary,
+          remote_gather.cells,
+          distributed ? remote_gather.global_envelope_physical : std::nullopt);
+    } catch (...) {
+      topology_failure = std::current_exception();
+    }
+    if (distributed) {
+      m_mpi_context.rethrowCollectivePreparationFailure(topology_failure, "metal-diffusion topology construction");
+    } else if (topology_failure != nullptr) {
+      std::rethrow_exception(topology_failure);
+    }
     m_diffusion_topology_scratch_high_water_bytes = std::max(
         m_diffusion_topology_scratch_high_water_bytes,
         topology.construction_scratch_high_water_bytes);
@@ -2801,7 +3114,7 @@ class SourceRuntimeImpl final : public SourceRuntime {
               m_diffusion_rho_kappa_code[cell_index]);
     }
 
-    if (m_diffusion_faces.empty()) {
+    if (m_diffusion_faces.empty() && !distributed) {
       if (m_memory_governor != nullptr &&
           replacement_phase_reservation.committed()) {
         m_diffusion_phase_reservation.release();
@@ -2818,23 +3131,42 @@ class SourceRuntimeImpl final : public SourceRuntime {
       core::MemoryReservation element_reservation;
       std::exception_ptr element_failure;
       physics::ElementDiffusionReport element_report;
+      // G0.5: elementDiffusionWorkspaceBytes is the single estimate of the
+      // operator's scratch INCLUDING the per-subcycle delta buffer; the delta
+      // is no longer added here (it was the only extra term, so the previous
+      // sum double-counted it once the estimator became complete).
       try {
         if (m_memory_governor != nullptr) {
           element_reservation = m_memory_governor->reserve(
               core::MemoryClass::kScratchArena,
-              core::checkedMemoryBytesAdd(
-                  physics::elementDiffusionWorkspaceBytes(sidecar.laneCount(), sidecar.rowCount()),
-                  static_cast<std::uint64_t>(sidecar.laneCount() * sidecar.rowCount() * sizeof(double)),
-                  "element diffusion workspace plus delta"),
+              physics::elementDiffusionWorkspaceBytes(sidecar.laneCount(), sidecar.rowCount()),
               "sources.element_diffusion.workspace");
           element_reservation.commit();
         }
-        element_report = physics::advanceElementResolvedDiffusion(
-            context.state.gas_composition, m_diffusion_faces, m_diffusion_rho_kappa_code,
-            context.integrator_state.dt_time_code, m_metal_diffusion.config().parabolic_cfl,
-            m_metal_diffusion.config().max_subcycles, m_element_diffusion_workspace);
       } catch (...) {
         element_failure = std::current_exception();
+      }
+      // A local refusal must be agreed before any rank enters the operator's
+      // collectives (otherwise peers would block in the face exchange).
+      if (distributed) {
+        m_mpi_context.rethrowCollectivePreparationFailure(element_failure, "element diffusion admission");
+      }
+      if (element_failure == nullptr) {
+        try {
+          std::optional<internal::DistributedElementDiffusionCoupling> coupling;
+          if (distributed) {
+            coupling.emplace(m_mpi_context, m_memory_governor, context.state, topology.remote_faces,
+                             m_diffusion_rho_kappa_code, sidecar.laneCount());
+            coupling->setup();
+          }
+          element_report = physics::advanceElementResolvedDiffusion(
+              context.state.gas_composition, m_diffusion_faces, m_diffusion_rho_kappa_code,
+              context.integrator_state.dt_time_code, m_metal_diffusion.config().parabolic_cfl,
+              m_metal_diffusion.config().max_subcycles, m_element_diffusion_workspace,
+              coupling.has_value() ? &*coupling : nullptr);
+        } catch (...) {
+          element_failure = std::current_exception();
+        }
       }
       m_element_diffusion_workspace.clear();
       m_element_diffusion_workspace.shrink_to_fit();
@@ -3020,15 +3352,35 @@ class SourceRuntimeImpl final : public SourceRuntime {
   std::array<double, 3> m_box_extent_comoving{};
   std::uint64_t m_sf_gradient_unavailable_cells = 0U;
   std::uint64_t m_sf_gradient_coarse_fine_cells = 0U;
-  core::SimulationConfig m_full_config{};
+  // SimulationConfig has no default constructor; initialized from the
+  // constructor's member-initializer list (declaration order preserved).
+  core::SimulationConfig m_full_config;
   physics::IsmRegimeReport m_last_ism_regime_report{};
   physics::ChemistryAdaptiveReport m_last_chemistry_adaptive_report{};
   physics::DustUpdateLedger m_last_dust_ledger{};
   physics::SgsLedger m_last_sgs_ledger{};
   physics::ChemistryShadowReport m_last_shadow_report{};
-  bool m_chemistry_control_restored = false;
   std::uint64_t m_last_skipped_effective_rows = 0U;
   physics::BaryonicSourceStageConfig m_source_stage_config{};
+  struct ControllerCheckpoint {
+    std::uint64_t ssp_table_clamps = 0U;
+    std::uint64_t ssp_negative_ejecta_clamps = 0U;
+    double ssp_untracked_mass_residual_msun = 0.0;
+    std::uint64_t ssp_nonmonotone_return_clamps = 0U;
+    std::uint64_t wind_metallicity_clamps = 0U;
+    std::uint64_t sf_gradient_unavailable_cells = 0U;
+    std::uint64_t sf_gradient_coarse_fine_cells = 0U;
+    physics::SourceLedger last_thermochemistry_ledger{};
+    physics::FeedbackLedger last_feedback_ledger{};
+    physics::IsmRegimeReport last_ism_regime_report{};
+    physics::ChemistryAdaptiveReport last_chemistry_adaptive_report{};
+    physics::DustUpdateLedger last_dust_ledger{};
+    physics::SgsLedger last_sgs_ledger{};
+    physics::ChemistryShadowReport last_shadow_report{};
+    std::uint64_t last_skipped_effective_rows = 0U;
+    physics::ElementDiffusionReport last_element_diffusion{};
+  };
+  std::optional<ControllerCheckpoint> m_rollback_checkpoint;
   DistributedParticleIdRegistry m_particle_id_registry;
   const parallel::MpiContext& m_mpi_context;
   const RuntimeServices* m_runtime_services = nullptr;

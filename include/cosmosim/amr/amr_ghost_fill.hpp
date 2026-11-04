@@ -3,6 +3,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <span>
 
 #include "cosmosim/amr/amr_hydro_geometry.hpp"
@@ -46,6 +47,11 @@ struct AmrHydroSparseRemoteCell {
   std::uint32_t patch_local_cell = 0U;
   std::uint64_t gas_cell_id = 0U;
   hydro::HydroConservedState conserved{};
+  // H02/G3.1: the owner's canonical SPECIFIC internal energy (code units),
+  // transported so remote same-level/coarse-fine ghosts seed the dual-energy
+  // auxiliary lane (rho_ghost * e) instead of falling back to E - K. NaN =
+  // unknown (the solver then uses E - K and counts the fallback).
+  double internal_energy_code = std::numeric_limits<double>::quiet_NaN();
 };
 
 struct AmrHydroSparseGhostSource {
