@@ -35,6 +35,7 @@ enum class AmrHydroGhostFillStatus : std::uint8_t {
   kRejectedTemporalTimeOutOfRange,
   kRejectedTemporalFineToCoarseMismatch,
   kMissingSource,
+  kFilledDeepLayerExtrapolated,
 };
 
 struct AmrHydroGeometryOptions {
@@ -47,6 +48,16 @@ struct AmrHydroGeometryOptions {
       AmrHydroBoundaryClass::kPhysical,
       AmrHydroBoundaryClass::kPhysical,
   };
+  // CHUI Part 3: number of ghost layers per boundary face. Layer 1 is the
+  // face-adjacent ghost that carries the boundary face; layers 2..N are
+  // stencil-only ghosts (no face, never advanced, never receive flux) that
+  // give PLM (N = 2) and PPM (N = 3) full-order reconstruction across patch,
+  // coarse/fine, rank and open/reflective boundaries. In-patch periodic wraps
+  // never need deep layers (the stencil resolves to real wrapped cells).
+  // A deep layer that cannot be formed (patch narrower than the mirror depth
+  // for reflective boundaries) is omitted and the resulting order reduction
+  // is counted by the solver's stencil-degradation counter.
+  std::uint8_t ghost_layers = 1;
 };
 
 struct AmrHydroCellDescriptor {
@@ -66,6 +77,9 @@ struct AmrHydroGhostDescriptor {
   std::size_t ghost_cell = hydro::k_invalid_cell_index;
   AmrHydroBoundaryClass boundary_class = AmrHydroBoundaryClass::kPhysical;
   AmrHydroGhostFillStatus fill_status = AmrHydroGhostFillStatus::kUnfilledPhysicalBoundary;
+  // 1 = face-adjacent ghost; >1 = stencil-only deep layer at distance
+  // ghost_layer cell widths from the owner cell along the outward normal.
+  std::uint8_t ghost_layer = 1;
 };
 
 struct AmrHydroFaceDescriptor {
@@ -112,7 +126,11 @@ struct AmrHydroGeometryCapacity {
 
 // Checked, exact topology counts for the regular patch representation.
 // retained_bytes excludes the AmrHydroPatchGeometry object itself.
-[[nodiscard]] AmrHydroGeometryCapacity amrHydroGeometryCapacity(const PatchDescriptor& patch);
+// ghost_layers >= 1 bounds the deep stencil-only layers (see
+// AmrHydroGeometryOptions::ghost_layers); the default keeps the historical
+// one-layer bound for existing callers.
+[[nodiscard]] AmrHydroGeometryCapacity amrHydroGeometryCapacity(
+    const PatchDescriptor& patch, std::uint8_t ghost_layers = 1);
 
 [[nodiscard]] AmrHydroPatchGeometry buildAmrHydroPatchGeometry(
     const core::SimulationState& state,

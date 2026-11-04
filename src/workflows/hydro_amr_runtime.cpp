@@ -2154,7 +2154,13 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
           sparse_consumer,
           sparse_admission,
           transport_round_limit_bytes,
-          context.integrator_state.step_index);
+          context.integrator_state.step_index,
+          parallel::AmrInterfaceTopologyOptions{
+              .periodic_box_extent_comoving =
+                  amr_options.physical_boundary_kind == hydro::HydroBoundaryKind::kPeriodic
+                      ? amr_options.periodic_box_extent_comoving
+                      : std::array<double, 3>{0.0, 0.0, 0.0},
+              .ghost_layers = amr::productionAmrHydroGhostLayers(amr_options)});
       directed_amr_diagnostics = directed_amr_exchange.diagnostics;
 
       std::unordered_map<std::uint64_t, int> owner_rank_by_patch_id;

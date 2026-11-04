@@ -4,6 +4,7 @@
 
 #include "cosmosim/amr/amr_patch_indexing.hpp"
 #include "amr/internal/amr_retained_state_admission.hpp"
+#include "amr/internal/amr_periodic_topology.hpp"
 #include "cosmosim/core/memory_accounting.hpp"
 #include "cosmosim/core/governed_scratch_arena.hpp"
 
@@ -42,6 +43,21 @@ std::uint64_t amrPreparedGhostWorkspaceBytes(
 namespace {
 
 constexpr double k_geometry_tol = 1.0e-10;
+
+// Ghost layers needed for full-order reconstruction across patch interfaces:
+// the reconstruction stencil half-width (PCM 1, PLM 2, PPM 3). An explicit
+// non-zero ProductionAmrHydroOptions::ghost_layers overrides (tests).
+[[nodiscard]] std::uint8_t amrHydroGhostLayersForOptions(const ProductionAmrHydroOptions& options) {
+  if (options.ghost_layers != 0U) {
+    return options.ghost_layers;
+  }
+  switch (options.reconstruction_scheme) {
+    case hydro::HydroReconstructionScheme::kPiecewiseConstant: return 1U;
+    case hydro::HydroReconstructionScheme::kPiecewiseLinear: return 2U;
+    case hydro::HydroReconstructionScheme::kPiecewiseParabolic: return 3U;
+  }
+  return 1U;
+}
 
 [[nodiscard]] std::size_t product(std::array<std::uint16_t, 3> dims) {
   return core::checkedSizeProduct3(
@@ -185,18 +201,23 @@ constexpr double k_geometry_tol = 1.0e-10;
 
 [[nodiscard]] std::array<double, 3> ghostProbePoint(
     const AmrHydroPatchGeometry& patch_geometry,
-    const hydro::HydroGhostCell& ghost) {
+    const hydro::HydroGhostCell& ghost,
+    std::uint8_t layer = 1U,
+    const internal::AmrPeriodicFrame& frame = {}) {
   std::array<double, 3> point = cellCenter(patch_geometry.patch, ghost.owner_real_cell);
   const auto widths = cellWidths(patch_geometry.patch);
-  point[axisIndex(ghost.axis)] += sideSign(ghost.side) * widths[axisIndex(ghost.axis)];
-  return point;
+  point[axisIndex(ghost.axis)] += sideSign(ghost.side) *
+      static_cast<double>(std::max<std::uint8_t>(layer, 1U)) * widths[axisIndex(ghost.axis)];
+  return internal::wrapPoint(frame, point);
 }
 
 [[nodiscard]] std::optional<PatchDescriptor> sourcePatchForGhost(
     const AmrHydroPatchGeometry& target,
     const hydro::HydroGhostCell& ghost,
-    std::span<const PatchDescriptor> all_patches) {
-  const std::array<double, 3> probe = ghostProbePoint(target, ghost);
+    std::span<const PatchDescriptor> all_patches,
+    const internal::AmrPeriodicFrame& frame = {},
+    std::uint8_t layer = 1U) {
+  const std::array<double, 3> probe = ghostProbePoint(target, ghost, layer, frame);
   for (const PatchDescriptor& candidate : all_patches) {
     if (candidate.patch_id == target.patch.patch_id) {
       continue;
@@ -216,7 +237,8 @@ constexpr double k_geometry_tol = 1.0e-10;
     const PatchDescriptor& target,
     const PatchDescriptor& candidate,
     hydro::HydroFaceAxis axis,
-    hydro::HydroFaceSide side) {
+    hydro::HydroFaceSide side,
+    const internal::AmrPeriodicFrame& frame = {}) {
   const int normal_axis = axisIndex(axis);
   const double target_face = side == hydro::HydroFaceSide::kLower
       ? target.origin_comov[normal_axis]
@@ -225,7 +247,12 @@ constexpr double k_geometry_tol = 1.0e-10;
       ? candidate.origin_comov[normal_axis] + candidate.extent_comov[normal_axis]
       : candidate.origin_comov[normal_axis];
   const double scale = std::max({1.0, std::abs(target_face), std::abs(candidate_face)});
-  if (std::abs(target_face - candidate_face) > k_geometry_tol * scale) {
+  // Periodic axes compare face positions with the minimum image, so the
+  // lower box face (0) touches an upper face at L. Non-periodic axes keep the
+  // exact historical comparison.
+  const double face_gap = internal::minImageDifference(
+      frame, static_cast<std::size_t>(normal_axis), target_face, candidate_face);
+  if (std::abs(face_gap) > k_geometry_tol * scale) {
     return false;
   }
   for (int other_axis = 0; other_axis < 3; ++other_axis) {
@@ -243,19 +270,23 @@ constexpr double k_geometry_tol = 1.0e-10;
   return true;
 }
 
-// Periodic AMR topology guard (box convention [0, L) per axis, the same as
-// core::canonicalPeriodicPosition and the TreePM domain). For every box-boundary side classified as
-// physical, the patch must span the whole box along that axis (in-patch wrap
-// handled by the geometry builder). A face that touches another patch only
-// through the periodic wrap would need wrapped ghost sampling, wrapped
-// coarse/fine flux registers and wrapped distributed exchange, which are not
-// implemented; refusing is the only correct option (the previous behavior
-// turned such faces into zero-flux walls).
+// Periodic AMR topology (CHUI Part 3 Checkpoint A; box convention [0, L)
+// per axis, the same as core::canonicalPeriodicPosition and the TreePM
+// domain). A patch that spans the box along an axis wraps in-patch (the
+// geometry builder sources the ghost from the opposite face of the SAME
+// patch). Any other patch face lying on a periodic box face must touch at
+// least one wrapped neighbour patch (same level or coarse/fine, local or
+// remote) through the minimum-image face test: that face is then an ordinary
+// same-level / coarse-fine interface with wrapped ghost sampling, wrapped
+// flux-register keys and the ordinary distributed exchange. Only a hierarchy
+// that does not tile the periodic box (no wrapped neighbour at all) is still
+// refused, because closing the face or inventing a ghost would be wrong.
 void validatePeriodicAmrPatchTopology(
     const PatchDescriptor& patch,
     std::span<const PatchDescriptor> patches,
-    const std::array<double, 3>& box_extent) {
-  (void)patches;  // reserved for wrapped-neighbour detection (Part 3)
+    const std::array<double, 3>& box_extent,
+    const std::array<AmrHydroBoundaryClass, 6>& boundary_classes) {
+  (void)patches;
   for (int axis = 0; axis < 3; ++axis) {
     const double length = box_extent[static_cast<std::size_t>(axis)];
     if (!(length > 0.0) || !std::isfinite(length)) {
@@ -265,17 +296,26 @@ void validatePeriodicAmrPatchTopology(
     const double lower = patch.origin_comov[static_cast<std::size_t>(axis)];
     const double upper = lower + patch.extent_comov[static_cast<std::size_t>(axis)];
     const double tolerance = k_geometry_tol * std::max(1.0, length);
+    if (lower < -tolerance || upper > length + tolerance) {
+      throw std::runtime_error(
+          "periodic AMR hydro: patch " + std::to_string(patch.patch_id) +
+          " lies outside the canonical periodic box [0, L) on axis " + std::to_string(axis));
+    }
     const bool spans = std::abs(patch.extent_comov[static_cast<std::size_t>(axis)] - length) <= tolerance;
-    const bool on_lower = std::abs(lower) <= tolerance;
-    const bool on_upper = std::abs(upper - length) <= tolerance;
-    if (spans || (!on_lower && !on_upper)) {
+    if (spans) {
       continue;
     }
-    throw std::runtime_error(
-        "periodic AMR hydro: patch " + std::to_string(patch.patch_id) +
-        " touches the periodic box boundary on axis " + std::to_string(axis) +
-        " without spanning the box; cross-patch periodic ghost/reflux topology is not implemented "
-        "(refusing instead of closing the box). Use a root patch that spans the periodic axis.");
+    // A non-spanning patch on a periodic axis has no physical face at all:
+    // both sides (interior or across the wrap) must touch a neighbour patch.
+    const std::size_t lower_slot = static_cast<std::size_t>(2 * axis);
+    if (boundary_classes[lower_slot] == AmrHydroBoundaryClass::kPhysical ||
+        boundary_classes[lower_slot + 1U] == AmrHydroBoundaryClass::kPhysical) {
+      throw std::runtime_error(
+          "periodic AMR hydro: patch " + std::to_string(patch.patch_id) +
+          " does not span periodic axis " + std::to_string(axis) +
+          " and a face has no (local or remote, direct or wrapped) neighbour patch; the AMR "
+          "hierarchy does not tile the periodic box (refusing instead of closing the face)");
+    }
   }
 }
 
@@ -283,12 +323,13 @@ void validatePeriodicAmrPatchTopology(
     const PatchDescriptor& target,
     std::span<const PatchDescriptor> patches,
     hydro::HydroFaceAxis axis,
-    hydro::HydroFaceSide side) {
+    hydro::HydroFaceSide side,
+    const internal::AmrPeriodicFrame& frame = {}) {
   for (const PatchDescriptor& candidate : patches) {
     if (candidate.patch_id == target.patch_id) {
       continue;
     }
-    if (!touchesOnSide(target, candidate, axis, side)) {
+    if (!touchesOnSide(target, candidate, axis, side, frame)) {
       continue;
     }
     return candidate.level == target.level
@@ -369,7 +410,9 @@ void validatePeriodicAmrPatchTopology(
 }
 
 
-void refreshTraceableGhostSourceIds(std::vector<AmrHydroPatchGeometry>& geometries) {
+void refreshTraceableGhostSourceIds(
+    std::vector<AmrHydroPatchGeometry>& geometries,
+    const internal::AmrPeriodicFrame& frame = {}) {
   std::unordered_map<std::uint64_t, std::size_t> patch_slot_by_id;
   patch_slot_by_id.reserve(geometries.size());
   for (std::size_t slot = 0; slot < geometries.size(); ++slot) {
@@ -386,7 +429,8 @@ void refreshTraceableGhostSourceIds(std::vector<AmrHydroPatchGeometry>& geometri
       }
       const AmrHydroPatchGeometry& source = geometries[source_slot_it->second];
       const hydro::HydroGhostCell& ghost = target.geometry.ghost_cells.at(ghost_descriptor.ghost_slot);
-      const std::array<double, 3> probe = ghostProbePoint(target, ghost);
+      const std::array<double, 3> probe =
+          ghostProbePoint(target, ghost, ghost_descriptor.ghost_layer, frame);
       if (!containsPoint(source.patch, probe)) {
         continue;
       }
@@ -426,7 +470,8 @@ void refreshTraceableGhostSourceIds(std::vector<AmrHydroPatchGeometry>& geometri
 
 void refreshRemoteTraceableGhostSourceIds(
     std::vector<AmrHydroPatchGeometry>& geometries,
-    std::span<const DistributedAmrRemotePatch> remote_patches) {
+    std::span<const DistributedAmrRemotePatch> remote_patches,
+    const internal::AmrPeriodicFrame& frame = {}) {
   std::unordered_map<std::uint64_t, const DistributedAmrRemotePatch*> remote_by_id;
   remote_by_id.reserve(remote_patches.size());
   for (const DistributedAmrRemotePatch& remote : remote_patches) {
@@ -441,7 +486,8 @@ void refreshRemoteTraceableGhostSourceIds(
       const DistributedAmrRemotePatch& remote = *remote_it->second;
       const hydro::HydroGhostCell& ghost =
           target.geometry.ghost_cells.at(ghost_descriptor.ghost_slot);
-      const std::array<double, 3> probe = ghostProbePoint(target, ghost);
+      const std::array<double, 3> probe =
+          ghostProbePoint(target, ghost, ghost_descriptor.ghost_layer, frame);
       if (!containsPoint(remote.patch, probe)) {
         continue;
       }
@@ -897,6 +943,10 @@ void writePatchDescriptorToStateRow(
   state.patches.cell_dim_z[patch_index] = patch.cell_dims[2];
 }
 
+std::uint8_t productionAmrHydroGhostLayers(const ProductionAmrHydroOptions& options) {
+  return amrHydroGhostLayersForOptions(options);
+}
+
 bool hasProductionAmrHydroCoverage(const core::SimulationState& state) {
   if (state.cells.size() == 0U || state.patches.size() == 0U) {
     return false;
@@ -958,9 +1008,32 @@ std::vector<PatchDescriptor> buildProductionAmrPatchDescriptors(const core::Simu
 void populateAmrHydroFluxRegisterFaces(
     AmrHydroPatchGeometry& patch_geometry,
     std::span<const PatchDescriptor> all_patches) {
+  populateAmrHydroFluxRegisterFaces(patch_geometry, all_patches, {0.0, 0.0, 0.0});
+}
+
+void populateAmrHydroFluxRegisterFaces(
+    AmrHydroPatchGeometry& patch_geometry,
+    std::span<const PatchDescriptor> all_patches,
+    const std::array<double, 3>& periodic_box_extent_comoving) {
+  const internal::AmrPeriodicFrame frame = internal::makeAmrPeriodicFrame(
+      periodic_box_extent_comoving[0] > 0.0 || periodic_box_extent_comoving[1] > 0.0 ||
+          periodic_box_extent_comoving[2] > 0.0,
+      periodic_box_extent_comoving);
   patch_geometry.geometry.flux_register_faces.assign(
       patch_geometry.geometry.faces.size(),
       hydro::HydroFluxRegisterFace{});
+  // Deep stencil-only ghosts own no face and no register; they only need the
+  // (possibly different, possibly wrapped) source patch so that their stable
+  // source gas-cell identity and dual-energy source can be traced.
+  for (AmrHydroGhostDescriptor& deep : patch_geometry.ghosts) {
+    if (deep.ghost_layer <= 1U || deep.boundary_class == AmrHydroBoundaryClass::kPhysical) {
+      continue;
+    }
+    const hydro::HydroGhostCell& ghost = patch_geometry.geometry.ghost_cells.at(deep.ghost_slot);
+    const std::optional<PatchDescriptor> source_patch =
+        sourcePatchForGhost(patch_geometry, ghost, all_patches, frame, deep.ghost_layer);
+    deep.source_patch_id = source_patch.has_value() ? source_patch->patch_id : 0U;
+  }
   for (std::size_t face_index = 0; face_index < patch_geometry.geometry.faces.size(); ++face_index) {
     const hydro::HydroFace& face = patch_geometry.geometry.faces[face_index];
     if (face.ghost_cell_slot == hydro::k_invalid_ghost_cell_slot) {
@@ -975,13 +1048,14 @@ void populateAmrHydroFluxRegisterFaces(
       continue;
     }
     const hydro::HydroGhostCell& ghost = patch_geometry.geometry.ghost_cells.at(face.ghost_cell_slot);
-    const std::optional<PatchDescriptor> source_patch = sourcePatchForGhost(patch_geometry, ghost, all_patches);
+    const std::optional<PatchDescriptor> source_patch =
+        sourcePatchForGhost(patch_geometry, ghost, all_patches, frame);
     if (!source_patch.has_value()) {
       continue;
     }
     AmrHydroGhostDescriptor& ghost_descriptor = *ghost_it;
     ghost_descriptor.source_patch_id = source_patch->patch_id;
-    const std::array<double, 3> probe = ghostProbePoint(patch_geometry, ghost);
+    const std::array<double, 3> probe = ghostProbePoint(patch_geometry, ghost, 1U, frame);
     [[maybe_unused]] const std::size_t source_cell = cellContainingPoint(*source_patch, probe);
     // Source gas-cell IDs are patched after all local AMR hydro geometries exist, because this
     // metadata belongs to the source patch's gas_cell_id vector, not the target patch.
@@ -1968,6 +2042,10 @@ struct AmrSynchronizedSweepWorkspace {
     }
   }
   diagnostics.patch_count = all_descriptors.size();
+  const bool periodic_box = options.physical_boundary_kind == hydro::HydroBoundaryKind::kPeriodic;
+  const internal::AmrPeriodicFrame periodic_frame =
+      internal::makeAmrPeriodicFrame(periodic_box, options.periodic_box_extent_comoving);
+  const std::uint8_t ghost_layers = amrHydroGhostLayersForOptions(options);
 
   const bool all_cells_active = active_cell_rows.empty();
   // Sparse active membership is a sorted, phase-local index rather than a
@@ -2005,7 +2083,7 @@ struct AmrSynchronizedSweepWorkspace {
       descriptors.size(), sizeof(AmrHydroPatchGeometry), "AMR geometry objects"));
   std::uint64_t row_scratch_bytes = 0U;
   for (const PatchDescriptor& patch : descriptors) {
-    const auto capacity = amrHydroGeometryCapacity(patch);
+    const auto capacity = amrHydroGeometryCapacity(patch, ghost_layers);
     geometry_bytes = core::checkedMemoryBytesAdd(
         geometry_bytes, capacity.retained_bytes, "AMR geometry live set");
     row_scratch_bytes = std::max(row_scratch_bytes, capacity.construction_scratch_bytes);
@@ -2028,23 +2106,26 @@ struct AmrSynchronizedSweepWorkspace {
     row_scratch_reservation.commit();
   }
   for (const PatchDescriptor& patch : descriptors) {
-    if (options.physical_boundary_kind == hydro::HydroBoundaryKind::kPeriodic) {
-      validatePeriodicAmrPatchTopology(patch, all_descriptors, options.periodic_box_extent_comoving);
-    }
     AmrHydroGeometryOptions geometry_options;
     geometry_options.physical_boundary_kind = options.physical_boundary_kind;
+    geometry_options.ghost_layers = ghost_layers;
     geometry_options.boundary_classes = {
-        boundaryClassForSide(patch, all_descriptors, hydro::HydroFaceAxis::kX, hydro::HydroFaceSide::kLower),
-        boundaryClassForSide(patch, all_descriptors, hydro::HydroFaceAxis::kX, hydro::HydroFaceSide::kUpper),
-        boundaryClassForSide(patch, all_descriptors, hydro::HydroFaceAxis::kY, hydro::HydroFaceSide::kLower),
-        boundaryClassForSide(patch, all_descriptors, hydro::HydroFaceAxis::kY, hydro::HydroFaceSide::kUpper),
-        boundaryClassForSide(patch, all_descriptors, hydro::HydroFaceAxis::kZ, hydro::HydroFaceSide::kLower),
-        boundaryClassForSide(patch, all_descriptors, hydro::HydroFaceAxis::kZ, hydro::HydroFaceSide::kUpper),
+        boundaryClassForSide(patch, all_descriptors, hydro::HydroFaceAxis::kX, hydro::HydroFaceSide::kLower, periodic_frame),
+        boundaryClassForSide(patch, all_descriptors, hydro::HydroFaceAxis::kX, hydro::HydroFaceSide::kUpper, periodic_frame),
+        boundaryClassForSide(patch, all_descriptors, hydro::HydroFaceAxis::kY, hydro::HydroFaceSide::kLower, periodic_frame),
+        boundaryClassForSide(patch, all_descriptors, hydro::HydroFaceAxis::kY, hydro::HydroFaceSide::kUpper, periodic_frame),
+        boundaryClassForSide(patch, all_descriptors, hydro::HydroFaceAxis::kZ, hydro::HydroFaceSide::kLower, periodic_frame),
+        boundaryClassForSide(patch, all_descriptors, hydro::HydroFaceAxis::kZ, hydro::HydroFaceSide::kUpper, periodic_frame),
     };
+    if (periodic_box) {
+      validatePeriodicAmrPatchTopology(
+          patch, all_descriptors, options.periodic_box_extent_comoving, geometry_options.boundary_classes);
+    }
     geometries.push_back(buildAmrHydroPatchGeometry(state, patch, geometry_options));
-    populateAmrHydroFluxRegisterFaces(geometries.back(), all_descriptors);
+    populateAmrHydroFluxRegisterFaces(geometries.back(), all_descriptors,
+        periodic_box ? options.periodic_box_extent_comoving : std::array<double, 3>{0.0, 0.0, 0.0});
     const std::uint64_t actual = geometries.back().ownedCapacityBytes();
-    if (actual > amrHydroGeometryCapacity(patch).retained_bytes) {
+    if (actual > amrHydroGeometryCapacity(patch, ghost_layers).retained_bytes) {
       throw std::runtime_error("AMR geometry physical capacity exceeds admitted topology bound");
     }
     diagnostics.geometry_capacity_bytes = core::checkedMemoryBytesAdd(
@@ -2084,9 +2165,9 @@ struct AmrSynchronizedSweepWorkspace {
     }
   }
 
-  refreshTraceableGhostSourceIds(geometries);
+  refreshTraceableGhostSourceIds(geometries, periodic_frame);
   if (distributed_exchange != nullptr) {
-    refreshRemoteTraceableGhostSourceIds(geometries, distributed_exchange->remote_patches);
+    refreshRemoteTraceableGhostSourceIds(geometries, distributed_exchange->remote_patches, periodic_frame);
   }
 
   const auto patchRequiresGhostFill = [&](std::size_t patch_index) {
@@ -2116,6 +2197,7 @@ struct AmrSynchronizedSweepWorkspace {
     target.temporal_identity_mismatch_rejections += source.temporal_identity_mismatch_rejections;
     target.missing_source_records += source.missing_source_records;
     target.unresolved_ghosts += source.unresolved_ghosts;
+    target.deep_layer_extrapolated_ghosts += source.deep_layer_extrapolated_ghosts;
   };
 
   // Snapshot only the ghost shell needed by each active local patch while the
@@ -2171,10 +2253,10 @@ struct AmrSynchronizedSweepWorkspace {
                hydro::HydroFaceAxis::kZ}) {
         touches = touches || touchesOnSide(
             geometries[patch_index].patch, geometries[source_index].patch,
-            axis, hydro::HydroFaceSide::kLower);
+            axis, hydro::HydroFaceSide::kLower, periodic_frame);
         touches = touches || touchesOnSide(
             geometries[patch_index].patch, geometries[source_index].patch,
-            axis, hydro::HydroFaceSide::kUpper);
+            axis, hydro::HydroFaceSide::kUpper, periodic_frame);
       }
       return touches;
     };
@@ -2272,7 +2354,9 @@ struct AmrSynchronizedSweepWorkspace {
             ? &state.amr_temporal_boundary_history
             : nullptr,
         .enable_temporal_coarse_to_fine = options.enable_temporal_coarse_to_fine,
-        .requires_ghost_fill = true});
+        .requires_ghost_fill = true,
+        .periodic_box_extent_comoving = periodic_box
+            ? options.periodic_box_extent_comoving : std::array<double, 3>{0.0, 0.0, 0.0}});
     for (std::size_t slot = 0; slot < local_source_indices.size(); ++slot) {
       ghost_views.push_back(AmrHydroGhostFillPatch{
           .geometry = &geometries[local_source_indices[slot]],

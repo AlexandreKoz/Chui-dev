@@ -1149,6 +1149,19 @@ if(COSMOSIM_ENABLE_TESTS)
     add_test(NAME unit_${chui_part1_test} COMMAND test_unit_${chui_part1_test})
   endforeach()
 
+  # CHUI Part 3 (periodic/distributed AMR, regrid, remote sources, multirate,
+  # gravity/zoom, adaptive research, science output, four-mode sources).
+  # Authored without execution: NOT RUN — USER-RESERVED.
+  set(CHUI_PART3_UNIT_TESTS
+      amr_periodic_cross_patch)
+  foreach(chui_part3_test IN LISTS CHUI_PART3_UNIT_TESTS)
+    add_executable(test_unit_${chui_part3_test} tests/unit/test_${chui_part3_test}.cpp)
+    target_include_directories(test_unit_${chui_part3_test} PRIVATE ${PROJECT_SOURCE_DIR}/src)
+    target_link_libraries(test_unit_${chui_part3_test} PRIVATE cosmosim_all)
+    add_test(NAME unit_${chui_part3_test} COMMAND test_unit_${chui_part3_test})
+    set_tests_properties(unit_${chui_part3_test} PROPERTIES LABELS "chui_part3;unit")
+  endforeach()
+
 
   add_executable(test_unit_cooling_heating tests/unit/test_cooling_heating.cpp)
   target_link_libraries(test_unit_cooling_heating PRIVATE cosmosim_all)
