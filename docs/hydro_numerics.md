@@ -82,23 +82,23 @@ upwind `max(chi_i, chi_{i+-1})` (needs a 7-cell stencil). Time evolution is the
 same single Hancock step using the parabola's mean gradient `a_R - a_L`.
 
 Stencil: cells `i-2 .. i+3` for face `i+1/2` (`HydroFace::owner_minus2_cell`,
-`neighbor_plus2_cell`). Every geometry builder now completes stencils through
-the existing one-layer ghost shell (`completeReconstructionStencils`): real
-cells first, then the adjacent boundary ghost row; periodic ghosts resolve to
-their wrapped real cell, so periodic boxes (fixed grid and box-spanning AMR
-patches) are full order everywhere. With one ghost layer:
+`neighbor_plus2_cell`). Production AMR completes these stencils through a
+normal ghost shell whose depth is selected from the reconstruction; periodic
+ghosts resolve to their wrapped real cell, so periodic boxes (fixed grid and
+box-spanning AMR patches) are full order everywhere. With the required shell:
 
 | face position | PLM | PPM |
 |---|---|---|
 | interior, >= 2 cells from a non-periodic patch boundary | full | full |
-| interior face adjacent to the boundary cell | full (ghost row used) | owner side full, neighbor side PLM |
-| patch-boundary face (owner real, neighbor ghost) | owner full, ghost side first order | owner PLM, ghost side first order |
+| interior face adjacent to the boundary cell | full | full |
+| patch-boundary face (owner real, neighbor ghost) | full | full |
 
-Every reduction is counted in `stencil_degradation_count` (fixed-grid
-`hydro.conservation` event, AMR diagnostics). Removing the remaining
-reductions needs a second/third ghost layer from the AMR ghost fill (Part 3
-contract: `HydroGhostCell` gains a layer index and the fill must provide
-`requiredStencilHalfWidth()` layers).
+The production AMR/MPI planner requests `requiredStencilHalfWidth()` normal
+layers (one for PCM, two for PLM and three for PPM), and the ghost filler
+resolves each layer at the step-start/temporally interpolated level clock.
+Only a physically thin patch that cannot provide the required reflected/open
+continuation may reduce order; every such reduction is reported by
+`stencil_degradation_count` and `deep_layer_extrapolated_ghosts`.
 
 ## 4. CTU (simplified Colella 1990 in 3D)
 
@@ -113,22 +113,31 @@ contract: `HydroGhostCell` gains a layer index and the fill must provide
    barotropic closure linearized: `P' = P + c^2 (rho' - rho)`), and solve again.
    Only pass-2 fluxes update the state and the AMR flux registers.
 
-Riemann calls: 2 per face (6 per cell in 3D, 4 in 2D). Stability: Courant
+Base Riemann calls: 2 per face (6 per cell in 3D, 4 in 2D). A non-periodic
+interface ghost also evaluates two transient Riemann problems per available
+tangential direction to reconstruct its pass-1 divergence. These extra solves
+are included in `riemann_solve_count` and `ctu_transverse_ghost_axes`. Stability: Courant
 `<= 1` in 2D, `<= 1/2` in 3D (no Saltzman 12-solve corner terms); the gas CFL
 candidate is `dt = 0.4 min_d a dx_d/(|v_d|+c)`, which satisfies it. With
 first-order states the scheme reproduces the exact donor-cell corner-transport
 update (unit test `test_hydro_ctu`).
 
-At patch boundaries the owner side of every boundary face is corrected (the
-owner is a real cell with all its faces); the ghost side has no transverse
-faces and keeps the normal-only state - counted per face side as
-`ctu_transverse_degraded_states` (the corrector is not silently dropped).
-Periodic ghosts use their wrapped real cell, so periodic boxes are corrected
-on both sides. Inadmissible corrected states keep the normal-only state
+At patch boundaries the owner side uses its ordinary pass-1 divergence. For a
+non-periodic ghost side, the solver uses the immutable AMR/MPI face slab and
+the selected PCM/PLM/PPM reconstruction to evaluate the lower/upper flux in
+each tangential direction on the target control volume. The term is accepted
+only if the complete selected-order stencil exists. At face edges/corners,
+where it crosses a second interface and the slab is incomplete, the whole
+ghost correction stays normal-only and is reported by
+`ctu_transverse_degraded_states`; there is no unilateral high-order proxy.
+Successful imported corrections are reported by
+`ctu_transverse_ghost_corrected_states`. Periodic ghosts use their wrapped
+real cell, so periodic boxes are corrected on both sides. Inadmissible corrected states keep the normal-only state
 (`ctu_transverse_inadmissible_states`). For partial active sets the
 transverse increment of a cell uses exactly the active faces, i.e. the same
-faces the final update uses. Scratch: three conserved states per touched cell,
-batch-scoped, admitted before the advance (`ctu_transverse_workspace`).
+faces the final update uses. Scratch: three conserved states per touched cell
+plus three per ghost-shell slot and an axis-validity byte, all transient and
+admitted before the advance (`ctu_transverse_workspace`).
 
 **Hydro CFL rule (stabilization pass).** The gas timestep is selected by the
 rule of the configured integration family, identically in `TimeCoordinator`

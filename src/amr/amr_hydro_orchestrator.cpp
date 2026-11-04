@@ -1792,6 +1792,8 @@ void accumulateDiagnostics(ProductionAmrHydroDiagnostics& lhs, const ProductionA
   lhs.positivity_fallback_count += rhs.positivity_fallback_count;
   lhs.stencil_degradation_count += rhs.stencil_degradation_count;
   lhs.ctu_transverse_degraded_states += rhs.ctu_transverse_degraded_states;
+  lhs.ctu_transverse_ghost_corrected_states += rhs.ctu_transverse_ghost_corrected_states;
+  lhs.ctu_transverse_ghost_axes += rhs.ctu_transverse_ghost_axes;
   lhs.dual_energy_auxiliary_cells += rhs.dual_energy_auxiliary_cells;
   lhs.dual_energy_unresolved_ghosts += rhs.dual_energy_unresolved_ghosts;
   lhs.dual_energy_thermal_correction_code += rhs.dual_energy_thermal_correction_code;
@@ -3030,6 +3032,9 @@ struct AmrSynchronizedSweepWorkspace {
     diagnostics.positivity_fallback_count += profile.positivity_fallback_count;
     diagnostics.stencil_degradation_count += profile.stencil_degradation_count;
     diagnostics.ctu_transverse_degraded_states += profile.ctu_transverse_degraded_states;
+    diagnostics.ctu_transverse_ghost_corrected_states +=
+        profile.ctu_transverse_ghost_corrected_states;
+    diagnostics.ctu_transverse_ghost_axes += profile.ctu_transverse_ghost_axes;
     diagnostics.dual_energy_auxiliary_cells += profile.dual_energy_auxiliary_cells;
     diagnostics.dual_energy_thermal_correction_code += profile.conservation.dual_energy_sync_delta.total_energy;
     diagnostics.active_cell_count += active_patch_cells.size();

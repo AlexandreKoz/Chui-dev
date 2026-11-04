@@ -117,11 +117,11 @@ struct ProductionAmrHydroOptions {
   RecursiveAmrLevelSourceOperator* recursive_level_source_operator = nullptr;
   // Spatial reconstruction and limiter used for every patch advance. The
   // time-integration family (MUSCL-Hancock / CTU) and dual-energy policy are
-  // owned by the HydroCoreSolver passed to the advance entry points. PPM and
-  // CTU use the patch-interior stencils; within two cells of a patch boundary
-  // PPM reduces to PLM and CTU transverse terms from non-periodic ghosts are
-  // omitted (both counted in HydroProfileEvent / diagnostics). Multi-layer
-  // AMR ghost shells are Part 3 scope.
+  // owned by the HydroCoreSolver passed to the advance entry points. PPM uses
+  // the multi-layer normal shell. CTU reconstructs imported/physical ghost
+  // transverse increments from complete tangential face-slab stencils; only
+  // the edge/corner region where the selected reconstruction's full stencil
+  // crosses a second interface uses the explicit counted normal-only fallback.
   hydro::HydroReconstructionScheme reconstruction_scheme = hydro::HydroReconstructionScheme::kPiecewiseLinear;
   hydro::HydroSlopeLimiter slope_limiter = hydro::HydroSlopeLimiter::kMonotonizedCentral;
   // Periodic box extent in the patch coordinate frame (comoving), required
@@ -151,6 +151,8 @@ struct ProductionAmrHydroDiagnostics {
   std::uint64_t positivity_fallback_count = 0;
   std::uint64_t stencil_degradation_count = 0;
   std::uint64_t ctu_transverse_degraded_states = 0;
+  std::uint64_t ctu_transverse_ghost_corrected_states = 0;
+  std::uint64_t ctu_transverse_ghost_axes = 0;
   std::uint64_t dual_energy_auxiliary_cells = 0;
   // Ghost rows whose auxiliary energy could not be resolved from a local
   // source cell (remote sources): dual-energy protection degraded there.

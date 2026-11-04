@@ -463,14 +463,26 @@ struct HydroProfileEvent {
   std::uint64_t limiter_clip_count = 0;
   std::uint64_t positivity_fallback_count = 0;
   std::uint64_t riemann_fallback_count = 0;
-  // Total Riemann evaluations (MUSCL-Hancock: 1 per face; CTU: 2 per face).
+  // Total Riemann evaluations (MUSCL-Hancock: 1 per face; CTU base: 2 per
+  // face, plus 2 per completed tangential ghost-slab axis).
   std::uint64_t riemann_solve_count = 0;
   std::uint64_t stencil_degradation_count = 0;
   // CTU transverse-correction outcome per face side.
   std::uint64_t ctu_transverse_corrected_states = 0;
   // Side state whose cell had no transverse information (non-periodic
-  // ghost / imported MPI ghost): normal-only predictor used.
+  // ghost / imported MPI ghost at a face/corner where the complete
+  // transverse reconstruction stencil is unavailable): normal-only
+  // predictor used. This is an explicit interface fallback, never an
+  // unreported high-order proxy.
   std::uint64_t ctu_transverse_degraded_states = 0;
+  // Imported/physical ghost side states corrected from a complete tangential
+  // ghost-slab stencil. The slab is an immutable step-start AMR/MPI snapshot;
+  // these increments are transient and never become conserved authority.
+  std::uint64_t ctu_transverse_ghost_corrected_states = 0;
+  // Tangential ghost-cell axes for which the full stencil required by the
+  // selected reconstruction was materialized and two transverse Riemann
+  // fluxes were evaluated. A face state may consume two such axes in 3-D.
+  std::uint64_t ctu_transverse_ghost_axes = 0;
   // Corrected state was inadmissible; normal-only predictor used.
   std::uint64_t ctu_transverse_inadmissible_states = 0;
   // Cells whose final thermal energy came from the auxiliary update.
@@ -514,7 +526,10 @@ enum class HydroIntegrationScheme : std::uint8_t {
   // half of the transverse increments (all axes except the face axis) to each
   // face state and re-solves. Two Riemann solves per face (6 per cell in 3D,
   // 4 in 2D). Stability: Courant <= 1 in 2D; <= 1/2 in 3D for this variant
-  // (no corner-coupled 12-solve terms of Saltzman 1994).
+  // (no corner-coupled 12-solve terms of Saltzman 1994). Complete imported
+  // ghost slabs require two additional transient Riemann solves per available
+  // tangential axis; they supply the same pass-1 divergence on the remote
+  // side without updating authority or a flux register.
   kCornerTransportUpwind = 1,
 };
 
@@ -568,6 +583,12 @@ struct HydroScratchBuffers {
   // pass-1 fluxes of the faces normal to x, y and z (same ordering as
   // touched_cells). Transient, batch-scoped, never restart truth.
   std::vector<std::array<HydroConservedState, 3>> ctu_transverse_delta;
+  // CTU interface completion: per ghost slot, tangential flux-divergence
+  // increments reconstructed from the immutable face ghost slab. The mask
+  // has one bit per valid axis. Only complete stencils are admitted; patch
+  // edges/corners remain an explicit, counted normal-only fallback.
+  std::vector<std::array<HydroConservedState, 3>> ctu_ghost_transverse_delta;
+  std::vector<std::uint8_t> ctu_ghost_transverse_axis_mask;
   // Dual energy only: per touched cell, the advective internal-energy flux
   // divergence and the face-velocity divergence (both already multiplied by
   // dt/(a V) and the face area), consumed by the auxiliary update.

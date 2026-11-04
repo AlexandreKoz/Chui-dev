@@ -39,7 +39,7 @@ que permanece código obrigatório ausente.
 
 | ID | Status nesta árvore | Evidência e limite preciso |
 |---|---|---|
-| H01 | **PARCIAL** | MUSCL–Hancock/PPM/CTU/HLLC-HLLE estão em `src/hydro/hydro_core_solver.cpp`; `transverseSourceCell()` ainda não transporta incrementos CTU de ghosts importados AMR/MPI e contabiliza degradação. A correção de área positiva foi feita em `src/amr/amr_hydro_orchestrator.cpp::intervalsOverlap`, mas a ordem multidimensional remota não está fechada. |
+| H01 | **IMPLEMENTADO EM FONTE, NÃO TESTADO** | MUSCL–Hancock/PPM/CTU/HLLC-HLLE permanecem em `src/hydro/hydro_core_solver.cpp`. O CTU agora reconstrói, com o mesmo PCM/PLM/PPM e Riemann do avanço, os dois fluxos de cada eixo tangencial do ghost a partir do halo imutável já preenchido por AMR/MPI; o incremento usa o volume-alvo e não cria autoridade persistente. Apenas a região de aresta/canto cujo stencil cruza uma segunda interface usa fallback normal conservativo explícito, contado em `ctu_transverse_degraded_states`; correções/axes remotos têm telemetria própria. Scratch do halo foi incluído em `HydroScratchBuffers::workspaceBytes`, na admissão AMR e nos diagnósticos runtime. Prova de ordem e estabilidade remota pertencem à campanha numérica posterior. |
 | H02 | **IMPLEMENTADO EM FONTE, NÃO TESTADO** | Dual energy, autoridade de energia interna, recuperação de primitivas, floors e conversões comoventes: `src/hydro/hydro_core_solver.cpp`, `src/amr/amr_ghost_fill.cpp`, `src/hydro/gas_thermodynamic_refresh.cpp`. Falta qualificação numérica, não uma rota conhecida de fonte. |
 | C01 | **BLOQUEADO POR DADOS EXTERNOS** | Operador, loader SHA-256/provenance, H/He não-equilíbrio, heating/shielding e cooling elementar estão em `src/physics/thermochemistry*.cpp` e `metal_cooling_table.cpp`. As tabelas físicas de produção exigidas pelos perfis não acompanham o pacote. |
 | C02 | **PARCIAL / BLOQUEADO POR DADOS EXTERNOS** | Backends analítico/equilíbrio existem; `fixed_detailed` em `src/physics/chemical_network.cpp` permanece rede reduzida primordial + C+/CO. Faltam inventário multiiônico aprovado e taxas/tabelas verificáveis; sem esses dados não é lícito inventar reações, mas a ligação do inventário definitivo também permanece código futuro. |
@@ -81,9 +81,9 @@ que permanece código obrigatório ausente.
 ## Pendências obrigatórias verdadeiras
 
 Não é correto declarar fechamento integral H01–V02 nesta árvore. Permanecem
-obrigatórias as implementações H01 remoto, C03 histórico/erro, I02 produção
-conservativa, T02 multinível bariônico, M01 química esparsa e o coordenador
-A03/A04/V02. C02 requer primeiro a especificação/dados verificáveis do
+obrigatórias as implementações T02 multinível bariônico, M01 química esparsa
+e o coordenador A03/A04/V02; a parte ainda parcial de C03 depende desse último.
+C02 requer primeiro a especificação/dados verificáveis do
 inventário detalhado; S02/F02 requerem tabelas físicas de produção. G01 é
 deliberadamente condicional à campanha de validação prevista pela norma.
 
