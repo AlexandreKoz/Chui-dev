@@ -104,3 +104,15 @@ cmake --preset cpu-only-debug
 cmake --build --preset build-cpu-debug
 ctest --preset test-cpu-debug --output-on-failure -L chui_part3
 ```
+
+## Completion campaign — append-only (branch `claude/chui-part3-closure-t02`, base `d34508c`)
+
+All entries SOURCE ONLY, NOT RUN — USER-RESERVED.
+
+| ID | Change | Source | Tests | Status | Commit |
+|---|---|---|---|---|---|
+| T02/A02 | recursive ≥3-level Berger-Oliger gas subcycling in production (`numerics.amr_time_stepping = recursive_subcycling`); nested per-level temporal intervals; per-level-pair reflux clocks; 2:1 and synchronized-boundary guards | `amr_hydro_orchestrator.cpp` (`advanceProductionAmrHydroRecursive`, `refluxIntervalForEntry`), `amr_ghost_fill.cpp` (`*ForLevel`), `hydro_amr_runtime.cpp`, `config.cpp`, `restart_checkpoint.cpp` | `unit_amr_recursive_subcycling` | **PARTIAL**: single rank; distributed per-substep exchange, level-relaxed CFL, per-level sources/events/gravity OPEN | `bd5ea29` |
+| T01/M01 | bounded rollback | — | — | OPEN (full-state reference retained; chemistry bias not reverted) | — |
+| D01, A01, F01/S02, H01/H02, A03/A04/C03/C04/V02, G01, M01/M02, V01 | per completion directive §3 | — | — | OPEN (unchanged) | — |
+
+Next actions: `docs/repair/chui_part3_completion_handoff.md` §3.

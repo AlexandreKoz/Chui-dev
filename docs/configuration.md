@@ -868,3 +868,12 @@ admission leaves the hierarchy untouched.
 now selects the element-resolved mixing operator (Part 2 refused it).
 Multi-rank metal diffusion remains refused (named blocker: no per-subcycle
 remote interface exchange).
+
+## CHUI Part 3 Milestone I — `numerics.amr_time_stepping`
+
+`synchronized` (default; every AMR level advances the coordinator interval)
+or `recursive_subcycling` (Berger-Oliger: level L advances dt / r^(L - L_min)
+with nested temporal ghost histories and per-level reflux; requires a 2:1
+balanced hierarchy; single rank only in this revision — refused on several
+ranks). The global dt is still limited by the finest-cell CFL (level-relaxed
+CFL is OPEN). Source only, NOT RUN — USER-RESERVED.
