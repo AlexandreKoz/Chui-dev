@@ -21,6 +21,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "cosmosim/amr/amr_hydro_orchestrator.hpp"
 #include "cosmosim/core/checked_arithmetic.hpp"
 #include "cosmosim/core/memory_governor.hpp"
 #include "cosmosim/core/governed_scratch_arena.hpp"
@@ -1008,6 +1009,8 @@ class SourceRuntimeImpl final : public SourceRuntime {
     checkpoint.last_dust_ledger = m_last_dust_ledger;
     checkpoint.last_sgs_ledger = m_last_sgs_ledger;
     checkpoint.last_shadow_report = m_last_shadow_report;
+    checkpoint.multilevel_shadow_report = m_multilevel_shadow_report;
+    checkpoint.multilevel_source_step = m_multilevel_source_step;
     checkpoint.last_skipped_effective_rows = m_last_skipped_effective_rows;
     checkpoint.last_element_diffusion = m_last_element_diffusion;
     m_rollback_checkpoint = std::move(checkpoint);
@@ -1034,6 +1037,8 @@ class SourceRuntimeImpl final : public SourceRuntime {
     m_last_dust_ledger = c.last_dust_ledger;
     m_last_sgs_ledger = c.last_sgs_ledger;
     m_last_shadow_report = c.last_shadow_report;
+    m_multilevel_shadow_report = c.multilevel_shadow_report;
+    m_multilevel_source_step = c.multilevel_source_step;
     m_last_skipped_effective_rows = c.last_skipped_effective_rows;
     m_last_element_diffusion = c.last_element_diffusion;
     m_particle_id_registry.invalidateOccupancyCache();
@@ -1242,6 +1247,102 @@ class SourceRuntimeImpl final : public SourceRuntime {
             "source staging modeled; population growth, ID coordination and topology scratch require owner-local admission"};
   }
 
+  void setAmrLevelSourceCouplingEnabled(bool enabled) noexcept override {
+    m_amr_level_source_coupling_enabled = enabled;
+  }
+
+  void executeAmrLevelSmoothSources(
+      core::StepContext& parent_context,
+      std::span<const std::uint32_t> level_rows,
+      const hydro::HydroUpdateContext& level_update,
+      core::SourceSplitPhase phase) override {
+    if (!m_amr_level_source_coupling_enabled ||
+        m_full_config.numerics.amr_time_stepping !=
+            core::AmrTimeSteppingConfigMode::kRecursiveSubcycling) {
+      throw std::logic_error(
+          "recursive AMR smooth source execution was not enabled by composition");
+    }
+    if (phase == core::SourceSplitPhase::kUnsplitCompatibility) {
+      throw std::invalid_argument(
+          "recursive AMR smooth source execution requires a Strang half phase");
+    }
+    if (!(std::isfinite(level_update.dt_code) && level_update.dt_code > 0.0 &&
+          std::isfinite(level_update.time_begin_code) &&
+          std::isfinite(level_update.time_end_code) &&
+          level_update.time_end_code > level_update.time_begin_code &&
+          std::isfinite(level_update.scale_factor_begin) &&
+          std::isfinite(level_update.scale_factor) &&
+          std::isfinite(level_update.scale_factor_end) &&
+          level_update.scale_factor_begin > 0.0 &&
+          level_update.scale_factor > 0.0 &&
+          level_update.scale_factor_end > 0.0)) {
+      throw std::invalid_argument(
+          "recursive AMR smooth source execution received an invalid level interval");
+    }
+
+    core::IntegratorState level_integrator = parent_context.integrator_state;
+    level_integrator.current_time_code =
+        level_update.time_begin_code + 0.5 * level_update.dt_code;
+    level_integrator.current_scale_factor = level_update.scale_factor;
+    level_integrator.current_redshift = m_is_cosmological
+        ? std::max(0.0, 1.0 / level_update.scale_factor - 1.0)
+        : 0.0;
+    level_integrator.current_hubble_rate_code = level_update.hubble_rate_code;
+    level_integrator.dt_time_code = level_update.dt_code;
+
+    core::StepContext level_context{parent_context.state, level_integrator};
+    level_context.active_set = core::ActiveSetDescriptor{
+        .particle_indices = {},
+        .cell_indices = level_rows,
+        .particles_are_subset = true,
+        .cells_are_subset = true,
+        .particles_from_scheduler = false,
+        .cells_from_scheduler = false,
+        .has_generation_metadata = true,
+        .source_particle_index_generation =
+            parent_context.state.particleIndexGeneration(),
+        .source_cell_index_generation = parent_context.state.cellIndexGeneration(),
+        .source_scheduler_tick = parent_context.active_set.source_scheduler_tick,
+        .has_global_synchronization_metadata = true,
+        .globally_complete_active_set = false,
+    };
+    level_context.workspace = parent_context.workspace;
+    level_context.cosmology_background = parent_context.cosmology_background;
+    level_context.mode_policy = parent_context.mode_policy;
+    level_context.profiler_session = parent_context.profiler_session;
+    level_context.timeline_step = parent_context.timeline_step;
+    level_context.timeline_step.time_begin_code = level_update.time_begin_code;
+    level_context.timeline_step.time_end_code = level_update.time_end_code;
+    level_context.timeline_step.dt_time_code = level_update.dt_code;
+    level_context.timeline_step.scale_factor_begin = level_update.scale_factor_begin;
+    level_context.timeline_step.scale_factor_midpoint = level_update.scale_factor;
+    level_context.timeline_step.scale_factor_end = level_update.scale_factor_end;
+    level_context.timeline_step.redshift_begin = m_is_cosmological
+        ? std::max(0.0, 1.0 / level_update.scale_factor_begin - 1.0)
+        : 0.0;
+    level_context.timeline_step.redshift_end = m_is_cosmological
+        ? std::max(0.0, 1.0 / level_update.scale_factor_end - 1.0)
+        : 0.0;
+    level_context.timeline_step.hubble_begin_code =
+        level_update.hubble_rate_begin_code;
+    level_context.timeline_step.hubble_end_code = level_update.hubble_rate_end_code;
+    level_context.timeline_step.dt_time_si =
+        m_is_cosmological && parent_context.cosmology_background != nullptr
+        ? parent_context.cosmology_background->cosmicTimeIntervalSi(
+              level_update.scale_factor_begin, level_update.scale_factor_end)
+        : level_update.dt_code * m_units.timeSiPerCode();
+    level_context.boundary = parent_context.boundary;
+    level_context.stage = core::IntegrationStage::kSourceTerms;
+    level_context.source_split_phase = phase;
+
+    if (m_multilevel_source_step != parent_context.integrator_state.step_index) {
+      resetMultilevelSourceAggregation(parent_context.integrator_state.step_index);
+    }
+    const physics::ChemistryShadowReport shadow = executeThermochemistry(
+        level_context, sourceEvaluationScaleFactor(level_context), false);
+    accumulateMultilevelShadowReport(shadow);
+  }
+
   void execute(SourceMutationStageView& view) override {
     view.requireFresh();
     core::StepContext& context = internal::RuntimeStageAccess::sourceContext(
@@ -1280,10 +1381,20 @@ class SourceRuntimeImpl final : public SourceRuntime {
       ~GrowthSchedulerReset() { slot = nullptr; }
     } growth_scheduler_reset{m_growth_scheduler};
 
-    // Smooth deterministic operators execute in both Strang halves. All
-    // stochastic/discrete transactions remain in the post half and therefore
-    // see one absolute end-of-interval event surface.
-    executeThermochemistry(context, smooth_source_evaluation_scale_factor);
+    // Recursive Berger-Oliger AMR owns the clocks of its smooth baryonic
+    // operators. In that mode hydro invokes thermochemistry/dust/SGS around
+    // every level transport interval; the global source stages retain only
+    // diffusion and the once-per-accepted-step discrete event surface.
+    const bool recursive_level_sources =
+        recursiveAmrLevelSourcesActive(context);
+    if (recursive_level_sources &&
+        context.source_split_phase == core::SourceSplitPhase::kStrangPreHalf) {
+      resetMultilevelSourceAggregation(context.integrator_state.step_index);
+    }
+    if (!recursive_level_sources) {
+      (void)executeThermochemistry(
+          context, smooth_source_evaluation_scale_factor, true);
+    }
     const double smooth_source_dt_code =
         context.source_split_phase == core::SourceSplitPhase::kUnsplitCompatibility
         ? context.integrator_state.dt_time_code
@@ -1292,6 +1403,14 @@ class SourceRuntimeImpl final : public SourceRuntime {
       executeMetalDiffusion(
           context, smooth_source_evaluation_scale_factor, smooth_source_dt_code);
       return;
+    }
+    if (recursive_level_sources) {
+      if (m_multilevel_source_step != context.integrator_state.step_index) {
+        throw std::logic_error(
+            "recursive AMR source post stage has no level-clock source history");
+      }
+      m_last_shadow_report = m_multilevel_shadow_report;
+      updateGlobalChemistryControl(context, m_multilevel_shadow_report);
     }
 
     // Discrete transactions remain tied to the absolute accepted interval
@@ -1661,6 +1780,51 @@ class SourceRuntimeImpl final : public SourceRuntime {
   }
 
  private:
+  [[nodiscard]] bool recursiveAmrLevelSourcesActive(
+      const core::StepContext& context) const {
+    if (!m_amr_level_source_coupling_enabled ||
+        m_full_config.numerics.amr_time_stepping !=
+            core::AmrTimeSteppingConfigMode::kRecursiveSubcycling ||
+        context.source_split_phase ==
+            core::SourceSplitPhase::kUnsplitCompatibility) {
+      return false;
+    }
+    const std::uint64_t local_has_production_amr =
+        amr::hasProductionAmrHydroCoverage(context.state) ? 1ULL : 0ULL;
+    return m_mpi_context.allreduceSumUint64(local_has_production_amr) > 0U;
+  }
+
+  void resetMultilevelSourceAggregation(std::uint64_t step_index) noexcept {
+    m_multilevel_shadow_report = {};
+    m_multilevel_source_step = step_index;
+  }
+
+  void accumulateMultilevelShadowReport(
+      const physics::ChemistryShadowReport& report) noexcept {
+    const std::uint64_t previous_samples = m_multilevel_shadow_report.samples;
+    const long double weighted_cost =
+        static_cast<long double>(m_multilevel_shadow_report.mean_substep_cost_ratio) *
+            static_cast<long double>(previous_samples) +
+        static_cast<long double>(report.mean_substep_cost_ratio) *
+            static_cast<long double>(report.samples);
+    m_multilevel_shadow_report.samples += report.samples;
+    m_multilevel_shadow_report.max_relative_species_difference = std::max(
+        m_multilevel_shadow_report.max_relative_species_difference,
+        report.max_relative_species_difference);
+    m_multilevel_shadow_report.max_relative_electron_difference = std::max(
+        m_multilevel_shadow_report.max_relative_electron_difference,
+        report.max_relative_electron_difference);
+    m_multilevel_shadow_report.max_relative_energy_difference = std::max(
+        m_multilevel_shadow_report.max_relative_energy_difference,
+        report.max_relative_energy_difference);
+    m_multilevel_shadow_report.mean_substep_cost_ratio =
+        m_multilevel_shadow_report.samples == 0U
+        ? 0.0
+        : static_cast<double>(
+              weighted_cost /
+              static_cast<long double>(m_multilevel_shadow_report.samples));
+  }
+
   [[nodiscard]] double scaleFactorAtPhysicalFraction(
       const core::StepContext& context, double fraction) const {
     if (!m_is_cosmological) return 1.0;
@@ -1756,9 +1920,12 @@ class SourceRuntimeImpl final : public SourceRuntime {
   // rejects the stage on EVERY rank (kNumericalRetry) and nothing is
   // committed (audit F2 contract). Touched rows are refreshed before any CFL
   // or source consumer reads P, T or c_s (audit F4 contract).
-  void executeThermochemistry(core::StepContext& context, double source_evaluation_scale_factor) {
+  [[nodiscard]] physics::ChemistryShadowReport executeThermochemistry(
+      core::StepContext& context,
+      double source_evaluation_scale_factor,
+      bool update_chemistry_control) {
     (void)physics::ensureGasCompositionInitialized(context.state, m_physics_config);
-    if (m_thermochemistry == nullptr) return;
+    if (m_thermochemistry == nullptr) return {};
     const physics::SourceInterval interval = makeSourceInterval(context, source_evaluation_scale_factor);
     const bool all_cells_active =
         !context.active_set.cells_are_subset && context.active_set.cell_indices.empty();
@@ -1821,7 +1988,8 @@ class SourceRuntimeImpl final : public SourceRuntime {
     // The persistent controller advances once per accepted interval. The pre
     // half may sample shadow chemistry, but must not feed a new bias into the
     // post half of the same Strang composition.
-    if (context.source_split_phase != core::SourceSplitPhase::kStrangPreHalf) {
+    if (update_chemistry_control &&
+        context.source_split_phase != core::SourceSplitPhase::kStrangPreHalf) {
       updateGlobalChemistryControl(context, current_shadow);
     }
     if (!touched.empty()) {
@@ -1883,6 +2051,7 @@ class SourceRuntimeImpl final : public SourceRuntime {
                       {"element_projection_residual", std::to_string(l.element_mass_residual_code)},
                       {"charge_residual", std::to_string(l.charge_residual)}}});
     }
+    return current_shadow;
   }
 
   // CHUI Part 3 Checkpoint F (C03/C04): global error-aware fidelity control.
@@ -3456,6 +3625,10 @@ class SourceRuntimeImpl final : public SourceRuntime {
   physics::DustUpdateLedger m_last_dust_ledger{};
   physics::SgsLedger m_last_sgs_ledger{};
   physics::ChemistryShadowReport m_last_shadow_report{};
+  physics::ChemistryShadowReport m_multilevel_shadow_report{};
+  std::uint64_t m_multilevel_source_step =
+      std::numeric_limits<std::uint64_t>::max();
+  bool m_amr_level_source_coupling_enabled = false;
   std::uint64_t m_last_skipped_effective_rows = 0U;
   physics::BaryonicSourceStageConfig m_source_stage_config{};
   struct ControllerCheckpoint {
@@ -3473,6 +3646,9 @@ class SourceRuntimeImpl final : public SourceRuntime {
     physics::DustUpdateLedger last_dust_ledger{};
     physics::SgsLedger last_sgs_ledger{};
     physics::ChemistryShadowReport last_shadow_report{};
+    physics::ChemistryShadowReport multilevel_shadow_report{};
+    std::uint64_t multilevel_source_step =
+        std::numeric_limits<std::uint64_t>::max();
     std::uint64_t last_skipped_effective_rows = 0U;
     physics::ElementDiffusionReport last_element_diffusion{};
   };

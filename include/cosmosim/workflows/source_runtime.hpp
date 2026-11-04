@@ -2,11 +2,13 @@
 
 #include <cstdint>
 #include <memory>
+#include <span>
 
 #include "cosmosim/core/config.hpp"
 #include "cosmosim/core/simulation_mode.hpp"
 #include "cosmosim/core/time_integration.hpp"
 #include "cosmosim/core/units.hpp"
+#include "cosmosim/hydro/hydro_core_solver.hpp"
 #include "cosmosim/workflows/runtime_resources.hpp"
 #include "cosmosim/workflows/runtime_module_registry.hpp"
 #include "cosmosim/parallel/distributed_memory.hpp"
@@ -30,6 +32,17 @@ class SourceRuntime {
   virtual ~SourceRuntime() = default;
 
   virtual void execute(SourceMutationStageView& view) = 0;
+  // T02: smooth thermochemistry/dust/SGS on one recursive AMR level
+  // subinterval. The caller is the AMR clock owner and invokes both phases on
+  // every rank, including empty local spans. Discrete sources and diffusion
+  // retain their separate global chronology until their dedicated contracts
+  // are connected; this method must never execute them implicitly.
+  virtual void executeAmrLevelSmoothSources(
+      core::StepContext& parent_context,
+      std::span<const std::uint32_t> level_rows,
+      const hydro::HydroUpdateContext& level_update,
+      core::SourceSplitPhase phase) = 0;
+  virtual void setAmrLevelSourceCouplingEnabled(bool enabled) noexcept = 0;
   [[nodiscard]] virtual RuntimeTaskMemoryEstimate estimateMemory(
       const core::SimulationState&) const {
     return {0U, false, "source owner does not publish a complete memory model"};

@@ -42,6 +42,7 @@
 #include "cosmosim/hydro/hydro_reconstruction.hpp"
 #include "cosmosim/hydro/hydro_riemann.hpp"
 #include "cosmosim/workflows/runtime_services.hpp"
+#include "cosmosim/workflows/source_runtime.hpp"
 #include "workflows/internal/runtime_stage_resource_access.hpp"
 #include "workflows/internal/cartesian_gas_cell_layout.hpp"
 #include "workflows/internal/gas_cell_ownership.hpp"
@@ -58,6 +59,35 @@ namespace cosmosim::workflows {
 namespace {
 
 constexpr double k_gamma_adiabatic = 5.0 / 3.0;
+
+class RecursiveAmrLevelSourceAdapter final
+    : public amr::RecursiveAmrLevelSourceOperator {
+ public:
+  RecursiveAmrLevelSourceAdapter(
+      SourceRuntime& source_runtime,
+      core::StepContext& parent_context) noexcept
+      : m_source_runtime(source_runtime), m_parent_context(parent_context) {}
+
+  void apply(
+      core::SimulationState& state,
+      std::span<const std::uint32_t> level_rows,
+      const hydro::HydroUpdateContext& level_update,
+      amr::RecursiveAmrSourcePhase phase) override {
+    if (&state != &m_parent_context.state) {
+      throw std::logic_error(
+          "recursive AMR source adapter received a non-authoritative state");
+    }
+    m_source_runtime.executeAmrLevelSmoothSources(
+        m_parent_context, level_rows, level_update,
+        phase == amr::RecursiveAmrSourcePhase::kPreHydroHalf
+            ? core::SourceSplitPhase::kStrangPreHalf
+            : core::SourceSplitPhase::kStrangPostHalf);
+  }
+
+ private:
+  SourceRuntime& m_source_runtime;
+  core::StepContext& m_parent_context;
+};
 
 // Mapping of the core-owned configuration selectors onto hydro types. Policy
 // resolution happens once at runtime construction / per step, never inside
@@ -641,6 +671,10 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
     }
   }
 
+  void setMultilevelSourceRuntime(SourceRuntime* source) noexcept override {
+    m_multilevel_source_runtime = source;
+  }
+
   [[nodiscard]] const hydro::HydroProfileEvent& lastHydroProfile() const noexcept { return m_last_hydro_profile; }
   [[nodiscard]] const internal::SolverGhostRefreshReport&
   lastGhostRefreshReport() const noexcept {
@@ -801,6 +835,7 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
     core::StepContext& context = internal::RuntimeStageAccess::hydroAmrContext(
         view,
         {{RuntimeResourceKey::kParticleVelocity, RuntimeResourceAccessMode::kReadWrite},
+         {RuntimeResourceKey::kSourceMutationState, RuntimeResourceAccessMode::kReadWrite},
          {RuntimeResourceKey::kHydroConservedState, RuntimeResourceAccessMode::kReadWrite},
          {RuntimeResourceKey::kHydroPrimitiveState, RuntimeResourceAccessMode::kReadWrite},
          {RuntimeResourceKey::kAmrPatchState, RuntimeResourceAccessMode::kReadWrite},
@@ -2704,6 +2739,12 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
     if (m_config.numerics.amr_time_stepping == core::AmrTimeSteppingConfigMode::kRecursiveSubcycling) {
       verifyAcceptedRecursiveAmrHydroCfl(context, amr::ProductionAmrHydroOptions{}.refinement_ratio);
     }
+    std::optional<RecursiveAmrLevelSourceAdapter> recursive_source_adapter;
+    if (m_config.numerics.amr_time_stepping ==
+            core::AmrTimeSteppingConfigMode::kRecursiveSubcycling &&
+        m_multilevel_source_runtime != nullptr) {
+      recursive_source_adapter.emplace(*m_multilevel_source_runtime, context);
+    }
     const amr::ProductionAmrHydroOptions amr_options{
         .physical_boundary_kind = hydroBoundaryKindFromModePolicy(m_mode_policy.hydro_boundary),
         .adiabatic_index = k_gamma_adiabatic,
@@ -2714,6 +2755,9 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
         .active_batch_policy = active_batch_policy,
         .physical_density_cgs_per_density_code = physical_density_cgs_per_density_code,
         .regrid_memory_governor = m_memory_governor,
+        .recursive_level_source_operator = recursive_source_adapter.has_value()
+            ? &*recursive_source_adapter
+            : nullptr,
         .reconstruction_scheme = hydroReconstructionSchemeFromConfig(m_config),
         .slope_limiter = hydroSlopeLimiterFromConfig(m_config),
         // Patch coordinates share the comoving coordinate frame of the
@@ -3710,6 +3754,7 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
   const core::SimulationConfig& m_config;
   const core::ModePolicy& m_mode_policy;
   const parallel::MpiContext& m_mpi_context;
+  SourceRuntime* m_multilevel_source_runtime = nullptr;
   core::MemoryGovernor* m_memory_governor = nullptr;
   core::UnitSystem m_units;
   std::uint32_t m_current_world_rank = 0;

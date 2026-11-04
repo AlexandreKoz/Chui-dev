@@ -58,6 +58,26 @@ struct AmrLevelRefluxInterval {
   bool valid = false;
 };
 
+// Workflow-owned smooth baryonic source seam for recursive AMR. The AMR
+// library owns level clocks and calls this operator on every rank before and
+// after each level transport interval. The implementation may perform MPI
+// collectives; empty local row spans are therefore meaningful participation,
+// not a reason to skip the call.
+enum class RecursiveAmrSourcePhase : std::uint8_t {
+  kPreHydroHalf = 0,
+  kPostHydroHalf = 1,
+};
+
+class RecursiveAmrLevelSourceOperator {
+ public:
+  virtual ~RecursiveAmrLevelSourceOperator() = default;
+  virtual void apply(
+      core::SimulationState& state,
+      std::span<const std::uint32_t> level_rows,
+      const hydro::HydroUpdateContext& level_update,
+      RecursiveAmrSourcePhase phase) = 0;
+};
+
 struct ProductionAmrHydroOptions {
   hydro::HydroBoundaryKind physical_boundary_kind = hydro::HydroBoundaryKind::kOpen;
   double adiabatic_index = 5.0 / 3.0;
@@ -93,6 +113,8 @@ struct ProductionAmrHydroOptions {
   // fail closed when this authority is absent; ordinary hydro stepping does
   // not require it. Runtime composition must pass the process MemoryGovernor.
   core::MemoryGovernor* regrid_memory_governor = nullptr;
+  // Non-owning synchronous hook. Null retains transport-only recursive AMR.
+  RecursiveAmrLevelSourceOperator* recursive_level_source_operator = nullptr;
   // Spatial reconstruction and limiter used for every patch advance. The
   // time-integration family (MUSCL-Hancock / CTU) and dual-energy policy are
   // owned by the HydroCoreSolver passed to the advance entry points. PPM and

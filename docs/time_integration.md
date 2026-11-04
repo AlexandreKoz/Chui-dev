@@ -23,6 +23,16 @@ Star births, stellar returns, SN/wind feedback and BH transactions run exactly
 once in the post dispatch at the absolute accepted-interval endpoint. Direct
 low-level source dispatch retains an explicit unsplit compatibility phase.
 
+With recursive AMR subcycling, the AMR clock owner replaces the coarse
+thermochemistry/dust/SGS halves with `S_L(dt_L/2) H_L(dt_L) S_L(dt_L/2)` for
+every level subinterval. Every rank enters each level-source transaction,
+including ranks whose local row span is empty. The level hook never executes
+star formation, stellar events, feedback, winds, BH transactions or diffusion;
+those remain exactly-once global operators until their separate multilevel
+chronology contracts are connected. Coarse temporal histories bracket the
+complete level split state, and source-controller state is reduced and
+committed once at the accepted global post surface.
+
 The scheduler (`StageScheduler`) owns this ordering and solver modules interact via stage-bound `IntegrationCallback` implementations. Each callback must declare its exact `integrationStages()` set during registration; `StepOrchestrator` stores handlers in per-stage buckets and dispatches only the bucket for the active stage in stable registration order. Production callbacks must treat any off-stage direct invocation as a contract violation rather than silently self-filtering. This keeps gravity/hydro/source/output sequencing explicit and auditable, prevents solvers from receiving irrelevant stages, and avoids per-stage broadcast scans in the hot path.
 
 ### Callback migration note

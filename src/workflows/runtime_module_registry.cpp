@@ -93,6 +93,7 @@ namespace {
     case RuntimeStageViewKind::kHydroAmr:
       switch (resource) {
         case Key::kParticleVelocity: return Mode::kReadWrite;
+        case Key::kSourceMutationState: return Mode::kReadWrite;
         case Key::kHydroConservedState: return Mode::kReadWrite;
         case Key::kHydroPrimitiveState: return Mode::kReadWrite;
         case Key::kAmrPatchState: return Mode::kReadWrite;

@@ -104,30 +104,24 @@ Key quantitative facts (details in `data_sources.md`):
 | Gas gravity kicks | Same KDK | Half-kicks at the coarse boundaries, all levels | Once per interval | Cell acceleration criterion, not relaxed | Gas velocity inside substeps has no gravity impulse | Same | Strang (gravity ⊕ hydro), second order in coarse Δt |
 | Hydro transport | `advance*Recursive` level clocks | Level L: Δt/r^(L−Lmin) | Each cell exactly once over its own interval | Level-relaxed CFL with a collective guard | Yes, at each level clock (temporal ghosts) | Same | Conservative FV with reflux |
 | Hydro source terms (legacy cooling, effective-ISM relaxation) | Sweep update context | Per level substep | Each substep | Internal subcycling | Yes | Same | Level-local |
-| Part 2 thermochemistry, dust, SGS | `SourceRuntime` (`makeSourceInterval`) | Two coarse-cadence half steps around hydro | Full interval as two physical half intervals | Internal error-controlled subcycling; rejection leads to retry | **No.** Recursive level clocks are still not source-local. | Stage transaction plus full-copy | Strang reference at coarse cadence |
+| Part 2 thermochemistry, dust, SGS | Recursive AMR clock through `SourceRuntime::executeAmrLevelSmoothSources` | Two half steps around every level subinterval | Every owned leaf row covers its level interval exactly once | Internal error-controlled subcycling; rejection leads to collective retry | Yes, at each level clock and in its temporal boundary history | Per-level collective stage transaction, private controller checkpoint and full-copy restore | Level-local Strang reference |
 | Star formation | `SourceRuntime` | Once in the post half | Full accepted interval; birth epoch is the absolute endpoint | SF timestep candidate, not relaxed | No | Transaction and full copy | Discrete endpoint event, not duplicated |
 | SSP return, events, feedback, winds | `SourceRuntime` plus cumulative chronology | Once in the post half | Full interval; events by cumulative Poisson, never duplicated | none (cumulative) | Deposits at the synchronized step end | Population sidecar restored | Discrete endpoint event |
 | Element diffusion | `SourceRuntime` | Two coarse-cadence half steps, each with internal global subcycles | Full interval as two half intervals | Parabolic candidate plus internal stable Δt | No | Collective all-or-nothing | Strang reference |
 | Regrid, output, checkpoint | Coordinator | Synchronized boundaries only | — | — | — | Full copy | — |
 
-**Assessment against the original T02.** Hydro, its source terms and the reflux are level-local,
-and every interval is covered exactly once with positive duration and correct chronology. Nothing
-is double counted, skipped or stale-accelerated.
+**Assessment against the original T02.** Hydro, its local thermochemistry/dust/SGS terms and reflux
+now share the recursive level clocks. The AMR driver calls a row-subset source transaction before
+and after every level sweep; empty ranks participate, coarse global source dispatch skips the same
+smooth operator, and accepted temporal-history endpoints include the split source state. The
+adaptive-chemistry shadow report is accumulated across all level halves and advances its persistent
+controller only once at the global post surface.
 
-The canonical `SourceRuntime` operators now use deterministic Strang splitting relative to the
-fine hydro clocks. The coarse Δt is **not** bounded by any thermochemical cooling time: no such
-candidate exists in `updateAdaptiveTimeBins`. In deeply refined, rapidly cooling gas, the
-splitting error therefore scales with the coarse interval, not with the level clock. This does
-**not** meet a fully level-local T02. **T02 remains PARTIAL.**
-
-Exact continuation:
-
-1. Add a `ProductionAmrHydroOptions` per-level source callback, called by
-   `advanceProductionAmrHydroRecursiveImpl` after each level sweep with that level's rows and
-   `subintervalUpdate`.
-2. Implement it in `SourceRuntime` as a row-subset `executeThermochemistry` (staged transaction,
-   collective vote per level clock), and skip those rows in the coarse-interval call.
-3. Until then, the owner can bound the error by setting `numerics.source_max_fractional_change`.
+T02 remains **PARTIAL** because star births, cumulative SSP/SN/wind events and element diffusion
+still execute at the synchronized global source surface. The exact continuation is a persistent
+absolute-time event queue with stable population/event IDs and cross-level conservative deposition,
+followed by a level-topology diffusion operator; both must participate in rollback/restart without
+replaying an event or applying a source twice.
    Alternatively, add a cooling-time timestep candidate. That would be a new key; not done here.
 
 No duplicate time authority is introduced either way.

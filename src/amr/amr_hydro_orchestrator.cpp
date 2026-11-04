@@ -3432,8 +3432,6 @@ ProductionAmrHydroDiagnostics advanceProductionAmrHydroRecursiveImpl(
     std::exception_ptr level_failure;
     try {
       if (has_finer) {
-        captureAmrTemporalBoundaryHistoryStartForLevel(
-            state, descriptors, level, t_begin, options.adiabatic_index, options.regrid_memory_governor);
         intervals[static_cast<std::size_t>(level)] = AmrLevelRefluxInterval{
             .interval_start_code = t_begin, .interval_end_code = t_end, .coarse_dt_code = update.dt_code,
             .substeps_per_interval = ratio_to_next[i], .substep_index = 0U, .valid = true};
@@ -3445,6 +3443,28 @@ ProductionAmrHydroDiagnostics advanceProductionAmrHydroRecursiveImpl(
       level_failure = std::current_exception();
     }
     reduce(level_failure, "recursive AMR level interval open");
+    try {
+      if (options.recursive_level_source_operator != nullptr) {
+        options.recursive_level_source_operator->apply(
+            state, rows_by_level[i], update,
+            RecursiveAmrSourcePhase::kPreHydroHalf);
+      }
+    } catch (...) {
+      level_failure = std::current_exception();
+    }
+    reduce(level_failure, "recursive AMR level pre-source half");
+    try {
+      if (has_finer) {
+        // Temporal endpoints include the source half-steps. Fine ghosts then
+        // interpolate between complete coarse Strang boundary states.
+        captureAmrTemporalBoundaryHistoryStartForLevel(
+            state, descriptors, level, t_begin, options.adiabatic_index,
+            options.regrid_memory_governor);
+      }
+    } catch (...) {
+      level_failure = std::current_exception();
+    }
+    reduce(level_failure, "recursive AMR level history start");
     ProductionAmrHydroOptions level_options = options;
     level_options.sweep_mode = ProductionAmrHydroSweepMode::kSynchronized;
     level_options.persist_incomplete_flux_registers = true;
@@ -3493,6 +3513,16 @@ ProductionAmrHydroDiagnostics advanceProductionAmrHydroRecursiveImpl(
       // pending store's substep coverage mask).
       hooks->exchangeLevelFluxRegisters(state, outbound, level_options);
     }
+    try {
+      if (options.recursive_level_source_operator != nullptr) {
+        options.recursive_level_source_operator->apply(
+            state, rows_by_level[i], update,
+            RecursiveAmrSourcePhase::kPostHydroHalf);
+      }
+    } catch (...) {
+      level_failure = std::current_exception();
+    }
+    reduce(level_failure, "recursive AMR level post-source half");
     diagnostics.substeps_by_level[static_cast<std::size_t>(level)] += 1U;
     diagnostics.subcycled_level_step_count += 1U;
     if (!has_finer) return;

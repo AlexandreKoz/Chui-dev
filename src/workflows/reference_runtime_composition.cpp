@@ -399,6 +399,7 @@ namespace {
           .ordinal = 0,
           .view_kind = RuntimeStageViewKind::kHydroAmr,
           .resources = {readWrite(RuntimeResourceKey::kParticleVelocity),
+                        readWrite(RuntimeResourceKey::kSourceMutationState),
                         readWrite(RuntimeResourceKey::kHydroConservedState),
                         readWrite(RuntimeResourceKey::kHydroPrimitiveState),
                         readWrite(RuntimeResourceKey::kAmrPatchState),
@@ -458,7 +459,10 @@ namespace {
                         read(RuntimeResourceKey::kEffectiveIsmThermodynamics),
                         readWrite(RuntimeResourceKey::kMigrationOwnership),
                         read(RuntimeResourceKey::kIntegratorTruth)},
-          .dependencies = {"hydro_amr::hydro_amr.update"},
+          // The integrator invokes this task at both Strang source surfaces.
+          // A static hydro dependency would contradict the pre-hydro half;
+          // phase order is owned by the time integrator.
+          .dependencies = {},
           .scheduling = schedulingProfile(
               0U, RuntimeTaskPressureClass::kHigh, RuntimeTaskPressureClass::kHigh,
               RuntimeTaskPressureClass::kModerate),
@@ -478,6 +482,12 @@ namespace {
                 assembly->effective_eos_table,
                 &services));
         assembly->source = owner;
+        if (assembly->hydro_amr != nullptr) {
+          assembly->hydro_amr->setMultilevelSourceRuntime(owner.get());
+          owner->setAmrLevelSourceCouplingEnabled(
+              config.numerics.amr_time_stepping ==
+              core::AmrTimeSteppingConfigMode::kRecursiveSubcycling);
+        }
         RuntimeModuleInstance instance;
         instance.owner_lifetime = owner;
         instance.stage_tasks.push_back(RuntimeStageTaskContribution{
