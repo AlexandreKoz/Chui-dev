@@ -899,6 +899,8 @@ class SourceRuntimeImpl final : public SourceRuntime {
         m_stellar_feedback(makeRuntimeStellarFeedbackConfig(config, units)),
         m_metal_diffusion(physics::makeMetalDiffusionConfig(config.physics)),
         m_black_hole(makeRuntimeBlackHoleAgnConfig(config.physics, units)),
+        m_physics_config(config.physics),
+        m_full_config(config),
         m_particle_id_registry(mpi_context),
         m_mpi_context(mpi_context),
         m_runtime_services(runtime_services),
@@ -936,8 +938,6 @@ class SourceRuntimeImpl final : public SourceRuntime {
     // CHUI Part 2: resolve the thermochemistry model, its data products and
     // the composition layout ONCE (never in cell loops). Missing production
     // data stops construction with SourceModelUnavailableError.
-    m_physics_config = config.physics;
-    m_full_config = config;
     m_box_extent_comoving = {config.cosmology.box_size_x_mpc_comoving, config.cosmology.box_size_y_mpc_comoving,
                              config.cosmology.box_size_z_mpc_comoving};
     if (config.physics.enable_stellar_evolution &&
@@ -1623,6 +1623,13 @@ class SourceRuntimeImpl final : public SourceRuntime {
     // from the step-start state, staged per row, and written together only
     // after the collective accept. A rejection leaves state, metadata and
     // the published diagnostics exactly as they were.
+    // G0.4: the committed promotion bias has exactly one authority, the
+    // canonical sidecar "chui_adaptive_chemistry_control_v1" carried by
+    // SimulationState (restart payload and rollback copy). The operator's
+    // cached bias is re-derived from it before EVERY fidelity decision, so a
+    // rejected/rolled-back step, a restart, or a retry cannot reuse a value
+    // that was never committed to the canonical state.
+    loadCommittedChemistryControl(context.state);
     physics::BaryonicSourceStage stage(*m_thermochemistry, m_source_stage_config);
     const internal::MpiStageCollectiveDecision decision(m_mpi_context);
     core::StageTransaction transaction("sources.baryonic_stage", m_memory_governor, &decision);
@@ -1658,7 +1665,12 @@ class SourceRuntimeImpl final : public SourceRuntime {
       m_last_shadow_report = report.shadow;
       m_last_skipped_effective_rows = report.skipped_effective_rows;
     }
-    updateGlobalChemistryControl(context);
+    // Ranks without local work contribute zero current samples (never a stale
+    // report from a previous stage) to the collective control reduction.
+    const physics::ChemistryShadowReport current_shadow =
+        local_work ? m_last_shadow_report : physics::ChemistryShadowReport{};
+    if (!local_work) m_last_shadow_report = current_shadow;
+    updateGlobalChemistryControl(context, current_shadow);
     if (!touched.empty()) {
       context.state.notifyGasThermodynamicMutation();
       std::unique_ptr<physics::EffectiveIsmThermodynamicClosure> closure;
@@ -1722,19 +1734,40 @@ class SourceRuntimeImpl final : public SourceRuntime {
   // (sum), applies the same deterministic control law, and persists the bias
   // in module sidecar "chui_adaptive_chemistry_control_v1" so a restart
   // continues with the identical decision history.
-  void updateGlobalChemistryControl(core::StepContext& context) {
-    if (m_thermochemistry == nullptr || !m_thermochemistry->config().adaptive.enabled) return;
-    const auto* stored = context.state.sidecars.find("chui_adaptive_chemistry_control_v1");
-    if (!m_chemistry_control_restored && stored != nullptr) {
-      const std::string text(reinterpret_cast<const char*>(stored->payload.data()), stored->payload.size());
-      const auto pos = text.find("promotion_bias=");
-      if (pos != std::string::npos) m_thermochemistry->setGlobalPromotionBias(std::stod(text.substr(pos + 15)));
+  // Parses the committed controller state from the canonical sidecar. Absent
+  // sidecar => the documented initial state (bias 0). A malformed payload is
+  // an invalid-state error, never a silent reset.
+  [[nodiscard]] static double committedPromotionBias(const core::SimulationState& state) {
+    const auto* stored = state.sidecars.find("chui_adaptive_chemistry_control_v1");
+    if (stored == nullptr) return 0.0;
+    const std::string text(reinterpret_cast<const char*>(stored->payload.data()), stored->payload.size());
+    const auto pos = text.find("promotion_bias=");
+    if (pos == std::string::npos) {
+      throw std::runtime_error("chui_adaptive_chemistry_control_v1 sidecar has no promotion_bias entry");
     }
-    m_chemistry_control_restored = true;
-    const double global_max = -m_mpi_context.allreduceMinDouble(-m_last_shadow_report.max_relative_species_difference);
-    const std::uint64_t global_samples = m_mpi_context.allreduceSumUint64(m_last_shadow_report.samples);
-    const double bias = physics::nextChemistryPromotionBias(
-        m_thermochemistry->globalPromotionBias(), global_max, global_samples);
+    std::size_t consumed = 0U;
+    const double bias = std::stod(text.substr(pos + 15), &consumed);
+    if (consumed == 0U || !std::isfinite(bias) || bias < 0.0) {
+      throw std::runtime_error("chui_adaptive_chemistry_control_v1 sidecar has an invalid promotion_bias");
+    }
+    return bias;
+  }
+
+  void loadCommittedChemistryControl(const core::SimulationState& state) {
+    if (m_thermochemistry == nullptr || !m_thermochemistry->config().adaptive.enabled) return;
+    m_thermochemistry->setGlobalPromotionBias(committedPromotionBias(state));
+  }
+
+  void updateGlobalChemistryControl(core::StepContext& context,
+                                    const physics::ChemistryShadowReport& current_shadow) {
+    if (m_thermochemistry == nullptr || !m_thermochemistry->config().adaptive.enabled) return;
+    // Next value is a pure function of the COMMITTED bias and this stage's
+    // collective shadow reduction; it becomes authoritative only by being
+    // written to the canonical sidecar (restored on rollback/restart).
+    const double committed_bias = committedPromotionBias(context.state);
+    const double global_max = -m_mpi_context.allreduceMinDouble(-current_shadow.max_relative_species_difference);
+    const std::uint64_t global_samples = m_mpi_context.allreduceSumUint64(current_shadow.samples);
+    const double bias = physics::nextChemistryPromotionBias(committed_bias, global_max, global_samples);
     m_thermochemistry->setGlobalPromotionBias(bias);
     std::ostringstream text;
     text.precision(17);
@@ -3020,13 +3053,14 @@ class SourceRuntimeImpl final : public SourceRuntime {
   std::array<double, 3> m_box_extent_comoving{};
   std::uint64_t m_sf_gradient_unavailable_cells = 0U;
   std::uint64_t m_sf_gradient_coarse_fine_cells = 0U;
-  core::SimulationConfig m_full_config{};
+  // SimulationConfig has no default constructor; initialized from the
+  // constructor's member-initializer list (declaration order preserved).
+  core::SimulationConfig m_full_config;
   physics::IsmRegimeReport m_last_ism_regime_report{};
   physics::ChemistryAdaptiveReport m_last_chemistry_adaptive_report{};
   physics::DustUpdateLedger m_last_dust_ledger{};
   physics::SgsLedger m_last_sgs_ledger{};
   physics::ChemistryShadowReport m_last_shadow_report{};
-  bool m_chemistry_control_restored = false;
   std::uint64_t m_last_skipped_effective_rows = 0U;
   physics::BaryonicSourceStageConfig m_source_stage_config{};
   DistributedParticleIdRegistry m_particle_id_registry;
