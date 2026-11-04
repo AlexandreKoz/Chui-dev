@@ -643,6 +643,7 @@ add_library(cosmosim_workflows STATIC
   src/workflows/initial_condition_runtime.cpp
   src/workflows/internal/cartesian_gas_cell_layout.cpp
   src/workflows/internal/metal_diffusion_topology.cpp
+  src/workflows/internal/distributed_element_diffusion.cpp
   src/workflows/internal/gas_cell_ownership.cpp
   src/workflows/internal/migration_wire.cpp
   src/workflows/internal/gravity_force_endpoint.cpp
@@ -945,6 +946,23 @@ if(COSMOSIM_ENABLE_TESTS)
     cosmosim_mark_runtime_truth_test(
       integration_reference_workflow_distributed_isolated_pm_mpi_two_rank
       mpi distributed pm isolated_pm guard workflow integration)
+  endif()
+
+  if(COSMOSIM_ENABLE_MPI)
+    # G2.1 distributed element-resolved diffusion (NOT RUN — USER-RESERVED).
+    add_executable(
+      test_integration_distributed_element_diffusion_mpi
+      tests/integration/test_distributed_element_diffusion_mpi.cpp)
+    target_include_directories(test_integration_distributed_element_diffusion_mpi PRIVATE ${PROJECT_SOURCE_DIR}/src)
+    target_link_libraries(test_integration_distributed_element_diffusion_mpi PRIVATE cosmosim_all)
+    foreach(chui_diffusion_np IN ITEMS 2 4)
+      add_test(
+        NAME integration_distributed_element_diffusion_mpi_np${chui_diffusion_np}
+        COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} ${chui_diffusion_np} ${MPIEXEC_PREFLAGS}
+                $<TARGET_FILE:test_integration_distributed_element_diffusion_mpi> ${MPIEXEC_POSTFLAGS})
+      set_tests_properties(integration_distributed_element_diffusion_mpi_np${chui_diffusion_np}
+        PROPERTIES SKIP_RETURN_CODE 77 LABELS "chui_part3;mpi;distributed;integration")
+    endforeach()
   endif()
 
   if(COSMOSIM_ENABLE_MPI AND COSMOSIM_ENABLE_HDF5)

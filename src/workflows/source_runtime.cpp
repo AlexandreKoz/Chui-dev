@@ -13,6 +13,7 @@
 #include <limits>
 #include <memory>
 #include <numeric>
+#include <optional>
 #include <memory_resource>
 #include <span>
 #include <stdexcept>
@@ -50,6 +51,7 @@
 #include "workflows/internal/gas_cell_ownership.hpp"
 #include "workflows/internal/mpi_stage_collective_decision.hpp"
 #include "workflows/internal/particle_id_registry.hpp"
+#include "workflows/internal/distributed_element_diffusion.hpp"
 #include "workflows/internal/metal_diffusion_topology.hpp"
 #include "workflows/internal/runtime_stage_resource_access.hpp"
 #include "workflows/internal/retained_population_growth.hpp"
@@ -1851,7 +1853,12 @@ class SourceRuntimeImpl final : public SourceRuntime {
     std::vector<Query> queries;
     std::vector<int> destinations;
     for (const auto& budget : budgets) {
-      if (budget.ejecta_mass_code == 0.0 && budget.supernova_energy_erg == 0.0 && budget.presn_momentum_code == 0.0) {
+      // Same activity predicate as MechanicalFeedbackDeposition::stage: a
+      // wind-only or dispersion-only source still deposits, so it must see the
+      // global stencil (previously skipped => rank-local stencil).
+      if (budget.ejecta_mass_code == 0.0 && budget.supernova_energy_erg == 0.0 && budget.presn_momentum_code == 0.0 &&
+          budget.wind_energy_erg == 0.0 && budget.wind_momentum_code == 0.0 &&
+          budget.association_dispersion_energy_code == 0.0) {
         continue;
       }
       const double r2 = deposition.localStencilRadius2(state, budget.position_comoving);
@@ -2846,13 +2853,28 @@ class SourceRuntimeImpl final : public SourceRuntime {
   void executeMetalDiffusion(
       core::StepContext& context,
       double source_evaluation_scale_factor) {
-    if (!m_metal_diffusion.config().enabled || context.state.cells.size() == 0U) {
+    if (!m_metal_diffusion.config().enabled) {
       return;
     }
-    if (m_mpi_context.isEnabled() && m_mpi_context.worldSize() > 1) {
-      throw std::runtime_error(
-          "metal diffusion is not permitted on multiple MPI ranks until the directed gas-cell interface exchange "
-          "and equal-and-opposite remote flux commit are available; refusing a decomposition-dependent result");
+    // G2.1: on more than one rank every rank enters every collective of the
+    // distributed element-resolved operator, including ranks without gas.
+    const bool distributed = m_mpi_context.isEnabled() && m_mpi_context.worldSize() > 1;
+    if (!distributed && context.state.cells.size() == 0U) {
+      return;
+    }
+    if (distributed) {
+      const std::uint64_t local_composition = context.state.gas_composition.enabled() ? 1U : 0U;
+      const std::uint64_t any_composition = m_mpi_context.allreduceMaxUint64(local_composition);
+      const std::uint64_t all_composition = m_mpi_context.allreduceMinUint64(local_composition);
+      if (any_composition != all_composition) {
+        throw std::runtime_error(
+            "distributed metal diffusion: composition sidecar enabled on some ranks only (invalid state)");
+      }
+      if (any_composition == 0U) {
+        throw std::runtime_error(
+            "metal diffusion on multiple MPI ranks requires the element-resolved composition sidecar; the "
+            "legacy total-Z scalar operator is single-rank only (refusing a decomposition-dependent result)");
+      }
     }
 
     const std::size_t cell_count = context.state.cells.size();
@@ -2901,13 +2923,47 @@ class SourceRuntimeImpl final : public SourceRuntime {
     const double scale_factor = m_coordinate_frame == core::CoordinateFrame::kComoving
         ? source_evaluation_scale_factor
         : 1.0;
-    internal::MetalDiffusionTopologyResult topology =
-        internal::buildMetalDiffusionTopology(
-            context.state,
-            m_owned_leaf_mask,
-            m_world_rank,
-            scale_factor,
-            m_hydro_boundary);
+    // G2.1: remote owned leaf neighbours (one ghost layer) and the global
+    // periodic envelope; collective on every rank.
+    internal::RemoteDiffusionCellGather remote_gather;
+    if (distributed) {
+      remote_gather = internal::gatherRemoteDiffusionCells(
+          context.state, m_mpi_context, m_memory_governor, scale_factor,
+          m_hydro_boundary == core::BoundaryCondition::kPeriodic, m_box_extent_comoving,
+          context.integrator_state.step_index);
+    }
+    // G0.5: admit the topology builder's complete construction working set
+    // (new faces/remote faces/strain coexisting with the retained graph, the
+    // boundary list, plane map, unique sets and directed refs) BEFORE it is
+    // allocated. Released when this stage returns.
+    core::MemoryReservation topology_reservation;
+    internal::MetalDiffusionTopologyResult topology;
+    std::exception_ptr topology_failure;
+    try {
+      if (m_memory_governor != nullptr) {
+        topology_reservation = m_memory_governor->reserve(
+            core::MemoryClass::kScratchArena,
+            internal::metalDiffusionTopologyConstructionBoundBytes(
+                context.state, m_owned_leaf_mask, m_world_rank, remote_gather.cells.size()),
+            "sources.metal_diffusion.topology_construction");
+        topology_reservation.commit();
+      }
+      topology = internal::buildMetalDiffusionTopology(
+          context.state,
+          m_owned_leaf_mask,
+          m_world_rank,
+          scale_factor,
+          m_hydro_boundary,
+          remote_gather.cells,
+          distributed ? remote_gather.global_envelope_physical : std::nullopt);
+    } catch (...) {
+      topology_failure = std::current_exception();
+    }
+    if (distributed) {
+      m_mpi_context.rethrowCollectivePreparationFailure(topology_failure, "metal-diffusion topology construction");
+    } else if (topology_failure != nullptr) {
+      std::rethrow_exception(topology_failure);
+    }
     m_diffusion_topology_scratch_high_water_bytes = std::max(
         m_diffusion_topology_scratch_high_water_bytes,
         topology.construction_scratch_high_water_bytes);
@@ -2997,7 +3053,7 @@ class SourceRuntimeImpl final : public SourceRuntime {
               m_diffusion_rho_kappa_code[cell_index]);
     }
 
-    if (m_diffusion_faces.empty()) {
+    if (m_diffusion_faces.empty() && !distributed) {
       if (m_memory_governor != nullptr &&
           replacement_phase_reservation.committed()) {
         m_diffusion_phase_reservation.release();
@@ -3014,23 +3070,42 @@ class SourceRuntimeImpl final : public SourceRuntime {
       core::MemoryReservation element_reservation;
       std::exception_ptr element_failure;
       physics::ElementDiffusionReport element_report;
+      // G0.5: elementDiffusionWorkspaceBytes is the single estimate of the
+      // operator's scratch INCLUDING the per-subcycle delta buffer; the delta
+      // is no longer added here (it was the only extra term, so the previous
+      // sum double-counted it once the estimator became complete).
       try {
         if (m_memory_governor != nullptr) {
           element_reservation = m_memory_governor->reserve(
               core::MemoryClass::kScratchArena,
-              core::checkedMemoryBytesAdd(
-                  physics::elementDiffusionWorkspaceBytes(sidecar.laneCount(), sidecar.rowCount()),
-                  static_cast<std::uint64_t>(sidecar.laneCount() * sidecar.rowCount() * sizeof(double)),
-                  "element diffusion workspace plus delta"),
+              physics::elementDiffusionWorkspaceBytes(sidecar.laneCount(), sidecar.rowCount()),
               "sources.element_diffusion.workspace");
           element_reservation.commit();
         }
-        element_report = physics::advanceElementResolvedDiffusion(
-            context.state.gas_composition, m_diffusion_faces, m_diffusion_rho_kappa_code,
-            context.integrator_state.dt_time_code, m_metal_diffusion.config().parabolic_cfl,
-            m_metal_diffusion.config().max_subcycles, m_element_diffusion_workspace);
       } catch (...) {
         element_failure = std::current_exception();
+      }
+      // A local refusal must be agreed before any rank enters the operator's
+      // collectives (otherwise peers would block in the face exchange).
+      if (distributed) {
+        m_mpi_context.rethrowCollectivePreparationFailure(element_failure, "element diffusion admission");
+      }
+      if (element_failure == nullptr) {
+        try {
+          std::optional<internal::DistributedElementDiffusionCoupling> coupling;
+          if (distributed) {
+            coupling.emplace(m_mpi_context, m_memory_governor, context.state, topology.remote_faces,
+                             m_diffusion_rho_kappa_code, sidecar.laneCount());
+            coupling->setup();
+          }
+          element_report = physics::advanceElementResolvedDiffusion(
+              context.state.gas_composition, m_diffusion_faces, m_diffusion_rho_kappa_code,
+              context.integrator_state.dt_time_code, m_metal_diffusion.config().parabolic_cfl,
+              m_metal_diffusion.config().max_subcycles, m_element_diffusion_workspace,
+              coupling.has_value() ? &*coupling : nullptr);
+        } catch (...) {
+          element_failure = std::current_exception();
+        }
       }
       m_element_diffusion_workspace.clear();
       m_element_diffusion_workspace.shrink_to_fit();

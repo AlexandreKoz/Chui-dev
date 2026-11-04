@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <limits>
 #include <map>
+#include <optional>
 #include <set>
 #include <stdexcept>
 #include <tuple>
@@ -15,6 +16,12 @@
 
 namespace cosmosim::workflows::internal {
 namespace {
+
+// Per-node allowances for node-based std::map/std::set scratch (libstdc++/
+// libc++ red-black node: 3 pointers + colour + payload, rounded to the
+// allocator's 16-byte granularity). A model, not measured allocator usage.
+constexpr std::size_t k_map_node_bytes = 96U;   // key (16) + vector header (24) + node (48) + pad
+constexpr std::size_t k_set_node_bytes = 64U;   // tuple key (12) + node (48) + pad
 
 struct DirectedFaceRef {
   std::uint32_t cell = 0U;
@@ -63,12 +70,54 @@ struct NeighborAccumulator {
 
 }  // namespace
 
+std::uint64_t metalDiffusionTopologyConstructionBoundBytes(
+    const core::SimulationState& state,
+    std::span<const std::uint8_t> owned_leaf_mask,
+    std::uint32_t world_rank,
+    std::size_t remote_cell_count) {
+  // Exact counts from patch dimensions (owned patches with owned leaves):
+  //  I = interior faces, B = local patch-boundary cell faces,
+  //  R = remote boundary cell faces (<= 6 per remote cell).
+  // Cross/periodic/remote faces <= B + R (each fine face matches at most one
+  // coarse face under 2:1 balance and each match consumes a distinct pair).
+  constexpr std::uint64_t k_max = std::numeric_limits<std::uint64_t>::max();
+  const auto add = [](std::uint64_t a, std::uint64_t b) { return a > k_max - b ? k_max : a + b; };
+  const auto mul = [](std::uint64_t a, std::uint64_t b) { return (a != 0U && b > k_max / a) ? k_max : a * b; };
+  std::uint64_t interior = 0U;
+  std::uint64_t boundary = 0U;
+  for (std::uint32_t p = 0; p < state.patches.size(); ++p) {
+    if (!patchHasOwnedLeafCells(state, owned_leaf_mask, p, world_rank)) continue;
+    const std::uint64_t nx = state.patches.cell_dim_x[p];
+    const std::uint64_t ny = state.patches.cell_dim_y[p];
+    const std::uint64_t nz = state.patches.cell_dim_z[p];
+    if (nx == 0U || ny == 0U || nz == 0U) continue;
+    interior = add(interior, add(add(mul(nx - 1U, mul(ny, nz)), mul(nx, mul(ny - 1U, nz))), mul(nx, mul(ny, nz - 1U))));
+    boundary = add(boundary, mul(2U, add(add(mul(ny, nz), mul(nx, nz)), mul(nx, ny))));
+  }
+  const std::uint64_t remote_boundary = mul(6U, static_cast<std::uint64_t>(remote_cell_count));
+  const std::uint64_t matched = add(boundary, remote_boundary);
+  std::uint64_t bytes = 0U;
+  bytes = add(bytes, mul(add(interior, matched), sizeof(physics::MetalDiffusionFace)));        // faces
+  bytes = add(bytes, mul(mul(2U, matched), sizeof(RemoteDiffusionFace)));                       // remote faces (+growth)
+  bytes = add(bytes, mul(state.cells.size(), sizeof(double)));                                  // strain
+  bytes = add(bytes, mul(matched, sizeof(PatchBoundaryFace)));                                  // boundary list
+  bytes = add(bytes, mul(matched, k_map_node_bytes + 2U * sizeof(std::size_t)));                // plane map
+  bytes = add(bytes, mul(matched, k_set_node_bytes));                                           // unique sets
+  bytes = add(bytes, mul(add(mul(2U, add(interior, matched)), matched), sizeof(DirectedFaceRef)));  // refs
+  // std::vector geometric growth can transiently hold old+new buffers of
+  // the push_back-built lists; allow one doubling of the largest list.
+  bytes = add(bytes, mul(add(interior, matched), sizeof(physics::MetalDiffusionFace)));
+  return bytes;
+}
+
 MetalDiffusionTopologyResult buildMetalDiffusionTopology(
     const core::SimulationState& state,
     std::span<const std::uint8_t> owned_leaf_mask,
     std::uint32_t world_rank,
     double scale_factor,
-    core::BoundaryCondition hydro_boundary) {
+    core::BoundaryCondition hydro_boundary,
+    std::span<const RemoteDiffusionCell> remote_cells,
+    const std::optional<std::array<double, 6>>& global_envelope_physical) {
   if (!std::isfinite(scale_factor) || !(scale_factor > 0.0)) {
     throw std::invalid_argument(
         "metal diffusion topology requires finite positive scale factor");
@@ -81,6 +130,19 @@ MetalDiffusionTopologyResult buildMetalDiffusionTopology(
   MetalDiffusionTopologyResult result;
   result.strain_magnitude_code.assign(state.cells.size(), 0.0);
   std::vector<PatchBoundaryFace> patch_boundary_faces;
+  {
+    // Exact capacity (matches metalDiffusionTopologyConstructionBoundBytes):
+    // no geometric-growth slack in the boundary list.
+    std::size_t boundary_capacity = 6U * remote_cells.size();
+    for (std::uint32_t p = 0; p < state.patches.size(); ++p) {
+      if (!patchHasOwnedLeafCells(state, owned_leaf_mask, p, world_rank)) continue;
+      const std::size_t nx = state.patches.cell_dim_x[p];
+      const std::size_t ny = state.patches.cell_dim_y[p];
+      const std::size_t nz = state.patches.cell_dim_z[p];
+      boundary_capacity += 2U * (ny * nz + nx * nz + nx * ny);
+    }
+    patch_boundary_faces.reserve(boundary_capacity);
+  }
   double topology_scale = 1.0;
   std::array<double, 3> domain_min{
       std::numeric_limits<double>::infinity(),
@@ -256,6 +318,52 @@ MetalDiffusionTopologyResult buildMetalDiffusionTopology(
     }
   }
 
+  // G2.1: remote owned leaf cells contribute their patch-boundary faces as
+  // virtual rows [local_count, local_count + remote_count). Geometry uses the
+  // owner's exact arithmetic so both ranks see identical planes.
+  const std::size_t local_count = state.cells.size();
+  if (remote_cells.size() > static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max()) - local_count) {
+    throw std::overflow_error("metal diffusion topology remote cell count exceeds uint32 row space");
+  }
+  for (std::size_t r = 0; r < remote_cells.size(); ++r) {
+    const RemoteDiffusionCell& cell = remote_cells[r];
+    const auto virtual_row = static_cast<std::uint32_t>(local_count + r);
+    std::array<double, 3> lo{}, hi{}, width{};
+    for (int c = 0; c < 3; ++c) {
+      if (cell.patch_dims[c] == 0U || cell.index[c] >= cell.patch_dims[c]) {
+        throw std::runtime_error("remote diffusion cell has an invalid patch index");
+      }
+      width[c] = cell.cell_width_comoving[c] * scale_factor;
+      const double origin = cell.patch_origin_comoving[c] * scale_factor;
+      lo[c] = origin + static_cast<double>(cell.index[c]) * width[c];
+      hi[c] = lo[c] + width[c];
+      if (!(width[c] > 0.0) || !std::isfinite(lo[c]) || !std::isfinite(hi[c])) {
+        throw std::runtime_error("remote diffusion cell has non-finite or non-positive geometry");
+      }
+    }
+    const auto push = [&](std::uint8_t axis, std::int8_t side) {
+      const int u = axis == 0U ? 1 : 0;
+      const int v = axis == 2U ? 1 : 2;
+      patch_boundary_faces.push_back(PatchBoundaryFace{
+          .cell = virtual_row, .axis = axis, .side = side,
+          .plane = side < 0 ? lo[axis] : hi[axis],
+          .transverse_u_min = lo[u], .transverse_u_max = hi[u],
+          .transverse_v_min = lo[v], .transverse_v_max = hi[v],
+          .normal_width = width[axis]});
+    };
+    for (std::uint8_t axis = 0U; axis < 3U; ++axis) {
+      if (cell.index[axis] == 0U) push(axis, -1);
+      if (cell.index[axis] + 1U == cell.patch_dims[axis]) push(axis, +1);
+    }
+  }
+  if (global_envelope_physical.has_value()) {
+    for (int c = 0; c < 3; ++c) {
+      domain_min[c] = (*global_envelope_physical)[c];
+      domain_max[c] = (*global_envelope_physical)[3 + c];
+      topology_scale = std::max({topology_scale, std::abs(domain_min[c]), std::abs(domain_max[c])});
+    }
+  }
+
   if (result.faces.empty() && patch_boundary_faces.empty()) {
     return result;
   }
@@ -276,6 +384,8 @@ MetalDiffusionTopologyResult buildMetalDiffusionTopology(
 
   std::set<std::tuple<std::uint32_t, std::uint32_t, std::uint8_t>>
       unique_cross_patch_faces;
+  std::set<std::tuple<std::uint32_t, std::uint32_t, std::uint8_t>>
+      unique_remote_faces;
   const auto addOverlappingInterface = [&](const PatchBoundaryFace& upper,
                                            const PatchBoundaryFace& lower,
                                            physics::MetalDiffusionBoundaryKind kind,
@@ -290,6 +400,42 @@ MetalDiffusionTopologyResult buildMetalDiffusionTopology(
         std::min(upper.transverse_v_max, lower.transverse_v_max) -
         std::max(upper.transverse_v_min, lower.transverse_v_min);
     if (!(overlap_u > face_tolerance) || !(overlap_v > face_tolerance)) {
+      return;
+    }
+    const bool upper_remote = upper.cell >= local_count;
+    const bool lower_remote = lower.cell >= local_count;
+    if (upper_remote && lower_remote) {
+      return;  // remote-remote interfaces belong to their owners
+    }
+    if (upper_remote || lower_remote) {
+      // Local "upper" face (side +1) touches the remote cell's lower face:
+      // the remote cell lies on the +axis side, and vice versa.
+      const PatchBoundaryFace& local_face = upper_remote ? lower : upper;
+      const PatchBoundaryFace& remote_face = upper_remote ? upper : lower;
+      const std::uint32_t remote_index = remote_face.cell - static_cast<std::uint32_t>(local_count);
+      const std::int8_t local_side = local_face.side;
+      // A direct and a periodic adjacency between the same pair are distinct
+      // faces (e.g. two ranks splitting a periodic axis), so the key carries
+      // the side and the boundary kind.
+      if (!unique_remote_faces.emplace(local_face.cell, remote_index,
+                                       static_cast<std::uint8_t>(upper.axis * 4U + (local_side > 0 ? 2U : 0U) +
+                                           (kind == physics::MetalDiffusionBoundaryKind::kPeriodic ? 1U : 0U)))
+               .second) {
+        return;
+      }
+      const RemoteDiffusionCell& remote = remote_cells[remote_index];
+      result.remote_faces.push_back(RemoteDiffusionFace{
+          .local_row = local_face.cell,
+          .remote_index = remote_index,
+          .local_gas_cell_id = state.gas_cells.gas_cell_id[local_face.cell],
+          .remote_gas_cell_id = remote.gas_cell_id,
+          .remote_rank = remote.owner_rank,
+          .axis = upper.axis,
+          .local_side = local_side,
+          .periodic = kind == physics::MetalDiffusionBoundaryKind::kPeriodic,
+          .area_code = overlap_u * overlap_v,
+          .center_distance_code = 0.5 * (upper.normal_width + lower.normal_width)});
+      ++result.remote_face_count;
       return;
     }
     const std::uint32_t lo = std::min(upper.cell, lower.cell);
@@ -363,7 +509,9 @@ MetalDiffusionTopologyResult buildMetalDiffusionTopology(
   // NeighborAccumulator objects (~240 B) per gas cell. The refs are sorted by
   // cell and face index so each cell reconstructs the exact same face-order
   // weighted derivative with one stack-local accumulator.
-  if (result.faces.size() > static_cast<std::size_t>(
+  // Remote faces are referenced from their local side only, at face index
+  // faces.size() + remote face index.
+  if (result.faces.size() + result.remote_faces.size() > static_cast<std::size_t>(
           std::numeric_limits<std::uint32_t>::max())) {
     throw std::overflow_error(
         "metal diffusion topology face count exceeds uint32 reference capacity");
@@ -374,7 +522,12 @@ MetalDiffusionTopologyResult buildMetalDiffusionTopology(
     throw std::overflow_error(
         "metal diffusion topology directed reference count overflow");
   }
-  directed_face_refs.reserve(result.faces.size() * 2U);
+  directed_face_refs.reserve(result.faces.size() * 2U + result.remote_faces.size());
+  for (std::size_t remote_index = 0U; remote_index < result.remote_faces.size(); ++remote_index) {
+    directed_face_refs.push_back(DirectedFaceRef{
+        .cell = result.remote_faces[remote_index].local_row,
+        .face_index = static_cast<std::uint32_t>(result.faces.size() + remote_index)});
+  }
   for (std::size_t face_index = 0U; face_index < result.faces.size(); ++face_index) {
     const auto face_row = static_cast<std::uint32_t>(face_index);
     const physics::MetalDiffusionFace& face = result.faces[face_index];
@@ -410,8 +563,18 @@ MetalDiffusionTopologyResult buildMetalDiffusionTopology(
     throw std::overflow_error(
         "metal diffusion topology aggregate scratch byte count overflow");
   }
+  // G0.5: node-based containers are included with the documented per-node
+  // allowance (k_map_node_bytes / k_set_node_bytes), matching the admission
+  // bound metalDiffusionTopologyConstructionBoundBytes.
+  std::uint64_t lower_index_capacity = 0U;
+  for (const auto& entry : lower_faces_by_plane) lower_index_capacity += entry.second.capacity();
+  const std::uint64_t map_bytes =
+      checkedCapacityBytes(lower_faces_by_plane.size(), k_map_node_bytes) +
+      checkedCapacityBytes(static_cast<std::size_t>(lower_index_capacity), sizeof(std::size_t));
+  const std::uint64_t set_bytes = checkedCapacityBytes(
+      unique_cross_patch_faces.size() + unique_remote_faces.size(), k_set_node_bytes);
   result.construction_scratch_high_water_bytes =
-      patch_boundary_scratch_bytes + directed_face_ref_scratch_bytes;
+      patch_boundary_scratch_bytes + directed_face_ref_scratch_bytes + map_bytes + set_bytes;
 
   const std::array<std::span<const double>, 3> velocity_fields{
       state.gas_cells.velocity_x_peculiar,
@@ -433,8 +596,24 @@ MetalDiffusionTopologyResult buildMetalDiffusionTopology(
 
     std::array<std::array<NeighborAccumulator, 2>, 3> accumulators{};
     for (std::size_t ref_index = ref_begin; ref_index < ref_end; ++ref_index) {
-      const physics::MetalDiffusionFace& face =
-          result.faces[directed_face_refs[ref_index].face_index];
+      const std::uint32_t face_ref = directed_face_refs[ref_index].face_index;
+      if (face_ref >= result.faces.size()) {
+        // Remote neighbour: its step-start velocity from the exchange, so the
+        // strain (and hence kappa) does not depend on the decomposition.
+        const RemoteDiffusionFace& rf = result.remote_faces[face_ref - result.faces.size()];
+        if (rf.axis >= 3U) {
+          throw std::runtime_error("metal diffusion topology remote face has invalid axis");
+        }
+        NeighborAccumulator& accumulator = accumulators[rf.axis][rf.local_side > 0 ? 1U : 0U];
+        const RemoteDiffusionCell& remote = remote_cells[rf.remote_index];
+        for (std::size_t component = 0U; component < 3U; ++component) {
+          accumulator.velocity_area_sum[component] += rf.area_code * remote.velocity_peculiar[component];
+        }
+        accumulator.distance_area_sum += rf.area_code * rf.center_distance_code;
+        accumulator.area_sum += rf.area_code;
+        continue;
+      }
+      const physics::MetalDiffusionFace& face = result.faces[face_ref];
       if (face.axis >= 3U) {
         throw std::runtime_error("metal diffusion topology face has invalid axis");
       }

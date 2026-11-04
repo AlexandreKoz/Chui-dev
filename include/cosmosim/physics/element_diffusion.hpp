@@ -35,6 +35,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <span>
 #include <vector>
 
@@ -52,8 +53,46 @@ struct ElementDiffusionReport {
   double max_relative_cell_mass_change = 0.0;
 };
 
+// G0.5: the ONE admission estimate for advanceElementResolvedDiffusion's
+// simultaneously live scratch: values (lanes x rows), per-row gas mass and
+// conductance sum, the per-subcycle delta (lanes x rows), the lane-index,
+// before and scale vectors (O(lanes)). `lanes` may be the full sidecar lane
+// count (an upper bound of the mixed lanes). Callers must NOT add the delta
+// separately. Remote-coupling buffers are admitted by the coupling owner.
+// Saturates at UINT64_MAX instead of wrapping.
 [[nodiscard]] std::uint64_t elementDiffusionWorkspaceBytes(std::size_t lanes, std::size_t rows) noexcept;
 
+// G2.1 distributed coupling. The operator is MPI-free; a distributed caller
+// supplies this interface. Contract (every method is COLLECTIVE: it is
+// entered by every rank the same number of times in the same order, also by
+// ranks without rows or faces):
+//  * reduceFailure(local): if any rank holds a failure, rethrows on every
+//    rank (the local exception where present, a peer-failure error
+//    otherwise). Called before every other collective so a local error never
+//    leaves peers blocked in an exchange.
+//  * addRemoteConductance(sum): adds, for every local row, the conductance
+//    of its remote interface faces (identical values on both sides).
+//  * globalMin / globalSum: deterministic reductions.
+//  * addRemoteFaceTransfers(values, gas_mass, lanes, dt_sub, delta): exchanges
+//    FRESH local boundary-row lane values (this subcycle), lets the unique
+//    face authority compute every remote face transfer exactly once, and adds
+//    the resulting equal-and-opposite contributions to the local rows of
+//    `delta` (layout lane-major: delta[k * rows + row]).
+class ElementDiffusionRemoteCoupling {
+ public:
+  virtual ~ElementDiffusionRemoteCoupling() = default;
+  virtual void reduceFailure(std::exception_ptr local_failure, const char* stage) = 0;
+  virtual void addRemoteConductance(std::span<double> conductance_sum) = 0;
+  [[nodiscard]] virtual double globalMin(double value) = 0;
+  virtual void globalSum(std::span<double> values) = 0;
+  virtual void addRemoteFaceTransfers(std::span<const double> values, std::span<const double> gas_mass,
+                                      std::size_t lane_count, double dt_sub, std::span<double> delta) = 0;
+};
+
+// Local (coupling == nullptr) or distributed element-resolved diffusion.
+// With a coupling, stable dt and the subcycle count are global (identical on
+// every rank), positivity and lane conservation are verified globally, and
+// every rank commits or every rank throws.
 [[nodiscard]] ElementDiffusionReport advanceElementResolvedDiffusion(
     core::GasCompositionSidecar& sidecar,
     std::span<const MetalDiffusionFace> faces,
@@ -61,6 +100,7 @@ struct ElementDiffusionReport {
     double dt_code,
     double parabolic_cfl,
     std::uint32_t max_subcycles,
-    std::vector<double>& workspace);
+    std::vector<double>& workspace,
+    ElementDiffusionRemoteCoupling* coupling = nullptr);
 
 }  // namespace cosmosim::physics
