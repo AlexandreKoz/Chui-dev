@@ -1,3 +1,18 @@
+## Design conformance checkpoint — 2026-11-04
+
+A1 recursive-driver preallocation admission and A2 history start/end publication
+are repaired **in source only**. Per-level retirement now releases nested memory
+without record-copy allocation and reconciles its governor baseline. Pending
+publication retains its candidate transaction and gains fault coverage. All
+tests are **NOT RUN — USER-RESERVED**. M01/T01/A02 remain partial.
+
+Next P0 work is A3 full diffusion/topology/coexistence accounting (delta is
+already reserved by the caller), A4 association refusal or complete global
+grouping/stencil/energy repair, and A5 chemistry private-state rollback. Do not
+begin distributed temporal integration until those Milestone A obligations close.
+The [requirement ledger](repair/chui_conformance_closure_20261104.md) supersedes
+older broad completeness wording and supplies exact next edit locations.
+
 ## Round 8 corrective source changes — 2026-10-29
 
 20261103 CHUI Part 1 — source complete, NOT compiled/run. Closed in source:

@@ -25,8 +25,10 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <optional>
 #include <stdexcept>
+#include <utility>
 #include <vector>
 
 #include "cosmosim/amr/amr_hydro_orchestrator.hpp"
@@ -35,6 +37,7 @@
 #include "cosmosim/hydro/hydro_core_solver.hpp"
 #include "cosmosim/hydro/hydro_riemann.hpp"
 #include "../support/test_require.hpp"
+#include "../support/scoped_allocation_failure.hpp"
 
 namespace {
 
@@ -235,9 +238,83 @@ void testSingleLevelEqualsSynchronizedReference() {
   }
 }
 
+void testRecursiveWorkingSetRefusalAndAllocationFailure() {
+  for (const bool refined : {false, true}) {
+    auto state = refined ? makeThreeLevels(true) : makeRoots(true);
+    const auto before = state;
+    const auto baseline = core::memoryReportBaselineOwnedBytes(core::collectSimulationMemoryReport(state));
+    const hy::HydroCoreSolver solver(k_gamma);
+    hy::HllcRiemannSolver riemann;
+    const hy::HydroUpdateContext update{.dt_code = 0.02, .time_begin_code = 0.0, .time_end_code = 0.02,
+                                        .scale_factor = 1.0, .hubble_rate_code = 0.0};
+    const hy::HydroSourceContext source{.update = update};
+    const auto unchanged = [&] {
+      CHUI_REQUIRE(std::memcmp(before.cells.mass_code.data(), state.cells.mass_code.data(),
+          state.cells.size() * sizeof(double)) == 0);
+      for (const auto lanes : {
+          std::pair{&before.gas_cells.density_code, &state.gas_cells.density_code},
+          std::pair{&before.gas_cells.internal_energy_code, &state.gas_cells.internal_energy_code},
+          std::pair{&before.gas_cells.pressure_code, &state.gas_cells.pressure_code},
+          std::pair{&before.gas_cells.velocity_x_peculiar, &state.gas_cells.velocity_x_peculiar},
+          std::pair{&before.gas_cells.metal_mass_code, &state.gas_cells.metal_mass_code}}) {
+        CHUI_REQUIRE(std::memcmp(lanes.first->data(), lanes.second->data(),
+            lanes.first->size() * sizeof(double)) == 0);
+      }
+      CHUI_REQUIRE(state.amr_temporal_boundary_history.empty());
+      CHUI_REQUIRE(state.pending_flux_registers.empty());
+      CHUI_REQUIRE(state.gasCellIdentityGeneration() == before.gasCellIdentityGeneration());
+      CHUI_REQUIRE(state.gravitySourceGeneration() == before.gravitySourceGeneration());
+    };
+    core::MemoryGovernor tight({.hard_limit_bytes = baseline});
+    auto options = baseOptions(state, tight);
+    bool refused = false;
+    try {
+      (void)amr::advanceProductionAmrHydroRecursive(state, {}, update, source, solver, riemann, {}, options);
+    } catch (const core::MemoryAdmissionError&) { refused = true; }
+    CHUI_REQUIRE(refused);
+    unchanged();
+    CHUI_REQUIRE(tight.snapshot().committed_bytes == 0U);
+    CHUI_REQUIRE(tight.snapshot().reserved_bytes == 0U);
+    CHUI_REQUIRE(tight.snapshot().baseline_owned_bytes == baseline);
+
+    core::MemoryGovernor governor;
+    options = baseOptions(state, governor);
+    bool failed = false;
+    std::size_t selected_rows = 0U;
+    for (std::size_t p = 0U; p < state.patches.size(); ++p) {
+      if (state.patches.level[p] == (refined ? 1 : 0)) selected_rows += state.patches.cell_count[p];
+    }
+    {
+      // Select one exact level-row allocation, after driver admission.
+      cosmosim::test_support::ScopedAllocationFailure inject(0, selected_rows * sizeof(std::uint32_t));
+      try {
+        (void)amr::advanceProductionAmrHydroRecursive(state, {}, update, source, solver, riemann, {}, options);
+      } catch (const std::bad_alloc&) { failed = true; }
+    }
+    CHUI_REQUIRE(failed);
+    unchanged();
+    CHUI_REQUIRE(governor.snapshot().peak_committed_bytes > 0U);
+    CHUI_REQUIRE(governor.snapshot().committed_bytes == 0U);
+    CHUI_REQUIRE(governor.snapshot().reserved_bytes == 0U);
+    CHUI_REQUIRE(governor.snapshot().baseline_owned_bytes == baseline);
+  }
+}
+
+void testCoverageRejectsOverlapAndMissingRows() {
+  auto state = makeRoots(false);
+  CHUI_REQUIRE(amr::hasProductionAmrHydroCoverage(state));
+  state.patches.first_cell[1] = 0U;
+  CHUI_REQUIRE(!amr::hasProductionAmrHydroCoverage(state));
+  state = makeRoots(false);
+  state.patches.cell_count[1] = 0U;
+  CHUI_REQUIRE(!amr::hasProductionAmrHydroCoverage(state));
+}
+
 }  // namespace
 
 int main() {
+  testRecursiveWorkingSetRefusalAndAllocationFailure();
+  testCoverageRejectsOverlapAndMissingRows();
   testClockStructureAndUniformState();
   testConservationAcrossNestedInterfaces();
   testIllegalMidCycleStartRefused();

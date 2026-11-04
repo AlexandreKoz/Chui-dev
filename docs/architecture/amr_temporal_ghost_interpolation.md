@@ -36,6 +36,30 @@ refine/derefine while histories are active. It has no MPI migration/remapping pa
 require equal source/target time. Fine-to-coarse ghost reads require synchronization time and otherwise
 reject with a named temporal-misalignment status.
 
+## 2026-11-04 source repair: publication and retirement
+
+Start capture, including per-level capture with parent intervals already open,
+builds one admitted candidate containing all new and retained records. End
+capture also completes a candidate before publication. Allocation, admission,
+geometry, identity or physical-state validation failure leaves all canonical
+records and their storage unchanged. Candidates count outer and nested cell
+capacities while the old store remains live; geometry scratch is separately
+admitted for start capture. Mathematical interpolation and endpoint values are
+unchanged. This is SOURCE ONLY; fault/conservation tests are NOT RUN — USER-RESERVED.
+
+Both retirement functions now take an optional trailing `MemoryGovernor*`.
+Pass the capture governor to reconcile freed nested capacity. Record compaction
+uses nonthrowing moves/destruction and retains the charged outer capacity. Calls
+without a governor remain supported, with accounting reconciliation owned by
+their caller. `applyCompletePendingFluxRegistersToSimulationState` similarly
+accepts a trailing defaulted governor for its candidate workspace. Existing
+source calls remain valid; dependents must be rebuilt. No restart schema changes.
+
+These are individual-operation guarantees. A failure after earlier hydro
+substeps committed still requires the coordinator's whole-step rollback; general
+distributed recursive integration remains open. See
+[`../repair/chui_conformance_closure_20261104.md`](../repair/chui_conformance_closure_20261104.md).
+
 ## Restart
 
 Schema `cosmosim_restart_v19` serializes active histories in

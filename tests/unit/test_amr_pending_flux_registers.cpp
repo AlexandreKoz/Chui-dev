@@ -8,6 +8,8 @@
 #include "cosmosim/amr/amr_hydro_orchestrator.hpp"
 #include "cosmosim/core/memory_accounting.hpp"
 #include "cosmosim/core/memory_governor.hpp"
+#include "../support/test_require.hpp"
+#include "../support/scoped_allocation_failure.hpp"
 
 namespace {
 
@@ -241,9 +243,70 @@ void testPendingReplacementAdmissionAndRetry() {
   assert(governor.snapshot().committed_bytes == 0U && governor.snapshot().reserved_bytes == 0U);
 }
 
+void testPendingCandidateFailureNeverPublishes() {
+  auto state = makeState();
+  const auto seed = makeEntry(true, false);
+  (void)cosmosim::amr::mergeFluxRegistersIntoPendingStore(state, {&seed, 1}, pendingOptions(0));
+  const auto before = state.pending_flux_registers.records().front();
+  const auto* address = state.pending_flux_registers.records().data();
+  const auto capacity = state.pending_flux_registers.ownedCapacityBytes();
+  const auto bytes_before = cosmosim::core::memoryReportBaselineOwnedBytes(
+      cosmosim::core::collectSimulationMemoryReport(state));
+  cosmosim::core::MemoryGovernor governor;
+  governor.setBaselineOwnedBytes(bytes_before);
+  auto options = pendingOptions(0);
+  options.regrid_memory_governor = &governor;
+  auto valid = makeEntry(true, false);
+  valid.register_key = 88U;  // Inserted into candidate before the late failure.
+  auto incompatible = seed;
+  incompatible.coarse_patch_id += 1U;
+  const std::vector<cosmosim::amr::FluxRegisterEntry> entries{valid, incompatible};
+  const auto unchanged = [&] {
+    CHUI_REQUIRE(state.pending_flux_registers.size() == 1U);
+    CHUI_REQUIRE(state.pending_flux_registers.records().data() == address);
+    CHUI_REQUIRE(state.pending_flux_registers.ownedCapacityBytes() == capacity);
+    const auto& after = state.pending_flux_registers.records().front();
+    CHUI_REQUIRE(after.register_key == before.register_key);
+    CHUI_REQUIRE(after.coarse_patch_id == before.coarse_patch_id);
+    CHUI_REQUIRE(after.coarse_gas_cell_id == before.coarse_gas_cell_id);
+    CHUI_REQUIRE(after.coarse_face_count == before.coarse_face_count);
+    CHUI_REQUIRE(after.fine_face_count == before.fine_face_count);
+    CHUI_REQUIRE(after.coarse_mass_flux_integral_code == before.coarse_mass_flux_integral_code);
+    CHUI_REQUIRE(after.fine_mass_flux_integral_code == before.fine_mass_flux_integral_code);
+    CHUI_REQUIRE(after.fine_substep_coverage_mask == before.fine_substep_coverage_mask);
+    CHUI_REQUIRE(governor.snapshot().baseline_owned_bytes == bytes_before);
+    CHUI_REQUIRE(governor.snapshot().committed_bytes == 0U);
+    CHUI_REQUIRE(governor.snapshot().reserved_bytes == 0U);
+  };
+  bool refused = false;
+  try {
+    (void)cosmosim::amr::mergeFluxRegistersIntoPendingStore(state, entries, options);
+  } catch (const std::runtime_error&) { refused = true; }
+  CHUI_REQUIRE(refused);
+  unchanged();
+  bool reached_success = false;
+  std::size_t failures = 0U;
+  for (std::ptrdiff_t allocation = 0; allocation < 512; ++allocation) {
+    bool failed = false;
+    {
+      cosmosim::test_support::ScopedAllocationFailure inject(allocation);
+      try {
+        (void)cosmosim::amr::mergeFluxRegistersIntoPendingStore(state, {&valid, 1}, options);
+      } catch (const std::bad_alloc&) { failed = true; }
+    }
+    if (!failed) { reached_success = true; break; }
+    ++failures;
+    unchanged();
+  }
+  CHUI_REQUIRE(reached_success);
+  CHUI_REQUIRE(failures > 0U);
+  CHUI_REQUIRE(state.pending_flux_registers.size() == 2U);
+}
+
 }  // namespace
 
 int main() {
+  testPendingCandidateFailureNeverPublishes();
   testPendingReplacementAdmissionAndRetry();
   testPendingAppliesOnlyAfterFinalFineSubstep();
   testAreaMismatchAndMissingTargetStayRejected();

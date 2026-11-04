@@ -247,7 +247,8 @@ void scatterAmrHydroConservedState(
     core::SimulationState& state,
     std::span<const PatchDescriptor> all_patches,
     double adiabatic_index,
-    const AmrThermodynamicCachePolicy& thermodynamic_cache = {});
+    const AmrThermodynamicCachePolicy& thermodynamic_cache = {},
+    core::MemoryGovernor* governor = nullptr);
 
 // Gate-2 active-level row storage contract. coarse_rows and fine_rows coexist,
 // so admission must include BOTH physical capacities. The workspace owns both

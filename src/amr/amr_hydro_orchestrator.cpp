@@ -1103,7 +1103,10 @@ bool hasProductionAmrHydroCoverage(const core::SimulationState& state) {
       !state.gasCellIdentityMapMatchesSidecarLanes()) {
     return false;
   }
-  std::vector<std::uint8_t> covered(state.cells.size(), 0U);
+  // Patch ranges are disjoint if every member row names that patch: an
+  // overlap between two distinct patches would fail that check. Counting the
+  // validated ranges therefore proves full coverage without an O(N) bitmap.
+  std::size_t covered_cells = 0U;
   for (std::size_t patch = 0; patch < state.patches.size(); ++patch) {
     const std::uint32_t first = state.patches.first_cell[patch];
     const std::uint32_t count = state.patches.cell_count[patch];
@@ -1118,22 +1121,22 @@ bool hasProductionAmrHydroCoverage(const core::SimulationState& state) {
             static_cast<std::size_t>(state.patches.cell_dim_z[patch]) != count) {
       return false;
     }
-    if (first + count > state.cells.size()) {
+    if (first > state.cells.size() || count > state.cells.size() - first) {
       return false;
     }
     for (std::uint32_t offset = 0; offset < count; ++offset) {
       const std::uint32_t row = first + offset;
-      if (covered[row] != 0U || state.cells.patch_index[row] != patch) {
+      if (state.cells.patch_index[row] != patch) {
         return false;
       }
       const auto* record = state.gas_cell_identity.findByLocalRow(row);
       if (record == nullptr || record->owning_patch_id != state.patches.patch_id[patch]) {
         return false;
       }
-      covered[row] = 1U;
     }
+    covered_cells += count;  // Disjoint validated ranges cannot exceed the cell count.
   }
-  return std::all_of(covered.begin(), covered.end(), [](std::uint8_t flag) { return flag != 0U; });
+  return covered_cells == state.cells.size();
 }
 
 std::vector<PatchDescriptor> buildProductionAmrPatchDescriptors(const core::SimulationState& state) {
@@ -1920,9 +1923,10 @@ std::size_t mergeFluxRegistersIntoPendingStore(
   const std::size_t max_records = core::checkedSizeAdd(
       state.pending_flux_registers.size(), entries.size(),
       "AMR pending register replacement count");
-  const std::uint64_t replacement_bound = static_cast<std::uint64_t>(
-      core::checkedSizeMultiply(max_records, sizeof(core::PendingFluxRegisterRecord),
-                                "AMR pending register replacement bytes"));
+  const std::uint64_t replacement_bound = core::checkedMemoryBytesAdd(
+      static_cast<std::uint64_t>(core::checkedSizeMultiply(
+          max_records, sizeof(core::PendingFluxRegisterRecord), "AMR pending register replacement bytes")),
+      max_records == 0U ? 0U : 64U, "AMR pending register allocation overhead");
   internal::AmrRetainedStateAdmission admission(
       state, options.regrid_memory_governor, replacement_bound,
       "amr.pending_flux_registers.replacement");
@@ -2007,7 +2011,8 @@ RefluxDiagnostics applyCompletePendingFluxRegistersToSimulationState(
     core::SimulationState& state,
     std::span<const PatchDescriptor> all_patches,
     double adiabatic_index,
-    const AmrThermodynamicCachePolicy& thermodynamic_cache) {
+    const AmrThermodynamicCachePolicy& thermodynamic_cache,
+    core::MemoryGovernor* governor) {
   RefluxDiagnostics diagnostics;
   // Gate-2 atomicity: phase 1 determines complete records, phase 2 fully
   // validates every convertible target (including stale mappings and invalid
@@ -2019,8 +2024,19 @@ RefluxDiagnostics applyCompletePendingFluxRegistersToSimulationState(
     std::size_t pending_index = 0U;
     FluxRegisterEntry entry{};
   };
+  core::MemoryReservation candidate_reservation;
+  if (governor != nullptr && !state.pending_flux_registers.empty()) {
+    candidate_reservation = governor->reserve(core::MemoryClass::kPhaseResident,
+        core::checkedMemoryBytesAdd(static_cast<std::uint64_t>(core::checkedSizeMultiply(
+            state.pending_flux_registers.size(), sizeof(PendingCandidate), "AMR reflux candidate bytes")),
+            64U, "AMR reflux allocation overhead"), "amr.reflux.candidates");
+    candidate_reservation.commit();
+  }
   std::vector<PendingCandidate> candidates;
   candidates.reserve(state.pending_flux_registers.size());
+  if (candidates.capacity() != state.pending_flux_registers.size()) {
+    throw std::length_error("AMR reflux candidate capacity exceeds admission");
+  }
   auto mutable_records = state.pending_flux_registers.mutableRecords();
   for (std::size_t index = 0; index < mutable_records.size(); ++index) {
     const core::PendingFluxRegisterRecord& pending = mutable_records[index];
@@ -2206,10 +2222,29 @@ struct AmrSynchronizedSweepWorkspace {
         "distributed AMR pending flux-register accumulation is gated off; synchronized remote reflux must complete in-step");
   }
   ProductionAmrHydroDiagnostics diagnostics;
+  // The recursive driver calls this sweep repeatedly. Its own descriptor
+  // lease does not cover these independent local/remote descriptor copies.
+  const auto descriptor_capacity = state.patches.size();
+  const auto all_descriptor_capacity = core::checkedSizeAdd(descriptor_capacity,
+      distributed_exchange == nullptr ? 0U : distributed_exchange->remote_patches.size(),
+      "AMR sweep descriptor count");
+  core::MemoryReservation descriptor_reservation;
+  if (options.regrid_memory_governor != nullptr) {
+    descriptor_reservation = options.regrid_memory_governor->reserve(core::MemoryClass::kPhaseResident,
+        core::checkedMemoryBytesAdd(static_cast<std::uint64_t>(core::checkedSizeMultiply(
+            core::checkedSizeAdd(descriptor_capacity, all_descriptor_capacity, "AMR descriptor copies"),
+            sizeof(PatchDescriptor), "AMR sweep descriptor bytes")), 128U, "AMR sweep descriptor overhead"),
+        "amr.sweep.descriptors");
+    descriptor_reservation.commit();
+  }
   const std::vector<PatchDescriptor> descriptors = buildProductionAmrPatchDescriptors(state);
-  std::vector<PatchDescriptor> all_descriptors = descriptors;
+  std::vector<PatchDescriptor> all_descriptors;
+  all_descriptors.reserve(all_descriptor_capacity);
+  if (descriptors.capacity() != descriptor_capacity || all_descriptors.capacity() != all_descriptor_capacity) {
+    throw std::length_error("AMR sweep descriptor capacity exceeds admission");
+  }
+  all_descriptors.insert(all_descriptors.end(), descriptors.begin(), descriptors.end());
   if (distributed_exchange != nullptr) {
-    all_descriptors.reserve(descriptors.size() + distributed_exchange->remote_patches.size());
     for (const DistributedAmrRemotePatch& remote : distributed_exchange->remote_patches) {
       all_descriptors.push_back(remote.patch);
     }
@@ -2901,7 +2936,7 @@ struct AmrSynchronizedSweepWorkspace {
     diagnostics.pending_register_completed_count = complete_pending;
     diagnostics.pending_register_deferred_count = state.pending_flux_registers.size() - complete_pending;
     diagnostics.reflux = applyCompletePendingFluxRegistersToSimulationState(
-        state, descriptors, options.adiabatic_index, options.thermodynamic_cache);
+        state, descriptors, options.adiabatic_index, options.thermodynamic_cache, options.regrid_memory_governor);
     diagnostics.pending_register_applied_count = diagnostics.reflux.complete_register_count;
     diagnostics.pending_register_rejected_count = diagnostics.reflux.skipped_area_mismatch_count +
         diagnostics.reflux.skipped_missing_target_count;
@@ -3068,32 +3103,95 @@ ProductionAmrHydroDiagnostics advanceProductionAmrHydroRecursive(
         "recursive AMR subcycling must start at a synchronized hierarchy boundary "
         "(no open temporal history or pending flux register)");
   }
+  // All levels fit the persistent uint8 patch-level representation. Count
+  // without heap storage, then admit EVERY recursive-driver allocation before
+  // constructing descriptors, diagnostics or per-level row vectors. The same
+  // governor carries the existing process/node policy; no independent quota.
+  constexpr std::size_t k_level_slots = 256U;
+  std::array<bool, k_level_slots> populated{};
+  std::array<std::size_t, k_level_slots> row_counts{};
+  std::size_t level_count = 0U;
+  std::size_t max_level = 0U;
+  for (std::size_t patch = 0; patch < state.patches.size(); ++patch) {
+    if (state.patches.cell_count[patch] == 0U) continue;
+    const int level = state.patches.level[patch];
+    if (level < 0 || level >= static_cast<int>(k_level_slots)) {
+      throw std::invalid_argument("recursive AMR patch level exceeds persistent level representation");
+    }
+    if (!populated[static_cast<std::size_t>(level)]) ++level_count;
+    populated[static_cast<std::size_t>(level)] = true;
+    max_level = std::max(max_level, static_cast<std::size_t>(level));
+  }
+  const auto countRow = [&](std::uint32_t row) {
+    if (row >= state.cells.patch_index.size()) return;
+    const auto patch = state.cells.patch_index[row];
+    if (patch >= state.patches.size() || state.patches.cell_count[patch] == 0U) return;
+    auto& count = row_counts[static_cast<std::size_t>(state.patches.level[patch])];
+    count = core::checkedSizeAdd(count, 1U, "recursive AMR row count");
+  };
+  if (active_cell_rows.empty()) {
+    for (std::uint32_t row = 0; row < state.cells.size(); ++row) countRow(row);
+  } else {
+    for (const auto row : active_cell_rows) countRow(row);
+  }
+  std::uint64_t driver_bytes = 0U;
+  const auto addCapacity = [&](std::size_t count, std::size_t width) {
+    driver_bytes = core::checkedMemoryBytesAdd(driver_bytes,
+        static_cast<std::uint64_t>(core::checkedSizeMultiply(count, width, "recursive AMR driver capacity")),
+        "recursive AMR driver capacity");
+    // Explicit allocator allowance per nonempty vector. The configured opaque
+    // allocator reserve still owns platform fragmentation beyond this model.
+    if (count != 0U) driver_bytes = core::checkedMemoryBytesAdd(
+        driver_bytes, 64U, "recursive AMR allocation overhead");
+  };
+  addCapacity(state.patches.size(), sizeof(PatchDescriptor));
+  addCapacity(level_count, sizeof(int));
+  addCapacity(level_count, sizeof(std::vector<std::uint32_t>));
+  for (std::size_t level = 0; level < k_level_slots; ++level) {
+    addCapacity(row_counts[level], sizeof(std::uint32_t));
+  }
+  addCapacity(level_count, sizeof(std::uint32_t));  // ratio_to_next
+  addCapacity(max_level + 1U, sizeof(AmrLevelRefluxInterval));
+  addCapacity(max_level + 1U, sizeof(std::uint32_t));  // diagnostics substep counts
+  // Declare the reservation first: all its buffers die before the lease.
+  core::MemoryReservation driver_reservation;
+  if (options.regrid_memory_governor != nullptr) {
+    driver_reservation = options.regrid_memory_governor->reserve(
+        core::MemoryClass::kPhaseResident, driver_bytes, "amr.recursive.driver");
+    driver_reservation.commit();
+  }
+  const auto requireCapacity = [](const auto& buffer, std::size_t capacity) {
+    if (buffer.capacity() != capacity) {
+      throw std::length_error("recursive AMR allocator exceeded admitted capacity");
+    }
+  };
   const std::vector<PatchDescriptor> descriptors = buildProductionAmrPatchDescriptors(state);
+  requireCapacity(descriptors, state.patches.size());
   std::vector<int> levels;
-  for (const PatchDescriptor& patch : descriptors) levels.push_back(static_cast<int>(patch.level));
-  std::sort(levels.begin(), levels.end());
-  levels.erase(std::unique(levels.begin(), levels.end()), levels.end());
+  levels.reserve(level_count);
+  requireCapacity(levels, level_count);
+  for (std::size_t level = 0; level < k_level_slots; ++level) {
+    if (populated[level]) levels.push_back(static_cast<int>(level));
+  }
   ProductionAmrHydroDiagnostics diagnostics;
   if (levels.empty()) return diagnostics;
   diagnostics.patch_count = descriptors.size();
   diagnostics.levels_advanced = levels.size();
-  diagnostics.max_level_advanced = static_cast<std::size_t>(levels.back());
-  diagnostics.substeps_by_level.assign(static_cast<std::size_t>(levels.back()) + 1U, 0U);
+  diagnostics.max_level_advanced = max_level;
+  diagnostics.substeps_by_level.assign(max_level + 1U, 0U);
+  requireCapacity(diagnostics.substeps_by_level, max_level + 1U);
 
-  // Active rows per level (one bounded list per level, admitted up front).
-  std::vector<std::vector<std::uint32_t>> rows_by_level(levels.size());
-  core::MemoryReservation rows_reservation;  // live for the whole recursion
-  {
-    std::uint64_t bytes = 0U;
-    for (std::size_t i = 0; i < levels.size(); ++i) {
-      fillActiveRowsForLevelInto(state, levels[i], active_cell_rows, rows_by_level[i]);
-      bytes = core::checkedMemoryBytesAdd(bytes,
-          static_cast<std::uint64_t>(rows_by_level[i].capacity()) * sizeof(std::uint32_t), "recursive AMR level rows");
-    }
-    if (options.regrid_memory_governor != nullptr && bytes != 0U) {
-      rows_reservation = options.regrid_memory_governor->reserve(
-          core::MemoryClass::kPhaseResident, bytes, "amr.recursive.level_rows");
-      rows_reservation.commit();
+  // Each requested row appears only in its own level list (no O(N*levels)
+  // capacity envelope). All reserve/fill failures precede canonical mutation.
+  std::vector<std::vector<std::uint32_t>> rows_by_level(level_count);
+  requireCapacity(rows_by_level, level_count);
+  for (std::size_t i = 0; i < level_count; ++i) {
+    const auto count = row_counts[static_cast<std::size_t>(levels[i])];
+    rows_by_level[i].reserve(count);
+    requireCapacity(rows_by_level[i], count);
+    fillActiveRowsForLevelInto(state, levels[i], active_cell_rows, rows_by_level[i]);
+    if (rows_by_level[i].size() != count) {
+      throw std::logic_error("recursive AMR row count changed during preparation");
     }
   }
   // 2:1 face balance (periodic wrap included) is required: a register of a
@@ -3119,6 +3217,7 @@ ProductionAmrHydroDiagnostics advanceProductionAmrHydroRecursive(
     }
   }
   std::vector<std::uint32_t> ratio_to_next(levels.size(), 1U);
+  requireCapacity(ratio_to_next, level_count);
   for (std::size_t i = 0; i + 1U < levels.size(); ++i) {
     std::uint32_t ratio = 1U;
     for (int gap = levels[i + 1U] - levels[i]; gap > 0; --gap) {
@@ -3127,9 +3226,10 @@ ProductionAmrHydroDiagnostics advanceProductionAmrHydroRecursive(
     }
     ratio_to_next[i] = ratio;
   }
-  std::vector<AmrLevelRefluxInterval> intervals(static_cast<std::size_t>(levels.back()) + 1U);
+  std::vector<AmrLevelRefluxInterval> intervals(max_level + 1U);
+  requireCapacity(intervals, max_level + 1U);
 
-  // Recursion depth is the level count (bounded by the hierarchy, <= 31).
+  // Recursion depth is bounded by the persistent patch-level representation.
   const auto advance_level = [&](const auto& self, std::size_t i, const hydro::HydroUpdateContext& update,
                                  double t_begin, std::uint32_t parent_substep) -> void {
     const int level = levels[i];
@@ -3177,8 +3277,8 @@ ProductionAmrHydroDiagnostics advanceProductionAmrHydroRecursive(
       self(self, i + 1U, child, t_begin + f0 * update.dt_code, k);
     }
     addRefluxDiagnostics(diagnostics, applyCompletePendingFluxRegistersToSimulationState(
-        state, buildProductionAmrPatchDescriptors(state), options.adiabatic_index, options.thermodynamic_cache));
-    retireAmrTemporalBoundaryHistoryLevel(state, level);
+        state, descriptors, options.adiabatic_index, options.thermodynamic_cache, options.regrid_memory_governor));
+    retireAmrTemporalBoundaryHistoryLevel(state, level, options.regrid_memory_governor);
     intervals[static_cast<std::size_t>(level)].valid = false;
   };
   hydro::HydroUpdateContext root = coarse_update;
@@ -3343,7 +3443,7 @@ ProductionAmrHydroDiagnostics advanceProductionAmrHydroSubcycled(
   }
 
   const RefluxDiagnostics post_child_reflux = applyCompletePendingFluxRegistersToSimulationState(
-      state, buildProductionAmrPatchDescriptors(state), options.adiabatic_index, options.thermodynamic_cache);
+      state, descriptors, options.adiabatic_index, options.thermodynamic_cache, options.regrid_memory_governor);
   diagnostics.reflux.complete_register_count += post_child_reflux.complete_register_count;
   diagnostics.reflux.skipped_incomplete_register_count += post_child_reflux.skipped_incomplete_register_count;
   diagnostics.reflux.skipped_area_mismatch_count += post_child_reflux.skipped_area_mismatch_count;
@@ -3373,7 +3473,7 @@ ProductionAmrHydroDiagnostics advanceProductionAmrHydroSubcycled(
   diagnostics.pending_register_completed_count = std::max(diagnostics.pending_register_completed_count, complete_pending);
   diagnostics.pending_register_deferred_count = state.pending_flux_registers.size() - complete_pending;
   if (state.pending_flux_registers.empty()) {
-    retireAmrTemporalBoundaryHistory(state);
+    retireAmrTemporalBoundaryHistory(state, options.regrid_memory_governor);
   }
   return diagnostics;
 }
