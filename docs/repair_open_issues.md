@@ -1,3 +1,27 @@
+## Final design closure — 2026-11-04 (supersedes the A3–A5 continuation below)
+
+Closed in source (NOT RUN):
+
+* A3: diffusion accounting;
+* A4: associations, via global FoF rather than refusal;
+* A5: chemistry rollback;
+* B1/B2: distributed recursion and level-relaxed CFL;
+* B5: source-controller checkpoint;
+* C1/C2: distributed diffusion and octet co-location;
+* the split-interface reflux defect.
+
+Open:
+
+* H02 remote auxiliary internal energy;
+* G3.1 CTU at remote boundaries;
+* G4.1/G4.2 indicators and predictor;
+* V01 snapshot import;
+* MPI end-to-end recursive and association tests;
+* benchmarks.
+
+Exact edit locations are in the
+[closure ledger](repair/chui_final_design_closure_20261104.md) (§2 and §10).
+
 ## Design conformance checkpoint — 2026-11-04
 
 A1 recursive-driver preallocation admission and A2 history start/end publication

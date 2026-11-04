@@ -1,5 +1,31 @@
 # Current repository status
 
+## Final design v1.0 implementation closure — 2026-11-04
+
+**IMPLEMENTED IN SOURCE — NOT COMPILED, NOT RUN — USER-RESERVED.** The
+following now exist in source:
+
+* distributed recursive AMR subcycling;
+* level-relaxed hydro CFL with a recorded limiter;
+* distributed element-resolved diffusion (unique flux authority);
+* global FoF stellar associations merged before the remote stencil query;
+* sidecar-authoritative adaptive-chemistry control;
+* complete diffusion memory admission;
+* split-interface reflux fix;
+* octet-family co-location in migration;
+* source-controller rollback checkpoint;
+* structurally monotone SSP returns;
+* operational zoom-contamination reporting.
+
+Still PARTIAL:
+
+* H02/G3.1 remote dual-energy and CTU;
+* G4 adaptive indicators and predictor;
+* V01 snapshot import;
+* several MPI end-to-end tests and benchmarks.
+
+See the [closure ledger and handoff](docs/repair/chui_final_design_closure_20261104.md).
+
 ## Design conformance A1/A2 checkpoint — 2026-11-04
 
 **SOURCE REPAIRED — NOT RUN — USER-RESERVED.** Recursive AMR driver rows and
