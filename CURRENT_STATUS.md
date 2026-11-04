@@ -1,5 +1,32 @@
 # Current repository status
 
+## Final data and closure, pass 2 — 2026-11-04
+
+**SOURCE ONLY — CHUI NOT BUILT OR RUN.**
+
+The data workflow ran (Python converters and validators only):
+
+* NuGrid/W7 yields, VALID;
+* SB99 winds (Z = 0.014);
+* the 49-redshift WSS09 element cooling, VALID;
+* FG20 TREECOOL, VALID.
+
+Added in source:
+
+* physics-aware AMR indicators with a mandatory/optional budget;
+* event-aware predictive AMR;
+* a cooling-time criterion for adaptive chemistry;
+* benchmark sources.
+
+Still PARTIAL:
+
+* T02 level-local source coupling;
+* H01 CTU interface stencils;
+* V02 coordinated controller;
+* V1–V3 end-to-end tests.
+
+See the [pass-2 ledger](docs/repair/chui_final_data_and_closure_20261104.md).
+
 ## Final design v1.0 implementation closure — 2026-11-04
 
 **IMPLEMENTED IN SOURCE — NOT COMPILED, NOT RUN — USER-RESERVED.** The
