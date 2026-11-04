@@ -225,6 +225,9 @@ ProductionAmrRegridPlan planProductionAmrRegrid(
         ++plan.truncated_by_budget;
         continue;
       }
+      if (policy.gravity_softening_code > 0.0 && 0.5 * minCellWidth(patch) < policy.gravity_softening_code) {
+        ++plan.refined_below_gravity_softening;
+      }
       const std::size_t cells = core::checkedSizeMultiply(cellCount(patch), 8U, "regrid refine cells");
       plan.operations.push_back(ProductionAmrRegridOperation{
           .kind = AmrRegridOperationKind::kRefine, .patch = patch,

@@ -2652,6 +2652,15 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
         ? context.integrator_state.current_scale_factor : 1.0;
     policy.periodic = amr_options.physical_boundary_kind == hydro::HydroBoundaryKind::kPeriodic;
     policy.periodic_box_extent_comoving = amr_options.periodic_box_extent_comoving;
+    {
+      const double softening_kpc = m_config.numerics.gravity_softening_gas_kpc_comoving > 0.0
+          ? m_config.numerics.gravity_softening_gas_kpc_comoving
+          : m_config.numerics.gravity_softening_kpc_comoving;
+      const core::UnitSystem units = core::makeUnitSystem(
+          m_config.units.length_unit, m_config.units.mass_unit, m_config.units.velocity_unit);
+      constexpr double k_kpc_m = 3.0856775814913673e19;
+      policy.gravity_softening_code = softening_kpc > 0.0 ? softening_kpc * k_kpc_m / units.length_si_per_code : 0.0;
+    }
 
     std::exception_ptr failure;
     amr::ProductionAmrRegridPlan plan;
@@ -2701,6 +2710,8 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
                       {"blocked_by_max_level", std::to_string(plan.blocked_by_max_level)},
                       {"skipped_remote_sibling", std::to_string(plan.skipped_remote_sibling)},
                       {"truncated_by_budget", std::to_string(plan.truncated_by_budget)},
+                      {"refined_below_gravity_softening_unqualified",
+                       std::to_string(plan.refined_below_gravity_softening)},
                       {"skipped_not_quiescent", plan.skipped_not_quiescent ? "true" : "false"},
                       {"mass_change_code", std::to_string(summary.mass_change_code)},
                       {"total_energy_change_code", std::to_string(summary.total_energy_change_code)}}});

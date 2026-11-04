@@ -72,6 +72,12 @@ struct ProductionAmrRegridPolicy {
   // Sorted, unique dense rows whose owning patch must be refined (physics
   // operator requests, e.g. predictive refinement before scheduled feedback).
   std::span<const std::uint32_t> forced_refine_rows{};
+  // CHUI Part 3 Checkpoint E (G01): gas gravitational softening (comoving
+  // code length). Refinement is NEVER blocked by it (mandatory Jeans/hydro
+  // refinement is not coarsened to fit gravity); refinements whose child cell
+  // width falls below it are COUNTED as the unqualified regime "hydro
+  // resolution finer than the gravitational force resolution". 0 disables.
+  double gravity_softening_code = 0.0;
 };
 
 enum class AmrRegridOperationKind : std::uint8_t {
@@ -96,6 +102,7 @@ struct ProductionAmrRegridPlan {
   std::size_t blocked_by_max_level = 0;
   std::size_t skipped_remote_sibling = 0;
   std::size_t truncated_by_budget = 0;
+  std::size_t refined_below_gravity_softening = 0;
   std::size_t required_patch_ids = 0;
   std::size_t required_gas_cell_ids = 0;
 };

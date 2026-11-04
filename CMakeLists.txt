@@ -616,7 +616,8 @@ add_library(cosmosim_io STATIC
   src/io/restart_checkpoint.cpp)
 add_library(cosmosim_analysis STATIC
   src/analysis/diagnostics.cpp
-  src/analysis/halo_workflow.cpp)
+  src/analysis/halo_workflow.cpp
+  src/analysis/zoom_contamination.cpp)
 add_library(cosmosim_parallel STATIC
   src/parallel/distributed_memory.cpp
   src/parallel/distributed_memory_transport.cpp
@@ -1161,13 +1162,14 @@ if(COSMOSIM_ENABLE_TESTS)
       amr_production_regrid
       chui_part3_remote_sources
       config_chui_part3
-      treepm_amr_force_resolution)
+      treepm_amr_force_resolution
+      zoom_contamination)
   foreach(chui_part3_test IN LISTS CHUI_PART3_UNIT_TESTS)
     add_executable(test_unit_${chui_part3_test} tests/unit/test_${chui_part3_test}.cpp)
     target_include_directories(test_unit_${chui_part3_test} PRIVATE ${PROJECT_SOURCE_DIR}/src)
     target_link_libraries(test_unit_${chui_part3_test} PRIVATE cosmosim_all)
     add_test(NAME unit_${chui_part3_test} COMMAND test_unit_${chui_part3_test})
-    set_tests_properties(unit_${chui_part3_test} PROPERTIES LABELS "chui_part3;unit")
+    set_tests_properties(unit_${chui_part3_test} PROPERTIES SKIP_RETURN_CODE 77 LABELS "chui_part3;unit")
   endforeach()
 
 
