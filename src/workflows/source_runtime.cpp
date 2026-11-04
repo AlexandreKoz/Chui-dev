@@ -1115,13 +1115,14 @@ class SourceRuntimeImpl final : public SourceRuntime {
         .estimate_only = false,
         .governed_commitment = m_particle_id_registry.occupiedCapacityGoverned(),
         .uncertainty_note = "one sorted immutable-ID cache per hash shard; no rank-global replication"});
-    const bool diffusion_governed = m_diffusion_phase_reservation.committed();
+    const bool smooth_transport_governed =
+        m_diffusion_phase_reservation.committed();
     add_container(
         core::MemorySubsystem::kScratch,
         core::MemoryClass::kPhaseResident,
         "sources.metal_diffusion.owned_leaf_mask",
         m_owned_leaf_mask,
-        diffusion_governed);
+        smooth_transport_governed);
     // These two containers are move-replaced by each topology rebuild. Report
     // historical retained-capacity high-water explicitly rather than letting a
     // smaller later topology erase the evidence of a larger residency peak.
@@ -1138,7 +1139,7 @@ class SourceRuntimeImpl final : public SourceRuntime {
             m_diffusion_rho_kappa_high_water_bytes,
             core::ownedCapacityBytesForContainer(m_diffusion_rho_kappa_code)),
         .estimate_only = false,
-        .governed_commitment = diffusion_governed,
+        .governed_commitment = smooth_transport_governed,
     });
     builder.addEntry(core::MemoryEntry{
         .subsystem = core::MemorySubsystem::kScratch,
@@ -1162,7 +1163,18 @@ class SourceRuntimeImpl final : public SourceRuntime {
         .owned_capacity_bytes = m_diffusion_workspace.ownedCapacityBytes(),
         .high_water_bytes = m_diffusion_workspace.highWaterBytes(),
         .estimate_only = false,
-        .governed_commitment = diffusion_governed,
+        .governed_commitment = smooth_transport_governed,
+    });
+    builder.addEntry(core::MemoryEntry{
+        .subsystem = core::MemorySubsystem::kScratch,
+        .lifetime = core::MemoryLifetime::kTransient,
+        .memory_class = core::MemoryClass::kPhaseResident,
+        .label = "sources.sgs_shear.staging",
+        .current_size_bytes = m_sgs_shear_workspace.ownedCapacityBytes(),
+        .owned_capacity_bytes = m_sgs_shear_workspace.ownedCapacityBytes(),
+        .high_water_bytes = m_sgs_shear_workspace.ownedCapacityBytes(),
+        .estimate_only = false,
+        .governed_commitment = smooth_transport_governed,
     });
     builder.addEntry(core::MemoryEntry{
         .subsystem = core::MemorySubsystem::kScratch,
@@ -1183,7 +1195,8 @@ class SourceRuntimeImpl final : public SourceRuntime {
       const core::SimulationState& state) const override {
     if (!m_star_formation.config().enabled &&
         !m_stellar_evolution.config().enabled &&
-        !m_metal_diffusion.config().enabled && !m_bh_enabled) {
+        !m_metal_diffusion.config().enabled &&
+        !m_source_stage_config.sgs.has_value() && !m_bh_enabled) {
       return {0U, true, {}};
     }
     const std::uint64_t cell_count = static_cast<std::uint64_t>(state.cells.size());
@@ -1233,15 +1246,25 @@ class SourceRuntimeImpl final : public SourceRuntime {
       // Sparse active rows have their own physical arena admission.
       peak = std::max(peak, evolution);
     }
-    if (m_metal_diffusion.config().enabled && cell_count != 0U) {
-      std::uint64_t diffusion = core::checkedMemoryBytesAdd(
-          m_metal_diffusion.requiredWorkspaceBytes(state.cells.size()),
-          multiply(cell_count, sizeof(std::uint8_t), "source diffusion mask"),
-          "source diffusion phase");
-      diffusion = core::checkedMemoryBytesAdd(diffusion,
-          multiply(cell_count, sizeof(double), "source diffusion rho-kappa"),
-          "source diffusion phase");
-      peak = std::max(peak, diffusion);
+    if ((m_metal_diffusion.config().enabled ||
+         m_source_stage_config.sgs.has_value()) && cell_count != 0U) {
+      std::uint64_t transport = core::checkedMemoryBytesAdd(
+          m_metal_diffusion.config().enabled
+              ? m_metal_diffusion.requiredWorkspaceBytes(state.cells.size())
+              : 0U,
+          multiply(cell_count, sizeof(std::uint8_t), "source transport mask"),
+          "source smooth transport phase");
+      transport = core::checkedMemoryBytesAdd(
+          transport,
+          multiply(cell_count, sizeof(double), "source transport strain/rho-kappa"),
+          "source smooth transport phase");
+      if (m_source_stage_config.sgs.has_value()) {
+        transport = core::checkedMemoryBytesAdd(
+            transport,
+            physics::SgsShearTransferWorkspace::requiredBytes(state.cells.size()),
+            "source SGS shear staging");
+      }
+      peak = std::max(peak, transport);
     }
     return {peak, false,
             "source staging modeled; population growth, ID coordination and topology scratch require owner-local admission"};
@@ -1400,7 +1423,7 @@ class SourceRuntimeImpl final : public SourceRuntime {
         ? context.integrator_state.dt_time_code
         : 0.5 * context.integrator_state.dt_time_code;
     if (context.source_split_phase == core::SourceSplitPhase::kStrangPreHalf) {
-      executeMetalDiffusion(
+      executeDiffusionAndSgsShear(
           context, smooth_source_evaluation_scale_factor, smooth_source_dt_code);
       return;
     }
@@ -1695,7 +1718,7 @@ class SourceRuntimeImpl final : public SourceRuntime {
     } else {
       executeStellarEvolutionAndEnrichment(context, source_evaluation_scale_factor);
     }
-    executeMetalDiffusion(
+    executeDiffusionAndSgsShear(
         context, smooth_source_evaluation_scale_factor, smooth_source_dt_code);
 
     physics::BlackHoleAgnStepReport black_hole_report{};
@@ -2038,6 +2061,10 @@ class SourceRuntimeImpl final : public SourceRuntime {
                       {"dust_gas_to_dust_code", std::to_string(m_last_dust_ledger.gas_to_dust_code)},
                       {"dust_dust_to_gas_code", std::to_string(m_last_dust_ledger.dust_to_gas_code)},
                       {"sgs_dissipated_code", std::to_string(m_last_sgs_ledger.dissipated_to_heat_code)},
+                      {"sgs_produced_from_resolved_code",
+                       std::to_string(m_last_sgs_ledger.produced_from_resolved_code)},
+                      {"sgs_resolved_stress_work_code",
+                       std::to_string(m_last_sgs_ledger.resolved_stress_work_code)},
                       {"shadow_samples", std::to_string(m_last_shadow_report.samples)},
                       {"physical_seconds", std::to_string(interval.physical_seconds)},
                       {"radiative_loss_erg", std::to_string(l.radiative_loss_erg)},
@@ -3193,16 +3220,24 @@ class SourceRuntimeImpl final : public SourceRuntime {
     }
   }
 
-  void executeMetalDiffusion(
+  void executeDiffusionAndSgsShear(
       core::StepContext& context,
       double source_evaluation_scale_factor,
       double source_dt_code) {
-    if (!m_metal_diffusion.config().enabled) {
+    const bool diffusion_enabled = m_metal_diffusion.config().enabled;
+    // Configuration is rank-uniform. Do not derive collective participation
+    // from local row count/sidecar population (empty ranks must still enter).
+    const bool sgs_shear_enabled = m_source_stage_config.sgs.has_value();
+    if (!diffusion_enabled && !sgs_shear_enabled) {
       return;
     }
     if (!(std::isfinite(source_dt_code) && source_dt_code > 0.0)) {
       throw std::invalid_argument(
-          "metal diffusion requires a finite positive source subinterval");
+          "smooth diffusion/SGS transport requires a finite positive source subinterval");
+    }
+    if (sgs_shear_enabled) {
+      (void)physics::ensureGasCompositionInitialized(
+          context.state, m_physics_config);
     }
     // G2.1: on more than one rank every rank enters every collective of the
     // distributed element-resolved operator, including ranks without gas.
@@ -3210,7 +3245,7 @@ class SourceRuntimeImpl final : public SourceRuntime {
     if (!distributed && context.state.cells.size() == 0U) {
       return;
     }
-    if (distributed) {
+    if (distributed && diffusion_enabled) {
       const std::uint64_t local_composition = context.state.gas_composition.enabled() ? 1U : 0U;
       const std::uint64_t any_composition = m_mpi_context.allreduceMaxUint64(local_composition);
       const std::uint64_t all_composition = m_mpi_context.allreduceMinUint64(local_composition);
@@ -3226,8 +3261,9 @@ class SourceRuntimeImpl final : public SourceRuntime {
     }
 
     const std::size_t cell_count = context.state.cells.size();
-    const std::uint64_t workspace_bytes =
-        m_metal_diffusion.requiredWorkspaceBytes(cell_count);
+    const std::uint64_t workspace_bytes = diffusion_enabled
+        ? m_metal_diffusion.requiredWorkspaceBytes(cell_count)
+        : 0U;
     const std::size_t mask_bytes = core::checkedSizeMultiply(
         cell_count, sizeof(std::uint8_t), "metal-diffusion owned-leaf mask");
     const std::size_t rho_kappa_bytes = core::checkedSizeMultiply(
@@ -3240,6 +3276,12 @@ class SourceRuntimeImpl final : public SourceRuntime {
         phase_bytes,
         static_cast<std::uint64_t>(rho_kappa_bytes),
         "metal-diffusion phase plus rho-kappa field");
+    if (sgs_shear_enabled) {
+      phase_bytes = core::checkedMemoryBytesAdd(
+          phase_bytes,
+          physics::SgsShearTransferWorkspace::requiredBytes(cell_count),
+          "smooth transport phase plus SGS shear staging");
+    }
 
     core::MemoryReservation replacement_phase_reservation;
     std::exception_ptr reservation_failure;
@@ -3247,7 +3289,10 @@ class SourceRuntimeImpl final : public SourceRuntime {
       if (m_memory_governor != nullptr &&
           (m_owned_leaf_mask.capacity() < cell_count ||
            m_diffusion_rho_kappa_code.capacity() < cell_count ||
-           m_diffusion_workspace.ownedCapacityBytes() < workspace_bytes)) {
+           m_diffusion_workspace.ownedCapacityBytes() < workspace_bytes ||
+           (sgs_shear_enabled &&
+            m_sgs_shear_workspace.ownedCapacityBytes() <
+                physics::SgsShearTransferWorkspace::requiredBytes(cell_count)))) {
         replacement_phase_reservation = m_memory_governor->reserve(
             core::MemoryClass::kPhaseResident,
             phase_bytes,
@@ -3370,6 +3415,121 @@ class SourceRuntimeImpl final : public SourceRuntime {
     if (m_diffusion_rho_kappa_code.size() != cell_count) {
       throw std::runtime_error(
           "metal diffusion topology returned the wrong strain-field extent");
+    }
+
+    // I02: the same authoritative face graph now drives the resolved SGS
+    // stress. Local faces receive equal/opposite momentum and stress-work
+    // updates. For a remote face, both owners reconstruct the same canonical
+    // lower/upper traction from exchanged step-start state and publish only
+    // their local half. The existing distributed topology handshake is used
+    // with zero scalar lanes solely to prove one-to-one interface geometry
+    // before any rank commits a momentum/energy mutation.
+    if (sgs_shear_enabled) {
+      physics::SgsLedger shear_ledger;
+      if (distributed) {
+        internal::DistributedElementDiffusionCoupling topology_agreement(
+            m_mpi_context, m_memory_governor, context.state,
+            topology.remote_faces, m_diffusion_rho_kappa_code, 0U);
+        topology_agreement.setup();
+      }
+      const internal::MpiStageCollectiveDecision decision(m_mpi_context);
+      core::StageTransaction transaction(
+          "sources.sgs_resolved_shear", m_memory_governor, &decision);
+      (void)transaction.prepare([&] {
+        shear_ledger = physics::prepareSgsShearTransfer(
+            context.state,
+            m_owned_leaf_mask,
+            m_diffusion_rho_kappa_code,
+            m_diffusion_faces,
+            topology.remote_faces,
+            scale_factor,
+            source_dt_code,
+            *m_source_stage_config.sgs,
+            m_sgs_shear_workspace);
+      });
+      if (!transaction.validate(true, core::StageRejectionKind::kNone, {})) {
+        m_sgs_shear_workspace.clear();
+        throw core::StageTransactionRejected(
+            transaction.outcome().rejection,
+            "SGS resolved-shear stage rejected (" +
+                std::string(core::stageRejectionKindLabel(
+                    transaction.outcome().rejection)) +
+                "): " + transaction.outcome().reason);
+      }
+
+      const bool touched_thermodynamics = std::any_of(
+          m_sgs_shear_workspace.touched.begin(),
+          m_sgs_shear_workspace.touched.end(),
+          [](std::uint8_t value) { return value != 0U; });
+      (void)transaction.commit([&] {
+        physics::commitSgsShearTransfer(
+            context.state, m_sgs_shear_workspace);
+      });
+      if (touched_thermodynamics) {
+        context.state.notifyGasThermodynamicMutation();
+        std::unique_ptr<physics::EffectiveIsmThermodynamicClosure> closure;
+        if (m_effective_eos_table != nullptr) {
+          closure = std::make_unique<physics::EffectiveIsmThermodynamicClosure>(
+              m_effective_eos_table);
+        }
+        const hydro::GasThermodynamicRefreshPolicy refresh_policy{
+            .adiabatic_index = 5.0 / 3.0,
+            .density_floor_code = m_hydro_density_floor_code,
+            .pressure_floor_code = m_hydro_pressure_floor_code,
+            .scale_factor = source_evaluation_scale_factor,
+            .redshift = m_is_cosmological
+                ? std::max(0.0, 1.0 / source_evaluation_scale_factor - 1.0)
+                : 0.0,
+            .closure = closure.get(),
+            .temperature_k_per_internal_energy_code =
+                hydro::temperatureKelvinPerInternalEnergyCode(
+                    5.0 / 3.0, m_units.velocity_si_per_code)};
+        for (std::uint32_t row = 0U; row < cell_count; ++row) {
+          if (m_sgs_shear_workspace.touched[row] != 0U) {
+            (void)hydro::refreshGasThermodynamicCell(
+                context.state, row, refresh_policy);
+          }
+        }
+        context.state.markGasThermodynamicsRefreshed();
+      }
+      m_last_sgs_ledger.produced_from_resolved_code +=
+          shear_ledger.produced_from_resolved_code;
+      m_last_sgs_ledger.resolved_stress_work_code +=
+          shear_ledger.resolved_stress_work_code;
+      m_last_sgs_ledger.momentum_impulse_l1_code +=
+          shear_ledger.momentum_impulse_l1_code;
+      m_last_sgs_ledger.shear_faces += shear_ledger.shear_faces;
+      m_last_sgs_ledger.shear_cells += shear_ledger.shear_cells;
+      if (context.profiler_session != nullptr) {
+        context.profiler_session->recordEvent(core::RuntimeEvent{
+            .event_kind = "sources.sgs_shear",
+            .severity = core::RuntimeEventSeverity::kInfo,
+            .subsystem = "physics.sgs",
+            .step_index = context.integrator_state.step_index,
+            .simulation_time_code = context.integrator_state.current_time_code,
+            .scale_factor = source_evaluation_scale_factor,
+            .message = "conservative resolved-stress to SGS transfer",
+            .payload = {
+                {"faces", std::to_string(shear_ledger.shear_faces)},
+                {"cells", std::to_string(shear_ledger.shear_cells)},
+                {"produced_from_resolved_code",
+                 std::to_string(shear_ledger.produced_from_resolved_code)},
+                {"resolved_stress_work_code",
+                 std::to_string(shear_ledger.resolved_stress_work_code)},
+                {"momentum_impulse_l1_code",
+                 std::to_string(shear_ledger.momentum_impulse_l1_code)},
+                {"dt_code", std::to_string(source_dt_code)}}});
+      }
+    }
+
+    if (!diffusion_enabled) {
+      if (m_memory_governor != nullptr &&
+          replacement_phase_reservation.committed()) {
+        m_diffusion_phase_reservation.release();
+        m_diffusion_phase_reservation =
+            std::move(replacement_phase_reservation);
+      }
+      return;
     }
 
     for (std::uint32_t cell_index = 0U; cell_index < cell_count; ++cell_index) {
@@ -3715,6 +3875,7 @@ class SourceRuntimeImpl final : public SourceRuntime {
   std::vector<double> m_element_diffusion_workspace;
   physics::ElementDiffusionReport m_last_element_diffusion{};
   physics::MetalDiffusionWorkspace m_diffusion_workspace;
+  physics::SgsShearTransferWorkspace m_sgs_shear_workspace;
   std::uint64_t m_diffusion_rho_kappa_high_water_bytes = 0U;
   std::uint64_t m_diffusion_faces_high_water_bytes = 0U;
   std::uint64_t m_diffusion_topology_scratch_high_water_bytes = 0U;

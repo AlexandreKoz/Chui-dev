@@ -8,6 +8,7 @@
 
 #include "cosmosim/core/simulation_mode.hpp"
 #include "cosmosim/core/simulation_state.hpp"
+#include "cosmosim/physics/ism_dust_sgs.hpp"
 #include "cosmosim/physics/metal_diffusion.hpp"
 
 namespace cosmosim::workflows::internal {
@@ -24,23 +25,13 @@ struct RemoteDiffusionCell {
   std::array<std::uint32_t, 3> index{};
   std::array<std::uint32_t, 3> patch_dims{};
   std::array<double, 3> velocity_peculiar{};
+  double density_physical_code = 0.0;
 };
 
 // Interface between a local owned leaf row and a remote owned leaf cell.
 // local_side = +1 when the remote cell lies on the +axis side of the local
 // cell. The unique flux authority is the side with the smaller gas_cell_id.
-struct RemoteDiffusionFace {
-  std::uint32_t local_row = 0U;
-  std::uint32_t remote_index = 0U;
-  std::uint64_t local_gas_cell_id = 0U;
-  std::uint64_t remote_gas_cell_id = 0U;
-  int remote_rank = 0;
-  std::uint8_t axis = 0U;
-  std::int8_t local_side = 0;
-  bool periodic = false;
-  double area_code = 0.0;
-  double center_distance_code = 0.0;
-};
+using RemoteDiffusionFace = physics::SgsRemoteShearFace;
 
 struct MetalDiffusionTopologyResult {
   std::vector<physics::MetalDiffusionFace> faces;

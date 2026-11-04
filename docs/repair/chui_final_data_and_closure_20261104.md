@@ -77,7 +77,7 @@ Key quantitative facts (details in `data_sources.md`):
 | C02 network references | **EXPERIMENTAL/UNQUALIFIED** | Unchanged. |
 | C03 adaptive chemistry | **IMPLEMENTED IN SOURCE — NOT RUN**, **EXPERIMENTAL/UNQUALIFIED** | Composition thresholds plus the R3 cooling-time/stiffness criterion, canonical-sidecar bias, hysteresis and dwell, all logged. There is still no solver-error-estimate criterion, because per-row error estimates are not retained. |
 | C04 shadow | **EXPERIMENTAL/UNQUALIFIED** | Unchanged; it never mutates state. |
-| I01, I02 | **EXPERIMENTAL/UNQUALIFIED** | Unchanged. |
+| I01, I02 | **EXPERIMENTAL/UNQUALIFIED** | Source path includes the resolved SGS stress/production transfer; physical calibration and the user-reserved numerical campaign remain pending. |
 | S01 | **IMPLEMENTED IN SOURCE — NOT RUN** | Unchanged. |
 | S02 SSP | **IMPLEMENTED IN SOURCE — NOT RUN**; yields **AVAILABLE** (D1) | Monotone quadrature from pass 1. |
 | F01 feedback | **IMPLEMENTED IN SOURCE — NOT RUN** | Pass 1 global associations. The MPI end-to-end test is not written (V2). |

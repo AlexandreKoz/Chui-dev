@@ -153,7 +153,9 @@ DustConfig makeDustConfig(const core::PhysicsConfig& p) {
 }
 
 SgsConfig makeSgsConfig(const core::PhysicsConfig& p) {
-  return SgsConfig{.dissipation_coefficient = p.sgs_dissipation_coefficient};
+  return SgsConfig{
+      .dissipation_coefficient = p.sgs_dissipation_coefficient,
+      .eddy_viscosity_coefficient = p.sgs_eddy_viscosity_coefficient};
 }
 
 }  // namespace cosmosim::physics

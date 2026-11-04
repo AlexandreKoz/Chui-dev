@@ -815,7 +815,7 @@ Handoff: `docs/repair/chui_part2_thermochemistry_stellar_physics_20261103.md`.
 | `ism_regime_model` | `legacy` \| `effective_or_resolved` | required with Part 2 + effective SF |
 | `ism_jeans_resolution_cells`, `ism_regime_hysteresis_fraction`, `ism_regime_min_dwell_years` | 4, 0.2, 1e6 | regime criterion |
 | `sgs_turbulence_model` | `none` \| `budgeted_v1` | research closure |
-| `sgs_dissipation_coefficient`, `sgs_eddy_viscosity_coefficient`, `sgs_feedback_energy_fraction` | 1.58, 0.05, 0 | |
+| `sgs_dissipation_coefficient`, `sgs_eddy_viscosity_coefficient`, `sgs_feedback_energy_fraction` | 1.58, 0.05, 0 | `budgeted_v1`: exact SGS-to-thermal decay; traceless resolved stress with `nu_t = C_v Delta^2 |S*|`, conservative momentum/stress-work update and equal resolved-to-SGS production transfer; exclusive feedback share. The explicit stress stage enforces its parabolic stability bound. EXPERIMENTAL/UNQUALIFIED. |
 | `chemistry_adaptive_selection` | `off` \| `local_v1` | requires `fixed_detailed` |
 | `chemistry_adaptive_hysteresis_fraction`, `chemistry_adaptive_min_dwell_years`, `chemistry_adaptive_cold_temperature_k`, `chemistry_adaptive_dense_nh_cm3` | 0.3, 1e6, 3e3, 1 | |
 | `chemistry_adaptive_cooling_time_ratio` | 0 | R3, EXPERIMENTAL/UNQUALIFIED. Promotes a row to detailed chemistry when the network's net cooling time `u / (Lambda + chemical - Gamma)` is shorter than `ratio x interval` (stiff, rapidly cooling gas). Demotion additionally requires `t_cool > ratio x interval x (1 + h)`. The global promotion bias scales the ratio. 0 disables. Counted in the source event as `fidelity_promoted_by_cooling_time`. |

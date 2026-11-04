@@ -470,7 +470,10 @@ External data — **BLOCKED BY DATA (nothing bundled or synthesized)**:
 Regimes by Truelove Jeans criterion + effective threshold with hysteresis
 and dwell; effective cells skip resolved thermochemistry; closure, refresh and
 relaxation honour the tag. SGS `budgeted_v1`: feedback-fraction source, exact
-dissipation to heat; no shear production (EXPERIMENTAL/UNQUALIFIED).
+dissipation to heat and a traceless Smagorinsky resolved-stress stage on the
+AMR face graph. Pairwise stress impulses and work update resolved momentum and
+energy, while positive production is transferred exactly into the persistent
+SGS lane. The closure remains EXPERIMENTAL/UNQUALIFIED.
 
 ## 7. Star formation and chronology
 Gradients via geometric neighbour index; SF removes the exact proportional

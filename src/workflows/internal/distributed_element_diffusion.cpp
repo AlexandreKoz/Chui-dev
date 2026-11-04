@@ -168,6 +168,10 @@ RemoteDiffusionCellGather gatherRemoteDiffusionCells(
         throw std::runtime_error("distributed diffusion: remote cell offset outside its patch");
       }
       out.velocity_peculiar = {cell.velocity_x_peculiar, cell.velocity_y_peculiar, cell.velocity_z_peculiar};
+      const double volume_factor = scale_factor * scale_factor * scale_factor;
+      out.density_physical_code = cell.density_code > 0.0
+          ? cell.density_code / volume_factor
+          : 0.0;
       gather.cells.push_back(out);
     }
     // Deterministic order (gas_cell_id), duplicates (multiple images or
