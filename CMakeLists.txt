@@ -565,7 +565,8 @@ add_library(cosmosim_amr STATIC
   src/amr/amr_framework.cpp
   src/amr/amr_hydro_geometry.cpp
   src/amr/amr_ghost_fill.cpp
-  src/amr/amr_hydro_orchestrator.cpp)
+  src/amr/amr_hydro_orchestrator.cpp
+  src/amr/amr_production_regrid.cpp)
 add_library(cosmosim_physics STATIC
   src/physics/cooling_heating.cpp
   src/physics/effective_multiphase_ism.cpp
@@ -624,6 +625,7 @@ add_library(cosmosim_parallel STATIC
   src/parallel/distributed_memory_mpi.cpp
   src/parallel/distributed_memory_tree_pm.cpp
   src/parallel/distributed_memory_amr.cpp
+  src/parallel/composition_exchange.cpp
   src/parallel/distributed_memory_hydro.cpp
   src/parallel/distributed_memory_device.cpp
   src/parallel/node_memory_pool.cpp)
@@ -1153,7 +1155,8 @@ if(COSMOSIM_ENABLE_TESTS)
   # gravity/zoom, adaptive research, science output, four-mode sources).
   # Authored without execution: NOT RUN — USER-RESERVED.
   set(CHUI_PART3_UNIT_TESTS
-      amr_periodic_cross_patch)
+      amr_periodic_cross_patch
+      amr_production_regrid)
   foreach(chui_part3_test IN LISTS CHUI_PART3_UNIT_TESTS)
     add_executable(test_unit_${chui_part3_test} tests/unit/test_${chui_part3_test}.cpp)
     target_include_directories(test_unit_${chui_part3_test} PRIVATE ${PROJECT_SOURCE_DIR}/src)

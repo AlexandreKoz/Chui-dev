@@ -702,6 +702,14 @@ parseInitialConditionMissingFieldPolicy(
                     "' (expected off or thermal_fraction)");
 }
 
+[[nodiscard]] AmrRegridConfigMode parseAmrRegridConfigMode(const std::string& value) {
+  const std::string lower = toLower(trim(value));
+  if (lower == "off") return AmrRegridConfigMode::kOff;
+  if (lower == "automatic") return AmrRegridConfigMode::kAutomatic;
+  throw ConfigError("key 'numerics.amr_regrid_mode': invalid value '" + value +
+                    "' (expected off or automatic)");
+}
+
 [[nodiscard]] NodeMemoryAdmissionMode parseNodeMemoryAdmissionMode(const std::string& value) {
   const std::string lower = toLower(trim(value));
   if (lower == "off") return NodeMemoryAdmissionMode::kOff;
@@ -1407,6 +1415,13 @@ struct ConfigKeySpec {
       {"numerics.hierarchical_encounter_timestep_enabled", "true"},
       {"numerics.gravity_timestep_eta", "0.2"},
       {"numerics.amr_max_level", "10"},
+      {"numerics.amr_regrid_mode", "off"},
+      {"numerics.amr_regrid_interval_steps", "1"},
+      {"numerics.amr_regrid_max_operations", "64"},
+      {"numerics.amr_refine_cell_mass_code", "0.0"},
+      {"numerics.amr_refine_jump_threshold", "0.0"},
+      {"numerics.amr_refine_jeans_cells", "4.0"},
+      {"numerics.amr_derefine_hysteresis", "0.5"},
       {"numerics.gravity_softening", "1.0 kpc"},
       {"numerics.gravity_softening_gas", ""},
       {"numerics.gravity_softening_dark_matter", ""},
@@ -2057,6 +2072,28 @@ void validateConfig(const SimulationConfig& config) {
       config.numerics.hydro_dual_energy_eta <= 0.0 ||
       config.numerics.hydro_dual_energy_eta >= 1.0) {
     throw ConfigError("numerics.hydro_dual_energy_eta must be finite and in (0, 1)");
+  }
+  // CHUI Part 3 automatic AMR regrid.
+  if (config.numerics.amr_regrid_interval_steps < 1 || config.numerics.amr_regrid_max_operations < 1) {
+    throw ConfigError("numerics.amr_regrid_interval_steps and numerics.amr_regrid_max_operations must be >= 1");
+  }
+  if (!std::isfinite(config.numerics.amr_refine_cell_mass_code) || config.numerics.amr_refine_cell_mass_code < 0.0 ||
+      !std::isfinite(config.numerics.amr_refine_jump_threshold) || config.numerics.amr_refine_jump_threshold < 0.0 ||
+      !std::isfinite(config.numerics.amr_refine_jeans_cells) || config.numerics.amr_refine_jeans_cells < 0.0) {
+    throw ConfigError("numerics.amr_refine_* criteria must be finite and >= 0 (0 disables a criterion)");
+  }
+  if (!std::isfinite(config.numerics.amr_derefine_hysteresis) || config.numerics.amr_derefine_hysteresis <= 0.0 ||
+      config.numerics.amr_derefine_hysteresis > 1.0) {
+    throw ConfigError("numerics.amr_derefine_hysteresis must be in (0, 1]");
+  }
+  if (config.numerics.amr_regrid_mode == AmrRegridConfigMode::kAutomatic) {
+    if (config.numerics.amr_refine_cell_mass_code == 0.0 && config.numerics.amr_refine_jump_threshold == 0.0 &&
+        config.numerics.amr_refine_jeans_cells == 0.0) {
+      throw ConfigError("numerics.amr_regrid_mode = automatic requires at least one non-zero amr_refine_* criterion");
+    }
+    if (config.numerics.amr_max_level < 1 || config.numerics.amr_max_level > 30) {
+      throw ConfigError("numerics.amr_regrid_mode = automatic requires numerics.amr_max_level in [1, 30]");
+    }
   }
   if (config.parallel.node_memory_admission == NodeMemoryAdmissionMode::kOff &&
       (config.parallel.node_memory_budget_bytes != 0U ||
@@ -2952,6 +2989,13 @@ class NormalizedConfigStream {
          << (frozen.config.numerics.hierarchical_encounter_timestep_enabled ? "true" : "false") << '\n';
   stream << "gravity_timestep_eta = " << frozen.config.numerics.gravity_timestep_eta << '\n';
   stream << "amr_max_level = " << frozen.config.numerics.amr_max_level << '\n';
+  stream << "amr_regrid_mode = " << amrRegridConfigModeToString(frozen.config.numerics.amr_regrid_mode) << '\n';
+  stream << "amr_regrid_interval_steps = " << frozen.config.numerics.amr_regrid_interval_steps << '\n';
+  stream << "amr_regrid_max_operations = " << frozen.config.numerics.amr_regrid_max_operations << '\n';
+  stream << "amr_refine_cell_mass_code = " << frozen.config.numerics.amr_refine_cell_mass_code << '\n';
+  stream << "amr_refine_jump_threshold = " << frozen.config.numerics.amr_refine_jump_threshold << '\n';
+  stream << "amr_refine_jeans_cells = " << frozen.config.numerics.amr_refine_jeans_cells << '\n';
+  stream << "amr_derefine_hysteresis = " << frozen.config.numerics.amr_derefine_hysteresis << '\n';
   stream << "gravity_softening = " << frozen.config.numerics.gravity_softening_kpc_comoving << " kpc\n";
   auto emitOptionalSoftening = [&](std::string_view key, double value_kpc_comoving) {
     stream << key << " = ";
@@ -3713,6 +3757,26 @@ class NormalizedConfigStream {
       "numerics.gravity_timestep_eta");
   frozen.config.numerics.amr_max_level = parseNumber<int>(
       requireString(entries, consumed, "numerics.amr_max_level", "10"), "numerics.amr_max_level");
+  frozen.config.numerics.amr_regrid_mode = parseAmrRegridConfigMode(requireString(
+      entries, consumed, "numerics.amr_regrid_mode", defaultFor("numerics.amr_regrid_mode")));
+  frozen.config.numerics.amr_regrid_interval_steps = parseNumber<int>(
+      requireString(entries, consumed, "numerics.amr_regrid_interval_steps",
+                    defaultFor("numerics.amr_regrid_interval_steps")), "numerics.amr_regrid_interval_steps");
+  frozen.config.numerics.amr_regrid_max_operations = parseNumber<int>(
+      requireString(entries, consumed, "numerics.amr_regrid_max_operations",
+                    defaultFor("numerics.amr_regrid_max_operations")), "numerics.amr_regrid_max_operations");
+  frozen.config.numerics.amr_refine_cell_mass_code = parseFloating(
+      requireString(entries, consumed, "numerics.amr_refine_cell_mass_code",
+                    defaultFor("numerics.amr_refine_cell_mass_code")), "numerics.amr_refine_cell_mass_code");
+  frozen.config.numerics.amr_refine_jump_threshold = parseFloating(
+      requireString(entries, consumed, "numerics.amr_refine_jump_threshold",
+                    defaultFor("numerics.amr_refine_jump_threshold")), "numerics.amr_refine_jump_threshold");
+  frozen.config.numerics.amr_refine_jeans_cells = parseFloating(
+      requireString(entries, consumed, "numerics.amr_refine_jeans_cells",
+                    defaultFor("numerics.amr_refine_jeans_cells")), "numerics.amr_refine_jeans_cells");
+  frozen.config.numerics.amr_derefine_hysteresis = parseFloating(
+      requireString(entries, consumed, "numerics.amr_derefine_hysteresis",
+                    defaultFor("numerics.amr_derefine_hysteresis")), "numerics.amr_derefine_hysteresis");
   frozen.config.numerics.gravity_softening_kpc_comoving = parseLengthKpc(
       requireString(entries, consumed, "numerics.gravity_softening", "1.0 kpc"),
       frozen.config.units.length_unit,
@@ -4879,6 +4943,14 @@ std::string hydroDualEnergyConfigModeToString(HydroDualEnergyConfigMode mode) {
     case HydroDualEnergyConfigMode::kThermalFraction: return "thermal_fraction";
   }
   throw ConfigError("unhandled HydroDualEnergyConfigMode enum value during serialization");
+}
+
+std::string amrRegridConfigModeToString(AmrRegridConfigMode mode) {
+  switch (mode) {
+    case AmrRegridConfigMode::kOff: return "off";
+    case AmrRegridConfigMode::kAutomatic: return "automatic";
+  }
+  throw ConfigError("unhandled AmrRegridConfigMode enum value during serialization");
 }
 
 std::string nodeMemoryAdmissionModeToString(NodeMemoryAdmissionMode mode) {

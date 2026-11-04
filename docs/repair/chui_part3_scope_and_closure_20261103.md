@@ -35,8 +35,8 @@ names the commit subject prefix (SHAs are listed in the final handoff
 | S02 | SSP returns, event timeline, associations (research) | Part 2 `stellar_population.cpp` | associations refused by config (open, C) | physics | Part 2 | IMPLEMENTED IN SOURCE; associations open | production yields need `chui_ssp_yield_table_v1` | P2, C |
 | F01 | mechanical SN deposition | Part 2 | cross-rank deposition refused (open, C) | physics/workflows | Part 2 | IMPLEMENTED IN SOURCE (local) | — | P2, C |
 | F02 | winds / pre-SN channels, event handling | Part 2 (pre-SN momentum EXPERIMENTAL) | time-dependent winds open (C) | physics | — | open | wind-rate tables | C |
-| D01 | elements, advection, diffusion, dust | Part 2 (advection, dust) | element diffusion refused (C); distributed composition AMR refused (B) | physics/amr | Part 2 | partial; open (B, C) | — | P2, B, C |
-| A01 | production automatic refine/derefine, prolong/restrict, ghosts, reflux, migration, restart | `amr_hydro_orchestrator.cpp`, `hydro_amr_runtime.cpp`; periodic topology (A) | automatic production trigger open (B) | amr/workflows | `unit_amr_periodic_cross_patch` | periodic topology IMPLEMENTED IN SOURCE (A); regrid open (B) | — | A, B |
+| D01 | elements, advection, diffusion, dust | Part 2 (advection, dust); Part 3 distributed composition (`composition_transport.cpp`, `parallel/composition_exchange.cpp`) and regrid | element diffusion refused (C) | physics/amr | Part 2, `unit_amr_production_regrid` | advection + regrid + distributed IMPLEMENTED IN SOURCE (B); diffusion open (C) | — | P2, B, C |
+| A01 | production automatic refine/derefine, prolong/restrict, ghosts, reflux, migration, restart | `amr_production_regrid.{hpp,cpp}`, `amr_hydro_orchestrator.cpp` (composition regrid), `hydro_amr_runtime.cpp::runAutomaticAmrRegrid` | first-order (piecewise-constant) prolongation; octets split across ranks skipped; grandparent link may be unrecoverable (blocks further coarsening); regrid ops individually transactional | amr/workflows | `unit_amr_periodic_cross_patch`, `unit_amr_production_regrid` | IMPLEMENTED IN SOURCE (A, B); NOT RUN | — | A, B |
 | A02 | distributed recursive subcycling + synchronized reference | existing 2-level local subcycling | ≥3 levels / distributed: open (B/D) | amr/workflows | — | open | — | B, D |
 | A03 | physics-aware indicators | `RefinementEvaluator` (mass/gradient/particles/Jeans) | shock/cooling/chemistry/feedback/gravity indicators open (B/F) | amr | — | open | — | B, F |
 | A04 | predictive / cost-aware refinement | — | open (F) | amr/workflows | — | open | — | F |
@@ -55,8 +55,8 @@ names the commit subject prefix (SHAs are listed in the final handoff
 |---|---|---|---|
 | Cross-patch periodic AMR refused | Part 1 §5, Part 2 §12.1 | **IMPLEMENTED IN SOURCE** — refusal replaced by wrapped topology; only an untiled periodic box is refused | A |
 | Multi-layer AMR ghost shells / PPM-CTU full order at patch boundaries | Part 1 §5 | **IMPLEMENTED IN SOURCE** for PLM/PPM (deep stencil-only layers, local + remote + wrapped); CTU ghost-side transverse terms still normal-only (counted) | A |
-| Distributed composition ghosts + composition reflux payloads | Part 2 §5/§12.2 | open | B |
-| Regrid wiring of `prolongComposition`/`restrictComposition` | Part 2 §5 | open | B |
+| Distributed composition ghosts + composition reflux payloads | Part 2 §5/§12.2 | **IMPLEMENTED IN SOURCE** — donor-fraction request/response and owner-targeted remote corrections (fine-side mirrored transfers onto remote coarse cells); refusal removed | B |
+| Regrid wiring of composition prolong/restrict | Part 2 §5 | **IMPLEMENTED IN SOURCE** — CSR transfer plan in the regrid candidate commit (same weights as hydro; lane totals verified before commit) | B |
 | Transactional AMR sweep | Part 1 §3 | open | B/D |
 | Remote auxiliary dual energy | Part 1 §5 | open | B |
 | Remote SF gradients, remote feedback | Part 2 §12.3 | open | C |
@@ -66,7 +66,7 @@ names the commit subject prefix (SHAs are listed in the final handoff
 | Global adaptive chemistry + shadow | Part 2 §12.5 | open | F |
 | Science snapshot export of composition / stars | Part 2 §0.5, §10.4 | open | G |
 | Benchmark matrices, four-mode validation sources | Part 2 §10.8 | open | H/I |
-| F6 runtime AMR | audit | open (A partial: topology) | B |
+| F6 runtime AMR | audit | **IMPLEMENTED IN SOURCE** — `numerics.amr_regrid_mode = automatic` drives refine/derefine in ordinary production evolution | A, B |
 | `massiveReturn` quadrature monotonicity | Part 2.5 §P2.5.8 | retained 401-point check; static review in C | C |
 
 ## 3. Static integration-risk ledger (parent never compiled)

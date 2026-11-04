@@ -800,6 +800,152 @@ struct ProductionAmrRegridAdmission {
   std::uint64_t state_baseline_before = 0U;
 };
 
+// CHUI Part 3 Checkpoint B — conservative composition transfer at regrid.
+//
+// One CSR record per candidate row lists the old-state rows and weights whose
+// weighted sum is that row's composition: a kept row copies its source
+// (weight 1); a refined child receives its parent's lanes times the child's
+// exact volume share 1/8 (piecewise-constant prolongation, the same rule as
+// the conserved hydro state, so every lane keeps the parent's mass fraction);
+// a derefined parent receives the plain sum of its eight children's lanes.
+// All composition lanes are extensive (element/species/dust masses, SGS
+// energy), so weights are non-negative and the lane totals are conserved
+// exactly up to roundoff; species stay consistent with element nuclei
+// because every lane of a row is scaled by the same weight. The plan and the
+// new sidecar are built and verified BEFORE the transactional commit; any
+// failure leaves the original hierarchy and sidecar untouched.
+struct CompositionRegridPlan {
+  std::vector<std::uint32_t> offsets{0U};
+  std::vector<std::uint32_t> source_rows;
+  std::vector<double> weights;
+
+  void reserve(std::size_t rows, std::size_t entries) {
+    offsets.reserve(rows + 1U);
+    source_rows.reserve(entries);
+    weights.reserve(entries);
+  }
+  void add(std::uint32_t source_row, double weight) {
+    source_rows.push_back(source_row);
+    weights.push_back(weight);
+  }
+  void closeRow() {
+    offsets.push_back(core::checkedIntegralNarrow<std::uint32_t>(
+        source_rows.size(), "composition regrid plan offset"));
+  }
+  [[nodiscard]] std::size_t rowCount() const noexcept { return offsets.size() - 1U; }
+  [[nodiscard]] static std::uint64_t workspaceBytes(std::size_t rows, std::size_t entries) {
+    return static_cast<std::uint64_t>(core::checkedSizeAdd(
+        core::checkedSizeMultiply(rows + 1U, sizeof(std::uint32_t), "composition plan offsets"),
+        core::checkedSizeMultiply(entries, sizeof(std::uint32_t) + sizeof(double), "composition plan entries"),
+        "composition plan bytes"));
+  }
+};
+
+[[nodiscard]] std::uint64_t compositionCandidateBytes(
+    const core::SimulationState& state, std::size_t candidate_rows, std::size_t plan_entries) {
+  if (!state.gas_composition.enabled()) {
+    return 0U;
+  }
+  const std::size_t per_row = core::checkedSizeAdd(
+      core::checkedSizeMultiply(state.gas_composition.laneCount(), sizeof(double), "composition lanes"),
+      sizeof(std::uint64_t) + 2U * sizeof(std::uint8_t) + 3U * sizeof(double),
+      "composition row bytes");
+  return core::checkedMemoryBytesAdd(
+      static_cast<std::uint64_t>(core::checkedSizeMultiply(candidate_rows, per_row, "composition candidate bytes")),
+      CompositionRegridPlan::workspaceBytes(candidate_rows, plan_entries),
+      "composition regrid bytes");
+}
+
+// Build the candidate composition sidecar aligned to candidate rows.
+// Metadata rules: copy/prolong inherit the single source's tags, dwell and
+// mean molecular weight (intensive; children share the parent's state). A
+// restriction takes the most detailed chemistry tag among the children (no
+// tracked species is ever discarded by a demotion at regrid), the ISM regime
+// of the most massive child (lowest source row on ties: deterministic), the
+// minimum dwell (hysteresis restarts conservatively) and an unknown (NaN)
+// mean molecular weight that the next chemistry/refresh rebuilds.
+[[nodiscard]] core::GasCompositionSidecar buildRegriddedComposition(
+    const core::SimulationState& old_state,
+    const core::SimulationState& candidate,
+    const CompositionRegridPlan& plan) {
+  const core::GasCompositionSidecar& old = old_state.gas_composition;
+  if (plan.rowCount() != candidate.cells.size()) {
+    throw std::logic_error("composition regrid plan does not cover every candidate row");
+  }
+  old.requireAlignedWith(old_state.gas_cells.gas_cell_id, "composition regrid source");
+  core::GasCompositionSidecar result = old.emptyLike(candidate.cells.size());
+  const std::size_t lanes = old.laneCount();
+  std::vector<double> before(lanes, 0.0);
+  std::vector<double> scale(lanes, 0.0);
+  for (std::size_t lane = 0; lane < lanes; ++lane) {
+    for (const double value : old.lane(lane)) {
+      before[lane] += value;
+      scale[lane] += std::abs(value);
+    }
+  }
+  for (std::size_t row = 0; row < plan.rowCount(); ++row) {
+    const std::uint32_t begin = plan.offsets[row];
+    const std::uint32_t end = plan.offsets[row + 1U];
+    if (begin == end) {
+      throw std::logic_error("composition regrid plan row has no source");
+    }
+    result.gas_cell_id[row] = candidate.gas_cells.gas_cell_id[row];
+    for (std::size_t lane = 0; lane < lanes; ++lane) {
+      double value = 0.0;
+      for (std::uint32_t entry = begin; entry < end; ++entry) {
+        const double weight = plan.weights[entry];
+        if (!(weight > 0.0) || !std::isfinite(weight)) {
+          throw std::logic_error("composition regrid weight must be positive and finite");
+        }
+        value += weight * old.value(lane, plan.source_rows[entry]);
+      }
+      result.setValue(lane, row, value);
+    }
+    if (end - begin == 1U) {
+      const std::uint32_t src = plan.source_rows[begin];
+      result.chemistry_model_tag[row] = old.chemistry_model_tag[src];
+      result.ism_regime_tag[row] = old.ism_regime_tag[src];
+      result.model_dwell_years[row] = old.model_dwell_years[src];
+      result.ism_regime_dwell_years[row] = old.ism_regime_dwell_years[src];
+      result.mean_molecular_weight[row] = old.mean_molecular_weight[src];
+      continue;
+    }
+    std::uint8_t tag = 0U;
+    double dwell = std::numeric_limits<double>::infinity();
+    double regime_dwell = std::numeric_limits<double>::infinity();
+    std::uint32_t heaviest = plan.source_rows[begin];
+    for (std::uint32_t entry = begin; entry < end; ++entry) {
+      const std::uint32_t src = plan.source_rows[entry];
+      tag = std::max(tag, old.chemistry_model_tag[src]);
+      dwell = std::min(dwell, old.model_dwell_years[src]);
+      regime_dwell = std::min(regime_dwell, old.ism_regime_dwell_years[src]);
+      const double mass = old_state.cells.mass_code[src];
+      const double best = old_state.cells.mass_code[heaviest];
+      if (mass > best || (mass == best && src < heaviest)) heaviest = src;
+    }
+    result.chemistry_model_tag[row] = tag;
+    result.ism_regime_tag[row] = old.ism_regime_tag[heaviest];
+    result.model_dwell_years[row] = std::isfinite(dwell) ? dwell : 0.0;
+    result.ism_regime_dwell_years[row] = std::isfinite(regime_dwell) ? regime_dwell : 0.0;
+    result.mean_molecular_weight[row] = std::numeric_limits<double>::quiet_NaN();
+  }
+  for (std::size_t lane = 0; lane < lanes; ++lane) {
+    double after = 0.0;
+    for (const double value : result.lane(lane)) {
+      if (value < 0.0 || !std::isfinite(value)) {
+        throw std::runtime_error("composition regrid produced a negative or non-finite lane value");
+      }
+      after += value;
+    }
+    if (std::abs(after - before[lane]) > 1.0e-12 * std::max(scale[lane], 1.0e-300)) {
+      throw std::runtime_error(
+          "composition regrid changed a lane inventory beyond roundoff (lane " + std::to_string(lane) + ")");
+    }
+  }
+  result.requireAlignedWith(candidate.gas_cells.gas_cell_id, "composition regrid candidate");
+  return result;
+}
+
 [[nodiscard]] ProductionAmrRegridAdmission admitProductionAmrRegrid(
     const core::SimulationState& state,
     const ProductionAmrHydroOptions& options,
@@ -826,27 +972,28 @@ struct ProductionAmrRegridAdmission {
 void commitProductionAmrCandidate(
     core::SimulationState& state,
     core::SimulationState&& candidate,
-    ProductionAmrRegridAdmission& admission) {
+    ProductionAmrRegridAdmission& admission,
+    const CompositionRegridPlan& composition_plan) {
   static_assert(std::is_nothrow_move_assignable_v<core::CellSoa>);
   static_assert(std::is_nothrow_move_assignable_v<core::GasCellSidecar>);
   static_assert(std::is_nothrow_move_assignable_v<core::PatchSoa>);
   static_assert(std::is_nothrow_move_assignable_v<core::GasCellIdentityMap>);
 
-  if (state.gas_composition.enabled()) {
-    // CHUI Part 2 fail-closed boundary: the conservative composition
-    // prolongation/restriction kernels exist (physics::prolongComposition /
-    // physics::restrictComposition) but regrid row construction does not yet
-    // carry them; wiring them into runtime refinement is Part 3 (audit F6).
-    // Refuse before any mutation instead of erasing species/dust lanes.
-    throw std::runtime_error(
-        "production AMR regrid with an enabled gas composition sidecar is not supported until Part 3 "
-        "wires conservative composition prolongation/restriction into regrid; refusing before mutation");
+  // CHUI Part 3: the composition sidecar is regridded with the hydro state
+  // (Part 2 refused here). Built and verified before any mutation.
+  core::GasCompositionSidecar regridded_composition;
+  const bool composition = state.gas_composition.enabled();
+  if (composition) {
+    regridded_composition = buildRegriddedComposition(state, candidate, composition_plan);
   }
   admission.reservation.commit();
   state.cells = std::move(candidate.cells);
   state.gas_cells = std::move(candidate.gas_cells);
   state.patches = std::move(candidate.patches);
   state.gas_cell_identity = std::move(candidate.gas_cell_identity);
+  if (composition) {
+    state.gas_composition = std::move(regridded_composition);
+  }
   state.bumpCellIndexGeneration();
 
   const std::uint64_t state_baseline_after = core::memoryReportBaselineOwnedBytes(
@@ -3032,10 +3179,18 @@ ProductionAmrRegridDiagnostics refineProductionPatchInSimulationState(
           child_cell_count, sizeof(std::uint32_t),
           "production AMR refine diagnostic row scratch bytes"),
       "production AMR refine row scratch bytes");
+  const std::uint64_t refine_composition_bytes =
+      compositionCandidateBytes(state, new_cell_count, new_cell_count);
   ProductionAmrRegridAdmission admission = admitProductionAmrRegrid(
       state, options,
-      productionAmrCandidateReservationBytes(new_cell_count, new_patch_count, refine_row_scratch_bytes),
+      productionAmrCandidateReservationBytes(new_cell_count, new_patch_count,
+          core::checkedSizeAdd(refine_row_scratch_bytes,
+              core::checkedIntegralNarrow<std::size_t>(refine_composition_bytes, "refine composition bytes"),
+              "production AMR refine scratch with composition")),
       "amr.production_refine.transaction");
+  CompositionRegridPlan composition_plan;
+  const bool track_composition = state.gas_composition.enabled();
+  if (track_composition) composition_plan.reserve(new_cell_count, new_cell_count);
 
   const std::vector<std::uint32_t> parent_rows =
       patchLocalRowsForPatch(state, parent_patch, "production AMR refine");
@@ -3079,6 +3234,10 @@ ProductionAmrRegridDiagnostics refineProductionPatchInSimulationState(
         copyCellRow(candidate, dst, state, first + offset);
         candidate.cells.patch_index[dst] = core::checkedIntegralNarrow<std::uint32_t>(
             write_patch, "production AMR refine kept cell patch index");
+        if (track_composition) {
+          composition_plan.add(first + offset, 1.0);
+          composition_plan.closeRow();
+        }
         ++write_row;
       }
       ++write_patch;
@@ -3138,6 +3297,10 @@ ProductionAmrRegridDiagnostics refineProductionPatchInSimulationState(
         candidate.gas_cells.parent_particle_id[dst] =
             state.gas_cells.parent_particle_id[parent_row];
         writeVolumeIntegratedToRow(candidate, dst, child_conserved, child_volume, options);
+        if (track_composition) {
+          composition_plan.add(parent_row, 1.0 / 8.0);
+          composition_plan.closeRow();
+        }
         new_child_rows.push_back(dst);
         ++write_row;
       }
@@ -3168,7 +3331,7 @@ ProductionAmrRegridDiagnostics refineProductionPatchInSimulationState(
       .conserved_momentum_z_after = after[3],
       .conserved_total_energy_before = before[4],
       .conserved_total_energy_after = after[4]};
-  commitProductionAmrCandidate(state, std::move(candidate), admission);
+  commitProductionAmrCandidate(state, std::move(candidate), admission, composition_plan);
   return diagnostics;
 }
 
@@ -3228,10 +3391,23 @@ ProductionAmrRegridDiagnostics derefineProductionPatchInSimulationState(
           parent_cell_count, sizeof(std::uint32_t),
           "production AMR derefine transient per-child row scratch bytes"),
       "production AMR derefine scratch bytes");
+  const std::size_t derefine_plan_entries = core::checkedSizeAdd(
+      kept_cell_count, child_cell_count, "production AMR derefine composition entries");
+  const std::uint64_t derefine_composition_bytes =
+      compositionCandidateBytes(state, kept_cell_count, derefine_plan_entries);
   ProductionAmrRegridAdmission admission = admitProductionAmrRegrid(
       state, options,
-      productionAmrCandidateReservationBytes(kept_cell_count, kept_patch_count, scratch_bytes),
+      productionAmrCandidateReservationBytes(kept_cell_count, kept_patch_count,
+          core::checkedSizeAdd(scratch_bytes,
+              core::checkedSizeAdd(
+                  core::checkedIntegralNarrow<std::size_t>(derefine_composition_bytes, "derefine composition bytes"),
+                  core::checkedSizeMultiply(child_cell_count, sizeof(std::uint32_t), "derefine child-by-parent rows"),
+                  "derefine composition scratch"),
+              "production AMR derefine scratch with composition")),
       "amr.production_derefine.transaction");
+  CompositionRegridPlan composition_plan;
+  const bool track_composition = state.gas_composition.enabled();
+  if (track_composition) composition_plan.reserve(kept_cell_count, derefine_plan_entries);
 
   std::vector<PatchDescriptor> children;
   children.reserve(8U);
@@ -3326,6 +3502,10 @@ ProductionAmrRegridDiagnostics derefineProductionPatchInSimulationState(
       parent_cell_count, std::numeric_limits<std::uint64_t>::max());
   std::vector<std::uint8_t> restricted_time_bin(
       parent_cell_count, std::numeric_limits<std::uint8_t>::max());
+  // Child rows grouped by parent cell (CSR by counting; 8 children/cell).
+  std::vector<std::uint32_t> child_rows_by_parent(track_composition ? child_cell_count : 0U);
+  std::vector<std::uint32_t> children_per_parent(track_composition ? parent_cell_count : 0U, 0U);
+  const std::size_t children_per_cell = parent_cell_count == 0U ? 0U : child_cell_count / parent_cell_count;
   for (const PatchDescriptor& child : children) {
     const std::vector<std::uint32_t> rows =
         patchLocalRowsForPatch(state, child, "production AMR derefine child restriction");
@@ -3344,6 +3524,13 @@ ProductionAmrRegridDiagnostics derefineProductionPatchInSimulationState(
       }
       restricted_time_bin[parent_cell] =
           std::min(restricted_time_bin[parent_cell], state.cells.time_bin[child_row]);
+      if (track_composition) {
+        const std::uint32_t slot = children_per_parent[parent_cell]++;
+        if (slot >= children_per_cell) {
+          throw std::runtime_error("production AMR derefine composition: parent cell has too many children");
+        }
+        child_rows_by_parent[parent_cell * children_per_cell + slot] = child_row;
+      }
     }
   }
 
@@ -3405,6 +3592,15 @@ ProductionAmrRegridDiagnostics derefineProductionPatchInSimulationState(
               ? 0U
               : restricted_parent_particle_id[cell];
           writeVolumeIntegratedToRow(candidate, dst, restricted[cell], parent_volume, options);
+          if (track_composition) {
+            if (children_per_parent[cell] != children_per_cell) {
+              throw std::runtime_error("production AMR derefine composition: incomplete child coverage");
+            }
+            for (std::size_t slot = 0; slot < children_per_cell; ++slot) {
+              composition_plan.add(child_rows_by_parent[cell * children_per_cell + slot], 1.0);
+            }
+            composition_plan.closeRow();
+          }
           parent_rows.push_back(dst);
           ++write_row;
         }
@@ -3426,6 +3622,10 @@ ProductionAmrRegridDiagnostics derefineProductionPatchInSimulationState(
       copyCellRow(candidate, dst, state, first + offset);
       candidate.cells.patch_index[dst] = core::checkedIntegralNarrow<std::uint32_t>(
           write_patch, "production AMR derefine kept cell patch index");
+      if (track_composition) {
+        composition_plan.add(first + offset, 1.0);
+        composition_plan.closeRow();
+      }
       ++write_row;
     }
     ++write_patch;
@@ -3454,7 +3654,7 @@ ProductionAmrRegridDiagnostics derefineProductionPatchInSimulationState(
       .conserved_momentum_z_after = after[3],
       .conserved_total_energy_before = before[4],
       .conserved_total_energy_after = after[4]};
-  commitProductionAmrCandidate(state, std::move(candidate), admission);
+  commitProductionAmrCandidate(state, std::move(candidate), admission, composition_plan);
   return diagnostics;
 }
 

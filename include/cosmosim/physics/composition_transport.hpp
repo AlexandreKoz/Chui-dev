@@ -75,6 +75,31 @@ class CompositionFluxAccumulator final : public hydro::HydroFaceMassFluxSink {
   //    mass (density-floor mass or round-off) by scaling with the row's own
   //    composition; the reconciled mass is ledgered in the report.
   void prepare(const core::SimulationState& state);
+
+  // CHUI Part 3 distributed composition (see parallel/composition_exchange.hpp).
+  // Sorted unique stable ids of remote (non-local) cells that are donors or
+  // conservative targets of recorded face transfers.
+  [[nodiscard]] std::vector<std::uint64_t> requiredRemoteDonorIds() const;
+  // Remote donor lane mass fractions (row-major, `lanes` per id, ids sorted
+  // unique). Must cover every id returned by requiredRemoteDonorIds() whose
+  // side is a donor; a missing donor fails closed in prepare.
+  void setRemoteDonorFractions(std::span<const std::uint64_t> sorted_ids,
+                               std::span<const double> fractions_row_major,
+                               std::size_t lanes);
+  // Two-phase prepare for the distributed path: deltas and outbound remote
+  // corrections are computed, inbound corrections from other ranks are added,
+  // then the complete local delta is validated (positivity, finiteness).
+  void prepareDeferred(const core::SimulationState& state);
+  struct RemoteCorrection {
+    std::uint64_t gas_cell_id = 0U;
+    std::vector<double> lane_delta_code;
+  };
+  [[nodiscard]] const std::vector<RemoteCorrection>& outboundRemoteCorrections() const noexcept {
+    return m_outbound;
+  }
+  void addInboundCorrection(const core::SimulationState& state, std::uint64_t gas_cell_id,
+                            std::span<const double> lane_delta_code);
+  void validatePrepared(const core::SimulationState& state);
   CompositionTransportCommitReport commit(core::SimulationState& state) noexcept;
 
   [[nodiscard]] std::size_t recordCount() const noexcept { return m_records.size(); }
@@ -95,8 +120,14 @@ class CompositionFluxAccumulator final : public hydro::HydroFaceMassFluxSink {
     double mass = 0.0;                          // owner -> neighbor
     std::uint8_t update_owner = 0;
     std::uint8_t update_neighbor = 0;
+    // Part 3: stable id of a side that lives on another rank (0 = local).
+    std::uint64_t owner_remote_id = 0U;
+    std::uint64_t neighbor_remote_id = 0U;
   };
-  [[nodiscard]] std::uint32_t resolveRow(std::size_t storage_row, bool& is_real) const;
+  [[nodiscard]] std::uint32_t resolveRow(std::size_t storage_row, bool& is_real,
+                                         std::uint64_t& remote_id) const;
+  void accumulateDeltas(const core::SimulationState& state);
+  [[nodiscard]] const double* remoteFractions(std::uint64_t gas_cell_id) const;
 
   const core::SimulationState& m_state;
   const hydro::HydroPatchGeometry* m_geometry = nullptr;
@@ -105,6 +136,10 @@ class CompositionFluxAccumulator final : public hydro::HydroFaceMassFluxSink {
   std::vector<Record> m_records;
   std::vector<double> m_delta;
   bool m_prepared = false;
+  std::vector<std::uint64_t> m_remote_ids;
+  std::vector<double> m_remote_fractions;
+  std::size_t m_remote_lanes = 0U;
+  std::vector<RemoteCorrection> m_outbound;
 };
 
 }  // namespace cosmosim::physics

@@ -3427,6 +3427,14 @@ std::string restartConfigurationCompatibilityRecord(
       current.config.parallel.node_memory_reserve_bytes != 0U ||
       // CHUI Part 2 keys must hold their (physics-disabled) defaults.
       !part2PhysicsKeysAtDefaults(current.config.physics) ||
+      // CHUI Part 3 regrid keys must hold their (static-hierarchy) defaults.
+      current.config.numerics.amr_regrid_mode != core::AmrRegridConfigMode::kOff ||
+      current.config.numerics.amr_regrid_interval_steps != 1 ||
+      current.config.numerics.amr_regrid_max_operations != 64 ||
+      current.config.numerics.amr_refine_cell_mass_code != 0.0 ||
+      current.config.numerics.amr_refine_jump_threshold != 0.0 ||
+      current.config.numerics.amr_refine_jeans_cells != 4.0 ||
+      current.config.numerics.amr_derefine_hysteresis != 0.5 ||
       current.config.schema_version != 1 ||
       current.provenance.config_hash_hex != core::stableConfigHashHex(current.normalized_text)) {
     fail("new options must retain legacy defaults and global KDK must remain selected");
@@ -3545,6 +3553,14 @@ std::string restartConfigurationCompatibilityRecord(
       fail("Part 2 checkpoint predates metal_cooling_accept_uv_background_mismatch; only its default is accepted");
     }
     removeKeyLines({"metal_cooling_accept_uv_background_mismatch"});
+  }
+  // CHUI Part 3 regrid group: removed only when the checkpoint predates it
+  // (all values verified at their defaults above).
+  if (projected.find("\namr_regrid_mode = ") != std::string::npos &&
+      restart.normalized_config_text.find("\namr_regrid_mode = ") == std::string::npos) {
+    removeKeyLines({"amr_regrid_mode", "amr_regrid_interval_steps", "amr_regrid_max_operations",
+        "amr_refine_cell_mass_code", "amr_refine_jump_threshold", "amr_refine_jeans_cells",
+        "amr_derefine_hysteresis"});
   }
   if (projected.find("\nhydro_reconstruction = ") != std::string::npos &&
       restart.normalized_config_text.find("\nhydro_reconstruction = ") == std::string::npos) {
