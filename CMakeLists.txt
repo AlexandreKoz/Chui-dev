@@ -2695,6 +2695,16 @@ if(COSMOSIM_ENABLE_BENCHMARKS)
   target_link_libraries(bench_hydro_method_matrix PRIVATE cosmosim_hydro)
   target_include_directories(bench_hydro_method_matrix PRIVATE ${PROJECT_SOURCE_DIR})
 
+  # CHUI final-design benchmarks (V5; NOT RUN — USER-RESERVED). Registered as
+  # executables only, never as mandatory CTest entries.
+  add_executable(bench_chui_final_kernels bench/chui_final/bench_chui_final_kernels.cpp)
+  target_link_libraries(bench_chui_final_kernels PRIVATE cosmosim_all)
+  if(COSMOSIM_ENABLE_MPI)
+    add_executable(bench_chui_final_mpi bench/chui_final/bench_chui_final_mpi.cpp)
+    target_include_directories(bench_chui_final_mpi PRIVATE ${PROJECT_SOURCE_DIR}/src)
+    target_link_libraries(bench_chui_final_mpi PRIVATE cosmosim_all)
+  endif()
+
   add_executable(bench_amr_regrid_kernel bench/amr/bench_amr_regrid_kernel.cpp)
   target_link_libraries(bench_amr_regrid_kernel PRIVATE cosmosim_amr)
   target_include_directories(bench_amr_regrid_kernel PRIVATE ${PROJECT_SOURCE_DIR})
