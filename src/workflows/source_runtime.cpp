@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <unordered_map>
 #include <exception>
 #include <limits>
 #include <memory>
@@ -37,6 +38,12 @@
 #include "cosmosim/physics/stellar_evolution.hpp"
 #include "cosmosim/physics/stellar_feedback.hpp"
 #include "cosmosim/physics/metal_diffusion.hpp"
+#include "cosmosim/physics/element_diffusion.hpp"
+#include "cosmosim/physics/stellar_wind.hpp"
+#include "cosmosim/parallel/composition_exchange.hpp"
+#include "cosmosim/parallel/distributed_mesh.hpp"
+#include "workflows/internal/amr_migration_payload.hpp"
+#include "cosmosim/physics/baryon_composition.hpp"
 #include "cosmosim/workflows/runtime_services.hpp"
 #include "workflows/internal/gas_cell_ownership.hpp"
 #include "workflows/internal/mpi_stage_collective_decision.hpp"
@@ -952,6 +959,10 @@ class SourceRuntimeImpl final : public SourceRuntime {
             config.physics.ssp_yield_table_path, config.physics.ssp_yield_table_sha256));
       }
       m_ssp_model = std::make_unique<physics::SspModel>(ssp, m_ssp_yield_table.get());
+      if (config.physics.ssp_wind_model == core::SspWindModelConfig::kTableV1) {
+        m_wind_table = std::make_shared<const physics::StellarWindTable>(physics::StellarWindTable::loadFromFile(
+            config.physics.ssp_wind_table_path, config.physics.ssp_wind_table_sha256));
+      }
     }
     if (physics::part2ThermochemistrySelected(config.physics)) {
       m_baryonic_data = physics::loadBaryonicDataProducts(config.physics);
@@ -1328,6 +1339,10 @@ class SourceRuntimeImpl final : public SourceRuntime {
       } catch (...) { neighbor_failure = std::current_exception(); }
       m_mpi_context.rethrowCollectivePreparationFailure(
           neighbor_failure, "star-formation neighbour index preparation");
+      if (m_mpi_context.isEnabled() && m_mpi_context.worldSize() > 1) {
+        // CHUI Part 3 Checkpoint C: remote neighbour halo (collective).
+        importRemoteStarFormationNeighbors(context);
+      }
 
       const std::size_t particle_count_before_birth =
           context.state.particles.size();
@@ -1701,6 +1716,126 @@ class SourceRuntimeImpl final : public SourceRuntime {
     }
   }
 
+  // CHUI Part 3 Checkpoint C: remote star-formation neighbours. The directed
+  // AMR boundary exchange (same planner as hydro; one face layer; periodic
+  // images) delivers every remote leaf cell that is a face neighbour of a
+  // local patch, with its step-start centre and velocity; the patch metadata
+  // gives its level and cell width. Ranks without patches still participate.
+  void importRemoteStarFormationNeighbors(core::StepContext& context) {
+    const auto local_patch_records =
+        internal::buildMigrationAmrPatchPayloadRecords(context.state, m_mpi_context.worldRank());
+    std::vector<parallel::AmrPatchCellPayloadRecord> received;
+    const auto exchange = parallel::executeBlockingDirectedAmrPatchPayloadExchange(
+        m_mpi_context, local_patch_records,
+        [&context, this](std::span<const parallel::AmrPatchBoundaryCellRequest> requests, std::uint64_t first_record,
+                         std::size_t max_records, std::vector<parallel::AmrPatchCellPayloadRecord>& output) {
+          internal::fillMigrationAmrPatchBoundaryCellPayloadChunk(
+              context.state, m_mpi_context.worldRank(), requests, first_record, max_records, output);
+        },
+        [&received](int, std::span<const parallel::AmrPatchCellPayloadRecord> records) {
+          received.insert(received.end(), records.begin(), records.end());
+        },
+        {}, 0U, context.integrator_state.step_index,
+        parallel::AmrInterfaceTopologyOptions{
+            .periodic_box_extent_comoving = m_hydro_boundary == core::BoundaryCondition::kPeriodic
+                ? m_box_extent_comoving : std::array<double, 3>{0.0, 0.0, 0.0},
+            .ghost_layers = 1U});
+    std::unordered_map<std::uint64_t, parallel::AmrPatchPayloadRecord> patch_by_id;
+    for (const auto& record : exchange.patch_payloads_received) patch_by_id.emplace(record.patch_id, record);
+    std::vector<internal::StarFormationNeighborIndex::RemoteCell> remote;
+    remote.reserve(received.size());
+    for (const auto& cell : received) {
+      const auto it = patch_by_id.find(cell.patch_id);
+      if (it == patch_by_id.end()) {
+        throw std::runtime_error("star-formation remote neighbour has no patch metadata (fail closed)");
+      }
+      const auto& patch = it->second;
+      remote.push_back(internal::StarFormationNeighborIndex::RemoteCell{
+          .center = {cell.center_x_comoving, cell.center_y_comoving, cell.center_z_comoving},
+          .width = {patch.extent_x_comoving / patch.cell_dim_x, patch.extent_y_comoving / patch.cell_dim_y,
+                    patch.extent_z_comoving / patch.cell_dim_z},
+          .level = patch.level,
+          .velocity = {cell.velocity_x_peculiar, cell.velocity_y_peculiar, cell.velocity_z_peculiar}});
+    }
+    if (m_sf_neighbor_index != nullptr) m_sf_neighbor_index->addRemoteCells(std::move(remote));
+  }
+
+  // CHUI Part 3 Checkpoint C: remote feedback halo. For every staged source
+  // the local k-NN radius bounds the global stencil; each other rank returns
+  // its own k nearest owned leaf cells within that radius (step-start
+  // properties), so the source owner sees the exact global k-NN stencil and
+  // normalizes its weights over local AND remote cells (never a rank-local
+  // renormalization). Query volume: O(active sources x ranks) small records.
+  void importRemoteFeedbackCandidates(
+      const core::SimulationState& state,
+      physics::MechanicalFeedbackDeposition& deposition,
+      std::span<const physics::FeedbackSourceBudget> budgets,
+      std::uint64_t sequence) {
+    struct Query {
+      std::array<double, 3> position{};
+      double radius2 = 0.0;
+      int requester_rank = 0;
+      int pad = 0;
+    };
+    const int rank = m_mpi_context.worldRank();
+    const int ranks = m_mpi_context.worldSize();
+    std::vector<Query> queries;
+    std::vector<int> destinations;
+    for (const auto& budget : budgets) {
+      if (budget.ejecta_mass_code == 0.0 && budget.supernova_energy_erg == 0.0 && budget.presn_momentum_code == 0.0) {
+        continue;
+      }
+      const double r2 = deposition.localStencilRadius2(state, budget.position_comoving);
+      for (int peer = 0; peer < ranks; ++peer) {
+        if (peer == rank) continue;
+        queries.push_back(Query{.position = budget.position_comoving, .radius2 = r2, .requester_rank = rank});
+        destinations.push_back(peer);
+      }
+    }
+    const auto query_bytes = parallel::executeBlockingDestinationRecordExchange(
+        m_mpi_context,
+        std::span<const std::byte>(reinterpret_cast<const std::byte*>(queries.data()), queries.size() * sizeof(Query)),
+        sizeof(Query), destinations, sequence);
+    std::vector<Query> inbound(query_bytes.size() / sizeof(Query));
+    if (!inbound.empty()) std::memcpy(inbound.data(), query_bytes.data(), query_bytes.size());
+    std::vector<physics::FeedbackRemoteCandidate> responses;
+    std::vector<int> response_destinations;
+    std::exception_ptr failure;
+    try {
+      for (const Query& query : inbound) {
+        for (const std::uint32_t row : deposition.localCandidatesWithin(state, query.position, query.radius2)) {
+          physics::FeedbackRemoteCandidate candidate;
+          candidate.gas_cell_id = state.gas_cells.gas_cell_id[row];
+          candidate.owner_rank = rank;
+          candidate.center_comoving = {state.cells.center_x_comoving[row], state.cells.center_y_comoving[row],
+                                       state.cells.center_z_comoving[row]};
+          candidate.mass_code = state.cells.mass_code[row];
+          candidate.momentum_code = {candidate.mass_code * state.gas_cells.velocity_x_peculiar[row],
+                                     candidate.mass_code * state.gas_cells.velocity_y_peculiar[row],
+                                     candidate.mass_code * state.gas_cells.velocity_z_peculiar[row]};
+          candidate.density_code = state.gas_cells.density_code[row];
+          candidate.hydrogen_mass_fraction = state.gas_composition.enabled()
+              ? state.gas_composition.value(state.gas_composition.descriptor().element_lane_begin, row) /
+                    std::max(physics::compositionGasMass(state.gas_composition, row), 1.0e-300)
+              : 0.76;
+          responses.push_back(candidate);
+          response_destinations.push_back(query.requester_rank);
+        }
+      }
+    } catch (...) {
+      failure = std::current_exception();
+    }
+    m_mpi_context.rethrowCollectivePreparationFailure(failure, "remote feedback halo responses");
+    const auto response_bytes = parallel::executeBlockingDestinationRecordExchange(
+        m_mpi_context,
+        std::span<const std::byte>(reinterpret_cast<const std::byte*>(responses.data()),
+                                   responses.size() * sizeof(physics::FeedbackRemoteCandidate)),
+        sizeof(physics::FeedbackRemoteCandidate), response_destinations, sequence);
+    std::vector<physics::FeedbackRemoteCandidate> remote(response_bytes.size() / sizeof(physics::FeedbackRemoteCandidate));
+    if (!remote.empty()) std::memcpy(remote.data(), response_bytes.data(), response_bytes.size());
+    deposition.setRemoteCandidates(state, std::move(remote));
+  }
+
   // CHUI Part 2 stellar populations: age-resolved SSP mass/element return
   // (AGB, CC continuous; Ia per event), discrete SN events from the
   // restart-safe cumulative-Poisson chronology, and conservative mechanical
@@ -1710,12 +1845,13 @@ class SourceRuntimeImpl final : public SourceRuntime {
     core::SimulationState& state = context.state;
     const std::uint64_t ranks_with_stars =
         m_mpi_context.allreduceSumUint64(state.star_particles.size() > 0U ? 1ULL : 0ULL);
-    if (ranks_with_stars > 0U && m_mpi_context.isEnabled() && m_mpi_context.worldSize() > 1) {
-      throw std::runtime_error(
-          "Part 2 mechanical stellar feedback across MPI ranks requires Part 3 remote-ghost deposition; "
-          "refusing instead of renormalizing onto rank-local cells (fail closed)");
-    }
-    if (state.star_particles.size() == 0U) return;
+    // CHUI Part 3 Checkpoint C: cross-rank deposition (Part 2 refused here).
+    // Every rank participates when any rank has stars, so the collective
+    // halo and delta exchanges never deadlock.
+    const bool distributed_feedback =
+        ranks_with_stars > 0U && m_mpi_context.isEnabled() && m_mpi_context.worldSize() > 1;
+    if (!distributed_feedback && state.star_particles.size() == 0U) return;
+    if (ranks_with_stars == 0U) return;
     const double elapsed_years = elapsedStellarEvolutionYears(context);
     const physics::ThermochemistryUnitBridge bridge =
         physics::makeThermochemistryOperatorConfig(m_full_config, m_units, m_baryonic_data).units;
@@ -1734,6 +1870,9 @@ class SourceRuntimeImpl final : public SourceRuntime {
     const physics::DustConfig dust_config = physics::makeDustConfig(m_physics_config);
     fb_config.dust_sn_swept_mass_per_1e51_erg_g = dust_config.sn_swept_mass_per_1e51_erg_g;
     fb_config.dust_sn_destruction_efficiency = dust_config.sn_destruction_efficiency;
+    // Decomposition-invariant deposition (step-start target state + per-cell
+    // kinetic closure); identical on 1 and N ranks.
+    fb_config.step_start_reference = true;
 
     buildOwnedLeafCellMetadata(context);
     std::vector<std::uint32_t> owned_leaf;
@@ -1780,7 +1919,11 @@ class SourceRuntimeImpl final : public SourceRuntime {
     const std::uint64_t negative_clamps_before = m_ssp_model->negative_ejecta_clamps;
     const double untracked_residual_before = m_ssp_model->untracked_mass_residual_msun;
     const std::uint64_t nonmonotone_before = m_ssp_model->nonmonotone_return_clamps;
+    std::vector<physics::FeedbackSourceBudget> staged_budgets;
+    std::vector<double> association_birth_years;
     (void)transaction.prepare([&] {
+      std::exception_ptr loop_failure;
+      try {
       for (const std::uint32_t s : star_rows) {
         const std::uint32_t p = state.star_particles.particle_index[s];
         const std::uint64_t pid = state.particle_sidecar.particle_id[p];
@@ -1884,7 +2027,18 @@ class SourceRuntimeImpl final : public SourceRuntime {
           budget.presn_momentum_code = p_dot_cgs * elapsed_years * physics::k_seconds_per_year /
               (bridge.mass_code_to_g * bridge.velocity_code_to_cm_s);
         }
-        deposition.stage(state, budget);
+        association_birth_years.push_back(
+            record.birth_time_code * (m_units.length_si_per_code / m_units.velocity_si_per_code) / physics::k_seconds_per_year);
+        if (energy_coupled && m_wind_table != nullptr) {
+          // CHUI Part 3 wind/pre-SN channel: energy and momentum only (the
+          // wind mass is part of the CC continuous return above).
+          const physics::StellarWindIntervalBudget wind = m_wind_table->interval(age_b, age_e, z);
+          budget.wind_energy_erg = wind.energy_erg_per_msun * birth_msun;
+          budget.wind_momentum_code = wind.momentum_msun_kms_per_msun * birth_msun *
+              (physics::k_solar_mass_g / bridge.mass_code_to_g) * (1.0e5 / bridge.velocity_code_to_cm_s);
+          if (wind.metallicity_clamped) ++m_wind_metallicity_clamps;
+        }
+        staged_budgets.push_back(budget);
         StarUpdate update;
         update.star_index = s;
         update.particle_index = p;
@@ -1899,6 +2053,49 @@ class SourceRuntimeImpl final : public SourceRuntime {
         record.returned_mass_code += returned;
         update.record = record;
         updates.push_back(update);
+      }
+      } catch (...) {
+        loop_failure = std::current_exception();
+      }
+      if (distributed_feedback) {
+        m_mpi_context.rethrowCollectivePreparationFailure(loop_failure, "stellar population budgets");
+        importRemoteFeedbackCandidates(state, deposition, staged_budgets, context.integrator_state.step_index);
+      } else if (loop_failure != nullptr) {
+        std::rethrow_exception(loop_failure);
+      }
+      if (m_physics_config.ssp_clustered_associations) {
+        // RESEARCH: correlated associations / superbubbles. Changes only WHERE
+        // budgets are deposited (event counts, energies and ejecta are those
+        // of the member stars, unchanged).
+        staged_budgets = physics::mergeAssociationSources(
+            staged_budgets, association_birth_years, m_physics_config.ssp_association_radius_code,
+            m_physics_config.ssp_association_time_window_years, units.periodic, units.box_extent_comoving);
+      }
+      std::exception_ptr stage_failure;
+      try {
+        for (const physics::FeedbackSourceBudget& budget : staged_budgets) deposition.stage(state, budget);
+      } catch (...) {
+        stage_failure = std::current_exception();
+      }
+      if (distributed_feedback) {
+        m_mpi_context.rethrowCollectivePreparationFailure(stage_failure, "mechanical feedback staging");
+        std::vector<physics::FeedbackCellDelta> outbound = deposition.remoteDeltas(m_mpi_context.worldRank());
+        std::vector<int> destinations;
+        for (const auto& d : outbound) destinations.push_back(d.owner_rank);
+        const std::vector<std::byte> bytes = parallel::executeBlockingDestinationRecordExchange(
+            m_mpi_context,
+            std::span<const std::byte>(reinterpret_cast<const std::byte*>(outbound.data()),
+                                       outbound.size() * sizeof(physics::FeedbackCellDelta)),
+            sizeof(physics::FeedbackCellDelta), destinations, context.integrator_state.step_index);
+        std::vector<physics::FeedbackCellDelta> inbound(bytes.size() / sizeof(physics::FeedbackCellDelta));
+        if (!inbound.empty()) std::memcpy(inbound.data(), bytes.data(), bytes.size());
+        // Deterministic merge order (cell id, then source rank).
+        std::sort(inbound.begin(), inbound.end(), [](const auto& l, const auto& r) {
+          return l.gas_cell_id != r.gas_cell_id ? l.gas_cell_id < r.gas_cell_id : l.source_rank < r.source_rank;
+        });
+        for (const auto& d : inbound) deposition.addImportedDelta(state, d);
+      } else if (stage_failure != nullptr) {
+        std::rethrow_exception(stage_failure);
       }
     });
     if (!transaction.validate(true, core::StageRejectionKind::kNone, {})) {
@@ -2578,6 +2775,49 @@ class SourceRuntimeImpl final : public SourceRuntime {
       }
       return;
     }
+    if (context.state.gas_composition.enabled()) {
+      // CHUI Part 3 Checkpoint C: element-resolved conservative mixing of
+      // every element/species/dust lane with the SAME diffusivity and face
+      // graph (replaces the Part 2 refusal). The total-Z mirror is then
+      // re-derived from the evolved lanes; it is never diffused on its own.
+      const auto& sidecar = context.state.gas_composition;
+      core::MemoryReservation element_reservation;
+      std::exception_ptr element_failure;
+      physics::ElementDiffusionReport element_report;
+      try {
+        if (m_memory_governor != nullptr) {
+          element_reservation = m_memory_governor->reserve(
+              core::MemoryClass::kScratchArena,
+              core::checkedMemoryBytesAdd(
+                  physics::elementDiffusionWorkspaceBytes(sidecar.laneCount(), sidecar.rowCount()),
+                  static_cast<std::uint64_t>(sidecar.laneCount() * sidecar.rowCount() * sizeof(double)),
+                  "element diffusion workspace plus delta"),
+              "sources.element_diffusion.workspace");
+          element_reservation.commit();
+        }
+        element_report = physics::advanceElementResolvedDiffusion(
+            context.state.gas_composition, m_diffusion_faces, m_diffusion_rho_kappa_code,
+            context.integrator_state.dt_time_code, m_metal_diffusion.config().parabolic_cfl,
+            m_metal_diffusion.config().max_subcycles, m_element_diffusion_workspace);
+      } catch (...) {
+        element_failure = std::current_exception();
+      }
+      m_element_diffusion_workspace.clear();
+      m_element_diffusion_workspace.shrink_to_fit();
+      if (m_runtime_services != nullptr) {
+        FailureCoordinator(*m_runtime_services).rethrowCollectiveFailure(
+            element_failure, "element-resolved metal diffusion");
+      } else if (element_failure != nullptr) {
+        std::rethrow_exception(element_failure);
+      }
+      (void)physics::synchronizeMetalMirrorFromComposition(context.state, std::span<const std::uint32_t>{});
+      m_last_element_diffusion = element_report;
+      if (m_memory_governor != nullptr && replacement_phase_reservation.committed()) {
+        m_diffusion_phase_reservation.release();
+        m_diffusion_phase_reservation = std::move(replacement_phase_reservation);
+      }
+      return;
+    }
     const physics::MetalDiffusionStepReport report =
         m_metal_diffusion.advanceFromView(
             physics::MetalDiffusionFieldView{
@@ -2789,6 +3029,10 @@ class SourceRuntimeImpl final : public SourceRuntime {
   std::vector<std::uint8_t> m_owned_leaf_mask;
   std::vector<double> m_diffusion_rho_kappa_code;
   std::vector<physics::MetalDiffusionFace> m_diffusion_faces;
+  std::shared_ptr<const physics::StellarWindTable> m_wind_table;
+  std::uint64_t m_wind_metallicity_clamps = 0U;
+  std::vector<double> m_element_diffusion_workspace;
+  physics::ElementDiffusionReport m_last_element_diffusion{};
   physics::MetalDiffusionWorkspace m_diffusion_workspace;
   std::uint64_t m_diffusion_rho_kappa_high_water_bytes = 0U;
   std::uint64_t m_diffusion_faces_high_water_bytes = 0U;

@@ -575,6 +575,8 @@ add_library(cosmosim_physics STATIC
   src/physics/stellar_evolution.cpp
   src/physics/stellar_feedback.cpp
   src/physics/metal_diffusion.cpp
+  src/physics/element_diffusion.cpp
+  src/physics/stellar_wind.cpp
   src/physics/tracer_support.cpp
   src/physics/baryon_composition.cpp
   src/physics/composition_transport.cpp
@@ -1156,7 +1158,8 @@ if(COSMOSIM_ENABLE_TESTS)
   # Authored without execution: NOT RUN — USER-RESERVED.
   set(CHUI_PART3_UNIT_TESTS
       amr_periodic_cross_patch
-      amr_production_regrid)
+      amr_production_regrid
+      chui_part3_remote_sources)
   foreach(chui_part3_test IN LISTS CHUI_PART3_UNIT_TESTS)
     add_executable(test_unit_${chui_part3_test} tests/unit/test_${chui_part3_test}.cpp)
     target_include_directories(test_unit_${chui_part3_test} PRIVATE ${PROJECT_SOURCE_DIR}/src)

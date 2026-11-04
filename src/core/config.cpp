@@ -702,6 +702,13 @@ parseInitialConditionMissingFieldPolicy(
                     "' (expected off or thermal_fraction)");
 }
 
+[[nodiscard]] SspWindModelConfig parseSspWindModelConfig(const std::string& value) {
+  const std::string lower = toLower(trim(value));
+  if (lower == "none") return SspWindModelConfig::kNone;
+  if (lower == "table_v1") return SspWindModelConfig::kTableV1;
+  throw ConfigError("key 'physics.ssp_wind_model': invalid value '" + value + "' (expected none or table_v1)");
+}
+
 [[nodiscard]] AmrRegridConfigMode parseAmrRegridConfigMode(const std::string& value) {
   const std::string lower = toLower(trim(value));
   if (lower == "off") return AmrRegridConfigMode::kOff;
@@ -1616,6 +1623,11 @@ struct ConfigKeySpec {
       {"physics.thermochemistry_allow_unqualified_rates", "false"},
       {"physics.ssp_stochastic_sn_events", "true"},
       {"physics.ssp_clustered_associations", "false"},
+      {"physics.ssp_association_radius_code", "0.0"},
+      {"physics.ssp_association_time_window_years", "3.0e6"},
+      {"physics.ssp_wind_model", "none"},
+      {"physics.ssp_wind_table_path", ""},
+      {"physics.ssp_wind_table_sha256", ""},
       {"output.run_name", "cosmosim_run"},
       {"output.output_directory", "outputs"},
       {"output.output_stem", "snapshot"},
@@ -1737,12 +1749,10 @@ void validatePart2BaryonicPhysics(const SimulationConfig& config) {
         "docs/chemistry_rate_provenance.md). Set physics.thermochemistry_allow_unqualified_rates = true to run it "
         "as an explicitly unqualified research model");
   }
-  if (part2 && p.enable_metal_diffusion) {
-    throw ConfigError(
-        "physics.enable_metal_diffusion diffuses total Z only; with element-resolved composition the Z mirror is "
-        "derived from element lanes, so element-resolved diffusion is required and is not implemented yet "
-        "(refused instead of silently discarding the diffusion)");
-  }
+  // CHUI Part 3: with an element-resolved composition sidecar,
+  // physics.enable_metal_diffusion selects the element-resolved mixing
+  // operator (physics/element_diffusion.hpp); the total-Z mirror is derived
+  // from the mixed lanes. The Part 2 refusal is lifted.
   if (part2 && !p.enable_cooling) {
     throw ConfigError("a Part 2 thermochemistry_backend requires physics.enable_cooling=true");
   }
@@ -1888,10 +1898,29 @@ void validatePart2BaryonicPhysics(const SimulationConfig& config) {
         "a Part 2 stellar_population_model deposits element/dust-resolved ejecta through "
         "fb_supernova_model=mechanical_resolved_unresolved (the legacy deposition cannot carry them)");
   }
-  if (p.ssp_clustered_associations) {
+  // CHUI Part 3: correlated associations (RESEARCH, EXPERIMENTAL/UNQUALIFIED).
+  if (!std::isfinite(p.ssp_association_radius_code) || p.ssp_association_radius_code < 0.0 ||
+      !std::isfinite(p.ssp_association_time_window_years) || !(p.ssp_association_time_window_years > 0.0)) {
+    throw ConfigError("physics.ssp_association_radius_code must be >= 0 and ssp_association_time_window_years > 0");
+  }
+  if (p.ssp_clustered_associations &&
+      (p.ssp_association_radius_code == 0.0 || p.stellar_population_model == StellarPopulationModelConfig::kLegacyTable)) {
     throw ConfigError(
-        "physics.ssp_clustered_associations=true is not implemented (it would have no effect); "
-        "refused instead of silently ignoring the request");
+        "physics.ssp_clustered_associations=true requires ssp_association_radius_code > 0 and a Part 2 "
+        "stellar_population_model (associations group SSP feedback sources)");
+  }
+  if (p.ssp_wind_model == SspWindModelConfig::kTableV1) {
+    require_checksum(p.ssp_wind_table_path, p.ssp_wind_table_sha256, "ssp_wind_table");
+    if (p.ssp_wind_table_path.empty() || p.stellar_population_model == StellarPopulationModelConfig::kLegacyTable) {
+      throw ConfigError("physics.ssp_wind_model=table_v1 requires ssp_wind_table_path (+ sha256) and a Part 2 "
+                        "stellar_population_model");
+    }
+    if (p.fb_presn_wind_momentum_lsun_per_c > 0.0) {
+      throw ConfigError("physics.ssp_wind_model=table_v1 and fb_presn_wind_momentum_lsun_per_c > 0 would count "
+                        "pre-SN momentum twice; select one channel");
+    }
+  } else if (!p.ssp_wind_table_path.empty()) {
+    throw ConfigError("physics.ssp_wind_table_path is set but ssp_wind_model = none (it would have no effect)");
   }
   if (p.fb_supernova_model == SupernovaFeedbackModelConfig::kMechanicalResolvedUnresolved &&
       p.stellar_population_model == StellarPopulationModelConfig::kLegacyTable) {
@@ -3260,6 +3289,11 @@ class NormalizedConfigStream {
   stream << "thermochemistry_allow_unqualified_rates = " << (frozen.config.physics.thermochemistry_allow_unqualified_rates ? "true" : "false") << '\n';
   stream << "ssp_stochastic_sn_events = " << (frozen.config.physics.ssp_stochastic_sn_events ? "true" : "false") << '\n';
   stream << "ssp_clustered_associations = " << (frozen.config.physics.ssp_clustered_associations ? "true" : "false") << '\n';
+  stream << "ssp_association_radius_code = " << frozen.config.physics.ssp_association_radius_code << '\n';
+  stream << "ssp_association_time_window_years = " << frozen.config.physics.ssp_association_time_window_years << '\n';
+  stream << "ssp_wind_model = " << sspWindModelConfigToString(frozen.config.physics.ssp_wind_model) << '\n';
+  stream << "ssp_wind_table_path = " << frozen.config.physics.ssp_wind_table_path << '\n';
+  stream << "ssp_wind_table_sha256 = " << frozen.config.physics.ssp_wind_table_sha256 << '\n';
   stream << "\n[output]\n";
   stream << "run_name = " << frozen.config.output.run_name << '\n';
   stream << "output_directory = " << frozen.config.output.output_directory << '\n';
@@ -4340,6 +4374,17 @@ class NormalizedConfigStream {
       requireString(entries, consumed, "physics.ssp_stochastic_sn_events", "true"), "physics.ssp_stochastic_sn_events");
   frozen.config.physics.ssp_clustered_associations = parseBool(
       requireString(entries, consumed, "physics.ssp_clustered_associations", "false"), "physics.ssp_clustered_associations");
+  frozen.config.physics.ssp_association_radius_code = parseFloating(
+      requireString(entries, consumed, "physics.ssp_association_radius_code", "0.0"), "physics.ssp_association_radius_code");
+  frozen.config.physics.ssp_association_time_window_years = parseFloating(
+      requireString(entries, consumed, "physics.ssp_association_time_window_years", "3.0e6"),
+      "physics.ssp_association_time_window_years");
+  frozen.config.physics.ssp_wind_model = parseSspWindModelConfig(
+      requireString(entries, consumed, "physics.ssp_wind_model", "none"));
+  frozen.config.physics.ssp_wind_table_path =
+      requireString(entries, consumed, "physics.ssp_wind_table_path", "");
+  frozen.config.physics.ssp_wind_table_sha256 =
+      requireString(entries, consumed, "physics.ssp_wind_table_sha256", "");
 
   frozen.config.output.run_name =
       requireString(entries, consumed, "output.run_name", frozen.config.output.run_name);
@@ -4943,6 +4988,14 @@ std::string hydroDualEnergyConfigModeToString(HydroDualEnergyConfigMode mode) {
     case HydroDualEnergyConfigMode::kThermalFraction: return "thermal_fraction";
   }
   throw ConfigError("unhandled HydroDualEnergyConfigMode enum value during serialization");
+}
+
+std::string sspWindModelConfigToString(SspWindModelConfig mode) {
+  switch (mode) {
+    case SspWindModelConfig::kNone: return "none";
+    case SspWindModelConfig::kTableV1: return "table_v1";
+  }
+  throw ConfigError("unhandled SspWindModelConfig enum value during serialization");
 }
 
 std::string amrRegridConfigModeToString(AmrRegridConfigMode mode) {

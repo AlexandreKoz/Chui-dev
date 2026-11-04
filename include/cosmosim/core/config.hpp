@@ -57,6 +57,12 @@ enum class HydroDualEnergyConfigMode {
   kThermalFraction,
 };
 
+// CHUI Part 3: stellar wind / pre-SN mechanical channel.
+enum class SspWindModelConfig {
+  kNone,
+  kTableV1,
+};
+
 // CHUI Part 3: production AMR regrid. kOff keeps the historical static
 // hierarchy; kAutomatic refines/derefines at synchronized hierarchy
 // boundaries every amr_regrid_interval_steps accepted steps.
@@ -654,6 +660,13 @@ struct PhysicsConfig {
   bool metal_cooling_accept_uv_background_mismatch = false;
   bool ssp_stochastic_sn_events = true;
   bool ssp_clustered_associations = false;
+  // CHUI Part 3 (docs/configuration.md): correlated associations (RESEARCH)
+  // and the table-driven wind/pre-SN mechanical channel.
+  double ssp_association_radius_code = 0.0;
+  double ssp_association_time_window_years = 3.0e6;
+  SspWindModelConfig ssp_wind_model = SspWindModelConfig::kNone;
+  std::string ssp_wind_table_path;
+  std::string ssp_wind_table_sha256;
 };
 
 enum class ScienceSnapshotLayout : std::uint8_t {
@@ -985,6 +998,7 @@ void writeNormalizedConfigSnapshot(
 [[nodiscard]] std::string hydroRiemannSolverModeToString(HydroRiemannSolverMode mode);
 [[nodiscard]] std::string hydroDualEnergyConfigModeToString(HydroDualEnergyConfigMode mode);
 [[nodiscard]] std::string amrRegridConfigModeToString(AmrRegridConfigMode mode);
+[[nodiscard]] std::string sspWindModelConfigToString(SspWindModelConfig mode);
 [[nodiscard]] std::string nodeMemoryAdmissionModeToString(NodeMemoryAdmissionMode mode);
 [[nodiscard]] std::string coordinateFrameToString(CoordinateFrame frame);
 [[nodiscard]] std::string initialConditionConventionToString(

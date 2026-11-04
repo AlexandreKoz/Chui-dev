@@ -63,6 +63,35 @@ class StarFormationNeighborIndex {
               [](const Entry& a, const Entry& b) { return a.key < b.key || (a.key == b.key && a.row < b.row); });
   }
 
+  // CHUI Part 3: remote (other-rank) leaf cells adjacent to local patches,
+  // imported from the directed AMR boundary exchange at the step-start state.
+  // With them, a neighbour on another rank is FOUND (not NaN), so gradients
+  // and stochastic birth decisions do not depend on the decomposition.
+  struct RemoteCell {
+    std::array<double, 3> center{};
+    std::array<double, 3> width{};
+    std::uint32_t level = 0;
+    std::array<double, 3> velocity{};
+  };
+  void addRemoteCells(std::vector<RemoteCell> cells) {
+    m_remote = std::move(cells);
+    const std::uint32_t base = static_cast<std::uint32_t>(m_state.cells.size());
+    for (std::uint32_t i = 0; i < m_remote.size(); ++i) {
+      const RemoteCell& cell = m_remote[i];
+      if (!(cell.width[0] > 0.0)) continue;
+      m_entries.push_back(Entry{latticeKey(cell.level, cell.center, cell.width), base + i, cell.level});
+      m_width_by_level_x.resize(std::max<std::size_t>(m_width_by_level_x.size(), cell.level + 1U), 0.0);
+      m_width_by_level_y.resize(m_width_by_level_x.size(), 0.0);
+      m_width_by_level_z.resize(m_width_by_level_x.size(), 0.0);
+      m_width_by_level_x[cell.level] = cell.width[0];
+      m_width_by_level_y[cell.level] = cell.width[1];
+      m_width_by_level_z[cell.level] = cell.width[2];
+    }
+    std::sort(m_entries.begin(), m_entries.end(),
+              [](const Entry& a, const Entry& b) { return a.key < b.key || (a.key == b.key && a.row < b.row); });
+  }
+  [[nodiscard]] std::size_t remoteCellCount() const noexcept { return m_remote.size(); }
+
   struct Gradient {
     std::array<std::array<double, 3>, 3> velocity{};
     bool valid = false;
@@ -106,12 +135,12 @@ class StarFormationNeighborIndex {
         double derivative = std::numeric_limits<double>::quiet_NaN();
         const double f0 = v[c][row];
         if (r_minus != core::kInvalidGasCellRow && r_plus != core::kInvalidGasCellRow && x_plus > x_minus) {
-          derivative = (v[c][r_plus] - v[c][r_minus]) / ((x_plus - x_minus) * length_to_physical);
+          derivative = (velocityOf(r_plus, c, v) - velocityOf(r_minus, c, v)) / ((x_plus - x_minus) * length_to_physical);
         } else if (r_plus != core::kInvalidGasCellRow && minus_physical && x_plus > 0.0) {
-          derivative = (v[c][r_plus] - f0) / (x_plus * length_to_physical);
+          derivative = (velocityOf(r_plus, c, v) - f0) / (x_plus * length_to_physical);
           g.used_one_sided = true;
         } else if (r_minus != core::kInvalidGasCellRow && plus_physical && x_minus < 0.0) {
-          derivative = (f0 - v[c][r_minus]) / (x_minus * length_to_physical);
+          derivative = (f0 - velocityOf(r_minus, c, v)) / (x_minus * length_to_physical);
           g.used_one_sided = true;
         } else if (axisCollapsed(axis) || (minus_physical && plus_physical)) {
           // Genuinely lower-dimensional domain along this axis (a single
@@ -146,7 +175,12 @@ class StarFormationNeighborIndex {
     const std::uint32_t p = m_state.cells.patch_index[row];
     return p < m_state.patches.size() ? static_cast<std::uint32_t>(std::max(m_state.patches.level[p], 0)) : 0U;
   }
+  [[nodiscard]] double velocityOf(std::uint32_t row, int c, const std::array<std::span<const double>, 3>& v) const {
+    if (row >= m_state.cells.size()) return m_remote.at(row - m_state.cells.size()).velocity[static_cast<std::size_t>(c)];
+    return v[static_cast<std::size_t>(c)][row];
+  }
   [[nodiscard]] double coordinate(std::uint32_t row, int axis) const {
+    if (row >= m_state.cells.size()) return m_remote.at(row - m_state.cells.size()).center[static_cast<std::size_t>(axis)];
     return axis == 0 ? m_state.cells.center_x_comoving[row]
                      : (axis == 1 ? m_state.cells.center_y_comoving[row] : m_state.cells.center_z_comoving[row]);
   }
@@ -204,6 +238,7 @@ class StarFormationNeighborIndex {
   std::array<double, 3> m_box{};
   std::vector<Entry> m_entries;
   std::vector<double> m_width_by_level_x, m_width_by_level_y, m_width_by_level_z;
+  std::vector<RemoteCell> m_remote;
 };
 
 }  // namespace cosmosim::workflows::internal

@@ -36,9 +36,125 @@ void MechanicalFeedbackDeposition::setCandidates(const core::SimulationState& st
   m_sorted_rows = std::move(owned_leaf_rows);
   m_sorted_x.resize(m_sorted_rows.size());
   for (std::size_t i = 0; i < m_sorted_rows.size(); ++i) m_sorted_x[i] = state.cells.center_x_comoving[m_sorted_rows[i]];
+  m_local_count = static_cast<std::uint32_t>(state.cells.size());
+  m_remote.clear();
   m_row_slot.assign(state.cells.size(), 0U);
   m_rows.clear();
   m_ledger = FeedbackLedger{};
+}
+
+void MechanicalFeedbackDeposition::setRemoteCandidates(const core::SimulationState& state,
+                                                       std::vector<FeedbackRemoteCandidate> remote) {
+  if (!m_rows.empty()) {
+    throw std::logic_error("feedback remote candidates must be set before any source is staged");
+  }
+  std::sort(remote.begin(), remote.end(),
+            [](const FeedbackRemoteCandidate& l, const FeedbackRemoteCandidate& r) { return l.gas_cell_id < r.gas_cell_id; });
+  remote.erase(std::unique(remote.begin(), remote.end(),
+                           [](const FeedbackRemoteCandidate& l, const FeedbackRemoteCandidate& r) {
+                             return l.gas_cell_id == r.gas_cell_id;
+                           }),
+               remote.end());
+  m_remote = std::move(remote);
+  for (std::uint32_t i = 0; i < m_remote.size(); ++i) {
+    if (m_remote[i].gas_cell_id == 0U || state.rowForGasCellId(m_remote[i].gas_cell_id).has_value()) {
+      throw std::invalid_argument("feedback remote candidate is zero or already local");
+    }
+    m_sorted_rows.push_back(m_local_count + i);
+  }
+  std::sort(m_sorted_rows.begin(), m_sorted_rows.end(), [&](std::uint32_t a, std::uint32_t b) {
+    const CandidateProps pa = props(state, a);
+    const CandidateProps pb = props(state, b);
+    return pa.center[0] < pb.center[0] || (pa.center[0] == pb.center[0] && pa.stable_id < pb.stable_id);
+  });
+  m_sorted_x.resize(m_sorted_rows.size());
+  for (std::size_t i = 0; i < m_sorted_rows.size(); ++i) m_sorted_x[i] = props(state, m_sorted_rows[i]).center[0];
+  m_row_slot.assign(static_cast<std::size_t>(m_local_count) + m_remote.size(), 0U);
+}
+
+MechanicalFeedbackDeposition::CandidateProps MechanicalFeedbackDeposition::props(
+    const core::SimulationState& state, std::uint32_t candidate) const {
+  CandidateProps result;
+  if (candidate >= m_local_count) {
+    const FeedbackRemoteCandidate& r = m_remote.at(candidate - m_local_count);
+    result.center = r.center_comoving;
+    result.mass = r.mass_code;
+    result.momentum = r.momentum_code;
+    result.density = r.density_code;
+    result.x_h = r.hydrogen_mass_fraction;
+    result.stable_id = r.gas_cell_id;
+    return result;
+  }
+  const std::uint32_t row = candidate;
+  result.center = {state.cells.center_x_comoving[row], state.cells.center_y_comoving[row],
+                   state.cells.center_z_comoving[row]};
+  result.mass = state.cells.mass_code[row];
+  result.momentum = {result.mass * state.gas_cells.velocity_x_peculiar[row],
+                     result.mass * state.gas_cells.velocity_y_peculiar[row],
+                     result.mass * state.gas_cells.velocity_z_peculiar[row]};
+  result.density = state.gas_cells.density_code[row];
+  result.x_h = state.gas_composition.enabled()
+      ? state.gas_composition.value(state.gas_composition.descriptor().element_lane_begin, row) /
+            std::max(compositionGasMass(state.gas_composition, row), 1.0e-300)
+      : 0.76;
+  result.stable_id = state.gas_cells.gas_cell_id[row];
+  return result;
+}
+
+double MechanicalFeedbackDeposition::localStencilRadius2(const core::SimulationState& state,
+                                                         const std::array<double, 3>& position) const {
+  const auto best = nearest(state, position);
+  if (best.size() < m_config.neighbor_count) return std::numeric_limits<double>::infinity();
+  return best.back().first;
+}
+
+std::vector<std::uint32_t> MechanicalFeedbackDeposition::localCandidatesWithin(
+    const core::SimulationState& state, const std::array<double, 3>& position, double r2_max) const {
+  std::vector<std::uint32_t> rows;
+  for (const auto& [r2, candidate] : nearest(state, position)) {
+    if (candidate < m_local_count && r2 <= r2_max) rows.push_back(candidate);
+  }
+  return rows;
+}
+
+std::vector<FeedbackCellDelta> MechanicalFeedbackDeposition::remoteDeltas(int source_rank) const {
+  std::vector<FeedbackCellDelta> out;
+  for (const RowDelta& d : m_rows) {
+    if (d.row < m_local_count) continue;
+    const FeedbackRemoteCandidate& r = m_remote.at(d.row - m_local_count);
+    FeedbackCellDelta w;
+    w.gas_cell_id = r.gas_cell_id;
+    w.source_rank = source_rank;
+    w.owner_rank = r.owner_rank;
+    w.mass = d.mass;
+    w.momentum = d.momentum;
+    w.thermal_energy = d.thermal_energy;
+    w.sgs_energy = d.sgs_energy;
+    w.intended_kinetic = d.intended_kinetic;
+    w.elements = d.elements;
+    w.dust = d.dust;
+    w.swept_mass_for_dust = d.swept_mass_for_dust;
+    out.push_back(w);
+  }
+  std::sort(out.begin(), out.end(),
+            [](const FeedbackCellDelta& l, const FeedbackCellDelta& r) { return l.gas_cell_id < r.gas_cell_id; });
+  return out;
+}
+
+void MechanicalFeedbackDeposition::addImportedDelta(const core::SimulationState& state, const FeedbackCellDelta& in) {
+  const auto row = state.rowForGasCellId(in.gas_cell_id);
+  if (!row.has_value() || *row >= m_local_count) {
+    throw std::runtime_error("feedback: imported delta targets a cell this rank does not own (fail closed)");
+  }
+  RowDelta& d = delta(*row);
+  d.mass += in.mass;
+  for (int c = 0; c < 3; ++c) d.momentum[c] += in.momentum[c];
+  d.thermal_energy += in.thermal_energy;
+  d.sgs_energy += in.sgs_energy;
+  d.intended_kinetic += in.intended_kinetic;
+  for (std::size_t e = 0; e < k_chemical_element_count; ++e) d.elements[e] += in.elements[e];
+  for (std::size_t r = 0; r < k_dust_reservoir_count; ++r) d.dust[r] += in.dust[r];
+  d.swept_mass_for_dust += in.swept_mass_for_dust;
 }
 
 std::vector<std::pair<double, std::uint32_t>> MechanicalFeedbackDeposition::nearest(
@@ -53,19 +169,27 @@ std::vector<std::pair<double, std::uint32_t>> MechanicalFeedbackDeposition::near
     }
     return d;
   };
+  // Ties are broken by the stable gas-cell id (not the rank-local row), so
+  // the stencil is identical under any MPI decomposition.
+  const auto key_less = [&](const std::pair<double, std::uint32_t>& l, const std::pair<double, std::uint32_t>& r) {
+    return l.first < r.first ||
+        (l.first == r.first && props(state, l.second).stable_id < props(state, r.second).stable_id);
+  };
   const auto consider = [&](std::size_t idx) {
     const std::uint32_t row = m_sorted_rows[idx];
-    const double dx = image(state.cells.center_x_comoving[row] - p[0], 0);
-    const double dy = image(state.cells.center_y_comoving[row] - p[1], 1);
-    const double dz = image(state.cells.center_z_comoving[row] - p[2], 2);
+    const std::array<double, 3> center = props(state, row).center;
+    const double dx = image(center[0] - p[0], 0);
+    const double dy = image(center[1] - p[1], 1);
+    const double dz = image(center[2] - p[2], 2);
     const double r2 = dx * dx + dy * dy + dz * dz;
+    const std::pair<double, std::uint32_t> item{r2, row};
     if (best.size() < k) {
-      best.emplace_back(r2, row);
-      std::push_heap(best.begin(), best.end());
-    } else if (r2 < best.front().first || (r2 == best.front().first && row < best.front().second)) {
-      std::pop_heap(best.begin(), best.end());
-      best.back() = {r2, row};
-      std::push_heap(best.begin(), best.end());
+      best.push_back(item);
+      std::push_heap(best.begin(), best.end(), key_less);
+    } else if (key_less(item, best.front())) {
+      std::pop_heap(best.begin(), best.end(), key_less);
+      best.back() = item;
+      std::push_heap(best.begin(), best.end(), key_less);
     }
   };
   // Expand left/right along the x-sorted list (circularly when periodic)
@@ -101,7 +225,7 @@ std::vector<std::pair<double, std::uint32_t>> MechanicalFeedbackDeposition::near
       }
     }
   }
-  std::sort(best.begin(), best.end());
+  std::sort(best.begin(), best.end(), key_less);
   return best;
 }
 
@@ -115,10 +239,12 @@ MechanicalFeedbackDeposition::RowDelta& MechanicalFeedbackDeposition::delta(std:
 
 void MechanicalFeedbackDeposition::stage(const core::SimulationState& state, const FeedbackSourceBudget& source) {
   if (!(source.ejecta_mass_code >= 0.0) || !(source.supernova_energy_erg >= 0.0) ||
-      !(source.supernova_count >= 0.0) || !(source.presn_momentum_code >= 0.0)) {
+      !(source.supernova_count >= 0.0) || !(source.presn_momentum_code >= 0.0) ||
+      !(source.wind_energy_erg >= 0.0) || !(source.wind_momentum_code >= 0.0)) {
     throw std::invalid_argument("feedback source budget must be non-negative");
   }
-  if (source.ejecta_mass_code == 0.0 && source.supernova_energy_erg == 0.0 && source.presn_momentum_code == 0.0) return;
+  if (source.ejecta_mass_code == 0.0 && source.supernova_energy_erg == 0.0 && source.presn_momentum_code == 0.0 &&
+      source.wind_energy_erg == 0.0 && source.wind_momentum_code == 0.0) return;
   const auto neighbors = nearest(state, source.position_comoving);
   if (neighbors.empty()) {
     throw std::runtime_error("feedback source " + std::to_string(source.source_id) +
@@ -142,21 +268,19 @@ void MechanicalFeedbackDeposition::stage(const core::SimulationState& state, con
   double w_sum = 0.0;
   for (std::size_t i = 0; i < k; ++i) {
     const std::uint32_t row = neighbors[i].second;
-    const double rho = std::max(state.gas_cells.density_code[row], 1.0e-300);
-    double mass = state.cells.mass_code[row];
-    std::array<double, 3> momentum{mass * state.gas_cells.velocity_x_peculiar[row],
-                                   mass * state.gas_cells.velocity_y_peculiar[row],
-                                   mass * state.gas_cells.velocity_z_peculiar[row]};
-    if (m_row_slot[row] != 0U) {
+    const CandidateProps cell = props(state, row);
+    const double rho = std::max(cell.density, 1.0e-300);
+    double mass = cell.mass;
+    std::array<double, 3> momentum = cell.momentum;
+    if (!m_config.step_start_reference && m_row_slot[row] != 0U) {
       const RowDelta& d = m_rows[m_row_slot[row] - 1U];
       mass += d.mass;
       for (int c = 0; c < 3; ++c) momentum[c] += d.momentum[c];
     }
-    const double volume = state.cells.mass_code[row] / rho;
+    const double volume = cell.mass / rho;
     const double h = std::cbrt(volume);
     std::array<double, 3> r{};
-    const std::array<double, 3> center{state.cells.center_x_comoving[row], state.cells.center_y_comoving[row],
-                                       state.cells.center_z_comoving[row]};
+    const std::array<double, 3> center = cell.center;
     double r2 = 0.0;
     for (int c = 0; c < 3; ++c) {
       double d = center[c] - source.position_comoving[c];
@@ -170,10 +294,7 @@ void MechanicalFeedbackDeposition::stage(const core::SimulationState& state, con
     std::array<double, 3> dir{};
     if (rr > 1.0e-12 * h) for (int c = 0; c < 3; ++c) dir[c] = r[c] / rr;
     const double w = std::pow(volume, 2.0 / 3.0) / std::max(r2, 0.25 * h * h);
-    const double x_h = state.gas_composition.enabled()
-        ? state.gas_composition.value(state.gas_composition.descriptor().element_lane_begin, row) /
-              std::max(compositionGasMass(state.gas_composition, row), 1.0e-300)
-        : 0.76;
+    const double x_h = cell.x_h;
     const double rho_cgs = rho * (m_units.comoving ? 1.0 / (a * a * a) : 1.0) * m_units.density_code_to_cgs;
     const double n_h = x_h * rho_cgs / (chemicalElementInfo(ChemicalElement::kH).atomic_mass_amu * k_amu_g);
     targets[i] = Target{row, dir, w, mass, momentum, n_h};
@@ -198,7 +319,7 @@ void MechanicalFeedbackDeposition::stage(const core::SimulationState& state, con
       if (p_energy <= p_term) { p = p_energy; ++m_ledger.resolved_cells; }
       else { p = p_term; ++m_ledger.unresolved_cells; }
     }
-    p += t.w * source.presn_momentum_code;
+    p += t.w * (source.presn_momentum_code + source.wind_momentum_code);
     radial_requested += p;
     for (int c = 0; c < 3; ++c) dp_star[i][c] = p * t.dir[c];
   }
@@ -217,7 +338,7 @@ void MechanicalFeedbackDeposition::stage(const core::SimulationState& state, con
   const double v2_star = source.velocity_peculiar[0] * source.velocity_peculiar[0] +
       source.velocity_peculiar[1] * source.velocity_peculiar[1] +
       source.velocity_peculiar[2] * source.velocity_peculiar[2];
-  const double e_available = e_code + 0.5 * m_ej * v2_star;
+  const double e_available = e_code + source.wind_energy_erg / erg_per_code + 0.5 * m_ej * v2_star;
   const auto kinetic_change = [&](double s) {
     double dke = 0.0;
     for (std::size_t i = 0; i < k; ++i) {
@@ -253,6 +374,18 @@ void MechanicalFeedbackDeposition::stage(const core::SimulationState& state, con
     const Target& t = targets[i];
     RowDelta& d = delta(t.row);
     const double dm = t.w * m_ej;
+    {
+      // Intended kinetic change of this target for this source (used by the
+      // per-cell closure at commit in step_start_reference mode).
+      double p_new2 = 0.0, p_old2 = 0.0;
+      for (int c = 0; c < 3; ++c) {
+        const double pn = t.momentum[c] + s * dp_star[i][c] + dm * source.velocity_peculiar[c];
+        p_new2 += pn * pn;
+        p_old2 += t.momentum[c] * t.momentum[c];
+      }
+      d.intended_kinetic += p_new2 / (2.0 * (t.mass + dm)) - (t.mass > 0.0 ? p_old2 / (2.0 * t.mass) : 0.0);
+    }
+    if (t.row >= m_local_count) ++m_ledger.remote_target_cells;
     d.mass += dm;
     for (int c = 0; c < 3; ++c) {
       const double dp = s * dp_star[i][c] + dm * source.velocity_peculiar[c];
@@ -296,6 +429,9 @@ std::vector<std::uint32_t> MechanicalFeedbackDeposition::commit(core::Simulation
   std::optional<CompositionLayout> layout;
   if (composition) layout = CompositionLayout::fromDescriptor(state.gas_composition.descriptor());
   for (const RowDelta& d : m_rows) {
+    if (d.row >= m_local_count) {
+      continue;  // remote target: delivered to its owner via remoteDeltas()
+    }
     const std::uint32_t row = d.row;
     const double m_old = state.cells.mass_code[row];
     const double m_new = m_old + d.mass;
@@ -303,13 +439,34 @@ std::vector<std::uint32_t> MechanicalFeedbackDeposition::commit(core::Simulation
     const double vx = state.gas_cells.velocity_x_peculiar[row];
     const double vy = state.gas_cells.velocity_y_peculiar[row];
     const double vz = state.gas_cells.velocity_z_peculiar[row];
+    double closure_thermal = 0.0;
+    if (m_config.step_start_reference) {
+      // Per-cell energy closure: the sources were evaluated independently
+      // against the step-start state, so the actual kinetic change of the
+      // summed momentum differs from the sum of intended changes by the
+      // cross terms; that difference is moved into thermal energy (exact
+      // total energy), and any part the thermal floor cannot absorb is
+      // ledgered as unclosed.
+      const double px = m_old * vx + d.momentum[0];
+      const double py = m_old * vy + d.momentum[1];
+      const double pz = m_old * vz + d.momentum[2];
+      const double ke_new = (px * px + py * py + pz * pz) / (2.0 * m_new);
+      const double ke_old = 0.5 * m_old * (vx * vx + vy * vy + vz * vz);
+      closure_thermal = d.intended_kinetic - (ke_new - ke_old);
+      const double thermal_available = m_old * state.gas_cells.internal_energy_code[row] + d.thermal_energy;
+      if (closure_thermal < -thermal_available) {
+        m_ledger.kinetic_cross_term_unclosed_code += -thermal_available - closure_thermal;
+        closure_thermal = -thermal_available;
+      }
+      m_ledger.kinetic_cross_term_to_thermal_code += closure_thermal;
+    }
     state.gas_cells.velocity_x_peculiar[row] = (m_old * vx + d.momentum[0]) / m_new;
     state.gas_cells.velocity_y_peculiar[row] = (m_old * vy + d.momentum[1]) / m_new;
     state.gas_cells.velocity_z_peculiar[row] = (m_old * vz + d.momentum[2]) / m_new;
     const bool sgs_lane = composition && state.gas_composition.descriptor().sgs_energy_lane !=
         core::GasCompositionLayoutDescriptor::k_no_lane;
     // Without an SGS reservoir the SGS share is thermal (never lost).
-    const double thermal = d.thermal_energy + (sgs_lane ? 0.0 : d.sgs_energy);
+    const double thermal = d.thermal_energy + (sgs_lane ? 0.0 : d.sgs_energy) + closure_thermal;
     state.gas_cells.internal_energy_code[row] =
         (m_old * state.gas_cells.internal_energy_code[row] + thermal) / m_new;
     state.gas_cells.density_code[row] *= m_new / std::max(m_old, 1.0e-300);
@@ -352,6 +509,90 @@ std::vector<std::uint32_t> MechanicalFeedbackDeposition::commit(core::Simulation
   for (const RowDelta& d : m_rows) m_row_slot[d.row] = 0U;
   m_rows.clear();
   return touched;
+}
+
+std::vector<FeedbackSourceBudget> mergeAssociationSources(
+    std::span<const FeedbackSourceBudget> sources, std::span<const double> birth_years,
+    double radius_code, double window_years, bool periodic, const std::array<double, 3>& box_extent_comoving) {
+  if (sources.size() != birth_years.size()) {
+    throw std::invalid_argument("mergeAssociationSources: birth time list does not match sources");
+  }
+  if (!(radius_code > 0.0) || !(window_years > 0.0)) {
+    throw std::invalid_argument("mergeAssociationSources: radius and window must be positive");
+  }
+  struct Keyed {
+    std::array<std::int64_t, 4> key{};
+    std::size_t index = 0;
+  };
+  std::vector<Keyed> keyed;
+  keyed.reserve(sources.size());
+  for (std::size_t i = 0; i < sources.size(); ++i) {
+    Keyed k;
+    for (int c = 0; c < 3; ++c) {
+      double x = sources[i].position_comoving[c];
+      if (periodic && box_extent_comoving[c] > 0.0) {
+        x -= box_extent_comoving[c] * std::floor(x / box_extent_comoving[c]);
+      }
+      k.key[c] = static_cast<std::int64_t>(std::floor(x / radius_code));
+    }
+    k.key[3] = static_cast<std::int64_t>(std::floor(birth_years[i] / window_years));
+    k.index = i;
+    keyed.push_back(k);
+  }
+  std::sort(keyed.begin(), keyed.end(), [&](const Keyed& l, const Keyed& r) {
+    return l.key != r.key ? l.key < r.key : sources[l.index].source_id < sources[r.index].source_id;
+  });
+  std::vector<FeedbackSourceBudget> merged;
+  std::size_t begin = 0;
+  while (begin < keyed.size()) {
+    std::size_t end = begin + 1U;
+    while (end < keyed.size() && keyed[end].key == keyed[begin].key) ++end;
+    const FeedbackSourceBudget& first = sources[keyed[begin].index];
+    FeedbackSourceBudget group = first;
+    group.member_count = 0U;
+    group.ejecta_mass_code = 0.0;
+    group.ejecta_elements_code = {};
+    group.ejecta_dust_code = {};
+    group.supernova_count = 0.0;
+    group.supernova_energy_erg = 0.0;
+    group.presn_momentum_code = 0.0;
+    group.wind_energy_erg = 0.0;
+    group.wind_momentum_code = 0.0;
+    std::array<double, 3> offset_sum{};
+    std::array<double, 3> momentum{};
+    std::array<double, 3> velocity_sum{};
+    for (std::size_t j = begin; j < end; ++j) {
+      const FeedbackSourceBudget& m = sources[keyed[j].index];
+      group.member_count += m.member_count;
+      group.source_id = std::min(group.source_id, m.source_id);
+      group.ejecta_mass_code += m.ejecta_mass_code;
+      for (std::size_t e = 0; e < k_chemical_element_count; ++e) group.ejecta_elements_code[e] += m.ejecta_elements_code[e];
+      for (std::size_t r = 0; r < k_dust_reservoir_count; ++r) group.ejecta_dust_code[r] += m.ejecta_dust_code[r];
+      group.supernova_count += m.supernova_count;
+      group.supernova_energy_erg += m.supernova_energy_erg;
+      group.presn_momentum_code += m.presn_momentum_code;
+      group.wind_energy_erg += m.wind_energy_erg;
+      group.wind_momentum_code += m.wind_momentum_code;
+      for (int c = 0; c < 3; ++c) {
+        double d = m.position_comoving[c] - first.position_comoving[c];
+        if (periodic && box_extent_comoving[c] > 0.0) {
+          d -= box_extent_comoving[c] * std::round(d / box_extent_comoving[c]);
+        }
+        offset_sum[c] += d;
+        momentum[c] += m.ejecta_mass_code * m.velocity_peculiar[c];
+        velocity_sum[c] += m.velocity_peculiar[c];
+      }
+    }
+    const double n = static_cast<double>(end - begin);
+    for (int c = 0; c < 3; ++c) {
+      group.position_comoving[c] = first.position_comoving[c] + offset_sum[c] / n;
+      group.velocity_peculiar[c] = group.ejecta_mass_code > 0.0 ? momentum[c] / group.ejecta_mass_code
+                                                                 : velocity_sum[c] / n;
+    }
+    merged.push_back(group);
+    begin = end;
+  }
+  return merged;
 }
 
 }  // namespace cosmosim::physics

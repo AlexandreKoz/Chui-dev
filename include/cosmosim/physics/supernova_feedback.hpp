@@ -68,6 +68,13 @@ struct FeedbackSourceBudget {
   double supernova_count = 0.0;
   double supernova_energy_erg = 0.0;
   double presn_momentum_code = 0.0;  // radiation/wind momentum budget
+  // CHUI Part 3 wind/pre-SN mechanical channel (no mass: wind mass is in the
+  // SSP CC continuous return). Energy enters the energy closure; momentum is
+  // deposited radially like presn_momentum_code.
+  double wind_energy_erg = 0.0;
+  double wind_momentum_code = 0.0;
+  // Number of member stars merged into this source (associations); 1 = single.
+  std::uint32_t member_count = 1U;
 };
 
 struct FeedbackUnits {
@@ -86,6 +93,39 @@ struct MechanicalFeedbackConfig {
   double sgs_energy_fraction = 0.0;
   double dust_sn_swept_mass_per_1e51_erg_g = 6800.0 * k_solar_mass_g;
   double dust_sn_destruction_efficiency = 0.3;
+  // CHUI Part 3: evaluate every source against the STEP-START target state
+  // (no dependence on the order of earlier staged sources). Required for
+  // results independent of the MPI decomposition; the kinetic-energy cross
+  // terms of several sources sharing a cell are closed per cell at commit so
+  // the total injected energy stays exact (see FeedbackLedger).
+  bool step_start_reference = false;
+};
+
+// CHUI Part 3: remote (other-rank) leaf gas cell imported as a deposition
+// candidate (step-start properties; owner applies the resulting delta).
+struct FeedbackRemoteCandidate {
+  std::uint64_t gas_cell_id = 0U;
+  int owner_rank = 0;
+  std::array<double, 3> center_comoving{};
+  double mass_code = 0.0;
+  std::array<double, 3> momentum_code{};
+  double density_code = 0.0;
+  double hydrogen_mass_fraction = 0.76;
+};
+
+// Owner-targeted wire record of one cell's accumulated feedback delta.
+struct FeedbackCellDelta {
+  std::uint64_t gas_cell_id = 0U;
+  int source_rank = 0;
+  int owner_rank = 0;
+  double mass = 0.0;
+  std::array<double, 3> momentum{};
+  double thermal_energy = 0.0;
+  double sgs_energy = 0.0;
+  double intended_kinetic = 0.0;
+  std::array<double, k_chemical_element_count> elements{};
+  std::array<double, k_dust_reservoir_count> dust{};
+  double swept_mass_for_dust = 0.0;
 };
 
 struct FeedbackLedger {
@@ -101,10 +141,32 @@ struct FeedbackLedger {
   double radial_momentum_delivered_code = 0.0;
   double net_vector_momentum_residual_code = 0.0;  // |sum dp - m_ej v_star| (round-off)
   double momentum_scaled_down_sources = 0.0;
+  // Per-cell kinetic closure (step_start_reference): sum over cells of
+  // (intended kinetic change - actual kinetic change) moved into thermal
+  // energy, and the part that could not be (thermal floor) — ledgered.
+  double kinetic_cross_term_to_thermal_code = 0.0;
+  double kinetic_cross_term_unclosed_code = 0.0;
+  std::uint64_t remote_target_cells = 0;
   std::uint64_t resolved_cells = 0;
   std::uint64_t unresolved_cells = 0;
   std::uint64_t sources = 0;
 };
+
+// CHUI Part 3 RESEARCH (EXPERIMENTAL/UNQUALIFIED): correlated stellar
+// associations / superbubbles. Sources born within the same association
+// lattice cell (comoving size `radius_code`, periodic-wrapped) and the same
+// birth-time window are merged into ONE deposition source: summed ejecta,
+// elements, dust, SN count/energy, pre-SN and wind budgets; position = member
+// mean (minimum image about the first member); velocity = ejecta-mass-weighted
+// mean (conserves the ejecta momentum). Budgets, event counts and energies
+// are therefore identical to the unmerged model; only the spatial/temporal
+// correlation of deposition changes (the research physics difference).
+// Deterministic: members ordered by stable source id. Limitation: grouping
+// is among sources owned by the same rank (cross-rank members form separate
+// groups; decomposition-dependent, documented).
+[[nodiscard]] std::vector<FeedbackSourceBudget> mergeAssociationSources(
+    std::span<const FeedbackSourceBudget> sources, std::span<const double> birth_years,
+    double radius_code, double window_years, bool periodic, const std::array<double, 3>& box_extent_comoving);
 
 // Exposed for tests: KO15 terminal momentum per SN (Msun km/s).
 [[nodiscard]] double kimOstriker2015TerminalMomentumMsunKms(double energy_per_sn_erg, double n_h_cm3);
@@ -115,6 +177,22 @@ class MechanicalFeedbackDeposition {
 
   // Candidate cells: owned leaf rows. Builds an x-sorted index.
   void setCandidates(const core::SimulationState& state, std::vector<std::uint32_t> owned_leaf_rows);
+  // Part 3: append remote candidates (after setCandidates). Deterministic:
+  // candidates are ordered by (x, stable id) and k-NN ties by stable id.
+  void setRemoteCandidates(const core::SimulationState& state, std::vector<FeedbackRemoteCandidate> remote);
+  // Squared distance of the k-th nearest LOCAL candidate (infinity if fewer
+  // than k local candidates). Any remote cell closer than this may enter the
+  // global stencil, so it bounds the remote halo query of a source.
+  [[nodiscard]] double localStencilRadius2(const core::SimulationState& state,
+                                           const std::array<double, 3>& position) const;
+  // Local candidates (dense rows) among the k nearest within r2_max.
+  [[nodiscard]] std::vector<std::uint32_t> localCandidatesWithin(const core::SimulationState& state,
+                                                                 const std::array<double, 3>& position,
+                                                                 double r2_max) const;
+  // Deltas staged on remote candidates, for delivery to their owners.
+  [[nodiscard]] std::vector<FeedbackCellDelta> remoteDeltas(int source_rank) const;
+  // Merge a delta delivered by another rank for a local cell (before commit).
+  void addImportedDelta(const core::SimulationState& state, const FeedbackCellDelta& delta);
   // Stage one source (no state mutation). Throws on invalid input.
   void stage(const core::SimulationState& state, const FeedbackSourceBudget& source);
   // Apply every staged delta; returns touched rows (sorted, unique).
@@ -132,7 +210,17 @@ class MechanicalFeedbackDeposition {
     std::array<double, k_chemical_element_count> elements{};
     std::array<double, k_dust_reservoir_count> dust{};
     double swept_mass_for_dust = 0.0;
+    double intended_kinetic = 0.0;
   };
+  struct CandidateProps {
+    std::array<double, 3> center{};
+    double mass = 0.0;
+    std::array<double, 3> momentum{};
+    double density = 0.0;
+    double x_h = 0.76;
+    std::uint64_t stable_id = 0U;
+  };
+  [[nodiscard]] CandidateProps props(const core::SimulationState& state, std::uint32_t candidate) const;
   [[nodiscard]] std::vector<std::pair<double, std::uint32_t>> nearest(const core::SimulationState& state,
                                                                       const std::array<double, 3>& p) const;
   RowDelta& delta(std::uint32_t row);
@@ -142,7 +230,9 @@ class MechanicalFeedbackDeposition {
   std::vector<std::uint32_t> m_sorted_rows;  // by x
   std::vector<double> m_sorted_x;
   std::vector<RowDelta> m_rows;
-  std::vector<std::uint32_t> m_row_slot;  // dense row -> slot+1 (0 = none)
+  std::vector<std::uint32_t> m_row_slot;  // candidate -> slot+1 (0 = none)
+  std::uint32_t m_local_count = 0U;       // candidates >= this are remote
+  std::vector<FeedbackRemoteCandidate> m_remote;
   FeedbackLedger m_ledger;
 };
 

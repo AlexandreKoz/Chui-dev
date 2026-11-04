@@ -3364,6 +3364,16 @@ namespace {
       physics.ssp_stochastic_sn_events == defaults.ssp_stochastic_sn_events &&
       physics.ssp_clustered_associations == defaults.ssp_clustered_associations;
 }
+
+// CHUI Part 3 physics keys at defaults (pre-Part-3 checkpoints).
+[[nodiscard]] bool part3PhysicsKeysAtDefaults(const core::PhysicsConfig& physics) {
+  const core::PhysicsConfig defaults{};
+  return physics.ssp_association_radius_code == defaults.ssp_association_radius_code &&
+      physics.ssp_association_time_window_years == defaults.ssp_association_time_window_years &&
+      physics.ssp_wind_model == defaults.ssp_wind_model &&
+      physics.ssp_wind_table_path == defaults.ssp_wind_table_path &&
+      physics.ssp_wind_table_sha256 == defaults.ssp_wind_table_sha256;
+}
 }  // namespace
 
 std::string restartConfigurationCompatibilityRecord(
@@ -3427,6 +3437,7 @@ std::string restartConfigurationCompatibilityRecord(
       current.config.parallel.node_memory_reserve_bytes != 0U ||
       // CHUI Part 2 keys must hold their (physics-disabled) defaults.
       !part2PhysicsKeysAtDefaults(current.config.physics) ||
+      !part3PhysicsKeysAtDefaults(current.config.physics) ||
       // CHUI Part 3 regrid keys must hold their (static-hierarchy) defaults.
       current.config.numerics.amr_regrid_mode != core::AmrRegridConfigMode::kOff ||
       current.config.numerics.amr_regrid_interval_steps != 1 ||
@@ -3561,6 +3572,11 @@ std::string restartConfigurationCompatibilityRecord(
     removeKeyLines({"amr_regrid_mode", "amr_regrid_interval_steps", "amr_regrid_max_operations",
         "amr_refine_cell_mass_code", "amr_refine_jump_threshold", "amr_refine_jeans_cells",
         "amr_derefine_hysteresis"});
+  }
+  if (projected.find("\nssp_wind_model = ") != std::string::npos &&
+      restart.normalized_config_text.find("\nssp_wind_model = ") == std::string::npos) {
+    removeKeyLines({"ssp_association_radius_code", "ssp_association_time_window_years", "ssp_wind_model",
+        "ssp_wind_table_path", "ssp_wind_table_sha256"});
   }
   if (projected.find("\nhydro_reconstruction = ") != std::string::npos &&
       restart.normalized_config_text.find("\nhydro_reconstruction = ") == std::string::npos) {

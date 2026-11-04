@@ -853,3 +853,18 @@ with every key at its default (exact restart projection).
 [1, 30]. Regrid transfers mass, momentum, total energy and every composition
 lane (elements, species, dust, SGS energy) conservatively; a refused memory
 admission leaves the hierarchy untouched.
+
+## CHUI Part 3 — stellar winds and associations (`physics.*`)
+
+| Key | Type / range | Default | Meaning |
+|---|---|---|---|
+| `ssp_wind_model` | `none` \| `table_v1` | `none` | `table_v1`: age/metallicity-dependent wind/pre-SN mechanical energy and momentum from a `chui_ssp_wind_table_v1` file (no mass: wind mass is in the SSP CC continuous return). Refused together with `fb_presn_wind_momentum_lsun_per_c > 0` (double count). |
+| `ssp_wind_table_path` / `ssp_wind_table_sha256` | path / 64-hex | empty | Required for `table_v1`; checksum verified at load. BLOCKED BY DATA: no table is bundled. |
+| `ssp_clustered_associations` | bool | `false` | RESEARCH (EXPERIMENTAL/UNQUALIFIED): merge feedback sources born in the same association lattice cell and time window into one deposition source (budgets unchanged). |
+| `ssp_association_radius_code` | double >= 0 | `0.0` | Comoving lattice size; must be > 0 when associations are enabled. |
+| `ssp_association_time_window_years` | double > 0 | `3.0e6` | Birth-time window of one association. |
+
+`physics.enable_metal_diffusion` with an element-resolved composition sidecar
+now selects the element-resolved mixing operator (Part 2 refused it).
+Multi-rank metal diffusion remains refused (named blocker: no per-subcycle
+remote interface exchange).
