@@ -1,0 +1,88 @@
+# CHUI final-design example deck for isolated_cluster (NOT RUN — USER-RESERVED).
+# Derived from configs/chui_part3; recursive multilevel AMR subcycling plus the
+# 2026-11-04 converted data products (tools/chui_data/fetch_and_convert.sh
+# writes them; copy or link them to ./chui_data/). Checksums are the derived
+# sha256 recorded in tools/chui_data/data_sources.md.
+# Non-star-forming cluster: no stellar data needed; recursive AMR only.
+schema_version = 1
+
+[units]
+length_unit = mpc
+mass_unit = msun
+velocity_unit = km_s
+coordinate_frame = comoving
+
+[mode]
+mode = isolated_cluster
+ic_file = isolated_cluster_ics.hdf5
+ic_convention = gadget_arepo_bridge_v1
+ic_bridge_source_length_unit_to_si = 3.0856775814913673e19
+ic_bridge_source_mass_unit_to_si = 1.98847e30
+ic_bridge_source_velocity_unit_to_si = 1000
+ic_bridge_coordinate_frame = comoving
+ic_bridge_velocity_convention = physical_peculiar
+ic_bridge_length_hubble_exponent = 0
+ic_bridge_length_scale_factor_exponent = 0
+ic_bridge_mass_hubble_exponent = 0
+ic_bridge_mass_scale_factor_exponent = 0
+ic_bridge_velocity_hubble_exponent = 0
+ic_bridge_velocity_scale_factor_exponent = 0
+zoom_high_res_region = false
+hydro_boundary = reflective
+gravity_boundary = isolated_monopole
+
+[cosmology]
+omega_matter = 0.31
+omega_lambda = 0.69
+omega_baryon = 0.0486
+hubble_param = 0.677
+sigma8 = 0.81
+scalar_index_ns = 0.966
+box_size = 10 mpc
+
+[numerics]
+amr_time_stepping = recursive_subcycling
+amr_regrid_mode = automatic
+amr_regrid_interval_steps = 4
+amr_regrid_max_operations = 64
+amr_refine_jeans_cells = 4.0
+amr_refine_jump_threshold = 0.3
+amr_derefine_hysteresis = 0.5
+global_step_max_retries = 2
+time_begin_code = 0.0
+time_end_code = 1.0
+max_global_steps = 2500
+hierarchical_max_rung = 0
+amr_max_level = 9
+gravity_softening = 2.0 kpc
+treepm_pm_grid = 64
+treepm_asmth_cells = 1.25
+treepm_rcut_cells = 6.25
+treepm_assignment_scheme = cic
+treepm_enable_window_deconvolution = false
+treepm_update_cadence_steps = 1
+
+[output]
+run_name = isolated_cluster_final
+output_directory = outputs/isolated_cluster_final
+output_stem = snapshot
+restart_stem = restart
+snapshot_interval_steps = 40
+write_restarts = true
+
+[parallel]
+mpi_ranks_expected = 2
+omp_threads = 1
+gpu_devices = 0
+deterministic_reduction = true
+
+[physics]
+metal_species_mode = core_elements
+uv_background_model = none
+self_shielding_model = rahmati13_like
+chemistry_metallicity_scaled_dust_proxy = false
+# UNQUALIFIED rates (docs/chemistry_rate_provenance.md): explicit research opt-in.
+thermochemistry_allow_unqualified_rates = true
+thermochemistry_backend = equilibrium_primordial
+enable_star_formation = false
+enable_feedback = false

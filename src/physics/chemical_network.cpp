@@ -134,7 +134,7 @@ ReactionDefinition withStatus(ReactionDefinition r, RateVerification v, double t
 }
 constexpr RateVerification k_primary = RateVerification::kVerifiedAgainstSource;
 constexpr RateVerification k_secondary = RateVerification::kVerifiedAgainstSecondarySource;
-constexpr RateVerification k_unverified = RateVerification::kUnverifiedTranscription;
+[[maybe_unused]] constexpr RateVerification k_unverified = RateVerification::kUnverifiedTranscription;
 
 std::vector<ReactionDefinition> primordialIonizationReactions() {
   using std::size_t;
@@ -196,8 +196,10 @@ std::vector<ReactionDefinition> hybridReactions() {
                   change({{H2, -1}, {HI, +2}}), rH2CollisionalDissociationH}, k_primary),
       withStatus({"R17", "H2+ + e -> 2H", "Schneider et al. 1994 fit, as listed by Abel et al. 1997 k18",
                   change({{H2p, -1}, {E, -1}, {HI, +2}}), rH2plusDissRec}, k_secondary),
-      withStatus({"R18", "H + H (grain) -> H2", "Jura 1975 ApJ 197 575, scaled by D/D_MW (primary not checked)",
-                  change({{HI, -2}, {H2, +1}}), rDustH2}, k_unverified),
+      withStatus({"R18", "H + H (grain) -> H2",
+                  "Jura 1975 ApJ 197 575, R = 3e-17 cm^3 s^-1, scaled by D/D_MW; secondary: Le Petit et al. 2006 "
+                  "(Meudon PDR, astro-ph/0602150), Gry et al. 2002 FUSE 3.1-4.5e-17; primary not read",
+                  change({{HI, -2}, {H2, +1}}), rDustH2}, k_secondary),
       withStatus({"R19", "H2 + gamma(FUV) -> 2H",
                   "Glover & Mac Low 2007 ApJS 169 239 eqs. 32 and 34; Draine & Bertoldi 1996 ApJ 468 269 eq. 37",
                   change({{H2, -1}, {HI, +2}}), rH2Photodissociation}, k_primary),
@@ -310,7 +312,9 @@ const NetworkManifest& hybridLightNetworkManifest() {
     m.cooling_records.push_back({"C05", "H2 formation heating 4.48 eV x n/(n + n_cr) and dissociation cooling (R15, R16)",
                                  "binding energy 4.48 eV (constants); thermalized fraction follows C04", k_secondary});
     m.cooling_records.push_back({"C06", "H2 photodissociation heating 0.4 eV per event",
-                                 "Black & Dalgarno 1977 ApJS 34 405 (primary not checked)", k_unverified});
+                                 "Black & Dalgarno 1977 ApJS 34 405; secondary: Glover & Mac Low 2007 (astro-ph/0605120) adopt "
+                                 "0.4 eV per dissociation (some sources attribute it to Stephens & Dalgarno 1973); "
+                                 "primary not read", k_secondary});
     appendOptionalCoolingRecords(m.cooling_records);
     m.cooling_channels = {
         "KWH96 collisional excitation HI, HeII; collisional ionization HI, HeI, HeII; recombination "

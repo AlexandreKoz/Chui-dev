@@ -99,7 +99,10 @@ double StellarWindTable::cumulative(std::size_t quantity, double age_years, doub
   const std::size_t nz = m_z.size();
   double z = metallicity;
   if (z < m_z.front() || z > m_z.back()) {
-    clamped = clamped || nz > 1U;
+    // D2: a single-metallicity table (e.g. one Starburst99 track set) used at
+    // any other Z is an extrapolation and is REPORTED (previously silent when
+    // nz == 1). Counted by the caller (m_wind_metallicity_clamps).
+    clamped = true;
     z = std::clamp(z, m_z.front(), m_z.back());
   }
   std::size_t zi = 0U;

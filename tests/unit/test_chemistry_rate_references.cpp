@@ -150,7 +150,7 @@ void testProvenanceStatuses() {
   CHUI_REQUIRE(!rateVerificationQualifies(RateVerification::kVerifiedAgainstSecondarySource));
   CHUI_REQUIRE(!rateVerificationQualifies(RateVerification::kUnverifiedTranscription));
   CHUI_REQUIRE(rateVerificationQualifies(RateVerification::kVerifiedAgainstSource));
-  CHUI_REQUIRE(!hybridLightNetworkManifest().qualified());     // R18 unverified, R13/R15/R17 secondary
+  CHUI_REQUIRE(!hybridLightNetworkManifest().qualified());     // R18, R13/R15/R17 secondary only (D4)
   CHUI_REQUIRE(!detailedCarbonOxygenNetworkManifest().qualified());
   // The equilibrium rate set is primary-verified (or derived) end to end;
   // the backend nevertheless stays gated until USER-RESERVED validation.
@@ -163,7 +163,8 @@ void testProvenanceStatuses() {
     CHUI_REQUIRE(r.verification == RateVerification::kVerifiedAgainstSource);
   }
   for (const auto& r : hybridLightNetworkManifest().reactions) {
-    if (r.id == "R18") CHUI_REQUIRE(r.verification == RateVerification::kUnverifiedTranscription);
+    // D4 (2026-11-04): R18 checked against secondary compilations; the gate stays.
+    if (r.id == "R18") CHUI_REQUIRE(r.verification == RateVerification::kVerifiedAgainstSecondarySource);
     CHUI_REQUIRE(!r.provenance.empty());
   }
   NetworkManifest empty;

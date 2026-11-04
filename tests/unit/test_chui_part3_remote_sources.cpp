@@ -283,6 +283,15 @@ void testWindTable() {
   CHUI_REQUIRE(close(energy_sum, whole.energy_erg_per_msun, 1.0e-12));
   CHUI_REQUIRE(close(momentum_sum, whole.momentum_msun_kms_per_msun, 1.0e-12));
   CHUI_REQUIRE(table.interval(1.0e6, 2.0e6, 0.5).metallicity_clamped);
+  {
+    // D2: a single-metallicity table (one SB99 track set) reports every use at
+    // another Z as an extrapolation; at its own Z it is not clamped.
+    const auto single = ph::StellarWindTable::loadFromString(
+        "# chui_ssp_wind_table_v1\n# source = test\nmetallicities 1 0.014\nages 2\n6.0 1.0 1.0\n7.0 2.0 2.0\n",
+        "single");
+    CHUI_REQUIRE(!single.interval(1.0e6, 2.0e6, 0.014).metallicity_clamped);
+    CHUI_REQUIRE(single.interval(1.0e6, 2.0e6, 0.002).metallicity_clamped);
+  }
   bool refused = false;
   try {
     (void)ph::StellarWindTable::loadFromString(
