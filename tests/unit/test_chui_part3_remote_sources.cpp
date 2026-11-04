@@ -22,6 +22,7 @@
 //     element, dust, SN count/energy, wind), ejecta momentum is conserved and
 //     the grouping is independent of input order.
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <optional>
@@ -322,6 +323,91 @@ void testAssociationsPreserveBudgets() {
   }
 }
 
+// G0.3: friends-of-friends discovery chains across what used to be a lattice
+// boundary, is independent of input order and "rank" partition, and the
+// merged budget carries the internal dispersion kinetic energy exactly.
+void testAssociationDiscoveryIsPartitionIndependent() {
+  // 0.95 and 1.05 straddle the old radius-1 lattice boundary; 1.9 chains to
+  // 1.05 (distance 0.85) but not directly to 0.95.
+  std::vector<ph::FeedbackSourceBudget> sources{testSource(40U, {0.95, 0.5, 0.5}), testSource(12U, {1.05, 0.5, 0.5}),
+                                                testSource(27U, {1.90, 0.5, 0.5}), testSource(5U, {8.0, 8.0, 8.0}),
+                                                testSource(9U, {0.97, 0.5, 0.5})};
+  sources[0].velocity_peculiar = {3.0, 0.0, 0.0};
+  sources[2].velocity_peculiar = {-1.0, 2.0, 0.0};
+  sources[4].ejecta_mass_code = 4.0;
+  const std::vector<double> birth{1.0e6, 1.4e6, 1.1e6, 1.0e6, 9.0e7};  // id 9 outside the time window
+  std::vector<ph::AssociationSourceDescriptor> descriptors(sources.size());
+  for (std::size_t i = 0; i < sources.size(); ++i) {
+    descriptors[i].source_id = sources[i].source_id;
+    descriptors[i].position_comoving = sources[i].position_comoving;
+    descriptors[i].birth_years = birth[i];
+    descriptors[i].owner_rank = static_cast<std::int32_t>(i % 2U);
+  }
+  const auto leaders = ph::discoverAssociationLeaders(descriptors, 1.0, 3.0e6, false, {});
+  CHUI_REQUIRE(leaders[0] == 12U && leaders[1] == 12U && leaders[2] == 12U);
+  CHUI_REQUIRE(leaders[3] == 5U && leaders[4] == 9U);
+  // Permuted input => identical leader per id.
+  std::vector<ph::AssociationSourceDescriptor> permuted(descriptors.rbegin(), descriptors.rend());
+  const auto permuted_leaders = ph::discoverAssociationLeaders(permuted, 1.0, 3.0e6, false, {});
+  for (std::size_t i = 0; i < permuted.size(); ++i) {
+    CHUI_REQUIRE(permuted_leaders[i] == leaders[descriptors.size() - 1U - i]);
+  }
+  // Partition independence of the merge: members arriving in any order (as
+  // from different ranks) merge to a bitwise-identical budget.
+  std::vector<ph::FeedbackSourceBudget> members{sources[0], sources[1], sources[2]};
+  const ph::FeedbackSourceBudget a = ph::mergeAssociationMembers(members, false, {});
+  std::vector<ph::FeedbackSourceBudget> shuffled{sources[2], sources[0], sources[1]};
+  const ph::FeedbackSourceBudget b = ph::mergeAssociationMembers(shuffled, false, {});
+  CHUI_REQUIRE(a.source_id == 12U && a.member_count == 3U);
+  for (int c = 0; c < 3; ++c) {
+    CHUI_REQUIRE(a.position_comoving[c] == b.position_comoving[c]);
+    CHUI_REQUIRE(a.velocity_peculiar[c] == b.velocity_peculiar[c]);
+  }
+  CHUI_REQUIRE(a.association_dispersion_energy_code == b.association_dispersion_energy_code);
+  // Conservation: mass, momentum, lab-frame kinetic energy.
+  double mass = 0.0, ke_lab = 0.0;
+  std::array<double, 3> p{};
+  for (const auto& m : members) {
+    mass += m.ejecta_mass_code;
+    double v2 = 0.0;
+    for (int c = 0; c < 3; ++c) { p[c] += m.ejecta_mass_code * m.velocity_peculiar[c]; v2 += m.velocity_peculiar[c] * m.velocity_peculiar[c]; }
+    ke_lab += 0.5 * m.ejecta_mass_code * v2;
+  }
+  CHUI_REQUIRE(close(a.ejecta_mass_code, mass, 1.0e-15));
+  double v2_group = 0.0;
+  for (int c = 0; c < 3; ++c) {
+    CHUI_REQUIRE(close(a.ejecta_mass_code * a.velocity_peculiar[c], p[c], 1.0e-14) || std::abs(p[c]) < 1.0e-14);
+    v2_group += a.velocity_peculiar[c] * a.velocity_peculiar[c];
+  }
+  CHUI_REQUIRE(a.association_dispersion_energy_code > 0.0);
+  CHUI_REQUIRE(close(0.5 * a.ejecta_mass_code * v2_group + a.association_dispersion_energy_code, ke_lab, 1.0e-13));
+  CHUI_REQUIRE(close(a.supernova_energy_erg, 3.0e51, 1.0e-15));
+  // Ejecta-mass-weighted centroid (equal masses here => mean x).
+  CHUI_REQUIRE(close(a.position_comoving[0], (0.95 + 1.05 + 1.90) / 3.0, 1.0e-14));
+  // Duplicate ids are an explicit error, never a silent merge.
+  descriptors[1].source_id = 40U;
+  bool refused = false;
+  try { (void)ph::discoverAssociationLeaders(descriptors, 1.0, 3.0e6, false, {}); }
+  catch (const std::invalid_argument&) { refused = true; }
+  CHUI_REQUIRE(refused);
+}
+
+void testAssociationDiscoveryPeriodicWrap() {
+  // Two sources across the periodic face are linked by minimum image; the
+  // merged centroid is wrapped into the box.
+  std::vector<ph::FeedbackSourceBudget> sources{testSource(2U, {0.05, 1.0, 1.0}), testSource(3U, {9.95, 1.0, 1.0})};
+  const std::array<double, 3> box{10.0, 10.0, 10.0};
+  const auto merged = ph::mergeAssociationSources(sources, std::vector<double>{1.0e6, 1.0e6}, 0.5, 1.0e6, true, box);
+  CHUI_REQUIRE(merged.size() == 1U && merged[0].member_count == 2U);
+  CHUI_REQUIRE(merged[0].position_comoving[0] >= 0.0 && merged[0].position_comoving[0] < 10.0);
+  CHUI_REQUIRE(std::abs(merged[0].position_comoving[0]) < 1.0e-12 ||
+               std::abs(merged[0].position_comoving[0] - 10.0) < 1.0e-12);
+  // Same velocities => no dispersion energy.
+  CHUI_REQUIRE(merged[0].association_dispersion_energy_code == 0.0);
+  const auto separate = ph::mergeAssociationSources(sources, std::vector<double>{1.0e6, 1.0e6}, 0.5, 1.0e6, false, box);
+  CHUI_REQUIRE(separate.size() == 2U);
+}
+
 }  // namespace
 
 int main() {
@@ -331,5 +417,7 @@ int main() {
   testStepStartReferenceClosesEnergyForSharedCells();
   testWindTable();
   testAssociationsPreserveBudgets();
+  testAssociationDiscoveryIsPartitionIndependent();
+  testAssociationDiscoveryPeriodicWrap();
   return 0;
 }

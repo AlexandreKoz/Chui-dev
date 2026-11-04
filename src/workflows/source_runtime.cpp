@@ -6,6 +6,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <type_traits>
+#include <utility>
 #include <unordered_map>
 #include <exception>
 #include <limits>
@@ -1903,6 +1905,163 @@ class SourceRuntimeImpl final : public SourceRuntime {
     deposition.setRemoteCandidates(state, std::move(remote));
   }
 
+  // G0.3: decomposition-independent association discovery and merge.
+  //  1. every rank contributes compact descriptors of its ACTIVE feedback
+  //     sources (non-zero budget this interval); one bounded all-gather
+  //     gives every rank the identical global descriptor set (count reduced
+  //     and admitted first);
+  //  2. every rank runs the same deterministic friends-of-friends discovery
+  //     (physics::discoverAssociationLeaders) => identical leader ids;
+  //  3. member budgets are routed to the rank owning the leader (minimum id)
+  //     and merged there in ascending source-id order, so the merged budget
+  //     is bitwise independent of the MPI partition;
+  //  4. inactive (zero-budget) sources are dropped exactly as before.
+  // Every collective is entered by every rank (failures are reduced first).
+  std::vector<physics::FeedbackSourceBudget> mergeAssociationsDistributed(
+      const std::vector<physics::FeedbackSourceBudget>& budgets,
+      const std::vector<double>& birth_years,
+      const physics::FeedbackUnits& units,
+      bool distributed,
+      std::uint64_t sequence) {
+    if (budgets.size() != birth_years.size()) {
+      throw std::logic_error("association merge: budget/birth-time lists differ in length");
+    }
+    const auto active = [](const physics::FeedbackSourceBudget& b) {
+      return b.ejecta_mass_code != 0.0 || b.supernova_energy_erg != 0.0 || b.presn_momentum_code != 0.0 ||
+          b.wind_energy_erg != 0.0 || b.wind_momentum_code != 0.0 || b.association_dispersion_energy_code != 0.0;
+    };
+    const int rank = distributed ? m_mpi_context.worldRank() : 0;
+    std::vector<physics::AssociationSourceDescriptor> local;
+    std::vector<std::size_t> local_budget_index;
+    std::exception_ptr failure;
+    try {
+      for (std::size_t i = 0; i < budgets.size(); ++i) {
+        if (!active(budgets[i])) continue;
+        physics::AssociationSourceDescriptor d;
+        d.source_id = budgets[i].source_id;
+        d.position_comoving = budgets[i].position_comoving;
+        d.birth_years = birth_years[i];
+        d.owner_rank = rank;
+        local.push_back(d);
+        local_budget_index.push_back(i);
+      }
+    } catch (...) {
+      failure = std::current_exception();
+    }
+    if (distributed) m_mpi_context.rethrowCollectivePreparationFailure(failure, "association descriptors");
+    else if (failure != nullptr) std::rethrow_exception(failure);
+
+    std::vector<physics::AssociationSourceDescriptor> global;
+    core::MemoryReservation global_reservation;
+    if (distributed) {
+      const std::uint64_t global_count = m_mpi_context.allreduceSumUint64(local.size());
+      try {
+        if (m_memory_governor != nullptr) {
+          // Gathered bytes, decoded descriptors and discovery scratch
+          // (entries, parent, leader ids, sort keys) coexist.
+          const std::uint64_t per_source = 2U * sizeof(physics::AssociationSourceDescriptor) +
+              sizeof(std::array<std::int64_t, 3>) + 4U * sizeof(std::uint64_t) + 2U * sizeof(std::size_t);
+          global_reservation = m_memory_governor->reserve(
+              core::MemoryClass::kPhaseResident, global_count * per_source, "sources.associations.global_discovery");
+          global_reservation.commit();
+        }
+      } catch (...) {
+        failure = std::current_exception();
+      }
+      m_mpi_context.rethrowCollectivePreparationFailure(failure, "association discovery admission");
+      const auto bytes = m_mpi_context.allgatherBytesBounded(std::span<const std::uint8_t>(
+          reinterpret_cast<const std::uint8_t*>(local.data()),
+          local.size() * sizeof(physics::AssociationSourceDescriptor)));
+      if (bytes.size() != global_count * sizeof(physics::AssociationSourceDescriptor)) {
+        throw std::runtime_error("association discovery: gathered descriptor size mismatch");
+      }
+      global.resize(static_cast<std::size_t>(global_count));
+      if (!bytes.empty()) std::memcpy(global.data(), bytes.data(), bytes.size());
+    } else {
+      global = local;
+    }
+    std::vector<std::uint64_t> leaders;
+    try {
+      leaders = physics::discoverAssociationLeaders(
+          global, m_physics_config.ssp_association_radius_code,
+          m_physics_config.ssp_association_time_window_years, units.periodic, units.box_extent_comoving);
+    } catch (...) {
+      failure = std::current_exception();
+    }
+    if (distributed) m_mpi_context.rethrowCollectivePreparationFailure(failure, "association discovery");
+    else if (failure != nullptr) std::rethrow_exception(failure);
+
+    // Leader id -> owner rank (the descriptor whose id equals the leader).
+    std::vector<std::pair<std::uint64_t, int>> owner_of;
+    owner_of.reserve(global.size());
+    for (const auto& d : global) owner_of.emplace_back(d.source_id, d.owner_rank);
+    std::sort(owner_of.begin(), owner_of.end());
+    const auto owner_rank_of = [&owner_of](std::uint64_t id) {
+      const auto it = std::lower_bound(owner_of.begin(), owner_of.end(), std::make_pair(id, -1));
+      if (it == owner_of.end() || it->first != id) {
+        throw std::logic_error("association discovery: leader id has no descriptor");
+      }
+      return it->second;
+    };
+    std::vector<std::uint64_t> local_leader(local.size());
+    {
+      std::vector<std::pair<std::uint64_t, std::uint64_t>> id_to_leader(global.size());
+      for (std::size_t g = 0; g < global.size(); ++g) id_to_leader[g] = {global[g].source_id, leaders[g]};
+      std::sort(id_to_leader.begin(), id_to_leader.end());
+      for (std::size_t l = 0; l < local.size(); ++l) {
+        const auto it = std::lower_bound(id_to_leader.begin(), id_to_leader.end(),
+                                         std::make_pair(local[l].source_id, std::uint64_t{0}));
+        local_leader[l] = it->second;
+      }
+    }
+    struct MemberRecord {
+      std::uint64_t leader_id = 0U;
+      physics::FeedbackSourceBudget budget{};
+    };
+    static_assert(std::is_trivially_copyable_v<MemberRecord>);
+    std::vector<MemberRecord> outbound;
+    std::vector<int> destinations;
+    std::vector<MemberRecord> kept;
+    for (std::size_t l = 0; l < local.size(); ++l) {
+      MemberRecord rec{local_leader[l], budgets[local_budget_index[l]]};
+      const int dest = owner_rank_of(local_leader[l]);
+      if (dest == rank) {
+        kept.push_back(rec);
+      } else {
+        outbound.push_back(rec);
+        destinations.push_back(dest);
+      }
+    }
+    if (distributed) {
+      const auto bytes = parallel::executeBlockingDestinationRecordExchange(
+          m_mpi_context,
+          std::span<const std::byte>(reinterpret_cast<const std::byte*>(outbound.data()),
+                                     outbound.size() * sizeof(MemberRecord)),
+          sizeof(MemberRecord), destinations, sequence);
+      const std::size_t received = bytes.size() / sizeof(MemberRecord);
+      const std::size_t base = kept.size();
+      kept.resize(base + received);
+      if (received > 0U) std::memcpy(kept.data() + base, bytes.data(), received * sizeof(MemberRecord));
+    } else if (!outbound.empty()) {
+      throw std::logic_error("association merge: single-rank merge routed a member off-rank");
+    }
+    std::sort(kept.begin(), kept.end(), [](const MemberRecord& l, const MemberRecord& r) {
+      return l.leader_id != r.leader_id ? l.leader_id < r.leader_id : l.budget.source_id < r.budget.source_id;
+    });
+    std::vector<physics::FeedbackSourceBudget> merged;
+    std::vector<physics::FeedbackSourceBudget> members;
+    std::size_t begin = 0U;
+    while (begin < kept.size()) {
+      std::size_t end = begin + 1U;
+      while (end < kept.size() && kept[end].leader_id == kept[begin].leader_id) ++end;
+      members.clear();
+      for (std::size_t k = begin; k < end; ++k) members.push_back(kept[k].budget);
+      merged.push_back(physics::mergeAssociationMembers(members, units.periodic, units.box_extent_comoving));
+      begin = end;
+    }
+    return merged;
+  }
+
   // CHUI Part 2 stellar populations: age-resolved SSP mass/element return
   // (AGB, CC continuous; Ia per event), discrete SN events from the
   // restart-safe cumulative-Poisson chronology, and conservative mechanical
@@ -2126,17 +2285,21 @@ class SourceRuntimeImpl final : public SourceRuntime {
       }
       if (distributed_feedback) {
         m_mpi_context.rethrowCollectivePreparationFailure(loop_failure, "stellar population budgets");
-        importRemoteFeedbackCandidates(state, deposition, staged_budgets, context.integrator_state.step_index);
       } else if (loop_failure != nullptr) {
         std::rethrow_exception(loop_failure);
       }
       if (m_physics_config.ssp_clustered_associations) {
-        // RESEARCH: correlated associations / superbubbles. Changes only WHERE
-        // budgets are deposited (event counts, energies and ejecta are those
-        // of the member stars, unchanged).
-        staged_budgets = physics::mergeAssociationSources(
-            staged_budgets, association_birth_years, m_physics_config.ssp_association_radius_code,
-            m_physics_config.ssp_association_time_window_years, units.periodic, units.box_extent_comoving);
+        // RESEARCH: correlated associations / superbubbles. G0.3 ordering:
+        // associations are discovered GLOBALLY and merged BEFORE any remote
+        // candidate query, because merging moves the deposition point. The
+        // merged budgets conserve mass, elements, dust, energy (including the
+        // internal velocity-dispersion kinetic energy) and vector momentum.
+        staged_budgets = mergeAssociationsDistributed(
+            staged_budgets, association_birth_years, units, distributed_feedback,
+            context.integrator_state.step_index);
+      }
+      if (distributed_feedback) {
+        importRemoteFeedbackCandidates(state, deposition, staged_budgets, context.integrator_state.step_index);
       }
       std::exception_ptr stage_failure;
       try {
