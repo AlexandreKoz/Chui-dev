@@ -608,4 +608,22 @@ void StellarPopulationStore::store(core::SimulationState& state) const {
   state.sidecars.upsert(std::move(block));
 }
 
+bool forecastStellarEvent(const SspModel& model, const StellarPopulationRecord& record, double age_years,
+                          double lookahead_years, double birth_mass_msun, bool stochastic, double expected_threshold) {
+  if (record.initialized == 0U || !(lookahead_years > 0.0) || !(birth_mass_msun > 0.0)) return false;
+  double z = 0.0;
+  for (std::size_t e = 2; e < k_chemical_element_count; ++e) z += record.birth_element_mass_fraction[e];
+  const double age_now = std::max(age_years, 0.0);
+  const double age_end = age_now + lookahead_years;
+  const double cc_end = model.ccCumulativeNumber(age_end, z) * birth_mass_msun;
+  const double ia_end = model.iaCumulativeNumber(age_end) * birth_mass_msun;
+  if (stochastic) {
+    StellarPopulationRecord copy = record;
+    return realizeEvents(copy, 0U, cc_end).count + realizeEvents(copy, 1U, ia_end).count > 0U;
+  }
+  const double expected = (cc_end - model.ccCumulativeNumber(age_now, z) * birth_mass_msun) +
+      (ia_end - model.iaCumulativeNumber(age_now) * birth_mass_msun);
+  return expected >= expected_threshold;
+}
+
 }  // namespace cosmosim::physics

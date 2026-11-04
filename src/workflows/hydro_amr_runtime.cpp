@@ -30,6 +30,7 @@
 #include "cosmosim/core/profiling.hpp"
 #include "cosmosim/core/units.hpp"
 #include "cosmosim/physics/cooling_heating.hpp"
+#include "cosmosim/physics/stellar_population.hpp"
 #include "cosmosim/physics/baryon_composition.hpp"
 #include "cosmosim/physics/baryonic_runtime_config.hpp"
 #include "cosmosim/physics/composition_transport.hpp"
@@ -3251,14 +3252,10 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
     // the star count; the physical event budgets are unchanged.
     std::vector<std::uint32_t> forced_rows;
     const double predictive_age = m_config.numerics.amr_predictive_feedback_age_years;
-    if (predictive_age > 0.0 && context.state.star_particles.size() > 0U) {
+    const double lookahead_years = m_config.numerics.amr_predictive_event_lookahead_years;
+    if ((predictive_age > 0.0 || lookahead_years > 0.0) && context.state.star_particles.size() > 0U) {
       const auto descriptors = amr::buildProductionAmrPatchDescriptors(context.state);
-      for (std::size_t s = 0; s < context.state.star_particles.size(); ++s) {
-        if (!(context.state.star_particles.stellar_age_years_last[s] < predictive_age)) continue;
-        const std::uint32_t p = context.state.star_particles.particle_index[s];
-        const std::array<double, 3> position{context.state.particles.position_x_comoving[p],
-                                             context.state.particles.position_y_comoving[p],
-                                             context.state.particles.position_z_comoving[p]};
+      const auto host_row = [&](const std::array<double, 3>& position) {
         for (const amr::PatchDescriptor& patch : descriptors) {
           bool inside = true;
           for (std::size_t c = 0; c < 3U && inside; ++c) {
@@ -3268,12 +3265,77 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
           const auto cell = amr::patchLocalCellForPoint(patch, position, "predictive refinement host cell");
           const auto rows = amr::rowsForPatchLocalCellOrder(context.state, patch, "predictive refinement");
           if (cell.linear_index < rows.size()) forced_rows.push_back(rows[cell.linear_index]);
-          break;
+          return;
+        }
+      };
+      // R2 (A04) event-aware forecast. For every star the canonical
+      // population record (restart/rollback state) gives its deterministic
+      // event chronology; a COPY is advanced to the expected cumulative count
+      // at age + lookahead, so the forecast consumes no event ordinal and
+      // changes no budget. Expectation mode (no stochastic events) predicts
+      // an "event" when >= 0.5 expected SNe fall in the window (HEURISTIC).
+      // The host cell now and at the drifted position x + v dt / a are forced.
+      std::optional<physics::SspModel> ssp;
+      std::optional<physics::StellarPopulationStore> store;
+      if (lookahead_years > 0.0) {
+        physics::SspConfig ssp_config;
+        ssp_config.imf_mass_min_msun = m_config.physics.ssp_imf_mass_min_msun;
+        ssp_config.imf_mass_max_msun = m_config.physics.ssp_imf_mass_max_msun;
+        ssp_config.cc_mass_min_msun = m_config.physics.ssp_cc_mass_min_msun;
+        ssp_config.cc_mass_max_msun = m_config.physics.ssp_cc_mass_max_msun;
+        ssp_config.snia_per_msun = m_config.physics.ssp_snia_per_msun;
+        ssp_config.snia_delay_min_years = m_config.physics.ssp_snia_delay_min_years;
+        ssp_config.snia_delay_max_years = m_config.physics.ssp_snia_delay_max_years;
+        ssp_config.stochastic_events = m_config.physics.ssp_stochastic_sn_events;
+        ssp.emplace(ssp_config);  // event counts only (lifetimes + IMF); no yields used
+        store.emplace(context.state);
+      }
+      constexpr double k_solar_mass_kg = 1.98847e30;
+      constexpr double k_year_s = 3.15576e7;
+      const double msun_code = k_solar_mass_kg / m_units.mass_si_per_code;
+      const double a = std::max(context.integrator_state.current_scale_factor, 1.0e-12);
+      const double drift_scale = m_config.units.coordinate_frame == core::CoordinateFrame::kComoving ? 1.0 / a : 1.0;
+      const double lookahead_code = lookahead_years * k_year_s / m_units.timeSiPerCode();
+      std::uint64_t forecast_events = 0U;
+      for (std::size_t s = 0; s < context.state.star_particles.size(); ++s) {
+        const double age = context.state.star_particles.stellar_age_years_last[s];
+        const std::uint32_t p = context.state.star_particles.particle_index[s];
+        bool forced = predictive_age > 0.0 && age < predictive_age;
+        if (!forced && ssp.has_value()) {
+          const std::uint64_t pid = context.state.particle_sidecar.particle_id[p];
+          if (store->has(pid)) {
+            const physics::StellarPopulationRecord record = store->get(pid);
+            {
+              forced = physics::forecastStellarEvent(
+                  *ssp, record, age, lookahead_years, context.state.star_particles.birth_mass_code[s] / msun_code,
+                  m_config.physics.ssp_stochastic_sn_events);
+              if (forced) ++forecast_events;
+            }
+          }
+        }
+        if (!forced) continue;
+        const std::array<double, 3> position{context.state.particles.position_x_comoving[p],
+                                             context.state.particles.position_y_comoving[p],
+                                             context.state.particles.position_z_comoving[p]};
+        host_row(position);
+        if (lookahead_code > 0.0) {
+          std::array<double, 3> drifted{
+              position[0] + context.state.particles.velocity_x_peculiar[p] * lookahead_code * drift_scale,
+              position[1] + context.state.particles.velocity_y_peculiar[p] * lookahead_code * drift_scale,
+              position[2] + context.state.particles.velocity_z_peculiar[p] * lookahead_code * drift_scale};
+          if (amr_options.physical_boundary_kind == hydro::HydroBoundaryKind::kPeriodic) {
+            for (std::size_t c = 0; c < 3U; ++c) {
+              const double box = amr_options.periodic_box_extent_comoving[c];
+              if (box > 0.0) drifted[c] -= box * std::floor(drifted[c] / box);
+            }
+          }
+          host_row(drifted);  // a drifted host on another rank is not forced (documented limitation)
         }
       }
       std::sort(forced_rows.begin(), forced_rows.end());
       forced_rows.erase(std::unique(forced_rows.begin(), forced_rows.end()), forced_rows.end());
       policy.forced_refine_rows = forced_rows;
+      m_last_predictive_forecast_events = forecast_events;
     }
     std::exception_ptr failure;
     amr::ProductionAmrRegridPlan plan;
@@ -3324,6 +3386,7 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
                       {"skipped_remote_sibling", std::to_string(plan.skipped_remote_sibling)},
                       {"truncated_by_budget", std::to_string(plan.truncated_by_budget)},
                       {"mandatory_refine_requests", std::to_string(plan.mandatory_refine_requests)},
+                      {"predictive_forecast_event_stars", std::to_string(m_last_predictive_forecast_events)},
                       {"optional_refine_requests", std::to_string(plan.optional_refine_requests)},
                       {"mandatory_truncated_by_budget", std::to_string(plan.mandatory_truncated_by_budget)},
                       {"optional_truncated_by_budget", std::to_string(plan.optional_truncated_by_budget)},
@@ -3623,6 +3686,7 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
   std::unique_ptr<hydro::HydroRiemannSolver> m_riemann_solver;
   std::unique_ptr<physics::CoolingHeatingSource> m_cooling_source;
   std::optional<physics::CoolingRateProvider> m_cooling_rate_provider;
+  std::uint64_t m_last_predictive_forecast_events = 0U;
   double m_cooling_specific_rate_cgs_to_code = 0.0;
   double m_cooling_temperature_per_energy_k = 0.0;
   double m_cooling_helium_mass_fraction = 0.24;

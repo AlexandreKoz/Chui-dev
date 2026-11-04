@@ -97,6 +97,9 @@ void testPhysicsIndicatorKeys() {
   CHUI_REQUIRE(rejects(base + "amr_refine_cooling_length_cells = 4\n[physics]\nenable_cooling = false\n"));
   // Species interfaces need a composition network backend.
   CHUI_REQUIRE(rejects(base + "amr_refine_species_jump = 0.1\n"));
+  // R2: event lookahead needs automatic regrid and a Part 2 population model.
+  CHUI_REQUIRE(rejects(base + "amr_predictive_event_lookahead_years = 1.0e7\n"));
+  CHUI_REQUIRE(rejects("[mode]\nmode = cosmo_cube\n[numerics]\namr_predictive_event_lookahead_years = 1.0e7\n"));
 }
 
 }  // namespace

@@ -1434,6 +1434,7 @@ struct ConfigKeySpec {
       {"numerics.global_step_max_retries", "0"},
       {"numerics.amr_time_stepping", "synchronized"},
       {"numerics.amr_predictive_feedback_age_years", "0.0"},
+      {"numerics.amr_predictive_event_lookahead_years", "0.0"},
       {"numerics.amr_regrid_interval_steps", "1"},
       {"numerics.amr_regrid_max_operations", "64"},
       {"numerics.amr_refine_cell_mass_code", "0.0"},
@@ -2122,6 +2123,17 @@ void validateConfig(const SimulationConfig& config) {
       (config.numerics.amr_predictive_feedback_age_years > 0.0 &&
        config.numerics.amr_regrid_mode != AmrRegridConfigMode::kAutomatic)) {
     throw ConfigError("numerics.amr_predictive_feedback_age_years must be >= 0 and requires amr_regrid_mode = automatic");
+  }
+  // R2 (A04): event-aware predictive refinement from the canonical SSP event
+  // chronology; needs automatic regrid and a Part 2 population model (the
+  // legacy table has no event records, which would make the key a no-op).
+  if (!std::isfinite(config.numerics.amr_predictive_event_lookahead_years) ||
+      config.numerics.amr_predictive_event_lookahead_years < 0.0 ||
+      (config.numerics.amr_predictive_event_lookahead_years > 0.0 &&
+       (config.numerics.amr_regrid_mode != AmrRegridConfigMode::kAutomatic ||
+        config.physics.stellar_population_model == StellarPopulationModelConfig::kLegacyTable))) {
+    throw ConfigError("numerics.amr_predictive_event_lookahead_years must be >= 0; > 0 requires "
+                      "amr_regrid_mode = automatic and a Part 2 stellar_population_model");
   }
   if (config.numerics.global_step_max_retries < 0 || config.numerics.global_step_max_retries > 32) {
     throw ConfigError("numerics.global_step_max_retries must be in [0, 32]");
@@ -3074,6 +3086,7 @@ class NormalizedConfigStream {
   stream << "global_step_max_retries = " << frozen.config.numerics.global_step_max_retries << '\n';
   stream << "amr_time_stepping = " << amrTimeSteppingConfigModeToString(frozen.config.numerics.amr_time_stepping) << '\n';
   stream << "amr_predictive_feedback_age_years = " << frozen.config.numerics.amr_predictive_feedback_age_years << '\n';
+  stream << "amr_predictive_event_lookahead_years = " << frozen.config.numerics.amr_predictive_event_lookahead_years << '\n';
   stream << "amr_regrid_interval_steps = " << frozen.config.numerics.amr_regrid_interval_steps << '\n';
   stream << "amr_regrid_max_operations = " << frozen.config.numerics.amr_regrid_max_operations << '\n';
   stream << "amr_refine_cell_mass_code = " << frozen.config.numerics.amr_refine_cell_mass_code << '\n';
@@ -3855,6 +3868,10 @@ class NormalizedConfigStream {
   frozen.config.numerics.amr_predictive_feedback_age_years = parseFloating(
       requireString(entries, consumed, "numerics.amr_predictive_feedback_age_years",
                     defaultFor("numerics.amr_predictive_feedback_age_years")), "numerics.amr_predictive_feedback_age_years");
+  frozen.config.numerics.amr_predictive_event_lookahead_years = parseFloating(
+      requireString(entries, consumed, "numerics.amr_predictive_event_lookahead_years",
+                    defaultFor("numerics.amr_predictive_event_lookahead_years")),
+      "numerics.amr_predictive_event_lookahead_years");
   frozen.config.numerics.amr_time_stepping = parseAmrTimeSteppingConfigMode(requireString(
       entries, consumed, "numerics.amr_time_stepping", defaultFor("numerics.amr_time_stepping")));
   frozen.config.numerics.global_step_max_retries = parseNumber<int>(

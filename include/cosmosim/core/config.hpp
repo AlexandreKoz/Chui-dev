@@ -442,6 +442,10 @@ struct NumericsConfig {
   // hosting stars younger than this age (pending CC SN / wind feedback);
   // 0 disables. Requires amr_regrid_mode = automatic.
   double amr_predictive_feedback_age_years = 0.0;
+  // R2 (A04, RESEARCH/HEURISTIC in expectation mode): refine host cells of
+  // stars whose canonical event chronology yields a CC/Ia event within this
+  // lookahead (also at the drifted position). 0 disables.
+  double amr_predictive_event_lookahead_years = 0.0;
   int amr_regrid_interval_steps = 1;
   int amr_regrid_max_operations = 64;
   double amr_refine_cell_mass_code = 0.0;
