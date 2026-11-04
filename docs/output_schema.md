@@ -473,3 +473,40 @@ energies (`energy_ledger_version=2`, `energy_ledger_units=integrated_code_energy
 No HDF5 group or dataset name changes; the snapshot/restart schema versions are
 unchanged. Legacy (version-less) ledgers are discarded on restart, see
 `docs/restart_checkpointing.md`.
+
+## CHUI Part 3 science-state export (composition and stellar populations)
+
+Source only; NOT RUN — USER-RESERVED. Additive optional datasets; the
+snapshot `schema_version` and every canonical GADGET/AREPO dataset are
+unchanged, so existing readers are unaffected. Presence is decided from the
+configuration (identical on every rank, required for collective single-file
+HDF5); an absent dataset means the physics is disabled, never zero.
+
+`/PartType0` (when the run carries a composition sidecar; attribute
+`CHUI_CompositionSchemaVersion = 1`, `CHUI_CompositionLayoutName`,
+`CHUI_ElementNames`, `CHUI_SpeciesNames`, `CHUI_DustNames`,
+`CHUI_CompositionFractionBasis`):
+
+| Dataset | Shape | Meaning |
+|---|---|---|
+| `CHUI_ElementMassFractions` | [N, 11] | gas-phase element lane mass / (elements + dust) (H, He, C, N, O, Ne, Mg, Si, S, Ca, Fe) |
+| `CHUI_SpeciesMassFractions` | [N, S] | species lane mass / same basis (hybrid/detailed networks only) |
+| `CHUI_DustMassFractions` | [N, D] | dust reservoir mass / same basis |
+| `CHUI_SgsSpecificEnergy` | [N] | SGS energy / gas mass (code units), when the SGS lane exists |
+| `CHUI_MeanMolecularWeight` | [N] | cached mu (amu); NaN = unknown (rebuilt by chemistry) |
+| `CHUI_ChemistryModelTag`, `CHUI_IsmRegimeTag` | [N] u8 | adaptive chemistry fidelity / ISM regime tags |
+| `CHUI_ChemistryModelDwellYears`, `CHUI_IsmRegimeDwellYears` | [N] | hysteresis dwell |
+
+Per cell, sum(`CHUI_ElementMassFractions`) + sum(`CHUI_DustMassFractions`) = 1;
+`Metallicity` remains the derived total-metal mirror (gas + dust metals).
+
+`/PartType4` (Part 2 stellar population models; attribute
+`CHUI_StellarPopulationSchemaVersion = 1`, `CHUI_StellarChannelOrder = AGB,CC,Ia`):
+`CHUI_StellarReturnedMassByChannel` [N, 3], `CHUI_StellarFeedbackEnergyByChannelErg`
+[N, 3], `CHUI_BirthElementMassFractions` [N, 11], `CHUI_BirthTimeCode`,
+`CHUI_SnCcRealized`, `CHUI_SnIaRealized` (u32), `CHUI_EventStreamKey` (u64),
+`CHUI_PopulationRecordInitialized` (u8; 0 = legacy star without a record).
+
+Restart-only transient state (flux registers, temporal histories, Jacobians,
+staged deltas) is never exported to science snapshots; it lives in the
+checkpoint (`docs/restart_checkpointing.md`).

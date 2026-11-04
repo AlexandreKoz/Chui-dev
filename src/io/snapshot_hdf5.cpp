@@ -1,5 +1,7 @@
 #include "cosmosim/io/snapshot_hdf5.hpp"
 
+#include "cosmosim/physics/baryon_composition.hpp"
+#include "cosmosim/physics/stellar_population.hpp"
 #include <algorithm>
 #include <array>
 #include <cstddef>
@@ -411,7 +413,8 @@ struct StreamingDataset {
     std::size_t rows,
     std::size_t width,
     const SnapshotIoPolicy& policy) {
-  if (rows == 0 || (width != 1 && width != 3)) {
+  // CHUI Part 3: any positive width (composition lanes are [N, lanes]).
+  if (rows == 0 || width == 0) {
     throw std::invalid_argument("invalid streaming dataset shape");
   }
   Hdf5Handle properties = createDatasetProperties(rows, width, policy);
@@ -1440,6 +1443,86 @@ void writeScienceSnapshotHdf5(
     if (type_index == 0U && policy.write_optional_pressure) {
       add_double("Pressure");
     }
+    // CHUI Part 3 Checkpoint G: science-state export of the composition
+    // sidecar (schema CHUI_CompositionSchemaVersion = 1, see
+    // docs/output_schema.md). Present iff the run carries a composition
+    // sidecar (identical decision on every rank: the layout is part of the
+    // configuration); absent datasets mean "physics disabled", never zero.
+    // Values are mass fractions of the composition gas mass (elements + dust)
+    // so sum(elements) + sum(dust) == 1 per cell and they are unit-free.
+    std::optional<StreamingDataset> composition_elements_ds;
+    std::optional<StreamingDataset> composition_species_ds;
+    std::optional<StreamingDataset> composition_dust_ds;
+    const bool composition_out = type_index == 0U && state.gas_composition.enabled();
+    const core::GasCompositionLayoutDescriptor composition_descriptor =
+        composition_out ? state.gas_composition.descriptor() : core::GasCompositionLayoutDescriptor{};
+    const bool composition_sgs = composition_out &&
+        composition_descriptor.sgs_energy_lane != core::GasCompositionLayoutDescriptor::k_no_lane;
+    if (composition_out) {
+      const physics::CompositionLayout layout = physics::CompositionLayout::fromDescriptor(composition_descriptor);
+      const auto names = [&](std::uint32_t begin, std::uint32_t count) {
+        std::string joined;
+        for (std::uint32_t l = begin; l < begin + count; ++l) {
+          if (!joined.empty()) joined += ",";
+          joined += layout.lanes().at(l).name;
+        }
+        return joined;
+      };
+      writeScalarUint32Attribute(type_group.get(), "CHUI_CompositionSchemaVersion", 1U);
+      writeScalarStringAttribute(type_group.get(), "CHUI_CompositionLayoutName", composition_descriptor.layout_name);
+      writeScalarStringAttribute(type_group.get(), "CHUI_CompositionFractionBasis",
+                                 "lane_mass / (sum(element lanes) + sum(dust lanes))");
+      writeScalarStringAttribute(type_group.get(), "CHUI_ElementNames",
+                                 names(composition_descriptor.element_lane_begin, composition_descriptor.element_lane_count));
+      composition_elements_ds.emplace(createStreamingDataset(
+          type_group.get(), "CHUI_ElementMassFractions", H5T_IEEE_F64LE, file_row_count,
+          composition_descriptor.element_lane_count, policy));
+      if (composition_descriptor.species_lane_count != 0U) {
+        writeScalarStringAttribute(type_group.get(), "CHUI_SpeciesNames",
+                                   names(composition_descriptor.species_lane_begin, composition_descriptor.species_lane_count));
+        composition_species_ds.emplace(createStreamingDataset(
+            type_group.get(), "CHUI_SpeciesMassFractions", H5T_IEEE_F64LE, file_row_count,
+            composition_descriptor.species_lane_count, policy));
+      }
+      if (composition_descriptor.dust_lane_count != 0U) {
+        writeScalarStringAttribute(type_group.get(), "CHUI_DustNames",
+                                   names(composition_descriptor.dust_lane_begin, composition_descriptor.dust_lane_count));
+        composition_dust_ds.emplace(createStreamingDataset(
+            type_group.get(), "CHUI_DustMassFractions", H5T_IEEE_F64LE, file_row_count,
+            composition_descriptor.dust_lane_count, policy));
+      }
+      if (composition_sgs) add_double("CHUI_SgsSpecificEnergy");
+      add_double("CHUI_MeanMolecularWeight");
+      add_u8("CHUI_ChemistryModelTag");
+      add_u8("CHUI_IsmRegimeTag");
+      add_double("CHUI_ChemistryModelDwellYears");
+      add_double("CHUI_IsmRegimeDwellYears");
+    }
+    // Stellar population science state (PartType4), present iff a Part 2
+    // stellar population model is configured (rank-uniform decision).
+    std::optional<StreamingDataset> star_channel_mass_ds;
+    std::optional<StreamingDataset> star_channel_energy_ds;
+    std::optional<StreamingDataset> star_birth_elements_ds;
+    const bool population_out = type_index == 4U &&
+        config.physics.stellar_population_model != core::StellarPopulationModelConfig::kLegacyTable;
+    std::optional<physics::StellarPopulationStore> population_store;
+    if (population_out) {
+      writeScalarUint32Attribute(type_group.get(), "CHUI_StellarPopulationSchemaVersion", 1U);
+      writeScalarStringAttribute(type_group.get(), "CHUI_StellarChannelOrder", "AGB,CC,Ia");
+      star_channel_mass_ds.emplace(createStreamingDataset(
+          type_group.get(), "CHUI_StellarReturnedMassByChannel", H5T_IEEE_F64LE, file_row_count, 3U, policy));
+      star_channel_energy_ds.emplace(createStreamingDataset(
+          type_group.get(), "CHUI_StellarFeedbackEnergyByChannelErg", H5T_IEEE_F64LE, file_row_count, 3U, policy));
+      star_birth_elements_ds.emplace(createStreamingDataset(
+          type_group.get(), "CHUI_BirthElementMassFractions", H5T_IEEE_F64LE, file_row_count,
+          physics::k_chemical_element_count, policy));
+      add_double("CHUI_BirthTimeCode");
+      add_u32("CHUI_SnCcRealized");
+      add_u32("CHUI_SnIaRealized");
+      add_u64("CHUI_EventStreamKey");
+      add_u8("CHUI_PopulationRecordInitialized");
+      population_store.emplace(state);
+    }
 
     const std::size_t chunk_rows = std::min(policy.chunk_particle_count, row_count);
     std::vector<double> coords(chunk_rows * 3U);
@@ -1578,6 +1661,41 @@ void writeScienceSnapshotHdf5(
         write_u64_extra("ParentParticleIDs", u641.data(), offset, count);
         write_u8_extra("HasParentParticle", u81.data(), offset, count);
         write_u64_extra("OwningPatchIDs", u642.data(), offset, count);
+        if (composition_out) {
+          const auto& sidecar = state.gas_composition;
+          const auto& cd = composition_descriptor;
+          std::vector<double> lanes_buffer;
+          const auto write_lanes = [&](const StreamingDataset& dataset, std::uint32_t begin, std::uint32_t width) {
+            lanes_buffer.assign(static_cast<std::size_t>(width) * count, 0.0);
+            for (std::size_t j = 0; j < count; ++j) {
+              const std::size_t row = offset + j;
+              const double gas = physics::compositionGasMass(sidecar, row);
+              for (std::uint32_t l = 0; l < width; ++l) {
+                lanes_buffer[j * width + l] = gas > 0.0 ? sidecar.value(begin + l, row) / gas : 0.0;
+              }
+            }
+            writeStreamingChunk(dataset, H5T_NATIVE_DOUBLE, lanes_buffer.data(), file_row_base + offset, count);
+          };
+          write_lanes(*composition_elements_ds, cd.element_lane_begin, cd.element_lane_count);
+          if (composition_species_ds.has_value()) write_lanes(*composition_species_ds, cd.species_lane_begin, cd.species_lane_count);
+          if (composition_dust_ds.has_value()) write_lanes(*composition_dust_ds, cd.dust_lane_begin, cd.dust_lane_count);
+          for (std::size_t j = 0; j < count; ++j) {
+            const std::size_t row = offset + j;
+            const double gas = physics::compositionGasMass(sidecar, row);
+            d0[j] = composition_sgs && gas > 0.0 ? sidecar.value(cd.sgs_energy_lane, row) / gas : 0.0;
+            d1[j] = sidecar.mean_molecular_weight[row];
+            d2[j] = sidecar.model_dwell_years[row];
+            d3[j] = sidecar.ism_regime_dwell_years[row];
+            u80[j] = sidecar.chemistry_model_tag[row];
+            u81[j] = sidecar.ism_regime_tag[row];
+          }
+          if (composition_sgs) write_double_extra("CHUI_SgsSpecificEnergy", d0.data(), offset, count);
+          write_double_extra("CHUI_MeanMolecularWeight", d1.data(), offset, count);
+          write_double_extra("CHUI_ChemistryModelDwellYears", d2.data(), offset, count);
+          write_double_extra("CHUI_IsmRegimeDwellYears", d3.data(), offset, count);
+          write_u8_extra("CHUI_ChemistryModelTag", u80.data(), offset, count);
+          write_u8_extra("CHUI_IsmRegimeTag", u81.data(), offset, count);
+        }
         const std::uint64_t staging_bytes = static_cast<std::uint64_t>(
             count * (6U * sizeof(double) + sizeof(double) + sizeof(std::uint64_t) +
                      10U * sizeof(double) + 3U * sizeof(std::uint64_t) + 2U * sizeof(std::uint8_t)));
@@ -1675,6 +1793,39 @@ void writeScienceSnapshotHdf5(
           write_double_extra("CHUI_StellarDepositedMassCumulative", d0.data(), output_offset, count);
           write_double_extra("CHUI_StellarDepositedMetalsCumulative", d1.data(), output_offset, count);
           write_double_extra("CHUI_StellarDepositedFeedbackEnergyCumulativeErg", d2.data(), output_offset, count);
+          if (population_out) {
+            std::vector<double> channel(count * 3U);
+            std::vector<double> energy(count * 3U);
+            std::vector<double> birth(count * physics::k_chemical_element_count, 0.0);
+            for (std::size_t j = 0; j < count; ++j) {
+              const std::size_t row = star_row_by_particle.rowFor(particle_indices[j]);
+              for (std::size_t c = 0; c < 3U; ++c) {
+                channel[j * 3U + c] = conversion.massToStored(
+                    state.star_particles.stellar_returned_mass_channel_cumulative_code[c][row]);
+                energy[j * 3U + c] = state.star_particles.stellar_feedback_energy_channel_cumulative_erg[c][row];
+              }
+              const std::uint64_t pid = state.particle_sidecar.particle_id[particle_indices[j]];
+              const bool has = population_store->has(pid);
+              const physics::StellarPopulationRecord record =
+                  has ? population_store->get(pid) : physics::StellarPopulationRecord{};
+              for (std::size_t e = 0; e < physics::k_chemical_element_count; ++e) {
+                birth[j * physics::k_chemical_element_count + e] = record.birth_element_mass_fraction[e];
+              }
+              d0[j] = record.birth_time_code;
+              u320[j] = record.cc_realized;
+              u321[j] = record.ia_realized;
+              u640[j] = record.event_stream_key;
+              u80[j] = has && record.initialized != 0U ? 1U : 0U;
+            }
+            writeStreamingChunk(*star_channel_mass_ds, H5T_NATIVE_DOUBLE, channel.data(), file_row_base + output_offset, count);
+            writeStreamingChunk(*star_channel_energy_ds, H5T_NATIVE_DOUBLE, energy.data(), file_row_base + output_offset, count);
+            writeStreamingChunk(*star_birth_elements_ds, H5T_NATIVE_DOUBLE, birth.data(), file_row_base + output_offset, count);
+            write_double_extra("CHUI_BirthTimeCode", d0.data(), output_offset, count);
+            write_u32_extra("CHUI_SnCcRealized", u320.data(), output_offset, count);
+            write_u32_extra("CHUI_SnIaRealized", u321.data(), output_offset, count);
+            write_u64_extra("CHUI_EventStreamKey", u640.data(), output_offset, count);
+            write_u8_extra("CHUI_PopulationRecordInitialized", u80.data(), output_offset, count);
+          }
         } else if (type_index == 3U) {
           write_u64_extra("TracerParentParticleID", u640.data(), output_offset, count);
           write_u64_extra("TracerInjectionStep", u641.data(), output_offset, count);
