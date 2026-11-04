@@ -63,6 +63,15 @@ enum class SspWindModelConfig {
   kTableV1,
 };
 
+// CHUI Part 3 Milestone I: gas AMR time stepping. kSynchronized (default)
+// advances every level with the coordinator interval; kRecursiveSubcycling
+// advances level L with dt / r^(L - L_min) (Berger-Oliger, nested temporal
+// histories, per-level reflux).
+enum class AmrTimeSteppingConfigMode {
+  kSynchronized,
+  kRecursiveSubcycling,
+};
+
 // CHUI Part 3: production AMR regrid. kOff keeps the historical static
 // hierarchy; kAutomatic refines/derefines at synchronized hierarchy
 // boundaries every amr_regrid_interval_steps accepted steps.
@@ -428,6 +437,7 @@ struct NumericsConfig {
   AmrRegridConfigMode amr_regrid_mode = AmrRegridConfigMode::kOff;
   // CHUI Part 3 collective global-step rollback (rung zero): 0 disables.
   int global_step_max_retries = 0;
+  AmrTimeSteppingConfigMode amr_time_stepping = AmrTimeSteppingConfigMode::kSynchronized;
   // CHUI Part 3 (A04 RESEARCH): predictive event-aware refinement of cells
   // hosting stars younger than this age (pending CC SN / wind feedback);
   // 0 disables. Requires amr_regrid_mode = automatic.
@@ -1004,6 +1014,7 @@ void writeNormalizedConfigSnapshot(
 [[nodiscard]] std::string hydroRiemannSolverModeToString(HydroRiemannSolverMode mode);
 [[nodiscard]] std::string hydroDualEnergyConfigModeToString(HydroDualEnergyConfigMode mode);
 [[nodiscard]] std::string amrRegridConfigModeToString(AmrRegridConfigMode mode);
+[[nodiscard]] std::string amrTimeSteppingConfigModeToString(AmrTimeSteppingConfigMode mode);
 [[nodiscard]] std::string sspWindModelConfigToString(SspWindModelConfig mode);
 [[nodiscard]] std::string nodeMemoryAdmissionModeToString(NodeMemoryAdmissionMode mode);
 [[nodiscard]] std::string coordinateFrameToString(CoordinateFrame frame);

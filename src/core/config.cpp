@@ -709,6 +709,14 @@ parseInitialConditionMissingFieldPolicy(
   throw ConfigError("key 'physics.ssp_wind_model': invalid value '" + value + "' (expected none or table_v1)");
 }
 
+[[nodiscard]] AmrTimeSteppingConfigMode parseAmrTimeSteppingConfigMode(const std::string& value) {
+  const std::string lower = toLower(trim(value));
+  if (lower == "synchronized") return AmrTimeSteppingConfigMode::kSynchronized;
+  if (lower == "recursive_subcycling") return AmrTimeSteppingConfigMode::kRecursiveSubcycling;
+  throw ConfigError("key 'numerics.amr_time_stepping': invalid value '" + value +
+                    "' (expected synchronized or recursive_subcycling)");
+}
+
 [[nodiscard]] AmrRegridConfigMode parseAmrRegridConfigMode(const std::string& value) {
   const std::string lower = toLower(trim(value));
   if (lower == "off") return AmrRegridConfigMode::kOff;
@@ -1424,6 +1432,7 @@ struct ConfigKeySpec {
       {"numerics.amr_max_level", "10"},
       {"numerics.amr_regrid_mode", "off"},
       {"numerics.global_step_max_retries", "0"},
+      {"numerics.amr_time_stepping", "synchronized"},
       {"numerics.amr_predictive_feedback_age_years", "0.0"},
       {"numerics.amr_regrid_interval_steps", "1"},
       {"numerics.amr_regrid_max_operations", "64"},
@@ -3035,6 +3044,7 @@ class NormalizedConfigStream {
   stream << "amr_max_level = " << frozen.config.numerics.amr_max_level << '\n';
   stream << "amr_regrid_mode = " << amrRegridConfigModeToString(frozen.config.numerics.amr_regrid_mode) << '\n';
   stream << "global_step_max_retries = " << frozen.config.numerics.global_step_max_retries << '\n';
+  stream << "amr_time_stepping = " << amrTimeSteppingConfigModeToString(frozen.config.numerics.amr_time_stepping) << '\n';
   stream << "amr_predictive_feedback_age_years = " << frozen.config.numerics.amr_predictive_feedback_age_years << '\n';
   stream << "amr_regrid_interval_steps = " << frozen.config.numerics.amr_regrid_interval_steps << '\n';
   stream << "amr_regrid_max_operations = " << frozen.config.numerics.amr_regrid_max_operations << '\n';
@@ -3813,6 +3823,8 @@ class NormalizedConfigStream {
   frozen.config.numerics.amr_predictive_feedback_age_years = parseFloating(
       requireString(entries, consumed, "numerics.amr_predictive_feedback_age_years",
                     defaultFor("numerics.amr_predictive_feedback_age_years")), "numerics.amr_predictive_feedback_age_years");
+  frozen.config.numerics.amr_time_stepping = parseAmrTimeSteppingConfigMode(requireString(
+      entries, consumed, "numerics.amr_time_stepping", defaultFor("numerics.amr_time_stepping")));
   frozen.config.numerics.global_step_max_retries = parseNumber<int>(
       requireString(entries, consumed, "numerics.global_step_max_retries",
                     defaultFor("numerics.global_step_max_retries")), "numerics.global_step_max_retries");
@@ -5019,6 +5031,14 @@ std::string sspWindModelConfigToString(SspWindModelConfig mode) {
     case SspWindModelConfig::kTableV1: return "table_v1";
   }
   throw ConfigError("unhandled SspWindModelConfig enum value during serialization");
+}
+
+std::string amrTimeSteppingConfigModeToString(AmrTimeSteppingConfigMode mode) {
+  switch (mode) {
+    case AmrTimeSteppingConfigMode::kSynchronized: return "synchronized";
+    case AmrTimeSteppingConfigMode::kRecursiveSubcycling: return "recursive_subcycling";
+  }
+  throw ConfigError("unhandled AmrTimeSteppingConfigMode enum value during serialization");
 }
 
 std::string amrRegridConfigModeToString(AmrRegridConfigMode mode) {

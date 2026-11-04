@@ -1036,11 +1036,70 @@ void captureAmrTemporalBoundaryHistoryEnd(
     std::span<const PatchDescriptor> patches,
     double interval_end_code,
     double adiabatic_index, core::MemoryGovernor* governor) {
+  captureAmrTemporalBoundaryHistoryEndForLevel(state, patches, -1, interval_end_code, adiabatic_index, governor);
+}
+
+// CHUI Part 3 Milestone I: per-level temporal intervals. Records of every
+// level coexist (keyed by stable patch id; each carries its own interval), so
+// a level-L interval [t_L, t_L + dt_L] can be open while the level-(L+1)
+// interval nested inside it is captured, used and retired.
+void captureAmrTemporalBoundaryHistoryStartForLevel(
+    core::SimulationState& state,
+    std::span<const PatchDescriptor> patches,
+    int level,
+    double interval_start_code,
+    double adiabatic_index, core::MemoryGovernor* governor) {
+  if (level < 0) {
+    throw std::invalid_argument("captureAmrTemporalBoundaryHistoryStartForLevel requires level >= 0");
+  }
+  std::vector<core::AmrTemporalBoundaryHistoryRecord> preserved;
+  for (const core::AmrTemporalBoundaryHistoryRecord& record : state.amr_temporal_boundary_history.records()) {
+    if (static_cast<int>(record.patch_level) == level) {
+      throw std::runtime_error(
+          "cannot open a level temporal interval while the same level's previous interval is still active");
+    }
+    preserved.push_back(record);
+  }
+  // Only level-L patches may be coarse sources in this capture: pass them
+  // together with the next finer level (which makes them coarse sources).
+  std::vector<PatchDescriptor> scoped;
+  for (const PatchDescriptor& patch : patches) {
+    const int patch_level = static_cast<int>(patch.level);
+    if (patch_level == level || patch_level == level + 1) scoped.push_back(patch);
+  }
+  state.amr_temporal_boundary_history.clear();
+  try {
+    captureAmrTemporalBoundaryHistoryStart(state, scoped, interval_start_code, adiabatic_index, governor);
+  } catch (...) {
+    state.amr_temporal_boundary_history.assign(std::move(preserved));
+    throw;
+  }
+  std::vector<core::AmrTemporalBoundaryHistoryRecord> merged(
+      state.amr_temporal_boundary_history.records().begin(), state.amr_temporal_boundary_history.records().end());
+  merged.insert(merged.end(), std::make_move_iterator(preserved.begin()), std::make_move_iterator(preserved.end()));
+  state.amr_temporal_boundary_history.assign(std::move(merged));
+}
+
+void retireAmrTemporalBoundaryHistoryLevel(core::SimulationState& state, int level) {
+  std::vector<core::AmrTemporalBoundaryHistoryRecord> kept;
+  for (const core::AmrTemporalBoundaryHistoryRecord& record : state.amr_temporal_boundary_history.records()) {
+    if (static_cast<int>(record.patch_level) != level) kept.push_back(record);
+  }
+  state.amr_temporal_boundary_history.assign(std::move(kept));
+}
+
+void captureAmrTemporalBoundaryHistoryEndForLevel(
+    core::SimulationState& state,
+    std::span<const PatchDescriptor> patches,
+    int level,
+    double interval_end_code,
+    double adiabatic_index, core::MemoryGovernor* governor) {
   (void)governor;  // End capture updates the already admitted fixed-size records.
   if (!std::isfinite(interval_end_code)) {
     throw std::invalid_argument("captureAmrTemporalBoundaryHistoryEnd requires finite interval_end_code");
   }
   for (core::AmrTemporalBoundaryHistoryRecord& record : state.amr_temporal_boundary_history.mutableRecords()) {
+    if (level >= 0 && static_cast<int>(record.patch_level) != level) continue;
     const auto patch_it = std::find_if(
         patches.begin(), patches.end(),
         [&record](const PatchDescriptor& patch) { return patch.patch_id == record.patch_id; });

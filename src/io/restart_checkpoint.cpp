@@ -3441,6 +3441,7 @@ std::string restartConfigurationCompatibilityRecord(
       // CHUI Part 3 regrid keys must hold their (static-hierarchy) defaults.
       current.config.numerics.amr_regrid_mode != core::AmrRegridConfigMode::kOff ||
       current.config.numerics.global_step_max_retries != 0 ||
+      current.config.numerics.amr_time_stepping != core::AmrTimeSteppingConfigMode::kSynchronized ||
       current.config.numerics.amr_predictive_feedback_age_years != 0.0 ||
       current.config.numerics.amr_regrid_interval_steps != 1 ||
       current.config.numerics.amr_regrid_max_operations != 64 ||
@@ -3571,10 +3572,15 @@ std::string restartConfigurationCompatibilityRecord(
   // (all values verified at their defaults above).
   if (projected.find("\namr_regrid_mode = ") != std::string::npos &&
       restart.normalized_config_text.find("\namr_regrid_mode = ") == std::string::npos) {
-    removeKeyLines({"amr_regrid_mode", "global_step_max_retries", "amr_predictive_feedback_age_years",
+    removeKeyLines({"amr_regrid_mode", "global_step_max_retries", "amr_time_stepping", "amr_predictive_feedback_age_years",
         "amr_regrid_interval_steps", "amr_regrid_max_operations",
         "amr_refine_cell_mass_code", "amr_refine_jump_threshold", "amr_refine_jeans_cells",
         "amr_derefine_hysteresis"});
+  }
+  // Milestone I key added after the first Part 3 pass (default verified above).
+  if (projected.find("\namr_time_stepping = ") != std::string::npos &&
+      restart.normalized_config_text.find("\namr_time_stepping = ") == std::string::npos) {
+    removeKeyLines({"amr_time_stepping"});
   }
   if (projected.find("\nssp_wind_model = ") != std::string::npos &&
       restart.normalized_config_text.find("\nssp_wind_model = ") == std::string::npos) {
