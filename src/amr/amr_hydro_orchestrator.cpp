@@ -2429,6 +2429,19 @@ struct AmrSynchronizedSweepWorkspace {
   if (distributed_exchange != nullptr) {
     refreshRemoteTraceableGhostSourceIds(geometries, distributed_exchange->remote_patches, periodic_frame);
   }
+  // H02/G3.1: remote specific internal energies by stable gas_cell_id for the
+  // dual-energy auxiliary lane of remote-sourced ghosts (sorted lookup).
+  std::vector<std::pair<std::uint64_t, double>> remote_internal_energy;
+  if (distributed_exchange != nullptr) {
+    for (const DistributedAmrRemotePatch& remote : distributed_exchange->remote_patches) {
+      for (const AmrHydroSparseRemoteCell& cell : remote.boundary_cells) {
+        if (std::isfinite(cell.internal_energy_code) && cell.internal_energy_code > 0.0) {
+          remote_internal_energy.emplace_back(cell.gas_cell_id, cell.internal_energy_code);
+        }
+      }
+    }
+    std::sort(remote_internal_energy.begin(), remote_internal_energy.end());
+  }
 
   const auto patchRequiresGhostFill = [&](std::size_t patch_index) {
     return all_cells_active || std::any_of(
@@ -2734,9 +2747,10 @@ struct AmrSynchronizedSweepWorkspace {
       }
       hydro::fillHydroBoundaryGhostAuxiliaryInternalEnergy(conserved_state, patch_geometry.geometry);
       // Same-level / coarse-fine ghosts: rho_ghost * e_source from the
-      // canonical e of the local source cell. Remote or unknown sources stay
-      // NaN; their face states then use E - K and are counted, so degraded
-      // dual-energy protection at such boundaries is reported, not silent.
+      // canonical e of the local source cell, or (H02) the transported e of a
+      // remote source cell. Unknown sources stay NaN; their face states then
+      // use E - K and are counted, so degraded dual-energy protection is
+      // reported, not silent.
       for (const AmrHydroGhostDescriptor& ghost : patch_geometry.ghosts) {
         if (ghost.ghost_cell >= auxiliary.size() || std::isfinite(auxiliary[ghost.ghost_cell])) {
           continue;
@@ -2744,7 +2758,12 @@ struct AmrSynchronizedSweepWorkspace {
         const auto source_row = ghost.source_gas_cell_id != 0U
             ? state.rowForGasCellId(ghost.source_gas_cell_id)
             : std::optional<std::uint32_t>{};
-        const double source_e = source_row.has_value() ? state.gas_cells.internal_energy_code[*source_row] : 0.0;
+        double source_e = source_row.has_value() ? state.gas_cells.internal_energy_code[*source_row] : 0.0;
+        if (!source_row.has_value() && ghost.source_gas_cell_id != 0U && !remote_internal_energy.empty()) {
+          const auto it = std::lower_bound(remote_internal_energy.begin(), remote_internal_energy.end(),
+                                           std::make_pair(ghost.source_gas_cell_id, -std::numeric_limits<double>::infinity()));
+          if (it != remote_internal_energy.end() && it->first == ghost.source_gas_cell_id) source_e = it->second;
+        }
         if (source_e > 0.0) {
           auxiliary[ghost.ghost_cell] = conserved_state.loadCell(ghost.ghost_cell).mass_density_comoving * source_e;
         } else {

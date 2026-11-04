@@ -19,7 +19,7 @@ following now exist in source:
 
 Still PARTIAL:
 
-* H02/G3.1 remote dual-energy and CTU;
+* G3.1 CTU at remote boundaries (H02 remote dual-energy is now in source);
 * G4 adaptive indicators and predictor;
 * V01 snapshot import;
 * several MPI end-to-end tests and benchmarks.

@@ -2121,7 +2121,10 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
                         .vel_z_peculiar = cell_record.velocity_z_peculiar,
                         .pressure_comoving = cell_record.pressure_code,
                         .metallicity_mass_fraction = metallicity_mass_fraction},
-                    k_gamma_adiabatic)});
+                    k_gamma_adiabatic),
+                .internal_energy_code = cell_record.internal_energy_code > 0.0
+                    ? cell_record.internal_energy_code
+                    : std::numeric_limits<double>::quiet_NaN()});
           }
         };
 
@@ -2488,6 +2491,9 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
         }
         amr::AmrHydroSparseRemoteCell cell = a;
         cell.conserved = (1.0 - alpha) * a.conserved + alpha * b.conserved;
+        // Specific internal energy interpolated with the same weights (NaN
+        // stays NaN: the dual-energy lane then falls back to E - K, counted).
+        cell.internal_energy_code = (1.0 - alpha) * a.internal_energy_code + alpha * b.internal_energy_code;
         if (!(cell.conserved.mass_density_comoving > 0.0) || !std::isfinite(cell.conserved.total_energy_density_comoving)) {
           throw std::runtime_error("distributed recursive AMR: interpolated remote coarse state is unphysical");
         }

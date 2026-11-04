@@ -32,7 +32,7 @@ numerical validity or scientific qualification.
 | ID | Status | Basis and exact remaining work |
 |---|---|---|
 | H01 Godunov/PPM/CTU | **PARTIAL** | The solver suite is unchanged. G3.1 CTU transverse reconstruction at MPI/coarse-fine boundaries is not reworked. Next edit: `amr_ghost_fill.cpp` deep-layer extrapolation (`deep_layer_extrapolated_ghosts`) for remote sparse sources. Owner evidence is needed first. |
-| H02 dual energy / comoving | **PARTIAL** | The remote sparse ghost record has no auxiliary internal-energy lane, so a remote ghost still derives e from E−K. Next edit: add `internal_energy_density_comoving` to `amr::AmrHydroSparseRemoteCell`, fill it in the sparse consumer of `HydroAmrRuntime::exchangeDirectedHydroGhosts` from `AmrPatchCellPayloadRecord::internal_energy_code`, and consume it in the ghost-fill auxiliary path. |
+| H02 dual energy / comoving | **IMPLEMENTED IN SOURCE — NOT RUN** (remote auxiliary lane) | The remote sparse ghost record now carries the owner's specific internal energy (`AmrHydroSparseRemoteCell::internal_energy_code`, filled from `AmrPatchCellPayloadRecord::internal_energy_code`, and interpolated with the conserved weights for recursive remote coarse ghosts). The AMR sweep seeds rho_ghost * e for remote-sourced ghosts, so the E−K fallback (counted in `dual_energy_unresolved_ghosts`) remains only for genuinely unknown sources. Missing test: a dual-energy remote-boundary assertion in `test_amr_distributed_remote_patch_boundary.cpp` that `dual_energy_unresolved_ghosts == 0`. |
 | C01 thermochemistry | **BLOCKED BY EXTERNAL DATA** (R18 / photodissociation heating tables) | Source contract unchanged. |
 | C02 network references | **EXPERIMENTAL/UNQUALIFIED** | Unchanged. |
 | C03 adaptive chemistry control | **IMPLEMENTED IN SOURCE — NOT RUN** (transaction); control law **EXPERIMENTAL/UNQUALIFIED** | G0.4: the single authority is the `chui_adaptive_chemistry_control_v1` sidecar. It is re-read before every fidelity decision. Empty ranks contribute zero current samples, and a malformed sidecar is an error. Rollback and restart restore it with `SimulationState`. Timescale/stiffness indicators are still heuristic (G4.3 PARTIAL). |
@@ -235,7 +235,8 @@ All are checksum- and reference-bound. Nothing was fabricated.
 
 ## 10. Precise continuation (same branch)
 
-1. **H02 / G3.1:** remote auxiliary internal-energy lane (exact edit in §2, H02 row).
+1. **G3.1:** CTU transverse reconstruction at remote and coarse/fine boundaries. Add the H02
+   remote dual-energy regression.
 2. **G4.1:** cooling-length, chemical-interface, vorticity and force-resolution indicators in
    `patchDecision`. Keep mandatory accuracy and resource priority separate. Never coarsen below
    a mandatory criterion.

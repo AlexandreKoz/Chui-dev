@@ -12,7 +12,6 @@ Closed in source (NOT RUN):
 
 Open:
 
-* H02 remote auxiliary internal energy;
 * G3.1 CTU at remote boundaries;
 * G4.1/G4.2 indicators and predictor;
 * V01 snapshot import;
