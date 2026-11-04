@@ -1207,6 +1207,8 @@ void TimeCoordinator::runRungZeroSegment(
         retry_point.layout_certificate = layoutCertificate();
         m_gravity.captureTransactionalForceEndpoint(state, retry_point.layout_certificate, retry_point.force_endpoint);
         m_gravity.beginCycleTransaction();
+        // G1.6: source-controller state outside SimulationState.
+        m_source.captureRollbackCheckpoint();
       } catch (...) {
         capture_failure = std::current_exception();
       }
@@ -1416,6 +1418,7 @@ void TimeCoordinator::runRungZeroSegment(
           gas_cell_scheduler = std::move(*retry_point.cells);
           pending_output = retry_point.pending;
           m_gravity.rollbackCycleTransaction(retry_point.force_endpoint, state, retry_point.layout_certificate);
+          m_source.restoreRollbackCheckpoint();
           integrator_state.pm_source_generation = state.gravitySourceGeneration();
           syncTimeBinsFromSchedulers(particle_scheduler, gas_cell_scheduler, state);
         } catch (...) {
@@ -1428,6 +1431,7 @@ void TimeCoordinator::runRungZeroSegment(
         continue;
       }
       if (m_gravity.cycleTransactionOpen()) m_gravity.commitCycleTransaction();
+      m_source.discardRollbackCheckpoint();
       global_step_retries = 0U;
       global_step_retry_dt_limit = 0.0;
     }

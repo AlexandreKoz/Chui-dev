@@ -36,6 +36,19 @@ class SourceRuntime {
   }
   [[nodiscard]] virtual core::MemoryReport memoryReport() const = 0;
 
+  // G1.6 whole-step transaction: persistent source-controller state that
+  // lives OUTSIDE SimulationState (model clamp/diagnostic counters, the
+  // particle-ID occupancy cache, last published ledgers) is checkpointed at
+  // the coordinator's step rollback point and restored when the step is
+  // rejected, so a retried step is bit-identical to a step that never
+  // failed. Everything authoritative (chemistry controller, populations,
+  // event ordinals, composition) is in SimulationState and restored with it.
+  // All three calls are rank-uniform (the coordinator calls them on every
+  // rank); restore performs no collective (collective caches are invalidated
+  // and rebuilt at their next collective use).
+  virtual void captureRollbackCheckpoint() {}
+  virtual void restoreRollbackCheckpoint() {}
+  virtual void discardRollbackCheckpoint() noexcept {}
 };
 
 [[nodiscard]] std::unique_ptr<SourceRuntime> makeSourceRuntime(

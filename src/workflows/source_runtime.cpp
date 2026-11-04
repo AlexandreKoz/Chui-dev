@@ -729,6 +729,11 @@ class DistributedParticleIdRegistry final : public physics::ParticleIdPrecommit 
 
   // Initial population validation is streamed in fixed local batches. The
   // persistent shard is O(owned hash shard), never replicated on every rank.
+  // G1.6: a rolled-back step may have occupied IDs that no longer exist in
+  // the restored state; the occupancy cache is rebuilt (collectively) from
+  // the authoritative particle IDs at its next use.
+  void invalidateOccupancyCache() noexcept { m_initialized = false; }
+
   void initializeOccupiedShard(std::span<const std::uint64_t> local_ids) {
     constexpr std::size_t k_initial_chunk = 4096U;
     const int world_size = m_mpi_context.worldSize();
@@ -984,6 +989,59 @@ class SourceRuntimeImpl final : public SourceRuntime {
           physics::CompositionLayout::make(physics::compositionLayoutRequestFromConfig(config.physics)));
     }
   }
+
+  void captureRollbackCheckpoint() override {
+    ControllerCheckpoint checkpoint;
+    if (m_ssp_model != nullptr) {
+      checkpoint.ssp_table_clamps = m_ssp_model->table_clamps;
+      checkpoint.ssp_negative_ejecta_clamps = m_ssp_model->negative_ejecta_clamps;
+      checkpoint.ssp_untracked_mass_residual_msun = m_ssp_model->untracked_mass_residual_msun;
+      checkpoint.ssp_nonmonotone_return_clamps = m_ssp_model->nonmonotone_return_clamps;
+    }
+    checkpoint.wind_metallicity_clamps = m_wind_metallicity_clamps;
+    checkpoint.sf_gradient_unavailable_cells = m_sf_gradient_unavailable_cells;
+    checkpoint.sf_gradient_coarse_fine_cells = m_sf_gradient_coarse_fine_cells;
+    checkpoint.last_thermochemistry_ledger = m_last_thermochemistry_ledger;
+    checkpoint.last_feedback_ledger = m_last_feedback_ledger;
+    checkpoint.last_ism_regime_report = m_last_ism_regime_report;
+    checkpoint.last_chemistry_adaptive_report = m_last_chemistry_adaptive_report;
+    checkpoint.last_dust_ledger = m_last_dust_ledger;
+    checkpoint.last_sgs_ledger = m_last_sgs_ledger;
+    checkpoint.last_shadow_report = m_last_shadow_report;
+    checkpoint.last_skipped_effective_rows = m_last_skipped_effective_rows;
+    checkpoint.last_element_diffusion = m_last_element_diffusion;
+    m_rollback_checkpoint = std::move(checkpoint);
+  }
+
+  void restoreRollbackCheckpoint() override {
+    if (!m_rollback_checkpoint.has_value()) {
+      throw std::logic_error("source runtime rollback restore without a captured checkpoint");
+    }
+    const ControllerCheckpoint& c = *m_rollback_checkpoint;
+    if (m_ssp_model != nullptr) {
+      m_ssp_model->table_clamps = c.ssp_table_clamps;
+      m_ssp_model->negative_ejecta_clamps = c.ssp_negative_ejecta_clamps;
+      m_ssp_model->untracked_mass_residual_msun = c.ssp_untracked_mass_residual_msun;
+      m_ssp_model->nonmonotone_return_clamps = c.ssp_nonmonotone_return_clamps;
+    }
+    m_wind_metallicity_clamps = c.wind_metallicity_clamps;
+    m_sf_gradient_unavailable_cells = c.sf_gradient_unavailable_cells;
+    m_sf_gradient_coarse_fine_cells = c.sf_gradient_coarse_fine_cells;
+    m_last_thermochemistry_ledger = c.last_thermochemistry_ledger;
+    m_last_feedback_ledger = c.last_feedback_ledger;
+    m_last_ism_regime_report = c.last_ism_regime_report;
+    m_last_chemistry_adaptive_report = c.last_chemistry_adaptive_report;
+    m_last_dust_ledger = c.last_dust_ledger;
+    m_last_sgs_ledger = c.last_sgs_ledger;
+    m_last_shadow_report = c.last_shadow_report;
+    m_last_skipped_effective_rows = c.last_skipped_effective_rows;
+    m_last_element_diffusion = c.last_element_diffusion;
+    m_particle_id_registry.invalidateOccupancyCache();
+    // The chemistry promotion bias is re-derived from the restored sidecar
+    // before the next fidelity decision (G0.4); nothing to restore here.
+  }
+
+  void discardRollbackCheckpoint() noexcept override { m_rollback_checkpoint.reset(); }
 
   [[nodiscard]] core::MemoryReport memoryReport() const override {
     core::MemoryReportBuilder builder;
@@ -3301,6 +3359,25 @@ class SourceRuntimeImpl final : public SourceRuntime {
   physics::ChemistryShadowReport m_last_shadow_report{};
   std::uint64_t m_last_skipped_effective_rows = 0U;
   physics::BaryonicSourceStageConfig m_source_stage_config{};
+  struct ControllerCheckpoint {
+    std::uint64_t ssp_table_clamps = 0U;
+    std::uint64_t ssp_negative_ejecta_clamps = 0U;
+    double ssp_untracked_mass_residual_msun = 0.0;
+    std::uint64_t ssp_nonmonotone_return_clamps = 0U;
+    std::uint64_t wind_metallicity_clamps = 0U;
+    std::uint64_t sf_gradient_unavailable_cells = 0U;
+    std::uint64_t sf_gradient_coarse_fine_cells = 0U;
+    physics::SourceLedger last_thermochemistry_ledger{};
+    physics::FeedbackLedger last_feedback_ledger{};
+    physics::IsmRegimeReport last_ism_regime_report{};
+    physics::ChemistryAdaptiveReport last_chemistry_adaptive_report{};
+    physics::DustUpdateLedger last_dust_ledger{};
+    physics::SgsLedger last_sgs_ledger{};
+    physics::ChemistryShadowReport last_shadow_report{};
+    std::uint64_t last_skipped_effective_rows = 0U;
+    physics::ElementDiffusionReport last_element_diffusion{};
+  };
+  std::optional<ControllerCheckpoint> m_rollback_checkpoint;
   DistributedParticleIdRegistry m_particle_id_registry;
   const parallel::MpiContext& m_mpi_context;
   const RuntimeServices* m_runtime_services = nullptr;
