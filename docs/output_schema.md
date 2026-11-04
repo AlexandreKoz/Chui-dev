@@ -501,11 +501,16 @@ Per cell, sum(`CHUI_ElementMassFractions`) + sum(`CHUI_DustMassFractions`) = 1;
 `Metallicity` remains the derived total-metal mirror (gas + dust metals).
 
 `/PartType4` (Part 2 stellar population models; attribute
-`CHUI_StellarPopulationSchemaVersion = 1`, `CHUI_StellarChannelOrder = AGB,CC,Ia`):
+`CHUI_StellarPopulationSchemaVersion = 2`, `CHUI_StellarChannelOrder = AGB,CC,Ia`):
 `CHUI_StellarReturnedMassByChannel` [N, 3], `CHUI_StellarFeedbackEnergyByChannelErg`
 [N, 3], `CHUI_BirthElementMassFractions` [N, 11], `CHUI_BirthTimeCode`,
 `CHUI_SnCcRealized`, `CHUI_SnIaRealized` (u32), `CHUI_EventStreamKey` (u64),
-`CHUI_PopulationRecordInitialized` (u8; 0 = legacy star without a record).
+`CHUI_PopulationRecordInitialized` (u8; 0 = legacy star without a record),
+`CHUI_ChronologyTimeCode`, `CHUI_ChronologyStepIndex` (u64), and
+`CHUI_ChronologyInitialized` (u8). The chronology triplet identifies the last
+accepted SSP/event interval represented by the cumulative ordinals and is
+analysis provenance; checkpoint restart still uses the complete module
+sidecar rather than reconstructing it from a science snapshot.
 
 Restart-only transient state (flux registers, temporal histories, Jacobians,
 staged deltas) is never exported to science snapshots; it lives in the

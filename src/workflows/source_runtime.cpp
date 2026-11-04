@@ -2407,6 +2407,17 @@ class SourceRuntimeImpl final : public SourceRuntime {
     if (!distributed_feedback && state.star_particles.size() == 0U) return;
     if (ranks_with_stars == 0U) return;
     const double elapsed_years = elapsedStellarEvolutionYears(context);
+    const bool explicit_event_interval =
+        std::isfinite(context.timeline_step.time_begin_code) &&
+        std::isfinite(context.timeline_step.time_end_code) &&
+        context.timeline_step.time_end_code > context.timeline_step.time_begin_code;
+    const double event_interval_begin_code = explicit_event_interval
+        ? context.timeline_step.time_begin_code
+        : context.integrator_state.current_time_code;
+    const double event_interval_end_code = explicit_event_interval
+        ? context.timeline_step.time_end_code
+        : context.integrator_state.current_time_code +
+              context.integrator_state.dt_time_code;
     const physics::ThermochemistryUnitBridge bridge =
         physics::makeThermochemistryOperatorConfig(m_full_config, m_units, m_baryonic_data).units;
     physics::FeedbackUnits units;
@@ -2496,8 +2507,17 @@ class SourceRuntimeImpl final : public SourceRuntime {
           const double z = std::clamp(state.star_particles.metallicity_mass_fraction[s], 0.0, 0.5);
           const auto masses = physics::initialElementMasses(1.0, z, physics::primordialPolicyFromConfig(m_physics_config));
           record = physics::makeStellarPopulationRecord(masses, 0.0, state.star_particles.birth_key[s]);
+          // A legacy star has no absolute event cursor. Its cumulative age
+          // lanes/ordinals remain authoritative for past evolution; the
+          // current interval establishes the first absolute boundary.
+          record.chronology_initialized = 0U;
           ++legacy_initialized;
         }
+        physics::advanceStellarPopulationChronology(
+            record,
+            event_interval_begin_code,
+            event_interval_end_code,
+            context.integrator_state.step_index);
         const double birth_mass = state.star_particles.birth_mass_code[s];
         const double birth_msun = birth_mass / msun_code;
         const double age_b = std::max(state.star_particles.stellar_age_years_last[s], 0.0);

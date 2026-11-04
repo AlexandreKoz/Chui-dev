@@ -1507,7 +1507,9 @@ void writeScienceSnapshotHdf5(
         config.physics.stellar_population_model != core::StellarPopulationModelConfig::kLegacyTable;
     std::optional<physics::StellarPopulationStore> population_store;
     if (population_out) {
-      writeScalarUint32Attribute(type_group.get(), "CHUI_StellarPopulationSchemaVersion", 1U);
+      writeScalarUint32Attribute(
+          type_group.get(), "CHUI_StellarPopulationSchemaVersion",
+          physics::k_stellar_population_schema);
       writeScalarStringAttribute(type_group.get(), "CHUI_StellarChannelOrder", "AGB,CC,Ia");
       star_channel_mass_ds.emplace(createStreamingDataset(
           type_group.get(), "CHUI_StellarReturnedMassByChannel", H5T_IEEE_F64LE, file_row_count, 3U, policy));
@@ -1521,6 +1523,9 @@ void writeScienceSnapshotHdf5(
       add_u32("CHUI_SnIaRealized");
       add_u64("CHUI_EventStreamKey");
       add_u8("CHUI_PopulationRecordInitialized");
+      add_double("CHUI_ChronologyTimeCode");
+      add_u64("CHUI_ChronologyStepIndex");
+      add_u8("CHUI_ChronologyInitialized");
       population_store.emplace(state);
     }
 
@@ -1816,6 +1821,9 @@ void writeScienceSnapshotHdf5(
               u321[j] = record.ia_realized;
               u640[j] = record.event_stream_key;
               u80[j] = has && record.initialized != 0U ? 1U : 0U;
+              d1[j] = record.chronology_time_code;
+              u641[j] = record.chronology_step_index;
+              u81[j] = has && record.chronology_initialized != 0U ? 1U : 0U;
             }
             writeStreamingChunk(*star_channel_mass_ds, H5T_NATIVE_DOUBLE, channel.data(), file_row_base + output_offset, count);
             writeStreamingChunk(*star_channel_energy_ds, H5T_NATIVE_DOUBLE, energy.data(), file_row_base + output_offset, count);
@@ -1825,6 +1833,9 @@ void writeScienceSnapshotHdf5(
             write_u32_extra("CHUI_SnIaRealized", u321.data(), output_offset, count);
             write_u64_extra("CHUI_EventStreamKey", u640.data(), output_offset, count);
             write_u8_extra("CHUI_PopulationRecordInitialized", u80.data(), output_offset, count);
+            write_double_extra("CHUI_ChronologyTimeCode", d1.data(), output_offset, count);
+            write_u64_extra("CHUI_ChronologyStepIndex", u641.data(), output_offset, count);
+            write_u8_extra("CHUI_ChronologyInitialized", u81.data(), output_offset, count);
           }
         } else if (type_index == 3U) {
           write_u64_extra("TracerParentParticleID", u640.data(), output_offset, count);

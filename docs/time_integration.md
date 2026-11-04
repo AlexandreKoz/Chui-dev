@@ -22,6 +22,11 @@ run for their half intervals at the physical quarter/three-quarter epochs.
 Star births, stellar returns, SN/wind feedback and BH transactions run exactly
 once in the post dispatch at the absolute accepted-interval endpoint. Direct
 low-level source dispatch retains an explicit unsplit compatibility phase.
+The stellar population sidecar carries both cumulative-Poisson thresholds and
+an absolute accepted-interval cursor. Its schema-2 cursor must match the next
+interval begin (within round-off); gaps, overlap and replay fail before event
+ordinals or physical state commit. Schema-1 records adopt their first
+post-restart boundary and are rewritten as schema 2.
 
 With recursive AMR subcycling, the AMR clock owner replaces the coarse
 thermochemistry/dust/SGS halves with `S_L(dt_L/2) H_L(dt_L) S_L(dt_L/2)` for

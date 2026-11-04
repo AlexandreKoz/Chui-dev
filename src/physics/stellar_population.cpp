@@ -21,6 +21,21 @@ constexpr double k_ln10 = 2.302585092994046;
 constexpr double k_chandrasekhar_msun = 1.38;
 constexpr double k_neutron_star_msun = 1.4;
 
+// On-disk/in-flight representation written by schema 1. Keep this definition
+// local to the migration reader; new code must use StellarPopulationRecord.
+struct StellarPopulationRecordV1 {
+  std::array<double, k_chemical_element_count> birth_element_mass_fraction{};
+  double birth_time_code = 0.0;
+  double cc_next_threshold = 0.0;
+  double ia_next_threshold = 0.0;
+  std::uint32_t cc_realized = 0;
+  std::uint32_t ia_realized = 0;
+  std::uint64_t event_stream_key = 0;
+  double returned_mass_code = 0.0;
+  std::uint32_t initialized = 0;
+  std::uint32_t reserved = 0;
+};
+
 [[nodiscard]] double chabrierXi(double log_m) {
   if (log_m <= 0.0) {
     const double d = log_m - std::log10(0.079);
@@ -525,6 +540,8 @@ StellarPopulationRecord makeStellarPopulationRecord(const std::array<double, k_c
   record.event_stream_key = stream_key;
   record.cc_next_threshold = eventExponentialDraw(stream_key, 0U, 0U);
   record.ia_next_threshold = eventExponentialDraw(stream_key, 1U, 0U);
+  record.chronology_time_code = birth_time_code;
+  record.chronology_initialized = 1U;
   record.initialized = 1U;
   return record;
 }
@@ -544,20 +561,85 @@ RealizedEvents realizeEvents(StellarPopulationRecord& record, std::uint32_t chan
   return events;
 }
 
+void advanceStellarPopulationChronology(
+    StellarPopulationRecord& record,
+    double interval_begin_code,
+    double interval_end_code,
+    std::uint64_t accepted_step_index) {
+  if (record.initialized == 0U) {
+    throw std::invalid_argument(
+        "stellar population chronology requires an initialized population record");
+  }
+  if (!(std::isfinite(interval_begin_code) && std::isfinite(interval_end_code) &&
+        interval_end_code > interval_begin_code)) {
+    throw std::invalid_argument(
+        "stellar population chronology requires a finite positive interval");
+  }
+  const auto tolerance = [](double lhs, double rhs) {
+    return 64.0 * std::numeric_limits<double>::epsilon() *
+        std::max({1.0, std::abs(lhs), std::abs(rhs)});
+  };
+  if (record.chronology_initialized == 0U) {
+    if (interval_begin_code + tolerance(interval_begin_code, record.birth_time_code) <
+        record.birth_time_code) {
+      throw std::runtime_error(
+          "stellar population chronology interval begins before the recorded birth time");
+    }
+    // Schema-1 and explicitly imported legacy records adopt the first
+    // authoritative interval boundary. Their cumulative age lane remains the
+    // physical age authority for already elapsed history.
+    record.chronology_time_code = interval_begin_code;
+    record.chronology_initialized = 1U;
+  }
+  if (!std::isfinite(record.chronology_time_code) ||
+      std::abs(record.chronology_time_code - interval_begin_code) >
+          tolerance(record.chronology_time_code, interval_begin_code)) {
+    throw std::runtime_error(
+        record.chronology_time_code > interval_begin_code
+            ? "stellar population chronology rejected an overlapping/replayed interval"
+            : "stellar population chronology rejected a gap between accepted intervals");
+  }
+  record.chronology_time_code = interval_end_code;
+  record.chronology_step_index = accepted_step_index;
+}
+
 StellarPopulationStore::StellarPopulationStore(const core::SimulationState& state) {
   const core::ModuleSidecarBlock* block = state.sidecars.find(k_stellar_population_module);
   if (block == nullptr) return;
-  if (block->schema_version != k_stellar_population_schema || !block->particle_indexed ||
-      block->row_stride_bytes != sizeof(StellarPopulationRecord)) {
+  const bool current_schema =
+      block->schema_version == k_stellar_population_schema &&
+      block->row_stride_bytes == sizeof(StellarPopulationRecord);
+  const bool legacy_schema =
+      block->schema_version == 1U &&
+      block->row_stride_bytes == sizeof(StellarPopulationRecordV1);
+  if (!block->particle_indexed || (!current_schema && !legacy_schema)) {
     throw std::runtime_error("chui_stellar_population_v1 sidecar has an incompatible schema/stride");
   }
   std::vector<std::pair<std::uint64_t, std::size_t>> order;
   for (std::size_t r = 0; r < block->rowCount(); ++r) order.emplace_back(block->particle_id_by_row[r], r);
   std::sort(order.begin(), order.end());
   for (const auto& [id, r] : order) {
-    StellarPopulationRecord record;
+    StellarPopulationRecord record{};
     const auto bytes = block->rowPayload(r);
-    std::memcpy(&record, bytes.data(), sizeof(record));
+    if (current_schema) {
+      std::memcpy(&record, bytes.data(), sizeof(record));
+    } else {
+      StellarPopulationRecordV1 legacy{};
+      std::memcpy(&legacy, bytes.data(), sizeof(legacy));
+      record.birth_element_mass_fraction = legacy.birth_element_mass_fraction;
+      record.birth_time_code = legacy.birth_time_code;
+      record.cc_next_threshold = legacy.cc_next_threshold;
+      record.ia_next_threshold = legacy.ia_next_threshold;
+      record.cc_realized = legacy.cc_realized;
+      record.ia_realized = legacy.ia_realized;
+      record.event_stream_key = legacy.event_stream_key;
+      record.returned_mass_code = legacy.returned_mass_code;
+      record.initialized = legacy.initialized;
+      record.reserved = legacy.reserved;
+      // The first post-restart source interval adopts its authoritative
+      // begin boundary; cumulative ages/ordinals already encode older work.
+      record.chronology_initialized = 0U;
+    }
     m_ids.push_back(id);
     m_records.push_back(record);
   }

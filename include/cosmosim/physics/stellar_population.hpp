@@ -157,11 +157,17 @@ struct StellarPopulationRecord {
   std::uint32_t ia_realized = 0;
   std::uint64_t event_stream_key = 0;  // birth_key or association key
   double returned_mass_code = 0.0;     // cumulative, all channels
+  // Absolute accepted-interval cursor. This is the single replay/gap
+  // authority for SSP return and discrete-event consumption. It advances on
+  // the staged record and becomes persistent only with the gas/star commit.
+  double chronology_time_code = 0.0;
+  std::uint64_t chronology_step_index = 0U;
+  std::uint32_t chronology_initialized = 0U;
   std::uint32_t initialized = 0;
   std::uint32_t reserved = 0;
 };
 inline constexpr const char* k_stellar_population_module = "chui_stellar_population_v1";
-inline constexpr std::uint32_t k_stellar_population_schema = 1U;
+inline constexpr std::uint32_t k_stellar_population_schema = 2U;
 
 [[nodiscard]] double eventExponentialDraw(std::uint64_t stream_key, std::uint32_t channel, std::uint32_t ordinal);
 // Initialize thresholds for a new star.
@@ -174,6 +180,17 @@ struct RealizedEvents {
   std::uint32_t first_ordinal = 0;
 };
 [[nodiscard]] RealizedEvents realizeEvents(StellarPopulationRecord& record, std::uint32_t channel, double lambda_end);
+
+// Validate exact chronological coverage and advance a staged record to the
+// accepted interval end. Schema-v1/legacy records have no cursor; their first
+// interval adopts `interval_begin_code` after validating it is not before the
+// recorded birth. Subsequent intervals must be contiguous to round-off. The
+// caller commits the returned record atomically with its physical deposits.
+void advanceStellarPopulationChronology(
+    StellarPopulationRecord& record,
+    double interval_begin_code,
+    double interval_end_code,
+    std::uint64_t accepted_step_index);
 
 // R2 (A04): does the population's own deterministic event chronology produce
 // a CC or Ia event in (age, age + lookahead]? Stochastic mode advances a COPY
