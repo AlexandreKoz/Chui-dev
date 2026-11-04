@@ -398,7 +398,8 @@ namespace {
           .stage = core::IntegrationStage::kHydroUpdate,
           .ordinal = 0,
           .view_kind = RuntimeStageViewKind::kHydroAmr,
-          .resources = {readWrite(RuntimeResourceKey::kParticleVelocity),
+          .resources = {readWrite(RuntimeResourceKey::kSourceMutationState),
+                        readWrite(RuntimeResourceKey::kParticleVelocity),
                         readWrite(RuntimeResourceKey::kHydroConservedState),
                         readWrite(RuntimeResourceKey::kHydroPrimitiveState),
                         readWrite(RuntimeResourceKey::kAmrPatchState),
@@ -478,6 +479,9 @@ namespace {
                 assembly->effective_eos_table,
                 &services));
         assembly->source = owner;
+        if (assembly->hydro_amr != nullptr) {
+          assembly->hydro_amr->bindSourceRuntime(owner.get());
+        }
         RuntimeModuleInstance instance;
         instance.owner_lifetime = owner;
         instance.stage_tasks.push_back(RuntimeStageTaskContribution{

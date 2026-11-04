@@ -371,7 +371,15 @@ void testPhysicsIndicators() {
     CHUI_REQUIRE(plan.operations.size() == 1U && plan.mandatory_refine_requests == 1U);
     policy.max_operations = 0U;
     const auto starved = amr::planProductionAmrRegrid(state, {}, policy);
-    CHUI_REQUIRE(starved.operations.empty() && starved.mandatory_truncated_by_budget == 1U);
+    CHUI_REQUIRE(starved.operations.size() == 1U);
+    CHUI_REQUIRE(starved.mandatory_truncated_by_budget == 0U);
+    CHUI_REQUIRE(starved.optional_truncated_by_budget == 0U);
+    // A hard criterion at max_level is reported explicitly rather than being
+    // confused with an optional resource-budget truncation.
+    policy.max_level = 0U;
+    const auto capped = amr::planProductionAmrRegrid(state, {}, policy);
+    CHUI_REQUIRE(capped.operations.empty());
+    CHUI_REQUIRE(capped.mandatory_blocked_by_max_level == 1U);
     // Missing per-row cooling times are an error, not a silent no-op.
     policy.physics.cooling_time_code = {};
     bool refused = false;

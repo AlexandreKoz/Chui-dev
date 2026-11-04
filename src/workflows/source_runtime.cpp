@@ -28,6 +28,7 @@
 #include "cosmosim/core/profiling.hpp"
 #include "cosmosim/core/time_scheduler.hpp"
 #include "cosmosim/hydro/gas_thermodynamic_refresh.hpp"
+#include "cosmosim/hydro/hydro_core_solver.hpp"
 #include "cosmosim/physics/black_hole_agn.hpp"
 #include "cosmosim/physics/baryonic_runtime_config.hpp"
 #include "cosmosim/physics/thermochemistry_operator.hpp"
@@ -990,6 +991,50 @@ class SourceRuntimeImpl final : public SourceRuntime {
     }
   }
 
+  [[nodiscard]] bool recursiveAmrThermochemistryEnabled() const noexcept override {
+    return m_thermochemistry != nullptr &&
+        m_full_config.numerics.amr_time_stepping ==
+            core::AmrTimeSteppingConfigMode::kRecursiveSubcycling;
+  }
+
+  void executeRecursiveAmrThermochemistry(
+      core::StepContext& context, std::span<const std::uint32_t> rows,
+      const hydro::HydroUpdateContext& update, int level) override {
+    if (!recursiveAmrThermochemistryEnabled()) return;
+    (void)physics::ensureGasCompositionInitialized(context.state, m_physics_config);
+    prepareRecursiveChemistryAccumulator(context.integrator_state.step_index);
+    const physics::SourceInterval interval = makeSourceInterval(context, update);
+    executeThermochemistryInterval(context, interval, rows, false, level, true);
+    m_recursive_thermochemistry_completed_step = context.integrator_state.step_index;
+  }
+
+  [[nodiscard]] bool fillAmrCoolingTimes(
+      core::StepContext& context, std::span<double> cooling_time_code) override {
+    if (m_thermochemistry == nullptr) return false;
+    if (cooling_time_code.size() != context.state.cells.size()) {
+      throw std::invalid_argument(
+          "AMR thermochemistry cooling-time output must cover every dense gas row");
+    }
+    (void)physics::ensureGasCompositionInitialized(context.state, m_physics_config);
+    const double evaluation_scale_factor = m_is_cosmological
+        ? std::max(context.timeline_step.scale_factor_end, 1.0e-12)
+        : 1.0;
+    const physics::SourceInterval interval =
+        makeSourceInterval(context, evaluation_scale_factor);
+    const double seconds_per_code = m_units.timeSiPerCode();
+    if (!(seconds_per_code > 0.0) || !std::isfinite(seconds_per_code)) {
+      throw std::runtime_error("invalid source time unit while evaluating AMR cooling length");
+    }
+    for (std::uint32_t row = 0; row < context.state.cells.size(); ++row) {
+      const double seconds = m_thermochemistry->coolingTimeSeconds(
+          context.state, row, interval);
+      cooling_time_code[row] = std::isfinite(seconds)
+          ? seconds / seconds_per_code
+          : std::numeric_limits<double>::infinity();
+    }
+    return true;
+  }
+
   void captureRollbackCheckpoint() override {
     ControllerCheckpoint checkpoint;
     if (m_ssp_model != nullptr) {
@@ -1010,6 +1055,10 @@ class SourceRuntimeImpl final : public SourceRuntime {
     checkpoint.last_shadow_report = m_last_shadow_report;
     checkpoint.last_skipped_effective_rows = m_last_skipped_effective_rows;
     checkpoint.last_element_diffusion = m_last_element_diffusion;
+    checkpoint.recursive_thermochemistry_completed_step =
+        m_recursive_thermochemistry_completed_step;
+    checkpoint.recursive_chemistry_shadow = m_recursive_chemistry_shadow;
+    checkpoint.recursive_chemistry_shadow_step = m_recursive_chemistry_shadow_step;
     m_rollback_checkpoint = std::move(checkpoint);
   }
 
@@ -1036,6 +1085,10 @@ class SourceRuntimeImpl final : public SourceRuntime {
     m_last_shadow_report = c.last_shadow_report;
     m_last_skipped_effective_rows = c.last_skipped_effective_rows;
     m_last_element_diffusion = c.last_element_diffusion;
+    m_recursive_thermochemistry_completed_step =
+        c.recursive_thermochemistry_completed_step;
+    m_recursive_chemistry_shadow = c.recursive_chemistry_shadow;
+    m_recursive_chemistry_shadow_step = c.recursive_chemistry_shadow_step;
     m_particle_id_registry.invalidateOccupancyCache();
     // The chemistry promotion bias is re-derived from the restored sidecar
     // before the next fidelity decision (G0.4); nothing to restore here.
@@ -1286,7 +1339,16 @@ class SourceRuntimeImpl final : public SourceRuntime {
     // hydro already done): thermochemistry -> star formation -> stellar
     // evolution/feedback -> metal diffusion -> BH. Each source term has one
     // owner; cooling is never also applied inside the hydro solver.
-    executeThermochemistry(context, source_evaluation_scale_factor);
+    if (m_recursive_thermochemistry_completed_step !=
+        context.integrator_state.step_index) {
+      executeThermochemistry(context, source_evaluation_scale_factor);
+    } else {
+      // Recursive AMR evaluates thermochemistry/ISM/dust/SGS at each level
+      // clock. Keep the adaptive chemistry controller fixed throughout that
+      // accepted coarse interval, then publish exactly one collective update
+      // at the synchronization barrier.
+      finalizeRecursiveChemistryControl(context);
+    }
 
     const std::size_t cell_count = context.state.cells.size();
     const bool local_has_mutable_gravity_sources =
@@ -1665,6 +1727,36 @@ class SourceRuntimeImpl final : public SourceRuntime {
     return interval;
   }
 
+  [[nodiscard]] physics::SourceInterval makeSourceInterval(
+      const core::StepContext& context,
+      const hydro::HydroUpdateContext& update) const {
+    physics::SourceInterval interval;
+    interval.time_begin_code = update.time_begin_code;
+    interval.time_end_code = update.time_end_code;
+    if (!(interval.time_end_code > interval.time_begin_code)) {
+      interval.time_begin_code = context.timeline_step.time_begin_code;
+      interval.time_end_code = interval.time_begin_code + update.dt_code;
+    }
+    interval.scale_factor_begin = m_is_cosmological
+        ? std::max(update.scale_factor_begin, 1.0e-12) : 1.0;
+    interval.scale_factor_end = m_is_cosmological
+        ? std::max(update.scale_factor_end, interval.scale_factor_begin) : 1.0;
+    double elapsed_si = update.dt_code * m_units.timeSiPerCode();
+    if (m_is_cosmological && context.cosmology_background != nullptr &&
+        interval.scale_factor_end >= interval.scale_factor_begin) {
+      elapsed_si = context.cosmology_background->cosmicTimeIntervalSi(
+          interval.scale_factor_begin, interval.scale_factor_end);
+    }
+    interval.physical_seconds = std::max(elapsed_si, 0.0);
+    interval.evaluation_scale_factor = m_is_cosmological
+        ? std::max(update.scale_factor_end, 1.0e-12) : 1.0;
+    interval.evaluation_redshift = m_is_cosmological
+        ? std::max(0.0, 1.0 / interval.evaluation_scale_factor - 1.0) : 0.0;
+    interval.cosmological = m_is_cosmological;
+    interval.accepted_step_index = context.integrator_state.step_index;
+    return interval;
+  }
+
   // CHUI Part 2 thermochemistry stage. Staged inside a StageTransaction with
   // one collective vote: a cell that cannot integrate the full interval
   // rejects the stage on EVERY rank (kNumericalRetry) and nothing is
@@ -1673,13 +1765,23 @@ class SourceRuntimeImpl final : public SourceRuntime {
   void executeThermochemistry(core::StepContext& context, double source_evaluation_scale_factor) {
     (void)physics::ensureGasCompositionInitialized(context.state, m_physics_config);
     if (m_thermochemistry == nullptr) return;
-    const physics::SourceInterval interval = makeSourceInterval(context, source_evaluation_scale_factor);
+    const physics::SourceInterval interval =
+        makeSourceInterval(context, source_evaluation_scale_factor);
     const bool all_cells_active =
         !context.active_set.cells_are_subset && context.active_set.cell_indices.empty();
     const std::span<const std::uint32_t> rows = all_cells_active
         ? std::span<const std::uint32_t>{}
         : std::span<const std::uint32_t>(context.active_set.cell_indices);
-    const std::size_t row_count = all_cells_active ? context.state.cells.size() : rows.size();
+    executeThermochemistryInterval(context, interval, rows, all_cells_active, -1, false);
+  }
+
+  void executeThermochemistryInterval(
+      core::StepContext& context, const physics::SourceInterval& interval,
+      std::span<const std::uint32_t> rows, bool all_cells_active,
+      int recursive_level, bool defer_adaptive_control) {
+    if (m_thermochemistry == nullptr) return;
+    const std::size_t row_count =
+        all_cells_active ? context.state.cells.size() : rows.size();
     // Local source-stage atomicity (corrective gate): regime decisions,
     // fidelity tags, dwell counters, chemistry, dust and SGS are evaluated
     // from the step-start state, staged per row, and written together only
@@ -1732,7 +1834,11 @@ class SourceRuntimeImpl final : public SourceRuntime {
     const physics::ChemistryShadowReport current_shadow =
         local_work ? m_last_shadow_report : physics::ChemistryShadowReport{};
     if (!local_work) m_last_shadow_report = current_shadow;
-    updateGlobalChemistryControl(context, current_shadow);
+    if (defer_adaptive_control) {
+      accumulateRecursiveChemistryShadow(current_shadow);
+    } else {
+      updateGlobalChemistryControl(context, current_shadow);
+    }
     if (!touched.empty()) {
       context.state.notifyGasThermodynamicMutation();
       std::unique_ptr<physics::EffectiveIsmThermodynamicClosure> closure;
@@ -1743,7 +1849,7 @@ class SourceRuntimeImpl final : public SourceRuntime {
           .adiabatic_index = 5.0 / 3.0,
           .density_floor_code = m_hydro_density_floor_code,
           .pressure_floor_code = m_hydro_pressure_floor_code,
-          .scale_factor = source_evaluation_scale_factor,
+          .scale_factor = interval.evaluation_scale_factor,
           .redshift = interval.evaluation_redshift,
           .closure = closure.get(),
           .temperature_k_per_internal_energy_code =
@@ -1779,6 +1885,7 @@ class SourceRuntimeImpl final : public SourceRuntime {
                       {"sgs_dissipated_code", std::to_string(m_last_sgs_ledger.dissipated_to_heat_code)},
                       {"shadow_samples", std::to_string(m_last_shadow_report.samples)},
                       {"physical_seconds", std::to_string(interval.physical_seconds)},
+                      {"recursive_level", std::to_string(recursive_level)},
                       {"radiative_loss_erg", std::to_string(l.radiative_loss_erg)},
                       {"heating_gain_erg", std::to_string(l.heating_gain_erg)},
                       {"chemical_binding_delta_erg", std::to_string(l.chemical_binding_delta_erg)},
@@ -1821,6 +1928,50 @@ class SourceRuntimeImpl final : public SourceRuntime {
   void loadCommittedChemistryControl(const core::SimulationState& state) {
     if (m_thermochemistry == nullptr || !m_thermochemistry->config().adaptive.enabled) return;
     m_thermochemistry->setGlobalPromotionBias(committedPromotionBias(state));
+  }
+
+  void prepareRecursiveChemistryAccumulator(std::uint64_t step_index) {
+    if (m_recursive_chemistry_shadow_step == step_index) return;
+    m_recursive_chemistry_shadow = physics::ChemistryShadowReport{};
+    m_recursive_chemistry_shadow_step = step_index;
+  }
+
+  void accumulateRecursiveChemistryShadow(const physics::ChemistryShadowReport& current) {
+    const std::uint64_t old_samples = m_recursive_chemistry_shadow.samples;
+    const std::uint64_t new_samples = old_samples + current.samples;
+    m_recursive_chemistry_shadow.max_relative_species_difference =
+        std::max(m_recursive_chemistry_shadow.max_relative_species_difference,
+                 current.max_relative_species_difference);
+    m_recursive_chemistry_shadow.max_relative_electron_difference =
+        std::max(m_recursive_chemistry_shadow.max_relative_electron_difference,
+                 current.max_relative_electron_difference);
+    m_recursive_chemistry_shadow.max_relative_energy_difference =
+        std::max(m_recursive_chemistry_shadow.max_relative_energy_difference,
+                 current.max_relative_energy_difference);
+    if (new_samples > 0U) {
+      const double weighted =
+          m_recursive_chemistry_shadow.mean_substep_cost_ratio *
+              static_cast<double>(old_samples) +
+          current.mean_substep_cost_ratio * static_cast<double>(current.samples);
+      m_recursive_chemistry_shadow.mean_substep_cost_ratio =
+          weighted / static_cast<double>(new_samples);
+    }
+    m_recursive_chemistry_shadow.samples = new_samples;
+  }
+
+  void finalizeRecursiveChemistryControl(core::StepContext& context) {
+    const std::uint64_t step_index = context.integrator_state.step_index;
+    if (m_recursive_chemistry_shadow_step != step_index) {
+      // A recursively covered rank may have no local rows on every level.
+      // It still participates in the one synchronization-barrier reduction
+      // with a zero local report.
+      m_recursive_chemistry_shadow = physics::ChemistryShadowReport{};
+      m_recursive_chemistry_shadow_step = step_index;
+    }
+    m_last_shadow_report = m_recursive_chemistry_shadow;
+    updateGlobalChemistryControl(context, m_recursive_chemistry_shadow);
+    m_recursive_chemistry_shadow = physics::ChemistryShadowReport{};
+    m_recursive_chemistry_shadow_step = std::numeric_limits<std::uint64_t>::max();
   }
 
   void updateGlobalChemistryControl(core::StepContext& context,
@@ -3379,8 +3530,18 @@ class SourceRuntimeImpl final : public SourceRuntime {
     physics::ChemistryShadowReport last_shadow_report{};
     std::uint64_t last_skipped_effective_rows = 0U;
     physics::ElementDiffusionReport last_element_diffusion{};
+    std::uint64_t recursive_thermochemistry_completed_step =
+        std::numeric_limits<std::uint64_t>::max();
+    physics::ChemistryShadowReport recursive_chemistry_shadow{};
+    std::uint64_t recursive_chemistry_shadow_step =
+        std::numeric_limits<std::uint64_t>::max();
   };
   std::optional<ControllerCheckpoint> m_rollback_checkpoint;
+  std::uint64_t m_recursive_thermochemistry_completed_step =
+      std::numeric_limits<std::uint64_t>::max();
+  physics::ChemistryShadowReport m_recursive_chemistry_shadow{};
+  std::uint64_t m_recursive_chemistry_shadow_step =
+      std::numeric_limits<std::uint64_t>::max();
   DistributedParticleIdRegistry m_particle_id_registry;
   const parallel::MpiContext& m_mpi_context;
   const RuntimeServices* m_runtime_services = nullptr;

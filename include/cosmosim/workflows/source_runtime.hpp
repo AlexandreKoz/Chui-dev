@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <span>
 
 #include "cosmosim/core/config.hpp"
 #include "cosmosim/core/simulation_mode.hpp"
@@ -13,7 +14,11 @@
 
 namespace cosmosim::physics {
 class EffectiveMultiphaseEosTable;
-}  // namespace cosmosim::physics
+}
+
+namespace cosmosim::hydro {
+struct HydroUpdateContext;
+}  // namespace cosmosim::hydro
 
 namespace cosmosim::core {
 struct MemoryReport;
@@ -35,6 +40,18 @@ class SourceRuntime {
     return {0U, false, "source owner does not publish a complete memory model"};
   }
   [[nodiscard]] virtual core::MemoryReport memoryReport() const = 0;
+
+  // T02/A03 bridge: the hydro owner may ask the source owner to advance the
+  // stiff baryonic stage on one recursive AMR level after that level's hydro
+  // sweep, and to expose the same thermochemistry model's cooling time to the
+  // production regrid planner. The default implementation preserves legacy
+  // runtimes that do not own Part-2 thermochemistry.
+  [[nodiscard]] virtual bool recursiveAmrThermochemistryEnabled() const noexcept { return false; }
+  virtual void executeRecursiveAmrThermochemistry(
+      core::StepContext&, std::span<const std::uint32_t>,
+      const hydro::HydroUpdateContext&, int) {}
+  [[nodiscard]] virtual bool fillAmrCoolingTimes(
+      core::StepContext&, std::span<double>) { return false; }
 
   // G1.6 whole-step transaction: persistent source-controller state that
   // lives OUTSIDE SimulationState (model clamp/diagnostic counters, the

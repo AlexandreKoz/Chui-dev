@@ -31,8 +31,9 @@
 //    at level > child level (else blocked). Octets split across ranks are
 //    skipped (`skipped_remote_sibling`) — migration consolidation is the
 //    balance runtime's job.
-//  * Operations are ordered by ascending patch id and truncated at
-//    `max_operations` (deterministic budget).
+//  * Operations are ordered by ascending patch id. Mandatory refinement is
+//    emitted before optional requests and bypasses `max_operations`; only
+//    optional operations are truncated by that deterministic resource budget.
 //
 // Indicators (typed, A03 seam): cell mass, normalized density/pressure jump
 // (contact and shock), comoving Truelove-Jeans resolution
@@ -140,8 +141,14 @@ struct ProductionAmrRegridPlan {
   // R1: classification of refinement requests and budget outcome.
   std::size_t mandatory_refine_requests = 0;
   std::size_t optional_refine_requests = 0;
-  std::size_t mandatory_truncated_by_budget = 0;  // resolution requirement NOT met this pass (reported)
+  // Hard resolution requirements are never truncated by max_operations.
+  // These counters identify the two remaining reasons a mandatory request
+  // cannot be satisfied in the current pass; the runtime reports them and
+  // fails closed rather than advancing below a mandatory accuracy criterion.
+  std::size_t mandatory_truncated_by_budget = 0;  // retained for schema/telemetry compatibility; always zero
   std::size_t optional_truncated_by_budget = 0;
+  std::size_t mandatory_blocked_by_max_level = 0;
+  std::size_t mandatory_blocked_by_balance = 0;
   std::size_t required_patch_ids = 0;
   std::size_t required_gas_cell_ids = 0;
 };

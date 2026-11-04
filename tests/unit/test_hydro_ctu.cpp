@@ -193,6 +193,54 @@ void testFreeStreamPreservationWithPlmCtuIn3d() {
   CHUI_REQUIRE(profile.ctu_transverse_corrected_states == 2U * box.active_faces.size());
 }
 
+void testImportedGhostUsesCountedOneSidedCtuClosure() {
+  hy::HydroPatchGeometry geometry = hy::makeCartesianPatchGeometry(
+      hy::HydroCartesianPatchSpec{
+          .nx = 3U, .ny = 3U, .nz = 1U,
+          .cell_width_x_comoving = 1.0, .cell_width_y_comoving = 1.0,
+          .cell_width_z_comoving = 1.0});
+  hy::appendCartesianBoundaryGhostFaces(geometry, hy::HydroBoundaryKind::kOpen);
+  (void)hy::completeReconstructionStencils(geometry);
+  hy::HydroConservedStateSoa conserved;
+  conserved.resize(geometry.totalCellStorageCount());
+  for (std::size_t cell = 0; cell < geometry.cellCount(); ++cell) {
+    hy::HydroPrimitiveState primitive;
+    primitive.rho_comoving = 1.0 + 0.01 * static_cast<double>(cell);
+    primitive.vel_x_peculiar = 0.15;
+    primitive.vel_y_peculiar = -0.08;
+    primitive.pressure_comoving = 1.0;
+    conserved.storeCell(cell, hy::HydroCoreSolver::conservedFromPrimitive(primitive, k_gamma));
+  }
+  for (hy::HydroGhostCell& ghost : geometry.ghost_cells) {
+    ghost.boundary_kind = hy::HydroBoundaryKind::kImportedMpi;
+    ghost.mutation_rights = hy::HydroGhostMutationRights::kReadOnlyImported;
+    CHUI_REQUIRE(ghost.owner_real_cell < geometry.cellCount());
+    conserved.storeCell(ghost.ghost_cell, conserved.loadCell(ghost.owner_real_cell));
+  }
+  std::vector<std::size_t> active_cells(geometry.cellCount());
+  for (std::size_t i = 0; i < active_cells.size(); ++i) active_cells[i] = i;
+  std::vector<std::size_t> active_faces(geometry.faces.size());
+  for (std::size_t i = 0; i < active_faces.size(); ++i) active_faces[i] = i;
+  const hy::HydroCoreSolver solver(
+      k_gamma, hy::HydroNumericsPolicy{
+          .integration_scheme = hy::HydroIntegrationScheme::kCornerTransportUpwind});
+  const auto courant = hy::hydroTransportCourantFactors(0.05, 1.0, 1.0, 1.0, 1.0);
+  const hy::MusclHancockReconstruction reconstruction(hy::HydroReconstructionPolicy{
+      .dt_over_dx_code = courant[0], .dt_over_cell_width_code = courant,
+      .rho_floor = 1.0e-12, .pressure_floor = 1.0e-12,
+      .adiabatic_index = k_gamma});
+  hy::HllcRiemannSolver riemann;
+  hy::HydroScratchBuffers scratch;
+  hy::HydroProfileEvent profile;
+  const hy::HydroUpdateContext update{.dt_code = 0.05, .scale_factor = 1.0};
+  const hy::HydroSourceContext source{.update = update};
+  solver.advancePatchActiveSetWithScratch(
+      conserved, geometry,
+      hy::HydroActiveSetView{.active_cells = active_cells, .active_faces = active_faces},
+      update, reconstruction, riemann, {}, source, scratch, nullptr, &profile);
+  CHUI_REQUIRE(profile.ctu_transverse_boundary_proxy_states > 0U);
+}
+
 void testPeriodicStencilCompletion() {
   hy::HydroPatchGeometry geometry = hy::makeCartesianPatchGeometry(hy::HydroCartesianPatchSpec{
       .nx = 5, .ny = 1, .nz = 1,
@@ -226,6 +274,7 @@ int main() {
   testMusclHancockFamilyIsUnsplitDonorCell();
   testPeriodicBoxFaceEvaluatedOnce();
   testFreeStreamPreservationWithPlmCtuIn3d();
+  testImportedGhostUsesCountedOneSidedCtuClosure();
   testPeriodicStencilCompletion();
   return 0;
 }

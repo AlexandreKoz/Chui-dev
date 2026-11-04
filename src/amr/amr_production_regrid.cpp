@@ -334,41 +334,53 @@ ProductionAmrRegridPlan planProductionAmrRegrid(
   };
 
   if (policy.pass == AmrRegridPassKind::kRefineOnly) {
-    // R1: mandatory (resolution) requests are scheduled before optional
-    // (structure-tracking) ones; the budget truncates optional ones first.
-    std::vector<std::pair<bool, const PatchDescriptor*>> candidates;
-    for (const PatchDescriptor& patch : local) {
-      bool forced = false;
-      bool mandatory = false;
-      if (patchDecision(state, patch, policy, forced, &mandatory) != RefinementDecision::kRefine) continue;
-      candidates.emplace_back(mandatory, &patch);
-      if (mandatory) ++plan.mandatory_refine_requests; else ++plan.optional_refine_requests;
-    }
-    std::stable_partition(candidates.begin(), candidates.end(), [](const auto& c) { return c.first; });
-    for (const auto& [mandatory, patch_ptr] : candidates) {
-      const PatchDescriptor& patch = *patch_ptr;
-      ++plan.refine_requests;
-      if (patch.level >= policy.max_level) {
-        ++plan.blocked_by_max_level;
-        continue;
+    // R1/V02: mandatory (resolution) requests are never discarded by the
+    // optional operation budget.  Two deterministic passes avoid the former
+    // candidate vector + std::stable_partition scratch allocation entirely:
+    // mandatory requests are emitted first, then optional requests consume
+    // only the remaining configured budget.  Memory pressure is handled by
+    // the admitted transactional applier, not by silently violating a hard
+    // scientific resolution criterion.
+    const auto schedule_pass = [&](bool schedule_mandatory) {
+      for (const PatchDescriptor& patch : local) {
+        bool forced = false;
+        bool mandatory = false;
+        if (patchDecision(state, patch, policy, forced, &mandatory) != RefinementDecision::kRefine ||
+            mandatory != schedule_mandatory) {
+          continue;
+        }
+        ++plan.refine_requests;
+        if (mandatory) {
+          ++plan.mandatory_refine_requests;
+        } else {
+          ++plan.optional_refine_requests;
+        }
+        if (patch.level >= policy.max_level) {
+          ++plan.blocked_by_max_level;
+          if (mandatory) ++plan.mandatory_blocked_by_max_level;
+          continue;
+        }
+        if (!neighbourLevelsAtLeast(patch, static_cast<int>(patch.level), {})) {
+          ++plan.blocked_by_balance;
+          if (mandatory) ++plan.mandatory_blocked_by_balance;
+          continue;
+        }
+        if (!mandatory && plan.operations.size() >= policy.max_operations) {
+          ++plan.truncated_by_budget;
+          ++plan.optional_truncated_by_budget;
+          continue;
+        }
+        if (policy.gravity_softening_code > 0.0 && 0.5 * minCellWidth(patch) < policy.gravity_softening_code) {
+          ++plan.refined_below_gravity_softening;
+        }
+        const std::size_t cells = core::checkedSizeMultiply(cellCount(patch), 8U, "regrid refine cells");
+        plan.operations.push_back(ProductionAmrRegridOperation{
+            .kind = AmrRegridOperationKind::kRefine, .patch = patch,
+            .new_patch_ids = 8U, .new_gas_cell_ids = cells});
       }
-      if (!neighbourLevelsAtLeast(patch, static_cast<int>(patch.level), {})) {
-        ++plan.blocked_by_balance;
-        continue;
-      }
-      if (plan.operations.size() >= policy.max_operations) {
-        ++plan.truncated_by_budget;
-        if (mandatory) ++plan.mandatory_truncated_by_budget; else ++plan.optional_truncated_by_budget;
-        continue;
-      }
-      if (policy.gravity_softening_code > 0.0 && 0.5 * minCellWidth(patch) < policy.gravity_softening_code) {
-        ++plan.refined_below_gravity_softening;
-      }
-      const std::size_t cells = core::checkedSizeMultiply(cellCount(patch), 8U, "regrid refine cells");
-      plan.operations.push_back(ProductionAmrRegridOperation{
-          .kind = AmrRegridOperationKind::kRefine, .patch = patch,
-          .new_patch_ids = 8U, .new_gas_cell_ids = cells});
-    }
+    };
+    schedule_pass(true);
+    schedule_pass(false);
   } else {
     // Group local leaves by parent id (deterministic: std::map ordered by id).
     std::map<std::uint64_t, std::vector<PatchDescriptor>> octets;

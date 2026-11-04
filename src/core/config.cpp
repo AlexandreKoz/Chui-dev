@@ -2162,12 +2162,15 @@ void validateConfig(const SimulationConfig& config) {
   }
   if (config.numerics.amr_refine_cooling_length_cells > 0.0 &&
       (!config.physics.enable_cooling ||
-       config.physics.thermochemistry_backend != ThermochemistryBackendMode::kLegacyCooling)) {
-    // Explicit refusal, not a silent no-op: the cooling time is evaluated from
-    // the in-solver legacy cooling-rate provider. Part 2 backends own cooling
-    // in the SourceRuntime and do not yet publish per-cell cooling times.
+       (config.physics.thermochemistry_backend != ThermochemistryBackendMode::kLegacyCooling &&
+        config.physics.thermochemistry_backend != ThermochemistryBackendMode::kFixedHybrid &&
+        config.physics.thermochemistry_backend != ThermochemistryBackendMode::kFixedDetailed &&
+        config.physics.thermochemistry_backend != ThermochemistryBackendMode::kEquilibriumPrimordial))) {
+    // Explicit refusal, not a silent no-op. Legacy cooling publishes its
+    // cooling time directly; Part-2 thermochemistry publishes the cooling
+    // time from the same solver/rate set that evolves the gas.
     throw ConfigError("numerics.amr_refine_cooling_length_cells > 0 requires physics.enable_cooling = true with "
-                      "thermochemistry_backend = legacy_cooling (Part 2 backends do not publish cooling times)");
+                      "legacy_cooling or a Part-2 thermochemistry backend");
   }
   if (config.numerics.amr_refine_species_jump > 0.0 &&
       config.physics.thermochemistry_backend != ThermochemistryBackendMode::kFixedHybrid &&

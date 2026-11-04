@@ -123,6 +123,11 @@ At patch boundaries the owner side of every boundary face is corrected (the
 owner is a real cell with all its faces); the ghost side has no transverse
 faces and keeps the normal-only state - counted per face side as
 `ctu_transverse_degraded_states` (the corrector is not silently dropped).
+Imported AMR/MPI ghosts that carry a validated adjacent real owner use that
+owner's transverse increment as a one-sided boundary proxy; these states are
+counted separately in `ctu_transverse_boundary_proxy_states`. This avoids an
+unconditional normal-only reduction while remaining explicit that a full
+ghost-centred transverse stencil is not available on that side.
 Periodic ghosts use their wrapped real cell, so periodic boxes are corrected
 on both sides. Inadmissible corrected states keep the normal-only state
 (`ctu_transverse_inadmissible_states`). For partial active sets the

@@ -95,11 +95,11 @@ struct ProductionAmrHydroOptions {
   core::MemoryGovernor* regrid_memory_governor = nullptr;
   // Spatial reconstruction and limiter used for every patch advance. The
   // time-integration family (MUSCL-Hancock / CTU) and dual-energy policy are
-  // owned by the HydroCoreSolver passed to the advance entry points. PPM and
-  // CTU use the patch-interior stencils; within two cells of a patch boundary
-  // PPM reduces to PLM and CTU transverse terms from non-periodic ghosts are
-  // omitted (both counted in HydroProfileEvent / diagnostics). Multi-layer
-  // AMR ghost shells are Part 3 scope.
+  // owned by the HydroCoreSolver passed to the advance entry points. PPM uses
+  // the multi-layer normal stencil. Imported AMR/MPI ghost sides use the
+  // adjacent real owner's transverse increment as a counted one-sided CTU
+  // boundary closure; physical open/reflective ghosts retain the normal-only
+  // fallback. Boundary convergence remains a qualification requirement.
   hydro::HydroReconstructionScheme reconstruction_scheme = hydro::HydroReconstructionScheme::kPiecewiseLinear;
   hydro::HydroSlopeLimiter slope_limiter = hydro::HydroSlopeLimiter::kMonotonizedCentral;
   // Periodic box extent in the patch coordinate frame (comoving), required
@@ -116,6 +116,19 @@ struct ProductionAmrHydroOptions {
   // coarse/fine and rank interfaces. A non-zero value overrides (tests).
   std::uint8_t ghost_layers = 0;
   AmrThermodynamicCachePolicy thermodynamic_cache{};
+
+  // T02 closure: optional workflow-owned stiff-source callback invoked after
+  // every recursive level hydro sweep and before the level end-state history
+  // is published. It is invoked on every rank for every global level clock,
+  // including ranks with an empty row span, so callback collectives have a
+  // deterministic ordering. The callback must either commit its whole row
+  // subset or throw; the recursive driver reduces failures before advancing.
+  using RecursiveLevelSourceCallback = void (*)(
+      void* user_data, core::SimulationState& state,
+      std::span<const std::uint32_t> level_rows, int level,
+      const hydro::HydroUpdateContext& update);
+  void* recursive_level_source_user_data = nullptr;
+  RecursiveLevelSourceCallback recursive_level_source_callback = nullptr;
 };
 
 // Complete physical workspace for immutable step-start ghost snapshots.
@@ -129,6 +142,7 @@ struct ProductionAmrHydroDiagnostics {
   std::uint64_t positivity_fallback_count = 0;
   std::uint64_t stencil_degradation_count = 0;
   std::uint64_t ctu_transverse_degraded_states = 0;
+  std::uint64_t ctu_transverse_boundary_proxy_states = 0;
   std::uint64_t dual_energy_auxiliary_cells = 0;
   // Ghost rows whose auxiliary energy could not be resolved from a local
   // source cell (remote sources): dual-energy protection degraded there.

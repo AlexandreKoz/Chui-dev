@@ -1120,16 +1120,30 @@ constexpr std::size_t k_invalid_touched_slot = static_cast<std::size_t>(-1);
 [[nodiscard]] std::size_t transverseSourceCell(
     const HydroPatchGeometry& geometry,
     std::size_t cell_index,
-    std::size_t real_cell_count) {
+    std::size_t real_cell_count,
+    bool& used_boundary_proxy) {
+  used_boundary_proxy = false;
   if (cell_index < real_cell_count) {
     return cell_index;
   }
-  if (cell_index == k_invalid_cell_index || cell_index - real_cell_count >= geometry.ghost_cells.size()) {
+  if (cell_index == k_invalid_cell_index ||
+      cell_index - real_cell_count >= geometry.ghost_cells.size()) {
     return k_invalid_cell_index;
   }
   const HydroGhostCell& ghost = geometry.ghost_cells[cell_index - real_cell_count];
   if (ghost.boundary_kind == HydroBoundaryKind::kPeriodic) {
     return ghost.source_real_cell;
+  }
+  // Distributed/same-level/coarse-fine AMR ghosts contain a valid imported
+  // normal predictor but do not own the transverse neighbor faces needed to
+  // construct a second local CTU delta. Use the adjacent real owner cell's
+  // transverse increment as the one-sided boundary closure. Physical open /
+  // reflective boundaries intentionally keep their existing normal-only
+  // fallback.
+  if (ghost.mutation_rights == HydroGhostMutationRights::kReadOnlyImported &&
+      ghost.owner_real_cell < real_cell_count) {
+    used_boundary_proxy = true;
+    return ghost.owner_real_cell;
   }
   return k_invalid_cell_index;
 }
@@ -1290,6 +1304,7 @@ void HydroCoreSolver::advancePatchActiveSetBatchedWithScratch(
   std::uint64_t riemann_solve_count = 0U;
   std::uint64_t ctu_corrected = 0U;
   std::uint64_t ctu_degraded = 0U;
+  std::uint64_t ctu_boundary_proxy = 0U;
   std::uint64_t ctu_inadmissible = 0U;
   const double flux_scale = update.dt_code / (update.scale_factor * geometry.cell_volume_comoving);
   // Floors used only to judge admissibility of CTU-corrected face states.
@@ -1375,8 +1390,10 @@ void HydroCoreSolver::advancePatchActiveSetBatchedWithScratch(
 
   // Half of the CTU transverse increment of `cell` excluding `face_axis`.
   const auto halfTransverse = [&](std::size_t cell, std::size_t face_axis,
-                                  HydroConservedState& out) -> bool {
-    const std::size_t source_cell = transverseSourceCell(geometry, cell, real_cell_count);
+                                  HydroConservedState& out,
+                                  bool& used_boundary_proxy) -> bool {
+    const std::size_t source_cell = transverseSourceCell(
+        geometry, cell, real_cell_count, used_boundary_proxy);
     if (source_cell == k_invalid_cell_index) {
       return false;
     }
@@ -1447,7 +1464,9 @@ void HydroCoreSolver::advancePatchActiveSetBatchedWithScratch(
         const HydroFace& face = geometry.faces[active_set.active_faces[batch_begin + slot]];
         const std::size_t axis = faceAxisIndex(face.axis);
         HydroConservedState half_transverse;
-        if (halfTransverse(face.owner_cell, axis, half_transverse)) {
+        bool boundary_proxy = false;
+        if (halfTransverse(face.owner_cell, axis, half_transverse, boundary_proxy)) {
+          if (boundary_proxy) ++ctu_boundary_proxy;
           if (applyTransverseCorrection(scratch.left_states[slot], half_transverse,
                   m_adiabatic_index, k_state_floor, k_state_floor)) {
             ++ctu_corrected;
@@ -1457,8 +1476,10 @@ void HydroCoreSolver::advancePatchActiveSetBatchedWithScratch(
         } else {
           ++ctu_degraded;
         }
+        boundary_proxy = false;
         if (face.neighbor_cell != k_invalid_cell_index &&
-            halfTransverse(face.neighbor_cell, axis, half_transverse)) {
+            halfTransverse(face.neighbor_cell, axis, half_transverse, boundary_proxy)) {
+          if (boundary_proxy) ++ctu_boundary_proxy;
           if (applyTransverseCorrection(scratch.right_states[slot], half_transverse,
                   m_adiabatic_index, k_state_floor, k_state_floor)) {
             ++ctu_corrected;
@@ -1704,6 +1725,7 @@ void HydroCoreSolver::advancePatchActiveSetBatchedWithScratch(
     profile->riemann_solve_count += riemann_solve_count;
     profile->ctu_transverse_corrected_states += ctu_corrected;
     profile->ctu_transverse_degraded_states += ctu_degraded;
+    profile->ctu_transverse_boundary_proxy_states += ctu_boundary_proxy;
     profile->ctu_transverse_inadmissible_states += ctu_inadmissible;
     profile->dual_energy_auxiliary_cells += dual_energy_auxiliary_cells;
     profile->dual_energy_unknown_auxiliary_cells += dual_energy_unknown_auxiliary_cells;

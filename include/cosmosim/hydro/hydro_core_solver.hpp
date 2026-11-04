@@ -471,6 +471,12 @@ struct HydroProfileEvent {
   // Side state whose cell had no transverse information (non-periodic
   // ghost / imported MPI ghost): normal-only predictor used.
   std::uint64_t ctu_transverse_degraded_states = 0;
+  // Imported AMR/MPI ghost side corrected with the adjacent owner's
+  // transverse increment. This one-sided CTU closure preserves temporal
+  // centering at a distributed/coarse-fine interface without pretending the
+  // remote ghost owns a local transverse-flux stencil. Qualification still
+  // requires the boundary convergence tests.
+  std::uint64_t ctu_transverse_boundary_proxy_states = 0;
   // Corrected state was inadmissible; normal-only predictor used.
   std::uint64_t ctu_transverse_inadmissible_states = 0;
   // Cells whose final thermal energy came from the auxiliary update.
