@@ -1163,10 +1163,12 @@ if(COSMOSIM_ENABLE_TESTS)
       chui_part3_remote_sources
       config_chui_part3
       treepm_amr_force_resolution
-      zoom_contamination)
+      zoom_contamination
+      chui_part3_adaptive_and_decks)
   foreach(chui_part3_test IN LISTS CHUI_PART3_UNIT_TESTS)
     add_executable(test_unit_${chui_part3_test} tests/unit/test_${chui_part3_test}.cpp)
     target_include_directories(test_unit_${chui_part3_test} PRIVATE ${PROJECT_SOURCE_DIR}/src)
+    target_compile_definitions(test_unit_${chui_part3_test} PRIVATE COSMOSIM_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
     target_link_libraries(test_unit_${chui_part3_test} PRIVATE cosmosim_all)
     add_test(NAME unit_${chui_part3_test} COMMAND test_unit_${chui_part3_test})
     set_tests_properties(unit_${chui_part3_test} PROPERTIES SKIP_RETURN_CODE 77 LABELS "chui_part3;unit")
@@ -2654,6 +2656,9 @@ if(COSMOSIM_ENABLE_BENCHMARKS)
   target_link_libraries(bench_hydro_kernels PRIVATE cosmosim_hydro)
   target_include_directories(bench_hydro_kernels PRIVATE ${PROJECT_SOURCE_DIR})
 
+  # CHUI Part 3 kernel microbenchmarks (NOT RUN — USER-RESERVED).
+  add_executable(bench_chui_part3_kernels bench/chui_part3/bench_chui_part3_kernels.cpp)
+  target_link_libraries(bench_chui_part3_kernels PRIVATE cosmosim_all)
   add_executable(bench_hydro_method_matrix bench/hydro/bench_hydro_method_matrix.cpp)
   target_link_libraries(bench_hydro_method_matrix PRIVATE cosmosim_hydro)
   target_include_directories(bench_hydro_method_matrix PRIVATE ${PROJECT_SOURCE_DIR})

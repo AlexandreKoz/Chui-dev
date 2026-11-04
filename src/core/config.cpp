@@ -1424,6 +1424,7 @@ struct ConfigKeySpec {
       {"numerics.amr_max_level", "10"},
       {"numerics.amr_regrid_mode", "off"},
       {"numerics.global_step_max_retries", "0"},
+      {"numerics.amr_predictive_feedback_age_years", "0.0"},
       {"numerics.amr_regrid_interval_steps", "1"},
       {"numerics.amr_regrid_max_operations", "64"},
       {"numerics.amr_refine_cell_mass_code", "0.0"},
@@ -2102,6 +2103,12 @@ void validateConfig(const SimulationConfig& config) {
       config.numerics.hydro_dual_energy_eta <= 0.0 ||
       config.numerics.hydro_dual_energy_eta >= 1.0) {
     throw ConfigError("numerics.hydro_dual_energy_eta must be finite and in (0, 1)");
+  }
+  if (!std::isfinite(config.numerics.amr_predictive_feedback_age_years) ||
+      config.numerics.amr_predictive_feedback_age_years < 0.0 ||
+      (config.numerics.amr_predictive_feedback_age_years > 0.0 &&
+       config.numerics.amr_regrid_mode != AmrRegridConfigMode::kAutomatic)) {
+    throw ConfigError("numerics.amr_predictive_feedback_age_years must be >= 0 and requires amr_regrid_mode = automatic");
   }
   if (config.numerics.global_step_max_retries < 0 || config.numerics.global_step_max_retries > 32) {
     throw ConfigError("numerics.global_step_max_retries must be in [0, 32]");
@@ -3028,6 +3035,7 @@ class NormalizedConfigStream {
   stream << "amr_max_level = " << frozen.config.numerics.amr_max_level << '\n';
   stream << "amr_regrid_mode = " << amrRegridConfigModeToString(frozen.config.numerics.amr_regrid_mode) << '\n';
   stream << "global_step_max_retries = " << frozen.config.numerics.global_step_max_retries << '\n';
+  stream << "amr_predictive_feedback_age_years = " << frozen.config.numerics.amr_predictive_feedback_age_years << '\n';
   stream << "amr_regrid_interval_steps = " << frozen.config.numerics.amr_regrid_interval_steps << '\n';
   stream << "amr_regrid_max_operations = " << frozen.config.numerics.amr_regrid_max_operations << '\n';
   stream << "amr_refine_cell_mass_code = " << frozen.config.numerics.amr_refine_cell_mass_code << '\n';
@@ -3802,6 +3810,9 @@ class NormalizedConfigStream {
       requireString(entries, consumed, "numerics.amr_max_level", "10"), "numerics.amr_max_level");
   frozen.config.numerics.amr_regrid_mode = parseAmrRegridConfigMode(requireString(
       entries, consumed, "numerics.amr_regrid_mode", defaultFor("numerics.amr_regrid_mode")));
+  frozen.config.numerics.amr_predictive_feedback_age_years = parseFloating(
+      requireString(entries, consumed, "numerics.amr_predictive_feedback_age_years",
+                    defaultFor("numerics.amr_predictive_feedback_age_years")), "numerics.amr_predictive_feedback_age_years");
   frozen.config.numerics.global_step_max_retries = parseNumber<int>(
       requireString(entries, consumed, "numerics.global_step_max_retries",
                     defaultFor("numerics.global_step_max_retries")), "numerics.global_step_max_retries");

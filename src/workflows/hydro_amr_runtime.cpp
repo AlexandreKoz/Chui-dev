@@ -22,6 +22,7 @@
 
 #include "cosmosim/amr/amr_hydro_orchestrator.hpp"
 #include "cosmosim/amr/amr_production_regrid.hpp"
+#include "cosmosim/amr/amr_patch_indexing.hpp"
 #include "cosmosim/parallel/composition_exchange.hpp"
 #include "cosmosim/core/checked_arithmetic.hpp"
 #include "cosmosim/core/memory_accounting.hpp"
@@ -2662,6 +2663,36 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
       policy.gravity_softening_code = softening_kpc > 0.0 ? softening_kpc * k_kpc_m / units.length_si_per_code : 0.0;
     }
 
+    // A04 predictive event-aware refinement: cells hosting young stars
+    // (pending CC SN / wind events) are refined BEFORE their deposition.
+    // Deterministic (host cell = leaf cell containing the star), bounded by
+    // the star count; the physical event budgets are unchanged.
+    std::vector<std::uint32_t> forced_rows;
+    const double predictive_age = m_config.numerics.amr_predictive_feedback_age_years;
+    if (predictive_age > 0.0 && context.state.star_particles.size() > 0U) {
+      const auto descriptors = amr::buildProductionAmrPatchDescriptors(context.state);
+      for (std::size_t s = 0; s < context.state.star_particles.size(); ++s) {
+        if (!(context.state.star_particles.stellar_age_years_last[s] < predictive_age)) continue;
+        const std::uint32_t p = context.state.star_particles.particle_index[s];
+        const std::array<double, 3> position{context.state.particles.position_x_comoving[p],
+                                             context.state.particles.position_y_comoving[p],
+                                             context.state.particles.position_z_comoving[p]};
+        for (const amr::PatchDescriptor& patch : descriptors) {
+          bool inside = true;
+          for (std::size_t c = 0; c < 3U && inside; ++c) {
+            inside = position[c] >= patch.origin_comov[c] && position[c] < patch.origin_comov[c] + patch.extent_comov[c];
+          }
+          if (!inside) continue;
+          const auto cell = amr::patchLocalCellForPoint(patch, position, "predictive refinement host cell");
+          const auto rows = amr::rowsForPatchLocalCellOrder(context.state, patch, "predictive refinement");
+          if (cell.linear_index < rows.size()) forced_rows.push_back(rows[cell.linear_index]);
+          break;
+        }
+      }
+      std::sort(forced_rows.begin(), forced_rows.end());
+      forced_rows.erase(std::unique(forced_rows.begin(), forced_rows.end()), forced_rows.end());
+      policy.forced_refine_rows = forced_rows;
+    }
     std::exception_ptr failure;
     amr::ProductionAmrRegridPlan plan;
     try {

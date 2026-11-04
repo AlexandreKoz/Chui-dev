@@ -1658,6 +1658,7 @@ class SourceRuntimeImpl final : public SourceRuntime {
       m_last_shadow_report = report.shadow;
       m_last_skipped_effective_rows = report.skipped_effective_rows;
     }
+    updateGlobalChemistryControl(context);
     if (!touched.empty()) {
       context.state.notifyGasThermodynamicMutation();
       std::unique_ptr<physics::EffectiveIsmThermodynamicClosure> closure;
@@ -1714,6 +1715,39 @@ class SourceRuntimeImpl final : public SourceRuntime {
                       {"element_projection_residual", std::to_string(l.element_mass_residual_code)},
                       {"charge_residual", std::to_string(l.charge_residual)}}});
     }
+  }
+
+  // CHUI Part 3 Checkpoint F (C03/C04): global error-aware fidelity control.
+  // Every rank reduces the sampled shadow disagreement (max) and sample count
+  // (sum), applies the same deterministic control law, and persists the bias
+  // in module sidecar "chui_adaptive_chemistry_control_v1" so a restart
+  // continues with the identical decision history.
+  void updateGlobalChemistryControl(core::StepContext& context) {
+    if (m_thermochemistry == nullptr || !m_thermochemistry->config().adaptive.enabled) return;
+    const auto* stored = context.state.sidecars.find("chui_adaptive_chemistry_control_v1");
+    if (!m_chemistry_control_restored && stored != nullptr) {
+      const std::string text(reinterpret_cast<const char*>(stored->payload.data()), stored->payload.size());
+      const auto pos = text.find("promotion_bias=");
+      if (pos != std::string::npos) m_thermochemistry->setGlobalPromotionBias(std::stod(text.substr(pos + 15)));
+    }
+    m_chemistry_control_restored = true;
+    const double global_max = -m_mpi_context.allreduceMinDouble(-m_last_shadow_report.max_relative_species_difference);
+    const std::uint64_t global_samples = m_mpi_context.allreduceSumUint64(m_last_shadow_report.samples);
+    const double bias = physics::nextChemistryPromotionBias(
+        m_thermochemistry->globalPromotionBias(), global_max, global_samples);
+    m_thermochemistry->setGlobalPromotionBias(bias);
+    std::ostringstream text;
+    text.precision(17);
+    text << "module=chui_adaptive_chemistry_control\npromotion_bias=" << bias
+         << "\nlast_global_shadow_max_relative_species_difference=" << global_max
+         << "\nlast_global_shadow_samples=" << global_samples << "\n";
+    const std::string payload = text.str();
+    core::ModuleSidecarBlock block;
+    block.module_name = "chui_adaptive_chemistry_control_v1";
+    block.schema_version = 1U;
+    block.payload.resize(payload.size());
+    for (std::size_t i = 0; i < payload.size(); ++i) block.payload[i] = static_cast<std::byte>(payload[i]);
+    context.state.sidecars.upsert(std::move(block));
   }
 
   // CHUI Part 3 Checkpoint C: remote star-formation neighbours. The directed
@@ -2992,6 +3026,7 @@ class SourceRuntimeImpl final : public SourceRuntime {
   physics::DustUpdateLedger m_last_dust_ledger{};
   physics::SgsLedger m_last_sgs_ledger{};
   physics::ChemistryShadowReport m_last_shadow_report{};
+  bool m_chemistry_control_restored = false;
   std::uint64_t m_last_skipped_effective_rows = 0U;
   physics::BaryonicSourceStageConfig m_source_stage_config{};
   DistributedParticleIdRegistry m_particle_id_registry;

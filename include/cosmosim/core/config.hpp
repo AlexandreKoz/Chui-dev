@@ -428,6 +428,10 @@ struct NumericsConfig {
   AmrRegridConfigMode amr_regrid_mode = AmrRegridConfigMode::kOff;
   // CHUI Part 3 collective global-step rollback (rung zero): 0 disables.
   int global_step_max_retries = 0;
+  // CHUI Part 3 (A04 RESEARCH): predictive event-aware refinement of cells
+  // hosting stars younger than this age (pending CC SN / wind feedback);
+  // 0 disables. Requires amr_regrid_mode = automatic.
+  double amr_predictive_feedback_age_years = 0.0;
   int amr_regrid_interval_steps = 1;
   int amr_regrid_max_operations = 64;
   double amr_refine_cell_mass_code = 0.0;

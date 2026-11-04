@@ -3441,6 +3441,7 @@ std::string restartConfigurationCompatibilityRecord(
       // CHUI Part 3 regrid keys must hold their (static-hierarchy) defaults.
       current.config.numerics.amr_regrid_mode != core::AmrRegridConfigMode::kOff ||
       current.config.numerics.global_step_max_retries != 0 ||
+      current.config.numerics.amr_predictive_feedback_age_years != 0.0 ||
       current.config.numerics.amr_regrid_interval_steps != 1 ||
       current.config.numerics.amr_regrid_max_operations != 64 ||
       current.config.numerics.amr_refine_cell_mass_code != 0.0 ||
@@ -3570,7 +3571,8 @@ std::string restartConfigurationCompatibilityRecord(
   // (all values verified at their defaults above).
   if (projected.find("\namr_regrid_mode = ") != std::string::npos &&
       restart.normalized_config_text.find("\namr_regrid_mode = ") == std::string::npos) {
-    removeKeyLines({"amr_regrid_mode", "global_step_max_retries", "amr_regrid_interval_steps", "amr_regrid_max_operations",
+    removeKeyLines({"amr_regrid_mode", "global_step_max_retries", "amr_predictive_feedback_age_years",
+        "amr_regrid_interval_steps", "amr_regrid_max_operations",
         "amr_refine_cell_mass_code", "amr_refine_jump_threshold", "amr_refine_jeans_cells",
         "amr_derefine_hysteresis"});
   }
