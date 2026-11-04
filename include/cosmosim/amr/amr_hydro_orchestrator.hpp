@@ -41,6 +41,20 @@ struct AmrThermodynamicCachePolicy {
   double dual_energy_eta = 1.0e-3;
 };
 
+// CHUI Part 3 Milestone I: reflux interval of one coarse/fine level pair
+// (coarse level = index into ProductionAmrHydroOptions::
+// reflux_intervals_by_coarse_level). A level-L sweep records registers of two
+// pairs: (L-1, L) as the fine side (substep k of the level-(L-1) interval)
+// and (L, L+1) as the coarse side (its own interval, substep 0).
+struct AmrLevelRefluxInterval {
+  double interval_start_code = 0.0;
+  double interval_end_code = 0.0;
+  double coarse_dt_code = 0.0;
+  std::uint32_t substeps_per_interval = 1;
+  std::uint32_t substep_index = 0;
+  bool valid = false;
+};
+
 struct ProductionAmrHydroOptions {
   hydro::HydroBoundaryKind physical_boundary_kind = hydro::HydroBoundaryKind::kOpen;
   double adiabatic_index = 5.0 / 3.0;
@@ -54,6 +68,10 @@ struct ProductionAmrHydroOptions {
   double reflux_coarse_dt_code = 0.0;
   std::uint32_t expected_fine_substeps = 1;
   std::uint32_t fine_substep_index = 0;
+  // When non-empty, register intervals are taken per entry from this table
+  // (indexed by the register's coarse level) instead of the scalar fields
+  // above; an entry whose level has no valid interval fails closed.
+  std::span<const AmrLevelRefluxInterval> reflux_intervals_by_coarse_level{};
   // Explicit AMR hydro state/ghost time.  Ghosts are consumed at update
   // step-start before the in-solver MUSCL-Hancock predictor evolves them.
   double state_time_code = 0.0;
@@ -278,6 +296,23 @@ void prepareAmrActiveLevelRows(
     std::span<const hydro::HydroSourceTerm* const> source_terms,
     const ProductionAmrHydroOptions& options,
     const DistributedAmrHydroExchange& exchange);
+
+// CHUI Part 3 Milestone I: recursive Berger-Oliger subcycling over every
+// level present (>= 2, no upper limit). Level L advances r^(L - L_min) times
+// per coarse step with dt_L = dt / r^(L - L_min); coarse-to-fine ghosts use
+// the parent level's nested temporal history; fine-to-coarse ghosts use the
+// synchronized fine state; the (L, L+1) reflux is applied once level L+1 has
+// completed all substeps of the level-L interval. Single-rank (local
+// hierarchy); a distributed recursive sweep is refused (see handoff).
+[[nodiscard]] ProductionAmrHydroDiagnostics advanceProductionAmrHydroRecursive(
+    core::SimulationState& state,
+    std::span<const std::uint32_t> active_cell_rows,
+    const hydro::HydroUpdateContext& coarse_update,
+    const hydro::HydroSourceContext& global_source_context,
+    const hydro::HydroCoreSolver& solver,
+    const hydro::HydroRiemannSolver& riemann_solver,
+    std::span<const hydro::HydroSourceTerm* const> source_terms,
+    const ProductionAmrHydroOptions& options = {});
 
 [[nodiscard]] ProductionAmrHydroDiagnostics advanceProductionAmrHydroSubcycled(
     core::SimulationState& state,

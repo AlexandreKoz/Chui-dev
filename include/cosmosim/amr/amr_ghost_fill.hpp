@@ -97,6 +97,19 @@ void captureAmrTemporalBoundaryHistoryEnd(
     double adiabatic_index, core::MemoryGovernor* governor = nullptr);
 void retireAmrTemporalBoundaryHistory(core::SimulationState& state);
 
+// CHUI Part 3 Milestone I: nested per-level intervals for recursive
+// subcycling (>= 3 levels). StartForLevel captures only level-`level` coarse
+// sources and refuses if that level already has an open interval; records of
+// other levels are preserved. EndForLevel completes only that level (level
+// -1 = all, the historical behaviour); RetireLevel removes only that level.
+void captureAmrTemporalBoundaryHistoryStartForLevel(
+    core::SimulationState& state, std::span<const PatchDescriptor> patches, int level,
+    double interval_start_code, double adiabatic_index, core::MemoryGovernor* governor = nullptr);
+void captureAmrTemporalBoundaryHistoryEndForLevel(
+    core::SimulationState& state, std::span<const PatchDescriptor> patches, int level,
+    double interval_end_code, double adiabatic_index, core::MemoryGovernor* governor = nullptr);
+void retireAmrTemporalBoundaryHistoryLevel(core::SimulationState& state, int level);
+
 
 // A single reusable selection is sufficient: at most one record per source
 // cell can contribute to any ghost. No theoretical refinement-volume bitmap

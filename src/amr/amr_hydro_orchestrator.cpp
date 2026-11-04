@@ -1586,14 +1586,38 @@ void validatePendingCompatible(
   }
 }
 
+// Interval of the register's level pair: the per-level table when supplied
+// (recursive subcycling), else the historical scalar option fields.
+[[nodiscard]] AmrLevelRefluxInterval refluxIntervalForEntry(
+    const FluxRegisterEntry& entry, const ProductionAmrHydroOptions& options) {
+  if (!options.reflux_intervals_by_coarse_level.empty()) {
+    const std::size_t level = entry.level;
+    if (level >= options.reflux_intervals_by_coarse_level.size() ||
+        !options.reflux_intervals_by_coarse_level[level].valid) {
+      throw std::runtime_error(
+          "recursive AMR reflux: register of coarse level " + std::to_string(level) +
+          " has no open level interval (fail closed)");
+    }
+    return options.reflux_intervals_by_coarse_level[level];
+  }
+  return AmrLevelRefluxInterval{
+      .interval_start_code = options.reflux_interval_start_code,
+      .interval_end_code = options.reflux_interval_end_code,
+      .coarse_dt_code = options.reflux_coarse_dt_code,
+      .substeps_per_interval = options.expected_fine_substeps,
+      .substep_index = options.fine_substep_index,
+      .valid = true};
+}
+
 [[nodiscard]] core::PendingFluxRegisterRecord makePendingRecordSeed(
     const core::SimulationState& state,
     const FluxRegisterEntry& entry,
     const ProductionAmrHydroOptions& options) {
-  const double coarse_dt = options.reflux_coarse_dt_code > 0.0 ? options.reflux_coarse_dt_code : entry.dt_code;
-  const double interval_start = options.reflux_interval_start_code;
-  const double interval_end = options.reflux_interval_end_code > interval_start
-      ? options.reflux_interval_end_code
+  const AmrLevelRefluxInterval pair = refluxIntervalForEntry(entry, options);
+  const double coarse_dt = pair.coarse_dt_code > 0.0 ? pair.coarse_dt_code : entry.dt_code;
+  const double interval_start = pair.interval_start_code;
+  const double interval_end = pair.interval_end_code > interval_start
+      ? pair.interval_end_code
       : interval_start + coarse_dt;
   const double expected_area = std::max({entry.face_area_comov, entry.coarse_area_comov, entry.fine_area_comov, 0.0});
   return core::PendingFluxRegisterRecord{
@@ -1608,7 +1632,7 @@ void validatePendingCompatible(
       .interval_start_code = interval_start,
       .interval_end_code = interval_end,
       .coarse_dt_code = coarse_dt,
-      .expected_fine_substeps = std::max<std::uint32_t>(1U, options.expected_fine_substeps),
+      .expected_fine_substeps = std::max<std::uint32_t>(1U, pair.substeps_per_interval),
       .gas_cell_identity_generation = state.gasCellIdentityGeneration(),
       .patch_geometry_generation = state.cellIndexGeneration()};
 }
@@ -1924,7 +1948,8 @@ std::size_t mergeFluxRegistersIntoPendingStore(
       ++created_count;
     } else {
       validatePendingCompatible(*pending, entry);
-      pending->expected_fine_substeps = std::max(pending->expected_fine_substeps, options.expected_fine_substeps);
+      pending->expected_fine_substeps = std::max(
+          pending->expected_fine_substeps, refluxIntervalForEntry(entry, options).substeps_per_interval);
       pending->expected_area_comov = std::max({pending->expected_area_comov, entry.face_area_comov, entry.coarse_area_comov, entry.fine_area_comov});
     }
 
@@ -1956,7 +1981,8 @@ std::size_t mergeFluxRegistersIntoPendingStore(
           entry.fine_area_comov,
           entry.dt_code);
       const std::uint32_t expected = std::max<std::uint32_t>(1U, pending->expected_fine_substeps);
-      const std::uint32_t substep = expected == 1U ? 0U : std::min(options.fine_substep_index, expected - 1U);
+      const std::uint32_t substep = expected == 1U
+          ? 0U : std::min(refluxIntervalForEntry(entry, options).substep_index, expected - 1U);
       if (substep < 64U) {
         const std::uint64_t bit = 1ULL << substep;
         if ((pending->fine_substep_coverage_mask & bit) == 0U) {
@@ -2946,6 +2972,227 @@ ProductionAmrHydroDiagnostics advanceDistributedProductionAmrHydro(
       source_terms,
       options,
       &exchange);
+}
+
+namespace {
+
+// Sub-interval update context: proper-time endpoints, scale factor and
+// Hubble rate linearly interpolated over the parent interval (the same rule
+// as the two-level subcycle; exact for the time endpoints, first-order for
+// a(t) inside one coarse step).
+[[nodiscard]] hydro::HydroUpdateContext subintervalUpdate(
+    const hydro::HydroUpdateContext& parent, double fraction_begin, double fraction_end) {
+  const auto lerp = [](double begin, double end, double f) { return begin + f * (end - begin); };
+  const double mid = 0.5 * (fraction_begin + fraction_end);
+  hydro::HydroUpdateContext update = parent;
+  update.dt_code = parent.dt_code * (fraction_end - fraction_begin);
+  update.time_begin_code = lerp(parent.time_begin_code, parent.time_end_code, fraction_begin);
+  update.time_end_code = lerp(parent.time_begin_code, parent.time_end_code, fraction_end);
+  update.scale_factor_begin = lerp(parent.scale_factor_begin, parent.scale_factor_end, fraction_begin);
+  update.scale_factor_end = lerp(parent.scale_factor_begin, parent.scale_factor_end, fraction_end);
+  update.scale_factor = lerp(parent.scale_factor_begin, parent.scale_factor_end, mid);
+  update.hubble_rate_begin_code = lerp(parent.hubble_rate_begin_code, parent.hubble_rate_end_code, fraction_begin);
+  update.hubble_rate_end_code = lerp(parent.hubble_rate_begin_code, parent.hubble_rate_end_code, fraction_end);
+  update.hubble_rate_code = lerp(parent.hubble_rate_begin_code, parent.hubble_rate_end_code, mid);
+  return update;
+}
+
+void addRefluxDiagnostics(ProductionAmrHydroDiagnostics& diagnostics, const RefluxDiagnostics& reflux) {
+  diagnostics.reflux.complete_register_count += reflux.complete_register_count;
+  diagnostics.reflux.skipped_incomplete_register_count += reflux.skipped_incomplete_register_count;
+  diagnostics.reflux.skipped_area_mismatch_count += reflux.skipped_area_mismatch_count;
+  diagnostics.reflux.skipped_missing_target_count += reflux.skipped_missing_target_count;
+  diagnostics.reflux.corrected_cells += reflux.corrected_cells;
+  diagnostics.reflux.corrected_mass_code += reflux.corrected_mass_code;
+  diagnostics.reflux.corrected_momentum_x_code += reflux.corrected_momentum_x_code;
+  diagnostics.reflux.corrected_momentum_y_code += reflux.corrected_momentum_y_code;
+  diagnostics.reflux.corrected_momentum_z_code += reflux.corrected_momentum_z_code;
+  diagnostics.reflux.corrected_total_energy_code += reflux.corrected_total_energy_code;
+  diagnostics.reflux.corrected_metal_mass_code += reflux.corrected_metal_mass_code;
+  diagnostics.reflux.corrected_energy_code += reflux.corrected_energy_code;
+  diagnostics.reflux.corrected_internal_energy_code += reflux.corrected_internal_energy_code;
+  diagnostics.reflux.dual_energy_reflux_cells += reflux.dual_energy_reflux_cells;
+  diagnostics.reflux.dual_energy_reflux_thermal_correction_code += reflux.dual_energy_reflux_thermal_correction_code;
+  diagnostics.pending_register_applied_count += reflux.complete_register_count;
+  diagnostics.pending_register_rejected_count += reflux.skipped_area_mismatch_count + reflux.skipped_missing_target_count;
+}
+
+}  // namespace
+
+// Recursive Berger-Oliger subcycling (CHUI Part 3 Milestone I, T02/A02).
+//
+// Time ownership: the caller's coarse interval [t, t + dt] belongs to the
+// coarsest level present. Level index i (absolute level L_i) advances
+// n_i = prod_{j<i} r^(L_{j+1}-L_j) times with dt_i = dt / n_i. For each
+// level-i step the driver:
+//   1. opens the level-i temporal interval (if a finer level exists): start
+//      states of every level-i coarse source cell at t_i;
+//   2. sweeps ONLY level-i rows (one HydroCoreSolver update of dt_i) with
+//      coarse-to-fine ghosts temporally interpolated from the level-(i-1)
+//      interval at t_i (i > 0), fine-to-coarse ghosts from the synchronized
+//      level-(i+1) state, same-level ghosts at t_i; flux registers of pair
+//      (i-1, i) are tagged with substep k of the parent interval and those
+//      of pair (i, i+1) with the level-i interval (reflux interval table);
+//   3. closes the level-i interval with end states at t_i + dt_i;
+//   4. recursively advances level i+1 over [t_i, t_i + dt_i];
+//   5. applies the now complete (i, i+1) reflux (coarse cells corrected by
+//      the time-integrated fine flux minus the coarse flux: exact
+//      conservation across the interface) and retires the level-i interval.
+// Leaf-only hierarchy: a refined region has no covered coarse cells, so no
+// restriction step exists; synchronized leaf states after the recursion are
+// the complete hierarchy state at t + dt.
+// Every conserved lane that the sweep transports (mass, momentum, total
+// energy, metals; composition via the face-mass sink; dual-energy auxiliary)
+// is advanced by exactly the sweep that owns its level, so each cell
+// integrates its full interval exactly once.
+ProductionAmrHydroDiagnostics advanceProductionAmrHydroRecursive(
+    core::SimulationState& state,
+    std::span<const std::uint32_t> active_cell_rows,
+    const hydro::HydroUpdateContext& coarse_update,
+    const hydro::HydroSourceContext& global_source_context,
+    const hydro::HydroCoreSolver& solver,
+    const hydro::HydroRiemannSolver& riemann_solver,
+    std::span<const hydro::HydroSourceTerm* const> source_terms,
+    const ProductionAmrHydroOptions& options) {
+  if (!hasProductionAmrHydroCoverage(state)) {
+    throw std::runtime_error("advanceProductionAmrHydroRecursive requires complete AMR patch coverage");
+  }
+  if (options.refinement_ratio < 2U) {
+    throw std::invalid_argument("recursive AMR subcycling requires refinement_ratio >= 2");
+  }
+  if (!std::isfinite(options.state_time_code) || !(coarse_update.dt_code > 0.0)) {
+    throw std::invalid_argument("recursive AMR subcycling requires a finite start time and dt > 0");
+  }
+  if (!state.amr_temporal_boundary_history.empty() || !state.pending_flux_registers.empty()) {
+    throw std::runtime_error(
+        "recursive AMR subcycling must start at a synchronized hierarchy boundary "
+        "(no open temporal history or pending flux register)");
+  }
+  const std::vector<PatchDescriptor> descriptors = buildProductionAmrPatchDescriptors(state);
+  std::vector<int> levels;
+  for (const PatchDescriptor& patch : descriptors) levels.push_back(static_cast<int>(patch.level));
+  std::sort(levels.begin(), levels.end());
+  levels.erase(std::unique(levels.begin(), levels.end()), levels.end());
+  ProductionAmrHydroDiagnostics diagnostics;
+  if (levels.empty()) return diagnostics;
+  diagnostics.patch_count = descriptors.size();
+  diagnostics.levels_advanced = levels.size();
+  diagnostics.max_level_advanced = static_cast<std::size_t>(levels.back());
+  diagnostics.substeps_by_level.assign(static_cast<std::size_t>(levels.back()) + 1U, 0U);
+
+  // Active rows per level (one bounded list per level, admitted up front).
+  std::vector<std::vector<std::uint32_t>> rows_by_level(levels.size());
+  core::MemoryReservation rows_reservation;  // live for the whole recursion
+  {
+    std::uint64_t bytes = 0U;
+    for (std::size_t i = 0; i < levels.size(); ++i) {
+      fillActiveRowsForLevelInto(state, levels[i], active_cell_rows, rows_by_level[i]);
+      bytes = core::checkedMemoryBytesAdd(bytes,
+          static_cast<std::uint64_t>(rows_by_level[i].capacity()) * sizeof(std::uint32_t), "recursive AMR level rows");
+    }
+    if (options.regrid_memory_governor != nullptr && bytes != 0U) {
+      rows_reservation = options.regrid_memory_governor->reserve(
+          core::MemoryClass::kPhaseResident, bytes, "amr.recursive.level_rows");
+      rows_reservation.commit();
+    }
+  }
+  // 2:1 face balance (periodic wrap included) is required: a register of a
+  // level pair (L, L+2) would be tagged with the wrong substep clock and
+  // complete before all fine substeps contributed. O(P^2) contact check.
+  {
+    const internal::AmrPeriodicFrame frame = internal::makeAmrPeriodicFrame(
+        options.physical_boundary_kind == hydro::HydroBoundaryKind::kPeriodic, options.periodic_box_extent_comoving);
+    for (std::size_t a = 0; a < descriptors.size(); ++a) {
+      for (std::size_t b = a + 1U; b < descriptors.size(); ++b) {
+        if (std::abs(static_cast<int>(descriptors[a].level) - static_cast<int>(descriptors[b].level)) <= 1) continue;
+        for (const hydro::HydroFaceAxis axis : {hydro::HydroFaceAxis::kX, hydro::HydroFaceAxis::kY, hydro::HydroFaceAxis::kZ}) {
+          for (const hydro::HydroFaceSide side : {hydro::HydroFaceSide::kLower, hydro::HydroFaceSide::kUpper}) {
+            if (touchesOnSide(descriptors[a], descriptors[b], axis, side, frame)) {
+              throw std::runtime_error(
+                  "recursive AMR subcycling requires 2:1 face balance; patches " +
+                  std::to_string(descriptors[a].patch_id) + " and " + std::to_string(descriptors[b].patch_id) +
+                  " differ by more than one level across a face (fail closed)");
+            }
+          }
+        }
+      }
+    }
+  }
+  std::vector<std::uint32_t> ratio_to_next(levels.size(), 1U);
+  for (std::size_t i = 0; i + 1U < levels.size(); ++i) {
+    std::uint32_t ratio = 1U;
+    for (int gap = levels[i + 1U] - levels[i]; gap > 0; --gap) {
+      ratio = core::checkedIntegralNarrow<std::uint32_t>(
+          static_cast<std::uint64_t>(ratio) * options.refinement_ratio, "recursive AMR ratio");
+    }
+    ratio_to_next[i] = ratio;
+  }
+  std::vector<AmrLevelRefluxInterval> intervals(static_cast<std::size_t>(levels.back()) + 1U);
+
+  // Recursion depth is the level count (bounded by the hierarchy, <= 31).
+  const auto advance_level = [&](const auto& self, std::size_t i, const hydro::HydroUpdateContext& update,
+                                 double t_begin, std::uint32_t parent_substep) -> void {
+    const int level = levels[i];
+    const bool has_finer = i + 1U < levels.size();
+    const double t_end = t_begin + update.dt_code;
+    if (has_finer) {
+      captureAmrTemporalBoundaryHistoryStartForLevel(
+          state, descriptors, level, t_begin, options.adiabatic_index, options.regrid_memory_governor);
+      intervals[static_cast<std::size_t>(level)] = AmrLevelRefluxInterval{
+          .interval_start_code = t_begin, .interval_end_code = t_end, .coarse_dt_code = update.dt_code,
+          .substeps_per_interval = ratio_to_next[i], .substep_index = 0U, .valid = true};
+    }
+    if (i > 0U) {
+      intervals[static_cast<std::size_t>(levels[i - 1U])].substep_index = parent_substep;
+    }
+    if (!rows_by_level[i].empty()) {
+      ProductionAmrHydroOptions level_options = options;
+      level_options.sweep_mode = ProductionAmrHydroSweepMode::kSynchronized;
+      level_options.persist_incomplete_flux_registers = true;
+      level_options.reflux_intervals_by_coarse_level = intervals;
+      level_options.state_time_code = t_begin;
+      level_options.ghost_fill_time_code = t_begin;
+      level_options.enable_temporal_coarse_to_fine = i > 0U;
+      if (update.comoving_coordinates && coarse_update.scale_factor > 0.0 && update.scale_factor > 0.0) {
+        level_options.source_density_rescale =
+            options.source_density_rescale * std::pow(coarse_update.scale_factor / update.scale_factor, 3.0);
+      }
+      hydro::HydroSourceContext source_context = global_source_context;
+      source_context.update = update;
+      source_context.redshift = update.scale_factor > 0.0
+          ? std::max(0.0, 1.0 / update.scale_factor - 1.0) : global_source_context.redshift;
+      accumulateDiagnostics(diagnostics, advanceProductionAmrHydro(
+          state, rows_by_level[i], update, source_context, solver, riemann_solver, source_terms, level_options));
+    }
+    diagnostics.substeps_by_level[static_cast<std::size_t>(level)] += 1U;
+    diagnostics.subcycled_level_step_count += 1U;
+    if (!has_finer) return;
+    captureAmrTemporalBoundaryHistoryEndForLevel(
+        state, descriptors, level, t_end, options.adiabatic_index, options.regrid_memory_governor);
+    const std::uint32_t substeps = ratio_to_next[i];
+    for (std::uint32_t k = 0; k < substeps; ++k) {
+      const double f0 = static_cast<double>(k) / static_cast<double>(substeps);
+      const double f1 = static_cast<double>(k + 1U) / static_cast<double>(substeps);
+      const hydro::HydroUpdateContext child = subintervalUpdate(update, f0, f1);
+      self(self, i + 1U, child, t_begin + f0 * update.dt_code, k);
+    }
+    addRefluxDiagnostics(diagnostics, applyCompletePendingFluxRegistersToSimulationState(
+        state, buildProductionAmrPatchDescriptors(state), options.adiabatic_index, options.thermodynamic_cache));
+    retireAmrTemporalBoundaryHistoryLevel(state, level);
+    intervals[static_cast<std::size_t>(level)].valid = false;
+  };
+  hydro::HydroUpdateContext root = coarse_update;
+  if (!(root.time_end_code > root.time_begin_code)) {
+    root.time_begin_code = options.state_time_code;
+    root.time_end_code = options.state_time_code + coarse_update.dt_code;
+  }
+  advance_level(advance_level, 0U, root, options.state_time_code, 0U);
+  if (!state.pending_flux_registers.empty() || !state.amr_temporal_boundary_history.empty()) {
+    throw std::runtime_error(
+        "recursive AMR subcycling left incomplete flux registers or open temporal intervals "
+        "(interface coverage defect; the hierarchy is not synchronized)");
+  }
+  return diagnostics;
 }
 
 ProductionAmrHydroDiagnostics advanceProductionAmrHydroSubcycled(

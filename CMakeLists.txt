@@ -1164,7 +1164,8 @@ if(COSMOSIM_ENABLE_TESTS)
       config_chui_part3
       treepm_amr_force_resolution
       zoom_contamination
-      chui_part3_adaptive_and_decks)
+      chui_part3_adaptive_and_decks
+      amr_recursive_subcycling)
   foreach(chui_part3_test IN LISTS CHUI_PART3_UNIT_TESTS)
     add_executable(test_unit_${chui_part3_test} tests/unit/test_${chui_part3_test}.cpp)
     target_include_directories(test_unit_${chui_part3_test} PRIVATE ${PROJECT_SOURCE_DIR}/src)

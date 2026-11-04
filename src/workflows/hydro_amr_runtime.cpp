@@ -1946,6 +1946,15 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
         source_context.face_mass_flux_sink = composition_flux.get();
       }
     }
+    if (m_mpi_context.isEnabled() && m_mpi_context.worldSize() > 1 &&
+        m_config.numerics.amr_time_stepping == core::AmrTimeSteppingConfigMode::kRecursiveSubcycling) {
+      // Rank-uniform (configuration) refusal before any exchange or mutation:
+      // a distributed recursive sweep needs one directed ghost/flux exchange
+      // per level substep, which is not implemented yet (Milestone I PARTIAL).
+      throw std::runtime_error(
+          "numerics.amr_time_stepping = recursive_subcycling is single-rank only in this revision; "
+          "distributed per-substep exchange is OPEN (fail closed)");
+    }
     if (m_mpi_context.isEnabled() && m_mpi_context.worldSize() > 1) {
       const auto local_patch_records =
           internal::buildMigrationAmrPatchPayloadRecords(
@@ -2391,6 +2400,19 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
         amr_diagnostics.reflux.dual_energy_reflux_thermal_correction_code +=
             remote_reflux.dual_energy_reflux_thermal_correction_code;
       }
+    } else if (m_config.numerics.amr_time_stepping == core::AmrTimeSteppingConfigMode::kRecursiveSubcycling) {
+      // CHUI Part 3 Milestone I: recursive multilevel subcycling of the gas
+      // hierarchy inside the coordinator's accepted interval (the interval
+      // belongs to the coarsest level; finer levels advance dt / r^dL).
+      amr_diagnostics = amr::advanceProductionAmrHydroRecursive(
+          context.state,
+          context.active_set.cell_indices,
+          update,
+          source_context,
+          m_solver,
+          *m_riemann_solver,
+          sources,
+          amr_options);
     } else {
       amr_diagnostics = amr::advanceProductionAmrHydro(
           context.state,
