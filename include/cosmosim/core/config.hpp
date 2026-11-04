@@ -657,6 +657,8 @@ struct PhysicsConfig {
   double chemistry_adaptive_hysteresis_fraction = 0.3;
   double chemistry_adaptive_min_dwell_years = 1.0e6;
   double chemistry_adaptive_cold_temperature_k = 3.0e3;
+  // R3: promote to detailed chemistry when t_cool < ratio x interval (0 off).
+  double chemistry_adaptive_cooling_time_ratio = 0.0;
   double chemistry_adaptive_dense_nh_cm3 = 1.0;
   double chemistry_shadow_sample_fraction = 0.0;
   double ssp_imf_mass_min_msun = 0.1;

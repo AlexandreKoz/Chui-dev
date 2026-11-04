@@ -167,9 +167,47 @@ void testSuccessCommitsAllTogether() {
   (void)energy_before;
 }
 
+// R3 (C03): timescale criterion. With every composition threshold out of
+// reach, the hot dense (rapidly cooling) row is promoted and flagged as a
+// cooling-time trigger; with ratio 0 nothing is promoted. The decision is a
+// pure function of the state (no mutation), so rollback/restart replay it.
+void testCoolingTimePromotion() {
+  const auto layout = physics::CompositionLayout::make({.network = physics::CompositionNetworkKind::kHybridLight,
+                                                        .dust = physics::CompositionDustKind::kTwoReservoirV1,
+                                                        .sgs_energy = true});
+  auto state = makeState(layout);
+  for (std::size_t r = 0; r < 3; ++r) state.gas_composition.chemistry_model_tag[r] = physics::k_chemistry_tag_hybrid;
+  physics::ThermochemistryOperatorConfig op_config;
+  op_config.solver.backend = physics::ThermochemistryBackend::kFixedHybrid;
+  op_config.units = units();
+  op_config.solver.allow_unqualified_rates = true;
+  op_config.adaptive.enabled = true;
+  op_config.adaptive.cold_temperature_k = 11.0;
+  op_config.adaptive.dense_n_h_cm3 = 1.0e30;
+  op_config.adaptive.molecular_fraction_threshold = 1.0e30;
+  op_config.adaptive.co_carbon_fraction_threshold = 1.0e30;
+  const physics::SourceInterval interval{.physical_seconds = 3.15576e12, .evaluation_scale_factor = 1.0};
+  {
+    const physics::ThermochemistryOperator chemistry(op_config, layout);
+    for (std::uint32_t r = 0; r < 3; ++r) {
+      const auto d = chemistry.decideChemistryFidelity(state, interval, r);
+      assert(d.tag == physics::k_chemistry_tag_hybrid && !d.cooling_time_trigger);
+    }
+  }
+  op_config.adaptive.cooling_time_ratio = 1.0;
+  const physics::ThermochemistryOperator chemistry(op_config, layout);
+  const Snapshot before = snapshot(state);
+  const auto hot = chemistry.decideChemistryFidelity(state, interval, 2U);
+  assert(hot.tag == physics::k_chemistry_tag_detailed && hot.promoted && hot.cooling_time_trigger);
+  assert(hot.cooling_time_seconds < interval.physical_seconds);
+  const Snapshot after = snapshot(state);
+  assert(bitIdentical(before.lanes, after.lanes) && before.tags == after.tags);
+}
+
 }  // namespace
 
 int main() {
+  testCoolingTimePromotion();
   testRejectionPreservesEverything();
   testSuccessCommitsAllTogether();
   return 0;

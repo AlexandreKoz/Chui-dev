@@ -73,6 +73,7 @@ void BaryonicSourceStage::prepare(const core::SimulationState& state, const Sour
     meta.chemistry_tag = fidelity.tag;
     meta.chemistry_dwell_years = fidelity.dwell_years;
     if (fidelity.promoted) ++m_pending.adaptive.promoted;
+    if (fidelity.promoted && fidelity.cooling_time_trigger) ++m_pending.adaptive.promoted_by_cooling_time;
     if (fidelity.demoted) ++m_pending.adaptive.demoted;
     if (fidelity.held_by_dwell) ++m_pending.adaptive.held_by_dwell;
     if (fidelity.tag == k_chemistry_tag_detailed) ++m_pending.adaptive.detailed_cells;
