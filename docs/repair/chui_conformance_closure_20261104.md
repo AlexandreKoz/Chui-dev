@@ -213,3 +213,46 @@ source-editing utilities, Git inspection/branch/commit/push operations. No proje
 code or executable validation was run. The design-bundle estimator and data
 converters were never invoked. CI is not dispatched; this feature branch does not
 match the repository workflow's push-to-main trigger, and commits carry skip-ci.
+
+## Committed handoff
+
+Implementation checkpoint SHA: **`ecb00914100b68835dc46fe00f6e685a023edfd3`**.
+This is the change reference for the A1/A2 subdefects of M01 and the history
+transaction portion of A02/T01. All other source obligations retain the starting
+SHA as reference; they have not been relabeled complete. The subsequent
+handoff-only commit records this SHA and this file's exact touched-file inventory.
+Both commits are on the dedicated feature branch. No PR, main merge, rebase or
+force-push is authorized or performed.
+
+| File | Purpose |
+|---|---|
+| `src/amr/amr_hydro_orchestrator.cpp` | Recursive/sweep descriptor and row admission; bitmap-free coverage; governed reflux candidate preparation and governor propagation |
+| `src/amr/amr_ghost_fill.cpp` | Atomic start/end candidates and no-copy retirement with baseline reconciliation |
+| `src/amr/internal/amr_retained_state_admission.hpp` | Checked in-place shrink transaction |
+| `include/cosmosim/core/simulation_state.hpp` | Nonthrowing temporal-store publication and level compaction primitive |
+| `include/cosmosim/amr/amr_ghost_fill.hpp` | Documented strong exception contract and defaulted retirement governor |
+| `include/cosmosim/amr/amr_hydro_orchestrator.hpp` | Defaulted pending-reflux governor |
+| `tests/unit/test_amr_history_atomicity.cpp` | New multi-level history failure/admission/retirement fixtures |
+| `tests/unit/test_amr_recursive_subcycling.cpp` | Driver refusal/allocation failure and coverage regressions; existing numerical tests unchanged |
+| `tests/unit/test_amr_pending_flux_registers.cpp` | Late merge refusal and allocation-failure publication fixtures |
+| `tests/support/scoped_allocation_failure.hpp` | Test-only thread-local one-shot C++ allocation interception |
+| `CMakeLists.txt` | Registers `unit_amr_history_atomicity`; other targets already registered |
+| `CURRENT_STATUS.md` | Current source-only checkpoint and incomplete Milestone A status |
+| `docs/repair_open_issues.md` | Prioritized remaining A3–A5 defects |
+| `docs/repair_state_recap.md` | Current repair state and ledger link |
+| `docs/validation_plan.md` | Owner-reserved test selection and reproducibility distinctions |
+| `docs/architecture/amr_temporal_ghost_interpolation.md` | Ownership/lifetime/API migration and transaction limits |
+| `docs/repair/chui_conformance_closure_20261104.md` | Complete requirement map, source closure boundary, commit identity and continuation |
+
+Git inspection confirmed the workflow's automatic push trigger is restricted to
+`main`. Only the feature branch is pushed; commit messages also include
+`[skip ci]`. Git hooks are disabled per commit/push command to honor the absolute
+prohibition on executing repository code. This is session-local command
+configuration, not a repository policy change. No workflow was dispatched.
+
+The required CPU and MPI/HDF5 executable evidence remains blocked by the
+**user-reserved execution contract**, not by a claim of missing dependencies.
+There is no compile, link, runtime, numerical-accuracy, performance or science
+qualification result for this checkpoint. The next source checkpoint is A3's
+complete diffusion memory lifecycle; remaining budget is not being spread over
+partial B/C/D/E implementations.
