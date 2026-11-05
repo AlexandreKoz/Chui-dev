@@ -4060,6 +4060,57 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
           "refusing the step rather than advancing an under-resolved hierarchy");
     }
 
+    // V02 feedback loop: the AMR half of the joint controller publishes its
+    // observed optional-refinement outcome once per regrid pass, on every
+    // rank with identical (globally reduced) values, into the canonical
+    // restart/rollback sidecar. Mandatory refinements are never part of
+    // these counts or budgets (they bypass the optional budget above).
+    core::V02ControlState v02_next = v02_state;
+    if (joint_v02) {
+      std::uint64_t local_requests = 0U;
+      std::uint64_t local_rejected = 0U;
+      failure = nullptr;
+      try {
+        local_requests = core::checkedIntegralNarrow<std::uint64_t>(
+            plan.optional_refine_requests, "V02 optional refinement requests");
+        local_rejected = core::checkedIntegralNarrow<std::uint64_t>(
+            plan.optional_truncated_by_budget + plan.optional_blocked_by_force_resolution,
+            "V02 optional refinement rejections");
+        local_rejected = std::min(local_rejected, local_requests);
+      } catch (...) {
+        failure = std::current_exception();
+      }
+      m_mpi_context.rethrowCollectivePreparationFailure(failure, "V02 optional outcome preparation");
+      const std::uint64_t global_requests = m_mpi_context.allreduceSumUint64(local_requests);
+      const std::uint64_t global_rejected = m_mpi_context.allreduceSumUint64(local_rejected);
+      const std::uint64_t global_budget_truncated = m_mpi_context.allreduceSumUint64(
+          static_cast<std::uint64_t>(plan.optional_truncated_by_budget));
+      const std::uint64_t local_headroom = m_memory_governor != nullptr
+          ? m_memory_governor->snapshot().headroom_bytes
+          : std::numeric_limits<std::uint64_t>::max();
+      const std::uint64_t global_headroom = m_mpi_context.allreduceMinUint64(local_headroom);
+      v02_next.optional_amr_requests = global_requests;
+      v02_next.optional_amr_admitted = global_requests - global_rejected;
+      v02_next.last_headroom_bytes = global_headroom;
+      v02_next.chemistry_growth_reserve_bytes = m_mpi_context.allreduceMaxUint64(v02_chemistry_reserve);
+      v02_next.optional_amr_budget_bytes = m_mpi_context.allreduceMinUint64(v02_optional_memory_budget);
+      // Deterministic selectivity law: a binding optional budget raises the
+      // benefit floor (x1.25, capped at 16); otherwise the 10%-per-pass decay
+      // toward 1 applied at load is the only change.
+      const double floor_used = policy.optional_control.enabled ? policy.optional_control.benefit_floor : 1.0;
+      v02_next.optional_benefit_floor = global_budget_truncated > 0U
+          ? std::min(16.0, std::max(1.0, floor_used) * 1.25)
+          : std::max(1.0, floor_used);
+      if (v02_next.epoch == std::numeric_limits<std::uint64_t>::max()) {
+        throw std::overflow_error("V02 controller epoch overflow");
+      }
+      v02_next.epoch += 1U;
+    }
+    const auto persist_v02_regrid_state = [&](core::SimulationState& target) {
+      if (!joint_v02) return;
+      core::storeV02ControlState(target, v02_next);
+    };
+
     std::uint64_t local_max_patch = 0U;
     for (const std::uint64_t id : context.state.patches.patch_id) {
       local_max_patch = std::max(local_max_patch, id);
@@ -4113,6 +4164,14 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
     }
     m_mpi_context.rethrowCollectivePreparationFailure(
         failure, "automatic AMR regrid application");
+    failure = nullptr;
+    try {
+      persist_v02_regrid_state(context.state);
+    } catch (...) {
+      failure = std::current_exception();
+    }
+    m_mpi_context.rethrowCollectivePreparationFailure(
+        failure, "automatic AMR V02 state publication");
     m_last_regrid_summary = summary;
     if (context.profiler_session != nullptr) {
       context.profiler_session->recordEvent(core::RuntimeEvent{
