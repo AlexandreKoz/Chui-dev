@@ -68,6 +68,28 @@ constexpr double k_gamma_adiabatic = 5.0 / 3.0;
 // patches, so a star predicted to cross a decomposition boundary refines the
 // destination rank as well as the source rank.  This keeps the prediction
 // independent of MPI ownership without introducing a second patch authority.
+// M01: composition transport may turn implicit adaptive-sparse rows into
+// explicit ones (a transported C+/CO/ion value that no longer equals its
+// implicit default). That retained growth is admitted against the canonical
+// memory class BEFORE commit, exactly as the source stage does; a refusal is
+// a MemoryAdmissionError raised before any canonical mutation.
+void admitCompositionSparseActivation(core::SimulationState& state,
+                                      const physics::CompositionFluxAccumulator& flux,
+                                      core::MemoryGovernor* governor,
+                                      std::string_view owner_label) {
+  auto& composition = state.gas_composition;
+  if (!composition.sparseStorageEnabled()) return;
+  const std::size_t activate = flux.sparseRowsToActivate(state);
+  if (activate == 0U) return;
+  core::RetainedCapacityTransaction sparse_capacity(
+      [&composition] { return composition.ownedCapacityBytes(); });
+  composition.planSparseRowCapacity(
+      sparse_capacity,
+      core::checkedSizeAdd(composition.sparseActiveRowCount(), activate,
+                           "transport sparse composition row capacity"));
+  sparse_capacity.execute(governor, core::MemoryClass::kCanonicalPersistent, owner_label);
+}
+
 struct PredictiveRefinementPoint {
   double x_comoving = 0.0;
   double y_comoving = 0.0;
@@ -3670,61 +3692,29 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
     // another rank is not forced" limitation.
     const double predictive_age = m_config.numerics.amr_predictive_feedback_age_years;
     const double lookahead_years = m_config.numerics.amr_predictive_event_lookahead_years;
-    if (predictive_age > 0.0 || lookahead_years > 0.0) {
-      std::vector<amr::PatchDescriptor> descriptors;
-      std::size_t maximum_forecast_positions = 0U;
-      core::MemoryReservation forecast_positions_reservation;
-      std::exception_ptr forecast_positions_admission_failure;
-      std::vector<std::array<double, 3>> forecast_positions;
-      try {
-        descriptors = amr::buildProductionAmrPatchDescriptors(context.state);
-        maximum_forecast_positions = core::checkedSizeMultiply(
-            context.state.star_particles.size(),
-            lookahead_years > 0.0 ? 2U : 1U,
+    const bool predictive_enabled = predictive_age > 0.0 || lookahead_years > 0.0;
+    failure = nullptr;
+    try {
+      if (predictive_enabled) {
+        // Local current/drifted event positions: one or two per star,
+        // admitted before allocation (no hidden growth in the loop below).
+        const std::size_t maximum_points = core::checkedSizeMultiply(
+            context.state.star_particles.size(), lookahead_years > 0.0 ? 2U : 1U,
             "predictive refinement local position capacity");
-        if (m_memory_governor != nullptr && maximum_forecast_positions > 0U) {
-          forecast_positions_reservation = m_memory_governor->reserve(
+        if (m_memory_governor != nullptr && maximum_points > 0U) {
+          predictive_local_reservation = m_memory_governor->reserve(
               core::MemoryClass::kPhaseResident,
               static_cast<std::uint64_t>(core::checkedSizeMultiply(
-                  maximum_forecast_positions, sizeof(std::array<double, 3>),
+                  maximum_points, sizeof(PredictiveRefinementPoint),
                   "predictive refinement local positions")),
               "hydro.amr_regrid.local_predictive_positions");
-          forecast_positions_reservation.commit();
+          predictive_local_reservation.commit();
         }
-        forecast_positions.reserve(maximum_forecast_positions);
-        if (forecast_positions.capacity() > maximum_forecast_positions) {
+        local_predictive_points.reserve(maximum_points);
+        if (local_predictive_points.capacity() > maximum_points) {
           throw std::length_error(
               "predictive refinement position allocator exceeded admitted capacity");
         }
-      } catch (...) {
-        forecast_positions_admission_failure = std::current_exception();
-      }
-      m_mpi_context.rethrowCollectivePreparationFailure(
-          forecast_positions_admission_failure,
-          "predictive refinement local position admission");
-      const auto host_row = [&](const std::array<double, 3>& position) {
-        for (const amr::PatchDescriptor& patch : descriptors) {
-          bool inside = true;
-          for (std::size_t c = 0; c < 3U && inside; ++c) {
-            inside = position[c] >= patch.origin_comov[c] && position[c] < patch.origin_comov[c] + patch.extent_comov[c];
-          }
-          if (!inside) continue;
-          const auto cell = amr::patchLocalCellForPoint(patch, position, "predictive refinement host cell");
-          const auto rows = amr::rowsForPatchLocalCellOrder(context.state, patch, "predictive refinement");
-          if (cell.linear_index < rows.size()) forced_rows.push_back(rows[cell.linear_index]);
-          return;
-        }
-      };
-      // R2 (A04) event-aware forecast. For every star the canonical
-      // population record (restart/rollback state) gives its deterministic
-      // event chronology; a COPY is advanced to the expected cumulative count
-      // at age + lookahead, so the forecast consumes no event ordinal and
-      // changes no budget. Expectation mode (no stochastic events) predicts
-      // an "event" when >= 0.5 expected SNe fall in the window (HEURISTIC).
-      // The host cell now and at the drifted position x + v dt / a are forced.
-      std::uint64_t forecast_events = 0U;
-      std::exception_ptr forecast_failure;
-      try {
         std::optional<physics::SspModel> ssp;
         std::optional<physics::StellarPopulationStore> store;
         if (lookahead_years > 0.0) {
@@ -4090,7 +4080,9 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
           : std::numeric_limits<std::uint64_t>::max();
       const std::uint64_t global_headroom = m_mpi_context.allreduceMinUint64(local_headroom);
       v02_next.optional_amr_requests = global_requests;
-      v02_next.optional_amr_admitted = global_requests - global_rejected;
+      const std::uint64_t global_admitted = m_mpi_context.allreduceSumUint64(
+          static_cast<std::uint64_t>(plan.optional_admitted_operations));
+      v02_next.optional_amr_admitted = std::min(global_admitted, global_requests - global_rejected);
       v02_next.last_headroom_bytes = global_headroom;
       v02_next.chemistry_growth_reserve_bytes = m_mpi_context.allreduceMaxUint64(v02_chemistry_reserve);
       v02_next.optional_amr_budget_bytes = m_mpi_context.allreduceMinUint64(v02_optional_memory_budget);
