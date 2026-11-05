@@ -17,26 +17,54 @@ The authoritative per-step stage order is:
 9. `output_check`
 
 The two source dispatches define the deterministic reference
-`S(dt/2) H(dt) S(dt/2)`. Smooth thermochemistry/dust/SGS/diffusion operators
-run for their half intervals at the physical quarter/three-quarter epochs.
-Star births, stellar returns, SN/wind feedback and BH transactions run exactly
-once in the post dispatch at the absolute accepted-interval endpoint. Direct
-low-level source dispatch retains an explicit unsplit compatibility phase.
-The stellar population sidecar carries both cumulative-Poisson thresholds and
-an absolute accepted-interval cursor. Its schema-2 cursor must match the next
-interval begin (within round-off); gaps, overlap and replay fail before event
-ordinals or physical state commit. Schema-1 records adopt their first
-post-restart boundary and are rewritten as schema 2.
+`S(dt/2) H(dt) S(dt/2)`. `SourceRuntimeImpl` derives one `SourceStagePlan` per
+dispatch from the integrator-owned `CosmologicalStepFactors` (the coarse or
+hierarchical-block interval) and the dispatch's `SourceSplitPhase`:
 
-With recursive AMR subcycling, the AMR clock owner replaces the coarse
-thermochemistry/dust/SGS halves with `S_L(dt_L/2) H_L(dt_L) S_L(dt_L/2)` for
-every level subinterval. Every rank enters each level-source transaction,
-including ranks whose local row span is empty. The level hook never executes
-star formation, stellar events, feedback, winds, BH transactions or diffusion;
-those remain exactly-once global operators until their separate multilevel
-chronology contracts are connected. Coarse temporal histories bracket the
-complete level split state, and source-controller state is reduced and
-committed once at the accepted global post surface.
+| Plan field | `kStrangPreHalf` | `kStrangPostHalf` | `kUnsplitCompatibility` |
+|---|---|---|---|
+| smooth sub-interval | `[t_b, t_mid]` | `[t_mid, t_e]` | `[t_b, t_e]` |
+| smooth evaluation epoch | a at physical fraction 1/4 | a at 3/4 | `a_end` |
+| smooth duration | `dt/2` (code = physical, code time is linear in cosmic time) | `dt/2` | `dt` |
+| discrete events | none | once, at `t_e`, `a_end`, full `dt` | once, at `t_e`, `a_end`, full `dt` |
+| opens / closes interval | opens | closes | both |
+
+Smooth order is palindromic: pre = element diffusion + SGS shear, then
+thermochemistry/ISM/dust/SGS dissipation; post = thermochemistry, then
+transport. Discrete events (star birth → SSP/stellar returns, winds/pre-SN, SN
+feedback → BH seeding/accretion/feedback) follow the post smooth half. In
+proper-coordinate runs every scale factor is exactly 1. The stellar population
+sidecar carries both cumulative-Poisson thresholds and an absolute
+accepted-interval cursor. Its schema-2 cursor must match the next interval
+begin (within round-off); gaps, overlap and replay fail before event ordinals
+or physical state commit. Schema-1 records adopt their first post-restart
+boundary and are rewritten as schema 2.
+
+**Controller publication.** Thermochemistry never publishes controller state
+itself: every half (and every AMR level half) accumulates its shadow/adaptive
+observations into `SourceIntervalAccumulator`; `closeSourceInterval()` performs
+the single collective `updateGlobalChemistryControl()` per Strang interval.
+The accumulator is part of the source runtime's rollback checkpoint, so a
+rejected trial (including one rejected between the halves) is replayed from a
+closed, empty interval. Opening a new interval while one is open, or a post
+half without its pre half, is a `std::logic_error`.
+
+With recursive AMR subcycling, `HydroAmrRuntime::bindSourceRuntime()` enables
+the level coupling and the AMR clock owner applies
+`S_L(dt_L/2) H_L(dt_L) S_L(dt_L/2)` to thermochemistry/ISM/dust/SGS for every
+level subinterval through `RecursiveAmrLevelSourceOperator`
+(`RecursiveAmrLevelSourceAdapter` → `SourceRuntime::executeAmrLevelSmoothSources`).
+The pre half precedes the level start-history capture; the post half follows
+the level sweep and its remote register exchange and precedes the end-history
+capture, so children interpolate complete coarse Strang states; reflux and
+restriction from finer levels commit after the children. Every rank enters
+each level-source transaction, including empty local spans. While the levels
+own thermochemistry, the global halves skip it (same predicate on both sides:
+coupling enabled, recursive mode, production AMR coverage on any rank) and the
+interval close verifies matched level pre/post counts. Element diffusion, SGS
+shear transfer and all discrete events stay globally synchronized at the
+coarse halves/endpoint (distinct smooth cadence vs. synchronized ownership
+transactions); the legacy post-sweep recursive chemistry callback was removed.
 
 The scheduler (`StageScheduler`) owns this ordering and solver modules interact via stage-bound `IntegrationCallback` implementations. Each callback must declare its exact `integrationStages()` set during registration; `StepOrchestrator` stores handlers in per-stage buckets and dispatches only the bucket for the active stage in stable registration order. Production callbacks must treat any off-stage direct invocation as a contract violation rather than silently self-filtering. This keeps gravity/hydro/source/output sequencing explicit and auditable, prevents solvers from receiving irrelevant stages, and avoids per-stage broadcast scans in the hot path.
 

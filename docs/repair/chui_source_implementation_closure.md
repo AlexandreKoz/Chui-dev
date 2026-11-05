@@ -1,3 +1,87 @@
+# CHUÍ — patch 49 source-completion record (supersedes the patch-48 self-assessment)
+
+Date: 2026-11-05. Scope: static source edits only.
+**No compilation, tests, benchmarks, simulations, or scientific validation were performed in this campaign.**
+
+**Status: NOT SOURCE-COMPLETE.** The patch-48 section below is retained as
+history; its matrix was an unverified self-declaration and is superseded by the
+matrix in this section (independent audit
+`CHUI_patch48_auditoria_independente_fonte_2026-11-04.md`).
+
+## Contradictions closed (P0 + additional findings)
+
+| ID | Defect | Resolution (symbol) |
+|---|---|---|
+| P0-01 | stale `source_evaluation_scale_factor` / undefined `smooth_source_dt_code` | `SourceStagePlan` + `makeSourceStagePlan()`; every operator reads its clock from the plan |
+| P0-02 | `executeThermochemistry` returned a report without value; caller arity | returns `void`; observations only accumulate (`accumulateSourceIntervalObservation`), publication in `closeSourceInterval()` |
+| P0-03/04 | `const amr_options` mutated; undefined adapter/context types | mutable options; `RecursiveAmrLevelSourceAdapter` (hydro_amr_runtime.cpp); legacy callback API removed |
+| P0-05 | `setMultilevelSourceRuntime ... override` with no base | removed; `bindSourceRuntime()` (already called by `reference_runtime_composition.cpp`) binds and calls `setAmrLevelSourceCouplingEnabled()` |
+| P0-06 | CTU ghost telemetry fields undeclared | declared in `HydroProfileEvent` and `ProductionAmrHydroDiagnostics`; patch/level aggregation and global rank sums |
+| P0-07 | private `invalidateOccupancyCache()` called from rollback | public `DistributedParticleIdRegistry::invalidateForRollback()` |
+| new | `persist_v02_regrid_state` called, never defined; applied regrid never published V02 | defined; AMR half of V02 published on no-op and applied passes |
+| new | `ProductionAmrRegridPlan::optional_admitted_*`, `optional_min_admitted_benefit` undeclared | declared |
+| new | predictive AMR block: `catch` body swallowed the local forecast; `predictive_enabled` undeclared | restructured, admitted before allocation |
+| new | `admitCompositionSparseActivation` called at three sites, never defined | defined (retained-capacity transaction, canonical class) |
+
+## Production reachability (traced call flow)
+
+* `.param.txt` → `SimulationConfig` → `reference_runtime_composition.cpp`
+  builds hydro then source owners and calls `HydroAmrRuntime::bindSourceRuntime()`
+  → coupling enabled iff `numerics.amr_time_stepping = recursive_subcycling`.
+* `StepOrchestrator` dispatches `kSourceTerms` twice (`kStrangPreHalf`,
+  `kStrangPostHalf`) in both the single-step and hierarchical-block paths →
+  `SourceRuntimeImpl::execute()` → plan → smooth halves → (post only)
+  `executeDiscreteSourceEvents()` → `closeSourceInterval()`.
+* `runProductionAmrHydroPath()` → recursive driver
+  (`advanceProductionAmrHydroRecursive[Impl]`, serial and distributed) → per level
+  `RecursiveAmrLevelSourceOperator::apply(kPreHydroHalf)` before history start
+  and `apply(kPostHydroHalf)` after sweep/register exchange →
+  `executeAmrLevelSmoothSources()` → `executeThermochemistryInterval()`.
+* Regrid cooling-length criterion: accepted chemistry history, else
+  `SourceRuntime::fillAmrCoolingTimes()` (same rate set), else legacy provider.
+
+## H01–V02 source-coverage matrix (patch 49)
+
+| ID | Status | Evidence / exact remaining gap |
+|---|---|---|
+| H01 | Implemented in source, not tested | CTU ghost-slab increments + counted fallback; telemetry now declared/aggregated. Formal order/convergence: later validation |
+| H02 | Implemented in source, not tested | dual-energy, floors, comoving factors (unchanged) |
+| C01 | External data dependency | hybrid network + table loaders; production UVB/metal tables not supplied |
+| C02 | Implemented in source, not tested + **External data dependency** | `metal_ion_network.*`: C/O/Si/Fe stage inventory, validated `chui_metal_ion_rates_v1` loader, ladder solver, layout/transport/diffusion/snapshot/restart-signature/config. No licensed, source-verified rate dataset exists in the repository; charge exchange with H/He not represented (schema v1) |
+| C03 | Implemented in source, not tested | residual/error history, hysteresis/dwell (physical years), sparse mapping; ion ladders initialized from equilibrium on promotion (counted) |
+| C04 | Implemented in source, not tested | shadow non-committing; controller published once per Strang interval |
+| I01 | Implemented in source, not tested | regime split unchanged |
+| I02 | Implemented in source, not tested | SGS shear transfer now receives the defined half duration |
+| S01 | Implemented in source, not tested | births only in post half at `t_end`; global synchronized (not per level) |
+| S02 | External data dependency | cursor/chronology once per interval; production yield tables absent |
+| F01 | Implemented in source, not tested | feedback once per interval (post half) |
+| F02 | External data dependency | winds/pre-SN once per interval; production wind dataset absent |
+| D01 | Implemented in source, not tested | capability authorizes `core_elements`, refuses `total_only` on >1 rank; ion lanes diffuse with elements |
+| A01 | Implemented in source, not tested | mandatory/optional budgets, transactional publication (patch 48, preserved) |
+| A02 | Implemented in source, not tested | recursive distributed reflux (patch 48, preserved); level Strang ordering w.r.t. histories now explicit |
+| A03 | Implemented in source, not tested | cooling-length fallback through `fillAmrCoolingTimes` |
+| A04 | Implemented in source, not tested (research) | predictive block repaired |
+| G01 | Conditional on later qualification | TreePM/KDK retained; no multilevel correction without evidence |
+| T01 | Implemented in source, not tested | `SourceStagePlan`, once-only events, single publication, rollback of open interval |
+| T02 | **Partial, exact missing code** | smooth thermochemistry/ISM/dust/SGS per level clock (pre+post). Diffusion, SGS shear transfer, SF, SSP, winds, SN, BH remain globally synchronized at coarse halves/endpoint. Missing: level-local cadence for element diffusion/SGS transfer with coarse/fine flux registers for composition-diffusion fluxes, and per-level event ownership for SF/feedback |
+| M01 | **Partial — not exhaustively traced** | sparse species/ion storage, transport sparse activation (`admitCompositionSparseActivation`), element-diffusion workspace (`elementDiffusionWorkspaceBytes` over all lanes, including ion lanes) and predictive-AMR points are admitted before allocation. Not traced end-to-end in this campaign: that a single admission decision accounts for the coexisting rollback copy + PM + HDF5 + MPI buffer peak, and that `parallel/node_memory_pool` node-aggregate admission covers every phase-resident owner |
+| M02 | Implemented in source, not tested | CPU serial/OpenMP/MPI unchanged; GPU optional |
+| V01 | Implemented in source, not tested | ledgers/restart; four modes untouched |
+| V02 | Implemented in source, not tested (research) | chemistry + AMR halves of the joint controller both publish; local estimators, not global error |
+| X01 | Out of scope | no MHD/RT/new AGN |
+
+## Remaining validation gates (owner-reserved)
+
+Build all presets; unit tests (`test_amr_recursive_subcycling` updated for the
+operator seam); Strang temporal convergence with mixed sources; exactly-once
+event counts per interval under retry; recursive vs synchronized AMR source
+equivalence; metal-ion ladder conservation/equilibrium against a qualified
+dataset; restart round-trip with ion lanes; MPI rank-count independence.
+
+---
+
+# Patch-48 history (unverified self-assessment, superseded)
+
 # CHUÍ — fechamento estático de implementação H01–V02
 
 Data: 2026-11-04. Escopo: inspeção e edição exclusivamente estáticas do patch
