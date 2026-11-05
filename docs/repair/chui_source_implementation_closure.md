@@ -6,7 +6,8 @@ benchmark, simulação, sanitizer ou validação numérica** nesta campanha.
 
 ## Resultado executivo
 
-Esta campanha fechou em fonte quatro contradições concretas do patch 47:
+Esta campanha fechou em fonte as contradições concretas do patch 47 e os
+blocos subsequentes de integração:
 
 1. **A02:** o refluxo recursivo distribuído deixou de ser proibido pelo sweep.
    As contribuições remotas entram no `PendingFluxRegisterStore` do proprietário
@@ -24,6 +25,16 @@ Esta campanha fechou em fonte quatro contradições concretas do patch 47:
 4. **A01:** refinamentos mandatórios não consomem o orçamento opcional. O
    runtime prepara a hierarquia inteira numa cópia admitida pelo governador,
    vota coletivamente e publica por move no-throw somente após sucesso global.
+5. **H01/I02:** CTU transversal em halos AMR/MPI e transferência SGS por
+   cisalhamento foram ligados aos caminhos conservativos, scratch governado,
+   reflux/regrid e telemetria existentes.
+6. **M01:** as lanes químicas detalhadas adaptativas passaram a armazenamento
+   esparso por `gas_cell_id`, com referência fixa densa, capacidade governada,
+   transporte, migração, regrid, rollback e restart schema 3.
+7. **A03/A04/V02:** a política força/resolução agora toma ação explícita; o
+   forecast de eventos cruza ranks; e um controlador persistente selecionável
+   coordena shadow químico, benefício AMR e custos tipados de cell-step,
+   comunicação, churn e RAM sem substituir as referências fixas.
 
 A inspeção pós-edição não encontrou chamadas desconectadas nas novas
 assinaturas, gates de capability contraditórios, whitespace inválido ou a
@@ -43,7 +54,7 @@ que permanece código obrigatório ausente.
 | H02 | **IMPLEMENTADO EM FONTE, NÃO TESTADO** | Dual energy, autoridade de energia interna, recuperação de primitivas, floors e conversões comoventes: `src/hydro/hydro_core_solver.cpp`, `src/amr/amr_ghost_fill.cpp`, `src/hydro/gas_thermodynamic_refresh.cpp`. Falta qualificação numérica, não uma rota conhecida de fonte. |
 | C01 | **BLOQUEADO POR DADOS EXTERNOS** | Operador, loader SHA-256/provenance, H/He não-equilíbrio, heating/shielding e cooling elementar estão em `src/physics/thermochemistry*.cpp` e `metal_cooling_table.cpp`. As tabelas físicas de produção exigidas pelos perfis não acompanham o pacote. |
 | C02 | **PARCIAL / BLOQUEADO POR DADOS EXTERNOS** | Backends analítico/equilíbrio existem; `fixed_detailed` em `src/physics/chemical_network.cpp` permanece rede reduzida primordial + C+/CO. Faltam inventário multiiônico aprovado e taxas/tabelas verificáveis; sem esses dados não é lícito inventar reações, mas a ligação do inventário definitivo também permanece código futuro. |
-| C03 | **PARCIAL** | Temperatura, densidade, H2/CO, cooling time, histerese, dwell, transição conservativa e bias shadow persistente existem em `thermochemistry_operator.cpp`/`source_runtime.cpp`. A `GasCompositionSidecar` schema 3 retém temperatura/cooling time, erro normalizado, resíduos, ledgers radiativo/heating e a materialização esparsa por identidade; esses campos participam de commit atômico, migração, regrid conservativo, rollback/restart e export HDF5. Os novos limiares opcionais de erro/resíduo alimentam promoção/demora de rebaixamento com histerese. Ainda falta a decisão conjunta com custo/MPI/RAM de V02. |
+| C03 | **IMPLEMENTADO EM FONTE, NÃO TESTADO** | Temperatura, densidade, H2/CO, cooling time, erro/resíduos, histerese, dwell e transição conservativa estão em `ThermochemistryOperator::decideChemistryFidelity`/`BaryonicSourceStage`. `GasCompositionSidecar` schema 3 preserva o histórico e a extensão esparsa por identidade através de commit, transporte MPI, migração, regrid, rollback/restart e HDF5. `SourceRuntimeImpl::updateGlobalChemistryControl` reduz o shadow global e, em modo V02 conjunto, grava bias, amostras e promoções multinível no controlador canônico. A qualificação dos limiares continua pendente de validação, não de código conhecido. |
 | C04 | **IMPLEMENTADO EM FONTE, NÃO TESTADO** | Shadow detalhado amostrado, determinístico, limitado e sem commit: `ThermochemistryOperator::advanceRow`; redução global em `SourceRuntimeImpl::updateGlobalChemistryControl`. O controlador agora avança uma vez por intervalo Strang, não entre as duas metades. |
 | I01 | **IMPLEMENTADO EM FONTE, NÃO TESTADO** | Regime efetivo versus frio resolvido, ownership térmico único e ausência de double cooling: `effective_multiphase_ism.cpp`, `baryonic_source_stage.cpp`, `gas_thermodynamic_refresh.cpp`. |
 | I02 | **IMPLEMENTADO EM FONTE, NÃO TESTADO** | `prepareSgsShearTransfer` em `ism_dust_sgs.cpp` usa `sgs_eddy_viscosity_coefficient` no stress traceless `nu_t=C_v Delta^2 |S*|`: impulsos e trabalho são antissimétricos por face, a produção sai da energia resolvida e entra na lane SGS no mesmo commit, e o limite viscoso pede retry numérico. `SourceRuntimeImpl::executeDiffusionAndSgsShear` reutiliza o grafo físico local/coarse-fine/periódico/MPI, valida interfaces remotas coletivamente, governa staging e refresca caches. Advecção/reflux/regrid/restart, feedback e dissipação permanecem na autoridade SGS existente. O modelo continua EXPERIMENTAL/UNQUALIFIED e requer validação numérica futura, não código obrigatório conhecido. |
@@ -54,15 +65,15 @@ que permanece código obrigatório ausente.
 | D01 | **IMPLEMENTADO EM FONTE, NÃO TESTADO** | Transporte conservativo de elementos/dust/moléculas/SGS por `CompositionFluxAccumulator`; difusão MPI por `DistributedElementDiffusionCoupling`; capability coerente em `buildRuntimeCapabilityReport`; integração Strang usa `source_dt_code`. |
 | A01 | **IMPLEMENTADO EM FONTE, NÃO TESTADO** | `planProductionAmrRegrid` separa `admitted_optional_operations`; `runAutomaticAmrRegrid` usa candidato integral governado + voto coletivo + publicação no-throw. Prolong/restrict de composição e identidades continuam nos operadores existentes. |
 | A02 | **IMPLEMENTADO EM FONTE, NÃO TESTADO** | `advanceProductionAmrHydroRecursiveImpl`, `mergeFluxRegistersIntoPendingStore`, `DistributedRecursiveHooks::exchangeLevelFluxRegisters`, histories start/end e restart de `PendingFluxRegisterRecord`. Intervalos incompatíveis e duplicatas por origem falham fechados; área fina repartida é recomposta no subpasso. |
-| A03 | **PARCIAL** | Massa, Jeans, jump/shock, cooling length, metal/species/vorticity, forced event rows e telemetria softening existem em `amr_production_regrid.cpp`/`runAutomaticAmrRegrid`. Falta política operacional de erro de força/resolução que coordene esses sinais além da contagem de regime não qualificado. |
-| A04 | **PARCIAL** | Previsão de evento/posição e forced refinement estão conectados; orçamento opcional e memória governada também. Falta função concreta benefício/cell-step/MPI/churn com histerese e decisão conjunta V02. Previsão de host driftado fora do rank ainda é limitação documentada. |
+| A03 | **IMPLEMENTADO EM FONTE, NÃO TESTADO** | `patchDecision` mantém massa/Jeans/cooling length como mandatórios e jump, metal/species/vorticidade/eventos como opcionais tipados. Todo backend Part 2 publica `chemistry_last_cooling_time_seconds`; `runAutomaticAmrRegrid` o converte ao tempo-code autoritativo. `AmrForceResolutionPolicy` oferece a referência histórica contabilizada e a política produtiva que bloqueia refinamento opcional abaixo do softening e falha coletivamente se requisito mandatório violar softening, `amr_max_level` ou a hierarquia 2:1. G01 continua condicional à validação. |
+| A04 | **IMPLEMENTADO EM FONTE, NÃO TESTADO** | `planProductionAmrRegrid` calcula severidade normalizada por critério e custos separados de cell-steps incrementais, faces MPI, churn e RAM; o modo conjunto ordena benefício/cell-step e usa MPI/churn como desempate, aplica piso com histerese e orçamento, enquanto mandatórios bypassam os tetos. `runAutomaticAmrRegrid` troca posições atual/driftada por `allgatherBytesBounded`, resolve o host somente no owner e propaga falhas/admissão coletivamente. O modelo permanece RESEARCH/UNQUALIFIED até validação numérica. |
 | G01 | **CONDICIONAL À VALIDAÇÃO** | TreePM/KDK e auditoria AMR-softening existem. A especificação condiciona uma correção gravitacional multinível adicional ao resultado de qualificação futura; esta rodada não executou essa qualificação e não inventou novo solver. |
 | T01 | **IMPLEMENTADO EM FONTE, NÃO TESTADO** | `SourceSplitPhase`, ordem de nove dispatches em `time_integration.cpp`, inversão determinística de tempo cosmológico, `makeSourceInterval` por metade e eventos somente post. Rollback global restaura estado, schedulers, force endpoint e checkpoint privado da fonte. |
-| T02 | **PARCIAL** | `advanceProductionAmrHydroRecursiveImpl` agora invoca `SourceRuntimeImpl::executeAmrLevelSmoothSources` em ambas as metades de cada subintervalo, inclusive nos ranks sem linhas locais; termoquímica/dust/SGS usam o relógio `dt_L`, entram nos históricos temporais e o shadow/controller é agregado uma vez por passo com rollback privado. A autoridade de eventos permanece O(1) na sidecar populacional e ganhou cursor absoluto persistente com rejeição de gap/replay e migração de schema. SF/SSP/feedback/ventos/difusão ainda usam a barreira global enquanto faltam depósitos cross-level e difusão no grafo multinível. |
+| T02 | **PARCIAL** | `advanceProductionAmrHydroRecursiveImpl` agora invoca `SourceRuntimeImpl::executeAmrLevelSmoothSources` em ambas as metades de cada subintervalo, inclusive nos ranks sem linhas locais; termoquímica/dust/SGS usam o relógio `dt_L`, entram nos históricos temporais e shadow, promoções adaptativas e controlador são agregados uma vez por passo com rollback privado. A autoridade de eventos permanece O(1) na sidecar populacional e ganhou cursor absoluto persistente com rejeição de gap/replay e migração de schema. SF/SSP/feedback/ventos/difusão ainda usam a barreira global enquanto faltam depósitos cross-level e difusão no grafo multinível. |
 | M01 | **IMPLEMENTADO EM FONTE, NÃO TESTADO** | `GasCompositionSidecar` mantém apenas as lanes básicas densas e armazena C+/CO adaptativos em vetores contíguos ordenados por `gas_cell_id`, com projeção implícita conservativa e retenção do histórico após rebaixamento. Crescimento em química, transporte Godunov MPI, difusão e demais commits usa `RetainedCapacityTransaction`/governador; regrid e migração dimensionam exatamente o candidato já admitido. Pack schema 3, restart com migração schema 1/2, HDF5, AMR prolong/restrict, ownership, rollback e depósitos de feedback/poeira preservam a mesma autoridade. O modo detalhado fixo continua denso como referência determinística. Qualificação de pico MPI fica para a campanha de testes reservada. |
 | M02 | **IMPLEMENTADO EM FONTE, NÃO TESTADO** | CPU scalar/SIMD/OpenMP/MPI, decomposição/migração e balanceamento ponderado permanecem nos runtimes existentes. GPU segue opcional e não foi transformada em dependência. |
 | V01 | **IMPLEMENTADO EM FONTE, NÃO TESTADO** | Contratos de configuração/provenance, ledgers, snapshots HDF5, restart versionado e quatro decks científicos permanecem conectados em `config.cpp`, `snapshot_hdf5.cpp`, `restart_checkpoint.cpp` e `configs/chui_part3`. Aceitação end-to-end foi deliberadamente adiada. |
-| V02 | **PARCIAL** | Bias químico por shadow e orçamento AMR por headroom existem, mas são controladores separados. Faltam estimadores tipados persistentes e coordenador conjunto de erro local, benefício, custo, MPI/churn e RAM, com referência fixa e rollback. |
+| V02 | **IMPLEMENTADO EM FONTE, NÃO TESTADO** | `V02ControlMode` seleciona `fixed_reference` ou `joint_error_resource_v1`. O estado versionado em `adaptive_resource_control.hpp` reside na sidecar de `SimulationState`, portanto acompanha rollback/restart sem segunda autoridade. `SourceRuntimeImpl` publica shadow, bias e demanda química multinível; `runAutomaticAmrRegrid` reserva crescimento esparso antes de expor headroom opcional, persiste decisões admitidas ou no-op e usa estimadores AMR tipados sem inventar erro físico universal. O modo fixo preserva bias químico e ordem AMR por `patch_id`; física mandatória nunca é reduzida pelo controlador. O modo conjunto permanece RESEARCH/UNQUALIFIED até qualificação. |
 
 ## Contratos alterados nesta campanha
 
@@ -77,13 +88,16 @@ que permanece código obrigatório ausente.
   após commit/rejeição.
 - Difusão distribuída somente é elegível com composição elementar. A capability
   não promove o operador escalar legado nem oculta a dependência de MPI.
+- `chui_v02_joint_error_resource_control_v1` é o único estado persistente do
+  controlador conjunto. Química continua dona de composição/fidelidade e AMR
+  continua dono da hierarquia; o sidecar guarda apenas histórico de decisão e
+  reservas, participa da cópia de rollback/restart e não duplica campos físicos.
 
 ## Pendências obrigatórias verdadeiras
 
 Não é correto declarar fechamento integral H01–V02 nesta árvore. Permanecem
-obrigatórias as implementações T02 multinível bariônico, M01 química esparsa
-e o coordenador A03/A04/V02; a parte ainda parcial de C03 depende desse último.
-C02 requer primeiro a especificação/dados verificáveis do
+obrigatórias a implementação T02 multinível bariônica e a ligação do
+inventário definitivo de C02. C02 requer primeiro a especificação/dados verificáveis do
 inventário detalhado; S02/F02 requerem tabelas físicas de produção. G01 é
 deliberadamente condicional à campanha de validação prevista pela norma.
 

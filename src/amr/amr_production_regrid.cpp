@@ -162,7 +162,8 @@ struct PhysicsIndicatorValues {
     const PatchDescriptor& patch,
     const ProductionAmrRegridPolicy& policy,
     bool& forced,
-    bool* mandatory_refine = nullptr) {
+    bool* mandatory_refine = nullptr,
+    double* optional_benefit = nullptr) {
   const std::vector<std::uint32_t> rows =
       rowsForPatchLocalCellOrder(state, patch, "production AMR regrid indicator");
   const double width = minCellWidth(patch);
@@ -171,6 +172,7 @@ struct PhysicsIndicatorValues {
   bool derefine_all = true;
   forced = false;
   if (mandatory_refine != nullptr) *mandatory_refine = false;
+  if (optional_benefit != nullptr) *optional_benefit = 0.0;
   if (policy.physics.cooling_length_cells > 0.0 && policy.physics.cooling_time_code.size() < state.cells.size()) {
     throw std::invalid_argument("production AMR regrid: cooling-length criterion needs one cooling time per gas row");
   }
@@ -179,6 +181,9 @@ struct PhysicsIndicatorValues {
     if (!policy.forced_refine_rows.empty() &&
         std::binary_search(policy.forced_refine_rows.begin(), policy.forced_refine_rows.end(), row)) {
       forced = true;
+      if (optional_benefit != nullptr) {
+        *optional_benefit = std::numeric_limits<double>::infinity();
+      }
       refine_any = true;
       derefine_all = false;
       continue;
@@ -221,6 +226,9 @@ struct PhysicsIndicatorValues {
     RefinementDecision optional = RefinementDecision::kDerefine;
     const auto apply_optional = [&](bool enabled, double value, double threshold) {
       if (!enabled) return;
+      if (optional_benefit != nullptr && threshold > 0.0) {
+        *optional_benefit = std::max(*optional_benefit, value / threshold);
+      }
       if (value > threshold) {
         optional = RefinementDecision::kRefine;
       } else if (optional == RefinementDecision::kDerefine && value > threshold * hysteresis) {
@@ -247,6 +255,29 @@ struct PhysicsIndicatorValues {
   if (refine_any) return RefinementDecision::kRefine;
   if (derefine_all) return RefinementDecision::kDerefine;
   return RefinementDecision::kKeep;
+}
+
+[[nodiscard]] std::uint64_t optionalMpiFaceCellCost(
+    const PatchDescriptor& patch,
+    std::span<const PatchDescriptor> remote,
+    const internal::AmrPeriodicFrame& frame) {
+  bool remote_interface = false;
+  for (const PatchDescriptor& other : remote) {
+    remote_interface = remote_interface || patchesTouch(patch, other, frame);
+  }
+  if (!remote_interface) return 0U;
+  const std::size_t nx = patch.cell_dims[0];
+  const std::size_t ny = patch.cell_dims[1];
+  const std::size_t nz = patch.cell_dims[2];
+  const std::size_t faces = core::checkedSizeAdd(
+      core::checkedSizeAdd(
+          core::checkedSizeMultiply(nx, ny, "AMR xy face cells"),
+          core::checkedSizeMultiply(nx, nz, "AMR xz face cells"),
+          "AMR boundary face cells"),
+      core::checkedSizeMultiply(ny, nz, "AMR yz face cells"),
+      "AMR boundary face cells");
+  return static_cast<std::uint64_t>(
+      core::checkedSizeMultiply(2U, faces, "AMR boundary face cells"));
 }
 
 }  // namespace
@@ -336,40 +367,174 @@ ProductionAmrRegridPlan planProductionAmrRegrid(
   if (policy.pass == AmrRegridPassKind::kRefineOnly) {
     // R1: mandatory (resolution) requests are scheduled before optional
     // (structure-tracking) ones; the budget truncates optional ones first.
-    std::vector<std::pair<bool, const PatchDescriptor*>> candidates;
+    struct Candidate {
+      bool mandatory = false;
+      bool forced = false;
+      const PatchDescriptor* patch = nullptr;
+      double benefit = 0.0;
+      std::uint64_t incremental_cell_steps = 0U;
+      std::uint64_t mpi_face_cells = 0U;
+      std::uint64_t churn_cells = 0U;
+      std::uint64_t memory_bytes = 0U;
+    };
+    const auto multiply_u64 = [](std::uint64_t a, std::uint64_t b, const char* label) {
+      if (a != 0U && b > std::numeric_limits<std::uint64_t>::max() / a) {
+        throw std::overflow_error(std::string(label) + " overflow");
+      }
+      return a * b;
+    };
+    std::vector<Candidate> candidates;
     for (const PatchDescriptor& patch : local) {
       bool forced = false;
       bool mandatory = false;
-      if (patchDecision(state, patch, policy, forced, &mandatory) != RefinementDecision::kRefine) continue;
-      candidates.emplace_back(mandatory, &patch);
+      double benefit = 0.0;
+      if (patchDecision(state, patch, policy, forced, &mandatory, &benefit) !=
+          RefinementDecision::kRefine) continue;
+      const std::uint64_t parent_cells = cellCount(patch);
+      const std::uint64_t incremental = multiply_u64(parent_cells, 7U, "AMR incremental cell-step cost");
+      const std::uint64_t churn = multiply_u64(parent_cells, 9U, "AMR churn cost");
+      candidates.push_back(Candidate{
+          .mandatory = mandatory,
+          .forced = forced,
+          .patch = &patch,
+          .benefit = benefit,
+          .incremental_cell_steps = incremental,
+          .mpi_face_cells = mandatory
+              ? 0U
+              : optionalMpiFaceCellCost(
+                    patch, remote_neighbor_patches, frame),
+          .churn_cells = churn,
+          .memory_bytes = multiply_u64(
+              incremental,
+              policy.optional_control.estimated_bytes_per_cell,
+              "AMR incremental memory cost")});
       if (mandatory) ++plan.mandatory_refine_requests; else ++plan.optional_refine_requests;
     }
-    std::stable_partition(candidates.begin(), candidates.end(), [](const auto& c) { return c.first; });
+    const bool rank_by_optional_value = policy.optional_control.enabled;
+    std::stable_sort(candidates.begin(), candidates.end(), [rank_by_optional_value](
+                         const Candidate& lhs, const Candidate& rhs) {
+      if (lhs.mandatory != rhs.mandatory) return lhs.mandatory;
+      if (lhs.mandatory) return lhs.patch->patch_id < rhs.patch->patch_id;
+      if (!rank_by_optional_value) {
+        return lhs.patch->patch_id < rhs.patch->patch_id;
+      }
+      if (lhs.forced != rhs.forced) return lhs.forced;
+      const bool lhs_inf = !std::isfinite(lhs.benefit);
+      const bool rhs_inf = !std::isfinite(rhs.benefit);
+      if (lhs_inf != rhs_inf) return lhs_inf;
+      const long double lhs_ratio = static_cast<long double>(lhs.benefit) /
+          static_cast<long double>(std::max<std::uint64_t>(lhs.incremental_cell_steps, 1U));
+      const long double rhs_ratio = static_cast<long double>(rhs.benefit) /
+          static_cast<long double>(std::max<std::uint64_t>(rhs.incremental_cell_steps, 1U));
+      if (lhs_ratio != rhs_ratio) return lhs_ratio > rhs_ratio;
+      if (lhs.mpi_face_cells != rhs.mpi_face_cells) return lhs.mpi_face_cells < rhs.mpi_face_cells;
+      if (lhs.churn_cells != rhs.churn_cells) return lhs.churn_cells < rhs.churn_cells;
+      return lhs.patch->patch_id < rhs.patch->patch_id;
+    });
     std::size_t admitted_optional_operations = 0U;
-    for (const auto& [mandatory, patch_ptr] : candidates) {
-      const PatchDescriptor& patch = *patch_ptr;
+    std::uint64_t admitted_mandatory_memory_bytes = 0U;
+    const auto exceeds = [](std::uint64_t used, std::uint64_t cost, std::uint64_t limit) {
+      return used > limit || cost > limit - used;
+    };
+    const auto add_cost = [](std::uint64_t& total, std::uint64_t cost, const char* label) {
+      if (cost > std::numeric_limits<std::uint64_t>::max() - total) {
+        throw std::overflow_error(std::string(label) + " overflow");
+      }
+      total += cost;
+    };
+    for (const Candidate& candidate : candidates) {
+      const bool mandatory = candidate.mandatory;
+      const PatchDescriptor& patch = *candidate.patch;
       ++plan.refine_requests;
       if (patch.level >= policy.max_level) {
         ++plan.blocked_by_max_level;
+        if (mandatory) {
+          throw std::runtime_error(
+              "mandatory AMR refinement of patch " +
+              std::to_string(patch.patch_id) +
+              " cannot be satisfied at numerics.amr_max_level");
+        }
         continue;
       }
       if (!neighbourLevelsAtLeast(patch, static_cast<int>(patch.level), {})) {
         ++plan.blocked_by_balance;
+        if (mandatory) {
+          throw std::runtime_error(
+              "mandatory AMR refinement of patch " +
+              std::to_string(patch.patch_id) +
+              " is blocked by the current 2:1 neighbour hierarchy; "
+              "refine/rebalance the coarser neighbour first");
+        }
         continue;
       }
-      if (!mandatory && admitted_optional_operations >= policy.max_operations) {
+      const bool below_force_resolution = policy.gravity_softening_code > 0.0 &&
+          0.5 * minCellWidth(patch) < policy.gravity_softening_code;
+      if (below_force_resolution &&
+          policy.force_resolution_action ==
+              AmrForceResolutionAction::kLimitOptionalRejectMandatory) {
+        if (mandatory) {
+          throw std::runtime_error(
+              "mandatory AMR refinement of patch " + std::to_string(patch.patch_id) +
+              " would make gas resolution finer than configured gravitational softening");
+        }
+        ++plan.optional_blocked_by_force_resolution;
+        continue;
+      }
+      const std::uint64_t admitted_memory_bytes =
+          admitted_mandatory_memory_bytes >
+                  std::numeric_limits<std::uint64_t>::max() -
+                      plan.optional_admitted_memory_bytes
+          ? std::numeric_limits<std::uint64_t>::max()
+          : admitted_mandatory_memory_bytes +
+                plan.optional_admitted_memory_bytes;
+      const bool resource_truncated = !mandatory && policy.optional_control.enabled &&
+          ((std::isfinite(candidate.benefit) &&
+            candidate.benefit < policy.optional_control.benefit_floor) ||
+           exceeds(plan.optional_admitted_cell_steps, candidate.incremental_cell_steps,
+                   policy.optional_control.cell_step_budget) ||
+           exceeds(plan.optional_admitted_mpi_face_cells, candidate.mpi_face_cells,
+                   policy.optional_control.mpi_face_cell_budget) ||
+           exceeds(plan.optional_admitted_churn_cells, candidate.churn_cells,
+                   policy.optional_control.churn_cell_budget) ||
+           exceeds(admitted_memory_bytes, candidate.memory_bytes,
+                   policy.optional_control.memory_budget_bytes));
+      if (!mandatory &&
+          (admitted_optional_operations >= policy.max_operations || resource_truncated)) {
         ++plan.truncated_by_budget;
         ++plan.optional_truncated_by_budget;
         continue;
       }
-      if (policy.gravity_softening_code > 0.0 && 0.5 * minCellWidth(patch) < policy.gravity_softening_code) {
+      if (below_force_resolution) {
         ++plan.refined_below_gravity_softening;
       }
       const std::size_t cells = core::checkedSizeMultiply(cellCount(patch), 8U, "regrid refine cells");
       plan.operations.push_back(ProductionAmrRegridOperation{
           .kind = AmrRegridOperationKind::kRefine, .patch = patch,
-          .new_patch_ids = 8U, .new_gas_cell_ids = cells});
-      if (!mandatory) ++admitted_optional_operations;
+          .new_patch_ids = 8U, .new_gas_cell_ids = cells,
+          .optional_benefit = mandatory ? 0.0 : candidate.benefit,
+          .incremental_cell_steps = candidate.incremental_cell_steps,
+          .mpi_face_cells = candidate.mpi_face_cells,
+          .churn_cells = candidate.churn_cells,
+          .estimated_memory_bytes = candidate.memory_bytes});
+      if (mandatory) {
+        add_cost(admitted_mandatory_memory_bytes, candidate.memory_bytes,
+                 "AMR mandatory memory cost");
+      } else {
+        ++admitted_optional_operations;
+        ++plan.optional_admitted_operations;
+        add_cost(plan.optional_admitted_cell_steps, candidate.incremental_cell_steps,
+                 "AMR admitted cell-step cost");
+        add_cost(plan.optional_admitted_mpi_face_cells, candidate.mpi_face_cells,
+                 "AMR admitted MPI-face cost");
+        add_cost(plan.optional_admitted_churn_cells, candidate.churn_cells,
+                 "AMR admitted churn cost");
+        add_cost(plan.optional_admitted_memory_bytes, candidate.memory_bytes,
+                 "AMR admitted memory cost");
+        if (plan.optional_min_admitted_benefit == 0.0 ||
+            candidate.benefit < plan.optional_min_admitted_benefit) {
+          plan.optional_min_admitted_benefit = candidate.benefit;
+        }
+      }
     }
   } else {
     // Group local leaves by parent id (deterministic: std::map ordered by id).

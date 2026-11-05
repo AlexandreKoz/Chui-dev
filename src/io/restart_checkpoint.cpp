@@ -3440,6 +3440,10 @@ std::string restartConfigurationCompatibilityRecord(
       !part3PhysicsKeysAtDefaults(current.config.physics) ||
       // CHUI Part 3 regrid keys must hold their (static-hierarchy) defaults.
       current.config.numerics.amr_regrid_mode != core::AmrRegridConfigMode::kOff ||
+      current.config.numerics.amr_force_resolution_policy !=
+          core::AmrForceResolutionPolicy::kLimitOptionalRejectMandatory ||
+      current.config.numerics.v02_control_mode != core::V02ControlMode::kFixedReference ||
+      current.config.numerics.v02_optional_memory_headroom_fraction != 0.5 ||
       current.config.numerics.global_step_max_retries != 0 ||
       current.config.numerics.amr_time_stepping != core::AmrTimeSteppingConfigMode::kSynchronized ||
       current.config.numerics.amr_predictive_feedback_age_years != 0.0 ||
@@ -3576,6 +3580,17 @@ std::string restartConfigurationCompatibilityRecord(
         "amr_regrid_interval_steps", "amr_regrid_max_operations",
         "amr_refine_cell_mass_code", "amr_refine_jump_threshold", "amr_refine_jeans_cells",
         "amr_derefine_hysteresis"});
+  }
+  if (projected.find("\namr_force_resolution_policy = ") != std::string::npos &&
+      restart.normalized_config_text.find("\namr_force_resolution_policy = ") == std::string::npos) {
+    if (current.config.numerics.amr_force_resolution_policy !=
+            core::AmrForceResolutionPolicy::kLimitOptionalRejectMandatory ||
+        current.config.numerics.v02_control_mode != core::V02ControlMode::kFixedReference ||
+        current.config.numerics.v02_optional_memory_headroom_fraction != 0.5) {
+      fail("checkpoint predates A03/V02 policy keys; only their fixed defaults are accepted");
+    }
+    removeKeyLines({"amr_force_resolution_policy", "v02_control_mode",
+                    "v02_optional_memory_headroom_fraction"});
   }
   // Milestone I key added after the first Part 3 pass (default verified above).
   if (projected.find("\namr_time_stepping = ") != std::string::npos &&

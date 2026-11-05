@@ -725,6 +725,27 @@ parseInitialConditionMissingFieldPolicy(
                     "' (expected off or automatic)");
 }
 
+[[nodiscard]] AmrForceResolutionPolicy parseAmrForceResolutionPolicy(
+    const std::string& value) {
+  const std::string lower = toLower(trim(value));
+  if (lower == "allow_counted_reference") {
+    return AmrForceResolutionPolicy::kAllowCountedReference;
+  }
+  if (lower == "limit_optional_reject_mandatory") {
+    return AmrForceResolutionPolicy::kLimitOptionalRejectMandatory;
+  }
+  throw ConfigError("key 'numerics.amr_force_resolution_policy': invalid value '" + value +
+                    "' (expected allow_counted_reference or limit_optional_reject_mandatory)");
+}
+
+[[nodiscard]] V02ControlMode parseV02ControlMode(const std::string& value) {
+  const std::string lower = toLower(trim(value));
+  if (lower == "fixed_reference") return V02ControlMode::kFixedReference;
+  if (lower == "joint_error_resource_v1") return V02ControlMode::kJointErrorResourceV1;
+  throw ConfigError("key 'numerics.v02_control_mode': invalid value '" + value +
+                    "' (expected fixed_reference or joint_error_resource_v1)");
+}
+
 [[nodiscard]] NodeMemoryAdmissionMode parseNodeMemoryAdmissionMode(const std::string& value) {
   const std::string lower = toLower(trim(value));
   if (lower == "off") return NodeMemoryAdmissionMode::kOff;
@@ -1431,6 +1452,9 @@ struct ConfigKeySpec {
       {"numerics.gravity_timestep_eta", "0.2"},
       {"numerics.amr_max_level", "10"},
       {"numerics.amr_regrid_mode", "off"},
+      {"numerics.amr_force_resolution_policy", "limit_optional_reject_mandatory"},
+      {"numerics.v02_control_mode", "fixed_reference"},
+      {"numerics.v02_optional_memory_headroom_fraction", "0.5"},
       {"numerics.global_step_max_retries", "0"},
       {"numerics.amr_time_stepping", "synchronized"},
       {"numerics.amr_predictive_feedback_age_years", "0.0"},
@@ -2156,6 +2180,19 @@ void validateConfig(const SimulationConfig& config) {
   if (config.numerics.amr_regrid_interval_steps < 1 || config.numerics.amr_regrid_max_operations < 1) {
     throw ConfigError("numerics.amr_regrid_interval_steps and numerics.amr_regrid_max_operations must be >= 1");
   }
+  if (!std::isfinite(config.numerics.v02_optional_memory_headroom_fraction) ||
+      !(config.numerics.v02_optional_memory_headroom_fraction > 0.0) ||
+      config.numerics.v02_optional_memory_headroom_fraction > 1.0) {
+    throw ConfigError(
+        "numerics.v02_optional_memory_headroom_fraction must be finite and in (0, 1]");
+  }
+  if (config.numerics.v02_control_mode == V02ControlMode::kJointErrorResourceV1 &&
+      (config.numerics.amr_regrid_mode != AmrRegridConfigMode::kAutomatic ||
+       config.physics.chemistry_adaptive_selection != ChemistryAdaptiveSelectionConfig::kLocalV1)) {
+    throw ConfigError(
+        "numerics.v02_control_mode=joint_error_resource_v1 requires automatic AMR and "
+        "physics.chemistry_adaptive_selection=local_v1");
+  }
   if (!std::isfinite(config.numerics.amr_refine_cell_mass_code) || config.numerics.amr_refine_cell_mass_code < 0.0 ||
       !std::isfinite(config.numerics.amr_refine_jump_threshold) || config.numerics.amr_refine_jump_threshold < 0.0 ||
       !std::isfinite(config.numerics.amr_refine_jeans_cells) || config.numerics.amr_refine_jeans_cells < 0.0) {
@@ -2169,13 +2206,12 @@ void validateConfig(const SimulationConfig& config) {
     }
   }
   if (config.numerics.amr_refine_cooling_length_cells > 0.0 &&
-      (!config.physics.enable_cooling ||
-       config.physics.thermochemistry_backend != ThermochemistryBackendMode::kLegacyCooling)) {
-    // Explicit refusal, not a silent no-op: the cooling time is evaluated from
-    // the in-solver legacy cooling-rate provider. Part 2 backends own cooling
-    // in the SourceRuntime and do not yet publish per-cell cooling times.
-    throw ConfigError("numerics.amr_refine_cooling_length_cells > 0 requires physics.enable_cooling = true with "
-                      "thermochemistry_backend = legacy_cooling (Part 2 backends do not publish cooling times)");
+      !config.physics.enable_cooling) {
+    // Legacy cooling publishes through the in-solver rate provider. Every
+    // Part 2 backend publishes its accepted per-cell cooling-time history in
+    // GasCompositionSidecar; both paths therefore require cooling ownership.
+    throw ConfigError(
+        "numerics.amr_refine_cooling_length_cells > 0 requires physics.enable_cooling = true");
   }
   if (config.numerics.amr_refine_species_jump > 0.0 &&
       config.physics.thermochemistry_backend != ThermochemistryBackendMode::kFixedHybrid &&
@@ -3093,6 +3129,12 @@ class NormalizedConfigStream {
   stream << "gravity_timestep_eta = " << frozen.config.numerics.gravity_timestep_eta << '\n';
   stream << "amr_max_level = " << frozen.config.numerics.amr_max_level << '\n';
   stream << "amr_regrid_mode = " << amrRegridConfigModeToString(frozen.config.numerics.amr_regrid_mode) << '\n';
+  stream << "amr_force_resolution_policy = "
+         << amrForceResolutionPolicyToString(frozen.config.numerics.amr_force_resolution_policy) << '\n';
+  stream << "v02_control_mode = "
+         << v02ControlModeToString(frozen.config.numerics.v02_control_mode) << '\n';
+  stream << "v02_optional_memory_headroom_fraction = "
+         << frozen.config.numerics.v02_optional_memory_headroom_fraction << '\n';
   stream << "global_step_max_retries = " << frozen.config.numerics.global_step_max_retries << '\n';
   stream << "amr_time_stepping = " << amrTimeSteppingConfigModeToString(frozen.config.numerics.amr_time_stepping) << '\n';
   stream << "amr_predictive_feedback_age_years = " << frozen.config.numerics.amr_predictive_feedback_age_years << '\n';
@@ -3880,6 +3922,15 @@ class NormalizedConfigStream {
       requireString(entries, consumed, "numerics.amr_max_level", "10"), "numerics.amr_max_level");
   frozen.config.numerics.amr_regrid_mode = parseAmrRegridConfigMode(requireString(
       entries, consumed, "numerics.amr_regrid_mode", defaultFor("numerics.amr_regrid_mode")));
+  frozen.config.numerics.amr_force_resolution_policy = parseAmrForceResolutionPolicy(requireString(
+      entries, consumed, "numerics.amr_force_resolution_policy",
+      defaultFor("numerics.amr_force_resolution_policy")));
+  frozen.config.numerics.v02_control_mode = parseV02ControlMode(requireString(
+      entries, consumed, "numerics.v02_control_mode", defaultFor("numerics.v02_control_mode")));
+  frozen.config.numerics.v02_optional_memory_headroom_fraction = parseFloating(
+      requireString(entries, consumed, "numerics.v02_optional_memory_headroom_fraction",
+                    defaultFor("numerics.v02_optional_memory_headroom_fraction")),
+      "numerics.v02_optional_memory_headroom_fraction");
   frozen.config.numerics.amr_predictive_feedback_age_years = parseFloating(
       requireString(entries, consumed, "numerics.amr_predictive_feedback_age_years",
                     defaultFor("numerics.amr_predictive_feedback_age_years")), "numerics.amr_predictive_feedback_age_years");
@@ -5127,6 +5178,24 @@ std::string amrRegridConfigModeToString(AmrRegridConfigMode mode) {
     case AmrRegridConfigMode::kAutomatic: return "automatic";
   }
   throw ConfigError("unhandled AmrRegridConfigMode enum value during serialization");
+}
+
+std::string amrForceResolutionPolicyToString(AmrForceResolutionPolicy mode) {
+  switch (mode) {
+    case AmrForceResolutionPolicy::kAllowCountedReference:
+      return "allow_counted_reference";
+    case AmrForceResolutionPolicy::kLimitOptionalRejectMandatory:
+      return "limit_optional_reject_mandatory";
+  }
+  throw ConfigError("unhandled AmrForceResolutionPolicy enum value during serialization");
+}
+
+std::string v02ControlModeToString(V02ControlMode mode) {
+  switch (mode) {
+    case V02ControlMode::kFixedReference: return "fixed_reference";
+    case V02ControlMode::kJointErrorResourceV1: return "joint_error_resource_v1";
+  }
+  throw ConfigError("unhandled V02ControlMode enum value during serialization");
 }
 
 std::string nodeMemoryAdmissionModeToString(NodeMemoryAdmissionMode mode) {

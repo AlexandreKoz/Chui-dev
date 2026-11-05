@@ -80,6 +80,23 @@ enum class AmrRegridConfigMode {
   kAutomatic,
 };
 
+// A03 force-resolution contract for gas AMR. The reference mode preserves
+// historical behavior and records the unqualified regime. The production
+// policy limits optional refinement below gas softening and rejects a
+// mandatory request that gravity cannot resolve.
+enum class AmrForceResolutionPolicy {
+  kAllowCountedReference,
+  kLimitOptionalRejectMandatory,
+};
+
+// V02 research controller. Fixed reference preserves independent chemistry
+// and deterministic max-operation AMR policies. Joint v1 coordinates their
+// retained state and RAM headroom without suppressing mandatory physics.
+enum class V02ControlMode {
+  kFixedReference,
+  kJointErrorResourceV1,
+};
+
 // Node-level memory admission policy. kOff preserves historical semantics:
 // only parallel.process_memory_budget_bytes (0 = unlimited) bounds a rank.
 enum class NodeMemoryAdmissionMode {
@@ -435,6 +452,12 @@ struct NumericsConfig {
   // CHUI Part 3 automatic AMR regrid (see docs/configuration.md). A criterion
   // value of 0 disables that criterion; kAutomatic requires at least one.
   AmrRegridConfigMode amr_regrid_mode = AmrRegridConfigMode::kOff;
+  AmrForceResolutionPolicy amr_force_resolution_policy =
+      AmrForceResolutionPolicy::kLimitOptionalRejectMandatory;
+  V02ControlMode v02_control_mode = V02ControlMode::kFixedReference;
+  // Fraction of governor headroom exposed to optional regrid candidates in
+  // joint mode after reserving observed adaptive-chemistry growth.
+  double v02_optional_memory_headroom_fraction = 0.5;
   // CHUI Part 3 collective global-step rollback (rung zero): 0 disables.
   int global_step_max_retries = 0;
   AmrTimeSteppingConfigMode amr_time_stepping = AmrTimeSteppingConfigMode::kSynchronized;
@@ -1032,6 +1055,8 @@ void writeNormalizedConfigSnapshot(
 [[nodiscard]] std::string hydroRiemannSolverModeToString(HydroRiemannSolverMode mode);
 [[nodiscard]] std::string hydroDualEnergyConfigModeToString(HydroDualEnergyConfigMode mode);
 [[nodiscard]] std::string amrRegridConfigModeToString(AmrRegridConfigMode mode);
+[[nodiscard]] std::string amrForceResolutionPolicyToString(AmrForceResolutionPolicy mode);
+[[nodiscard]] std::string v02ControlModeToString(V02ControlMode mode);
 [[nodiscard]] std::string amrTimeSteppingConfigModeToString(AmrTimeSteppingConfigMode mode);
 [[nodiscard]] std::string sspWindModelConfigToString(SspWindModelConfig mode);
 [[nodiscard]] std::string nodeMemoryAdmissionModeToString(NodeMemoryAdmissionMode mode);

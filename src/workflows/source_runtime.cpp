@@ -23,6 +23,7 @@
 
 #include "cosmosim/amr/amr_hydro_orchestrator.hpp"
 #include "cosmosim/core/checked_arithmetic.hpp"
+#include "cosmosim/core/adaptive_resource_control.hpp"
 #include "cosmosim/core/memory_governor.hpp"
 #include "cosmosim/core/governed_scratch_arena.hpp"
 #include "cosmosim/core/memory_accounting.hpp"
@@ -1011,6 +1012,8 @@ class SourceRuntimeImpl final : public SourceRuntime {
     checkpoint.last_sgs_ledger = m_last_sgs_ledger;
     checkpoint.last_shadow_report = m_last_shadow_report;
     checkpoint.multilevel_shadow_report = m_multilevel_shadow_report;
+    checkpoint.multilevel_chemistry_adaptive_report =
+        m_multilevel_chemistry_adaptive_report;
     checkpoint.multilevel_source_step = m_multilevel_source_step;
     checkpoint.last_skipped_effective_rows = m_last_skipped_effective_rows;
     checkpoint.last_element_diffusion = m_last_element_diffusion;
@@ -1039,6 +1042,8 @@ class SourceRuntimeImpl final : public SourceRuntime {
     m_last_sgs_ledger = c.last_sgs_ledger;
     m_last_shadow_report = c.last_shadow_report;
     m_multilevel_shadow_report = c.multilevel_shadow_report;
+    m_multilevel_chemistry_adaptive_report =
+        c.multilevel_chemistry_adaptive_report;
     m_multilevel_source_step = c.multilevel_source_step;
     m_last_skipped_effective_rows = c.last_skipped_effective_rows;
     m_last_element_diffusion = c.last_element_diffusion;
@@ -1365,6 +1370,8 @@ class SourceRuntimeImpl final : public SourceRuntime {
     const physics::ChemistryShadowReport shadow = executeThermochemistry(
         level_context, sourceEvaluationScaleFactor(level_context), false);
     accumulateMultilevelShadowReport(shadow);
+    accumulateMultilevelChemistryAdaptiveReport(
+        m_last_chemistry_adaptive_report);
   }
 
   void execute(SourceMutationStageView& view) override {
@@ -1434,6 +1441,8 @@ class SourceRuntimeImpl final : public SourceRuntime {
             "recursive AMR source post stage has no level-clock source history");
       }
       m_last_shadow_report = m_multilevel_shadow_report;
+      m_last_chemistry_adaptive_report =
+          m_multilevel_chemistry_adaptive_report;
       updateGlobalChemistryControl(context, m_multilevel_shadow_report);
     }
 
@@ -1820,7 +1829,29 @@ class SourceRuntimeImpl final : public SourceRuntime {
 
   void resetMultilevelSourceAggregation(std::uint64_t step_index) noexcept {
     m_multilevel_shadow_report = {};
+    m_multilevel_chemistry_adaptive_report = {};
     m_multilevel_source_step = step_index;
+  }
+
+  void accumulateMultilevelChemistryAdaptiveReport(
+      const physics::ChemistryAdaptiveReport& report) noexcept {
+    const auto add = [](std::uint64_t& value, std::uint64_t increment) {
+      value = increment > std::numeric_limits<std::uint64_t>::max() - value
+          ? std::numeric_limits<std::uint64_t>::max()
+          : value + increment;
+    };
+    add(m_multilevel_chemistry_adaptive_report.promoted, report.promoted);
+    add(m_multilevel_chemistry_adaptive_report.demoted, report.demoted);
+    add(m_multilevel_chemistry_adaptive_report.held_by_dwell,
+        report.held_by_dwell);
+    add(m_multilevel_chemistry_adaptive_report.promoted_by_cooling_time,
+        report.promoted_by_cooling_time);
+    add(m_multilevel_chemistry_adaptive_report.promoted_by_error_history,
+        report.promoted_by_error_history);
+    add(m_multilevel_chemistry_adaptive_report.detailed_cells,
+        report.detailed_cells);
+    add(m_multilevel_chemistry_adaptive_report.hybrid_cells,
+        report.hybrid_cells);
   }
 
   void accumulateMultilevelShadowReport(
@@ -2021,7 +2052,10 @@ class SourceRuntimeImpl final : public SourceRuntime {
     // report from a previous stage) to the collective control reduction.
     const physics::ChemistryShadowReport current_shadow =
         local_work ? m_last_shadow_report : physics::ChemistryShadowReport{};
-    if (!local_work) m_last_shadow_report = current_shadow;
+    if (!local_work) {
+      m_last_shadow_report = current_shadow;
+      m_last_chemistry_adaptive_report = {};
+    }
     // The persistent controller advances once per accepted interval. The pre
     // half may sample shadow chemistry, but must not feed a new bias into the
     // post half of the same Strang composition.
@@ -2123,7 +2157,19 @@ class SourceRuntimeImpl final : public SourceRuntime {
 
   void loadCommittedChemistryControl(const core::SimulationState& state) {
     if (m_thermochemistry == nullptr || !m_thermochemistry->config().adaptive.enabled) return;
-    m_thermochemistry->setGlobalPromotionBias(committedPromotionBias(state));
+    double bias = 0.0;
+    std::exception_ptr load_failure;
+    try {
+      bias = m_config.numerics.v02_control_mode ==
+                  core::V02ControlMode::kJointErrorResourceV1
+          ? core::loadV02ControlState(state).chemistry_promotion_bias
+          : committedPromotionBias(state);
+    } catch (...) {
+      load_failure = std::current_exception();
+    }
+    m_mpi_context.rethrowCollectivePreparationFailure(
+        load_failure, "adaptive chemistry controller load");
+    m_thermochemistry->setGlobalPromotionBias(bias);
   }
 
   void updateGlobalChemistryControl(core::StepContext& context,
@@ -2132,23 +2178,77 @@ class SourceRuntimeImpl final : public SourceRuntime {
     // Next value is a pure function of the COMMITTED bias and this stage's
     // collective shadow reduction; it becomes authoritative only by being
     // written to the canonical sidecar (restored on rollback/restart).
-    const double committed_bias = committedPromotionBias(context.state);
+    const bool joint =
+        m_config.numerics.v02_control_mode == core::V02ControlMode::kJointErrorResourceV1;
+    core::V02ControlState joint_state;
+    double committed_bias = 0.0;
+    std::exception_ptr load_failure;
+    try {
+      if (joint) {
+        joint_state = core::loadV02ControlState(context.state);
+        committed_bias = joint_state.chemistry_promotion_bias;
+      } else {
+        committed_bias = committedPromotionBias(context.state);
+      }
+    } catch (...) {
+      load_failure = std::current_exception();
+    }
+    m_mpi_context.rethrowCollectivePreparationFailure(
+        load_failure, "adaptive chemistry controller update load");
     const double global_max = -m_mpi_context.allreduceMinDouble(-current_shadow.max_relative_species_difference);
     const std::uint64_t global_samples = m_mpi_context.allreduceSumUint64(current_shadow.samples);
     const double bias = physics::nextChemistryPromotionBias(committed_bias, global_max, global_samples);
     m_thermochemistry->setGlobalPromotionBias(bias);
-    std::ostringstream text;
-    text.precision(17);
-    text << "module=chui_adaptive_chemistry_control\npromotion_bias=" << bias
-         << "\nlast_global_shadow_max_relative_species_difference=" << global_max
-         << "\nlast_global_shadow_samples=" << global_samples << "\n";
-    const std::string payload = text.str();
-    core::ModuleSidecarBlock block;
-    block.module_name = "chui_adaptive_chemistry_control_v1";
-    block.schema_version = 1U;
-    block.payload.resize(payload.size());
-    for (std::size_t i = 0; i < payload.size(); ++i) block.payload[i] = static_cast<std::byte>(payload[i]);
-    context.state.sidecars.upsert(std::move(block));
+    if (joint) {
+      std::uint64_t local_detailed = 0U;
+      for (const std::uint8_t tag : context.state.gas_composition.chemistry_model_tag) {
+        local_detailed += tag == physics::k_chemistry_tag_detailed ? 1U : 0U;
+      }
+      joint_state.chemistry_promotion_bias = bias;
+      joint_state.last_shadow_species_error = std::max(global_max, 0.0);
+      joint_state.last_shadow_samples = global_samples;
+      joint_state.chemistry_detailed_rows =
+          m_mpi_context.allreduceSumUint64(local_detailed);
+      joint_state.chemistry_total_rows =
+          m_mpi_context.allreduceSumUint64(
+              static_cast<std::uint64_t>(context.state.gas_composition.rowCount()));
+      joint_state.chemistry_promoted_last_interval =
+          m_mpi_context.allreduceSumUint64(m_last_chemistry_adaptive_report.promoted);
+      std::exception_ptr publication_failure;
+      try {
+        if (joint_state.epoch == std::numeric_limits<std::uint64_t>::max()) {
+          throw std::overflow_error("V02 controller epoch overflow");
+        }
+        joint_state.epoch += 1U;
+        core::storeV02ControlState(context.state, joint_state);
+      } catch (...) {
+        publication_failure = std::current_exception();
+      }
+      m_mpi_context.rethrowCollectivePreparationFailure(
+          publication_failure, "V02 chemistry controller publication");
+      return;
+    }
+    std::exception_ptr publication_failure;
+    try {
+      std::ostringstream text;
+      text.precision(17);
+      text << "module=chui_adaptive_chemistry_control\npromotion_bias=" << bias
+           << "\nlast_global_shadow_max_relative_species_difference=" << global_max
+           << "\nlast_global_shadow_samples=" << global_samples << "\n";
+      const std::string payload = text.str();
+      core::ModuleSidecarBlock block;
+      block.module_name = "chui_adaptive_chemistry_control_v1";
+      block.schema_version = 1U;
+      block.payload.resize(payload.size());
+      for (std::size_t i = 0; i < payload.size(); ++i) {
+        block.payload[i] = static_cast<std::byte>(payload[i]);
+      }
+      context.state.sidecars.upsert(std::move(block));
+    } catch (...) {
+      publication_failure = std::current_exception();
+    }
+    m_mpi_context.rethrowCollectivePreparationFailure(
+        publication_failure, "fixed chemistry controller publication");
   }
 
   // CHUI Part 3 Checkpoint C: remote star-formation neighbours. The directed
@@ -3822,6 +3922,7 @@ class SourceRuntimeImpl final : public SourceRuntime {
   physics::SgsLedger m_last_sgs_ledger{};
   physics::ChemistryShadowReport m_last_shadow_report{};
   physics::ChemistryShadowReport m_multilevel_shadow_report{};
+  physics::ChemistryAdaptiveReport m_multilevel_chemistry_adaptive_report{};
   std::uint64_t m_multilevel_source_step =
       std::numeric_limits<std::uint64_t>::max();
   bool m_amr_level_source_coupling_enabled = false;
@@ -3843,6 +3944,7 @@ class SourceRuntimeImpl final : public SourceRuntime {
     physics::SgsLedger last_sgs_ledger{};
     physics::ChemistryShadowReport last_shadow_report{};
     physics::ChemistryShadowReport multilevel_shadow_report{};
+    physics::ChemistryAdaptiveReport multilevel_chemistry_adaptive_report{};
     std::uint64_t multilevel_source_step =
         std::numeric_limits<std::uint64_t>::max();
     std::uint64_t last_skipped_effective_rows = 0U;

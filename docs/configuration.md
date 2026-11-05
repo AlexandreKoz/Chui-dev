@@ -846,15 +846,18 @@ with every key at its default (exact restart projection).
 |---|---|---|---|
 | `amr_regrid_mode` | `off` \| `automatic` | `off` | `automatic` refines/derefines production AMR at synchronized hierarchy boundaries (after hydro sweep, reflux and composition commit). `off` keeps the static hierarchy. |
 | `amr_regrid_interval_steps` | int >= 1 | `1` | Regrid every N accepted steps. Passes alternate refine-only / derefine-only (2:1 face balance without exchanging decisions across ranks). |
-| `amr_regrid_max_operations` | int >= 1 | `64` | Deterministic per-pass budget (ascending patch id). |
+| `amr_regrid_max_operations` | int >= 1 | `64` | Deterministic optional-operation budget per pass. Fixed-reference mode uses ascending patch id; joint V02 mode uses the documented typed benefit/cost order with patch id as its final tie-breaker. |
+| `amr_force_resolution_policy` | enum | `limit_optional_reject_mandatory` | A03 force-resolution action. `limit_optional_reject_mandatory` refuses optional refinement below gas softening and fails explicitly if a mandatory mass/Jeans/cooling request would cross it; `allow_counted_reference` preserves the historical counted/unqualified reference. |
+| `v02_control_mode` | enum | `fixed_reference` | `fixed_reference` keeps chemistry shadow control and AMR operation budgets independent. `joint_error_resource_v1` persists their shared controller state, reserves observed sparse-chemistry growth, and ranks optional AMR by typed benefit/cell-step, MPI-face, churn and RAM costs. Requires automatic AMR and adaptive chemistry. |
+| `v02_optional_memory_headroom_fraction` | double in (0,1] | `0.5` | Fraction of remaining governor headroom available to optional AMR in joint V02 mode after the collective old/new hierarchy copy and observed chemistry-growth reserve. Mandatory refinement is never reduced by this budget. |
 | `amr_refine_cell_mass_code` | double >= 0 | `0.0` | Refine when the comoving cell mass `rho_com dx^3` exceeds it (0 disables). |
 | `amr_refine_jump_threshold` | double >= 0 | `0.0` | Refine when `max(|drho|/rho_min, |dP|/P_min)` over in-patch face neighbours exceeds it (contact/shock indicator; 0 disables). |
 | `amr_refine_jeans_cells` | double >= 0 | `4.0` | Truelove criterion on the comoving Jeans length `c_s sqrt(pi a/(G rho_com))` (0 disables). |
 | `amr_derefine_hysteresis` | (0, 1] | `0.5` | Derefinement requires every criterion to be below `hysteresis x threshold` (Jeans: above `threshold / hysteresis`). |
-| `amr_refine_cooling_length_cells` | double >= 0 | `0.0` | **Mandatory** (2026-11-04). Refine when the cooling length `c_s t_cool` spans fewer than N cells (physical lengths). `t_cool = e / (Lambda_net n_H^2 / rho)` comes from the legacy in-solver cooling-rate provider; net heating imposes no constraint. Requires `enable_cooling = true` and `thermochemistry_backend = legacy_cooling`; any other combination is refused (Part 2 backends do not publish cooling times). |
+| `amr_refine_cooling_length_cells` | double >= 0 | `0.0` | **Mandatory** (2026-11-04). Refine when the cooling length `c_s t_cool` spans fewer than N cells (physical lengths). Legacy cooling evaluates `t_cool = e / (Lambda_net n_H^2 / rho)` through its in-solver provider; Part 2 backends publish the accepted per-cell `t_cool` from their owning rate set in `GasCompositionSidecar`. Net heating imposes no constraint. Requires `enable_cooling = true`. |
 | `amr_refine_metallicity_jump` | double >= 0 | `0.0` | Optional. Refine when `max |Z_a - Z_b| / max(Z_a, Z_b, 1e-6)` over in-patch face neighbours exceeds it. |
 | `amr_refine_species_jump` | double >= 0 | `0.0` | Optional. Refine when the maximum absolute jump of a species mass fraction (composition gas mass) over in-patch face neighbours exceeds it. Requires `fixed_hybrid` or `fixed_detailed`. |
-| `amr_predictive_event_lookahead_years` | double >= 0 | `0.0` | R2 (RESEARCH). A star's host cell, both now and at its drifted position `x + v dt / a`, is refined when that star's own event chronology produces a core-collapse or Ia event within this window. The chronology is the cumulative-Poisson thresholds of its population record, evaluated on a copy; no ordinal is consumed and no budget changes. In expectation mode (no stochastic events) the criterion is at least 0.5 expected events, which is a heuristic. Requires `amr_regrid_mode = automatic` and a Part 2 population model. Forced rows are optional-priority refinements, and they also block derefinement. Limitation: a drifted host cell on another rank is not forced. |
+| `amr_predictive_event_lookahead_years` | double >= 0 | `0.0` | R2 (RESEARCH). A star's host cell, both now and at its drifted position `x + v dt / a`, is refined when that star's own event chronology produces a core-collapse or Ia event within this window. The chronology is the cumulative-Poisson thresholds of its population record, evaluated on a copy; no ordinal is consumed and no budget changes. In expectation mode (no stochastic events) the criterion is at least 0.5 expected events, which is a heuristic. Requires `amr_regrid_mode = automatic` and a Part 2 population model. Forecast positions are exchanged collectively, so a host crossing an MPI boundary is forced by its owning rank. Forced rows are optional-priority refinements, and they also block derefinement. |
 | `amr_refine_vorticity` | double >= 0 | `0.0` | Optional. Refine when `|curl v| dx / c_s` (comoving gradients and widths, so the value is scale-free) exceeds it. |
 
 **Mandatory versus optional (R1).**
@@ -863,8 +866,11 @@ with every key at its default (exact restart projection).
   is never derefined.
 - Optional criteria: the jump indicator, metallicity, species and vorticity.
   The per-pass budget truncates these first.
-- A truncated mandatory request is reported in the
-  `hydro.amr_automatic_regrid` event as `mandatory_truncated_by_budget`.
+- Mandatory requests bypass operation/RAM budgets. If `amr_max_level`, the
+  current 2:1 hierarchy, or the selected force-resolution policy prevents
+  them, planning fails explicitly and collectively instead of silently
+  accepting an under-resolved state. The legacy
+  `mandatory_truncated_by_budget` telemetry field therefore remains zero.
 - Every stencil uses in-patch neighbours, so decisions are identical on any
   MPI decomposition.
 
