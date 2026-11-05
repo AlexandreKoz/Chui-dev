@@ -183,6 +183,13 @@ class ThermochemistryOperator {
   // Build the solver input of one row (also used by the shadow sampler).
   [[nodiscard]] ThermochemistryCellInput cellInput(const core::SimulationState& state, std::uint32_t row,
                                                    const SourceInterval& interval) const;
+  // Net thermal cooling time using this operator's exact rate set. +inf means
+  // net heating/no cooling constraint. Exposed to AMR so cooling-length
+  // refinement cannot drift from the chemistry model that actually evolves
+  // the gas.
+  [[nodiscard]] double coolingTimeSeconds(
+      const core::SimulationState& state, std::uint32_t row,
+      const SourceInterval& interval) const;
 
  private:
   ThermochemistryOperatorConfig m_config;

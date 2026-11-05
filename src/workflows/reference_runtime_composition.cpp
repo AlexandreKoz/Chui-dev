@@ -398,8 +398,8 @@ namespace {
           .stage = core::IntegrationStage::kHydroUpdate,
           .ordinal = 0,
           .view_kind = RuntimeStageViewKind::kHydroAmr,
-          .resources = {readWrite(RuntimeResourceKey::kParticleVelocity),
-                        readWrite(RuntimeResourceKey::kSourceMutationState),
+          .resources = {readWrite(RuntimeResourceKey::kSourceMutationState),
+                        readWrite(RuntimeResourceKey::kParticleVelocity),
                         readWrite(RuntimeResourceKey::kHydroConservedState),
                         readWrite(RuntimeResourceKey::kHydroPrimitiveState),
                         readWrite(RuntimeResourceKey::kAmrPatchState),
@@ -483,10 +483,7 @@ namespace {
                 &services));
         assembly->source = owner;
         if (assembly->hydro_amr != nullptr) {
-          assembly->hydro_amr->setMultilevelSourceRuntime(owner.get());
-          owner->setAmrLevelSourceCouplingEnabled(
-              config.numerics.amr_time_stepping ==
-              core::AmrTimeSteppingConfigMode::kRecursiveSubcycling);
+          assembly->hydro_amr->bindSourceRuntime(owner.get());
         }
         RuntimeModuleInstance instance;
         instance.owner_lifetime = owner;

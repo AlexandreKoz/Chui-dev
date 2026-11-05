@@ -2206,12 +2206,16 @@ void validateConfig(const SimulationConfig& config) {
     }
   }
   if (config.numerics.amr_refine_cooling_length_cells > 0.0 &&
-      !config.physics.enable_cooling) {
-    // Legacy cooling publishes through the in-solver rate provider. Every
-    // Part 2 backend publishes its accepted per-cell cooling-time history in
-    // GasCompositionSidecar; both paths therefore require cooling ownership.
-    throw ConfigError(
-        "numerics.amr_refine_cooling_length_cells > 0 requires physics.enable_cooling = true");
+      (!config.physics.enable_cooling ||
+       (config.physics.thermochemistry_backend != ThermochemistryBackendMode::kLegacyCooling &&
+        config.physics.thermochemistry_backend != ThermochemistryBackendMode::kFixedHybrid &&
+        config.physics.thermochemistry_backend != ThermochemistryBackendMode::kFixedDetailed &&
+        config.physics.thermochemistry_backend != ThermochemistryBackendMode::kEquilibriumPrimordial))) {
+    // Explicit refusal, not a silent no-op. Legacy cooling publishes its
+    // cooling time directly; Part-2 thermochemistry publishes the cooling
+    // time from the same solver/rate set that evolves the gas.
+    throw ConfigError("numerics.amr_refine_cooling_length_cells > 0 requires physics.enable_cooling = true with "
+                      "legacy_cooling or a Part-2 thermochemistry backend");
   }
   if (config.numerics.amr_refine_species_jump > 0.0 &&
       config.physics.thermochemistry_backend != ThermochemistryBackendMode::kFixedHybrid &&

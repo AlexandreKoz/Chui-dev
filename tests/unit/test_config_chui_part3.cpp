@@ -91,9 +91,10 @@ void testPhysicsIndicatorKeys() {
   }
   CHUI_REQUIRE(frozen.normalized_text == reparsed.normalized_text);
   CHUI_REQUIRE(rejects(base + "amr_refine_vorticity = -1\n"));
-  // Cooling length needs the legacy in-solver cooling provider.
-  CHUI_REQUIRE(rejects(base + "amr_refine_cooling_length_cells = 4\n[physics]\nthermochemistry_backend = fixed_hybrid\n"
-                              "thermochemistry_allow_unqualified_rates = true\nuv_background_model = none\n"));
+  // Cooling length supports both the legacy provider and Part-2 chemistry;
+  // disabling cooling remains an explicit configuration error.
+  CHUI_REQUIRE(!rejects(base + "amr_refine_cooling_length_cells = 4\n[physics]\nthermochemistry_backend = fixed_hybrid\n"
+                               "thermochemistry_allow_unqualified_rates = true\nuv_background_model = none\n"));
   CHUI_REQUIRE(rejects(base + "amr_refine_cooling_length_cells = 4\n[physics]\nenable_cooling = false\n"));
   // Species interfaces need a composition network backend.
   CHUI_REQUIRE(rejects(base + "amr_refine_species_jump = 0.1\n"));

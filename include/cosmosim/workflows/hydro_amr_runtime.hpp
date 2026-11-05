@@ -30,9 +30,11 @@ class HydroAmrRuntime {
   virtual ~HydroAmrRuntime() = default;
 
   virtual void execute(HydroAmrStageView& view) = 0;
-  // Composition-time wiring; non-owning because the runtime module assembly
-  // owns both objects for the complete coordinator lifetime.
-  virtual void setMultilevelSourceRuntime(SourceRuntime* source) noexcept = 0;
+  // Source owner is constructed after hydro/AMR in the runtime composition.
+  // Binding is non-owning; the composition owns both runtimes for the full
+  // workflow lifetime. It enables T02 level-local thermochemistry without a
+  // second source implementation inside the AMR module.
+  virtual void bindSourceRuntime(SourceRuntime* source_runtime) noexcept = 0;
   [[nodiscard]] virtual RuntimeTaskMemoryEstimate estimateMemory(
       const core::SimulationState&) const {
     return {0U, false, "hydro/AMR owner does not publish a complete memory model"};

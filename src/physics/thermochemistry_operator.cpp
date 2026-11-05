@@ -185,6 +185,32 @@ double nextChemistryPromotionBias(double bias, double global_max_shadow_differen
   return bias;
 }
 
+double ThermochemistryOperator::coolingTimeSeconds(
+    const core::SimulationState& state, std::uint32_t row,
+    const SourceInterval& interval) const {
+  const ThermochemistryCellInput input = cellInput(state, row, interval);
+  double mu = state.gas_composition.mean_molecular_weight[row];
+  if (!(mu > 0.0) || !std::isfinite(mu)) mu = 1.22;
+  const double temperature_k = (m_config.solver.adiabatic_index - 1.0) * mu * k_amu_g *
+      input.specific_internal_energy_erg_g / k_boltzmann_erg_per_k;
+  if (!(temperature_k > 0.0) || !(input.mass_density_cgs > 0.0) ||
+      !(input.specific_internal_energy_erg_g > 0.0)) {
+    return std::numeric_limits<double>::infinity();
+  }
+  const CoolingHeatingTerms terms =
+      m_solver.coolingHeating(input, input.species_cm3, temperature_k);
+  const double loss =
+      terms.radiative_cooling + terms.chemical_cooling - terms.heating;
+  const double energy_density =
+      input.mass_density_cgs * input.specific_internal_energy_erg_g;
+  if (!(loss > 0.0) || !(energy_density > 0.0) || !std::isfinite(loss)) {
+    return std::numeric_limits<double>::infinity();
+  }
+  const double cooling_time = energy_density / loss;
+  return std::isfinite(cooling_time) && cooling_time > 0.0
+      ? cooling_time : std::numeric_limits<double>::infinity();
+}
+
 ChemistryFidelityDecision ThermochemistryOperator::decideChemistryFidelity(
     const core::SimulationState& state, const SourceInterval& interval, std::uint32_t row) const {
   const auto& sidecar = state.gas_composition;

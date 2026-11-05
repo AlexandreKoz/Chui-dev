@@ -62,51 +62,136 @@ namespace {
 
 constexpr double k_gamma_adiabatic = 5.0 / 3.0;
 
-void admitCompositionSparseActivation(
-    core::SimulationState& state,
-    const physics::CompositionFluxAccumulator& transport,
-    core::MemoryGovernor* governor,
-    std::string_view owner) {
-  auto& sidecar = state.gas_composition;
-  if (!sidecar.sparseStorageEnabled()) return;
-  core::RetainedCapacityTransaction capacity(
-      [&sidecar] { return sidecar.ownedCapacityBytes(); });
-  sidecar.planSparseRowCapacity(
-      capacity,
-      core::checkedSizeAdd(sidecar.sparseActiveRowCount(),
-                           transport.sparseRowsToActivate(state),
-                           "composition transport sparse row capacity"));
-  capacity.execute(governor, core::MemoryClass::kCanonicalPersistent, owner);
+
+// Final-closure predictive AMR wire record.  Positions are deliberately the
+// only distributed payload: every rank resolves them against its own leaf
+// patches, so a star predicted to cross a decomposition boundary refines the
+// destination rank as well as the source rank.  This keeps the prediction
+// independent of MPI ownership without introducing a second patch authority.
+struct PredictiveRefinementPoint {
+  double x_comoving = 0.0;
+  double y_comoving = 0.0;
+  double z_comoving = 0.0;
+};
+static_assert(std::is_trivially_copyable_v<PredictiveRefinementPoint>);
+
+[[nodiscard]] bool finitePredictivePoint(const PredictiveRefinementPoint& point) noexcept {
+  return std::isfinite(point.x_comoving) && std::isfinite(point.y_comoving) &&
+      std::isfinite(point.z_comoving);
 }
 
-class RecursiveAmrLevelSourceAdapter final
-    : public amr::RecursiveAmrLevelSourceOperator {
- public:
-  RecursiveAmrLevelSourceAdapter(
-      SourceRuntime& source_runtime,
-      core::StepContext& parent_context) noexcept
-      : m_source_runtime(source_runtime), m_parent_context(parent_context) {}
-
-  void apply(
-      core::SimulationState& state,
-      std::span<const std::uint32_t> level_rows,
-      const hydro::HydroUpdateContext& level_update,
-      amr::RecursiveAmrSourcePhase phase) override {
-    if (&state != &m_parent_context.state) {
-      throw std::logic_error(
-          "recursive AMR source adapter received a non-authoritative state");
+[[nodiscard]] std::vector<PredictiveRefinementPoint> allgatherPredictiveRefinementPoints(
+    const parallel::MpiContext& mpi_context,
+    std::span<const PredictiveRefinementPoint> local_points) {
+  std::exception_ptr local_failure;
+  try {
+    for (const PredictiveRefinementPoint& point : local_points) {
+      if (!finitePredictivePoint(point)) {
+        throw std::invalid_argument("predictive AMR refinement point is non-finite");
+      }
     }
-    m_source_runtime.executeAmrLevelSmoothSources(
-        m_parent_context, level_rows, level_update,
-        phase == amr::RecursiveAmrSourcePhase::kPreHydroHalf
-            ? core::SourceSplitPhase::kStrangPreHalf
-            : core::SourceSplitPhase::kStrangPostHalf);
+  } catch (...) {
+    local_failure = std::current_exception();
   }
+  mpi_context.rethrowCollectivePreparationFailure(
+      local_failure, "predictive AMR local point validation");
 
- private:
-  SourceRuntime& m_source_runtime;
-  core::StepContext& m_parent_context;
-};
+  std::span<const std::uint8_t> local_bytes;
+  local_failure = nullptr;
+  try {
+    const std::size_t byte_count = core::checkedSizeMultiply(
+        local_points.size(), sizeof(PredictiveRefinementPoint),
+        "predictive AMR point byte count");
+    local_bytes = std::span<const std::uint8_t>(
+        reinterpret_cast<const std::uint8_t*>(local_points.data()), byte_count);
+  } catch (...) {
+    local_failure = std::current_exception();
+  }
+  mpi_context.rethrowCollectivePreparationFailure(
+      local_failure, "predictive AMR point byte framing");
+
+  const std::vector<std::uint8_t> gathered_bytes =
+      mpi_context.allgatherBytesBounded(local_bytes);
+  std::vector<PredictiveRefinementPoint> gathered;
+  local_failure = nullptr;
+  try {
+    if (gathered_bytes.size() % sizeof(PredictiveRefinementPoint) != 0U) {
+      throw std::runtime_error("predictive AMR all-gather returned a partial point record");
+    }
+    gathered.resize(gathered_bytes.size() / sizeof(PredictiveRefinementPoint));
+    if (!gathered_bytes.empty()) {
+      std::memcpy(gathered.data(), gathered_bytes.data(), gathered_bytes.size());
+    }
+    for (const PredictiveRefinementPoint& point : gathered) {
+      if (!finitePredictivePoint(point)) {
+        throw std::runtime_error("predictive AMR all-gather returned a non-finite point");
+      }
+    }
+  } catch (...) {
+    local_failure = std::current_exception();
+  }
+  mpi_context.rethrowCollectivePreparationFailure(
+      local_failure, "predictive AMR point reassembly validation");
+  return gathered;
+}
+
+// Memory-aware OPTIONAL refinement budget.  Hard accuracy requests never use
+// this limiter.  The estimate is intentionally conservative and models the
+// incremental retained state created by one worst-case local refinement plus
+// composition lanes.  Transactional candidate-state admission remains the
+// hard memory authority when an operation is actually applied.
+[[nodiscard]] std::size_t memoryAwareOptionalRegridBudget(
+    const core::SimulationState& state,
+    core::MemoryGovernor* governor,
+    std::size_t configured_max_operations) {
+  if (configured_max_operations == 0U || governor == nullptr) {
+    return configured_max_operations;
+  }
+  const core::MemoryGovernorSnapshot snapshot = governor->snapshot();
+  if (snapshot.headroom_bytes == std::numeric_limits<std::uint64_t>::max()) {
+    return configured_max_operations;
+  }
+  std::size_t max_patch_cells = 1U;
+  for (std::size_t patch = 0; patch < state.patches.size(); ++patch) {
+    max_patch_cells = std::max<std::size_t>(max_patch_cells, state.patches.cell_count[patch]);
+  }
+  // A refinement replaces N rows by 8N rows: +7N retained rows and +7 patch
+  // descriptors.  The byte model deliberately over-counts the dense/gas
+  // sidecars and lookup overhead because this is only an advisory budget.
+  const std::size_t composition_lane_bytes = state.gas_composition.enabled()
+      ? core::checkedSizeMultiply(
+            state.gas_composition.laneCount(), sizeof(double),
+            "optional AMR composition lane bytes")
+      : 0U;
+  const std::size_t per_cell_bytes = core::checkedSizeAdd(
+      24U * sizeof(double) + 6U * sizeof(std::uint64_t) + 8U * sizeof(std::uint32_t),
+      composition_lane_bytes,
+      "optional AMR retained per-cell bytes");
+  const std::size_t incremental_cells = core::checkedSizeMultiply(
+      max_patch_cells, 7U, "optional AMR incremental cells");
+  const std::size_t estimated_bytes = core::checkedSizeAdd(
+      core::checkedSizeMultiply(
+          incremental_cells, per_cell_bytes,
+          "optional AMR incremental state bytes"),
+      7U * (16U * sizeof(std::uint64_t) + 16U * sizeof(double)),
+      "optional AMR incremental patch bytes");
+  if (estimated_bytes == 0U) {
+    return configured_max_operations;
+  }
+  const core::DeterministicBatchSizingResult selected = core::selectDeterministicBatchSize(
+      snapshot,
+      core::DeterministicBatchSizingPolicy{
+          .requested_max_items = static_cast<std::uint64_t>(configured_max_operations),
+          .bytes_per_item = core::checkedIntegralNarrow<std::uint64_t>(
+              estimated_bytes, "optional AMR budget bytes per operation"),
+          .fixed_reserve_bytes = 0U,
+          .minimum_items = 1U,
+          .alignment_items = 1U,
+          .headroom_use_basis_points = 5000U,
+      });
+  return core::checkedIntegralNarrow<std::size_t>(
+      selected.selected_items, "optional AMR memory-aware operation budget");
+}
 
 // Mapping of the core-owned configuration selectors onto hydro types. Policy
 // resolution happens once at runtime construction / per step, never inside
@@ -829,6 +914,10 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
           .uncertainty_note = "O(remote patches) sparse ghost descriptors; no remote solver geometry or full-volume SoA"});
     }
     return std::move(builder).finish();
+  }
+
+  void bindSourceRuntime(SourceRuntime* source_runtime) noexcept override {
+    m_source_runtime = source_runtime;
   }
 
   [[nodiscard]] RuntimeTaskMemoryEstimate estimateMemory(
@@ -2795,6 +2884,26 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
             m_config.cosmology.box_size_y_mpc_comoving,
             m_config.cosmology.box_size_z_mpc_comoving},
         .thermodynamic_cache = amrThermodynamicCachePolicy(update.scale_factor, source_context.redshift)};
+    if (m_config.numerics.amr_time_stepping ==
+            core::AmrTimeSteppingConfigMode::kRecursiveSubcycling &&
+        m_source_runtime != nullptr &&
+        m_source_runtime->recursiveAmrThermochemistryEnabled()) {
+      amr_options.recursive_level_source_user_data =
+          &recursive_source_callback_context;
+      amr_options.recursive_level_source_callback =
+          +[](void* user_data, core::SimulationState& state,
+              std::span<const std::uint32_t> rows, int level,
+              const hydro::HydroUpdateContext& level_update) {
+            auto* callback = static_cast<RecursiveSourceCallbackContext*>(user_data);
+            if (callback == nullptr || callback->source == nullptr ||
+                callback->step == nullptr || &callback->step->state != &state) {
+              throw std::logic_error(
+                  "recursive AMR source callback has invalid workflow ownership");
+            }
+            callback->source->executeRecursiveAmrThermochemistry(
+                *callback->step, rows, level_update, level);
+          };
+    }
     amr::ProductionAmrHydroDiagnostics amr_diagnostics;
     std::size_t remote_patch_count = 0;
     std::size_t remote_flux_register_count = 0;
@@ -3260,37 +3369,83 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
       return;
     }
     const std::uint64_t epoch = step / interval;
+
+    // All rank-local preparation that can allocate or throw is separated by a
+    // collective failure gate before the next payload collective.  This is
+    // deliberately more conservative than the old implementation, where
+    // cooling evaluation / predictive-event preparation could throw on one
+    // rank before its peers entered regrid planning.
     amr::ProductionAmrRegridPolicy policy;
-    policy.criteria.use_mass_threshold = m_config.numerics.amr_refine_cell_mass_code > 0.0;
-    policy.criteria.mass_threshold_code = m_config.numerics.amr_refine_cell_mass_code;
-    policy.criteria.use_gradient_indicator = m_config.numerics.amr_refine_jump_threshold > 0.0;
-    policy.criteria.gradient_threshold = m_config.numerics.amr_refine_jump_threshold;
-    policy.criteria.use_jeans_condition = m_config.numerics.amr_refine_jeans_cells > 0.0;
-    policy.criteria.jeans_resolution_cells = m_config.numerics.amr_refine_jeans_cells;
-    policy.criteria.use_particle_count = false;
-    policy.criteria.derefine_hysteresis = m_config.numerics.amr_derefine_hysteresis;
-    policy.criteria.gravitational_constant_code = core::newtonGravitationalConstantCode(core::makeUnitSystem(
-        m_config.units.length_unit, m_config.units.mass_unit, m_config.units.velocity_unit));
-    // R1 physics-aware indicators (thresholds from typed config).
-    policy.physics.cooling_length_cells = m_config.numerics.amr_refine_cooling_length_cells;
-    policy.physics.metallicity_jump = m_config.numerics.amr_refine_metallicity_jump;
-    policy.physics.species_jump = m_config.numerics.amr_refine_species_jump;
-    policy.physics.vorticity = m_config.numerics.amr_refine_vorticity;
-    core::MemoryReservation cooling_time_reservation;  // declared before the buffer it covers
+    core::MemoryReservation cooling_time_reservation;      // outlives covered vector
+    core::MemoryReservation predictive_local_reservation; // outlives local points
+    core::MemoryReservation predictive_global_reservation;// outlives gathered/index scratch
     std::vector<double> cooling_time_code;
+    std::vector<PredictiveRefinementPoint> local_predictive_points;
+    std::vector<PredictiveRefinementPoint> global_predictive_points;
+    std::vector<std::uint32_t> forced_rows;
+    std::uint64_t local_forecast_events = 0U;
+    std::exception_ptr failure;
+
+    try {
+      policy.criteria.use_mass_threshold = m_config.numerics.amr_refine_cell_mass_code > 0.0;
+      policy.criteria.mass_threshold_code = m_config.numerics.amr_refine_cell_mass_code;
+      policy.criteria.use_gradient_indicator = m_config.numerics.amr_refine_jump_threshold > 0.0;
+      policy.criteria.gradient_threshold = m_config.numerics.amr_refine_jump_threshold;
+      policy.criteria.use_jeans_condition = m_config.numerics.amr_refine_jeans_cells > 0.0;
+      policy.criteria.jeans_resolution_cells = m_config.numerics.amr_refine_jeans_cells;
+      policy.criteria.use_particle_count = false;
+      policy.criteria.derefine_hysteresis = m_config.numerics.amr_derefine_hysteresis;
+      policy.criteria.gravitational_constant_code = core::newtonGravitationalConstantCode(core::makeUnitSystem(
+          m_config.units.length_unit, m_config.units.mass_unit, m_config.units.velocity_unit));
+
+      policy.physics.cooling_length_cells = m_config.numerics.amr_refine_cooling_length_cells;
+      policy.physics.metallicity_jump = m_config.numerics.amr_refine_metallicity_jump;
+      policy.physics.species_jump = m_config.numerics.amr_refine_species_jump;
+      policy.physics.vorticity = m_config.numerics.amr_refine_vorticity;
+      policy.max_level = static_cast<std::uint8_t>(std::clamp(m_config.numerics.amr_max_level, 0, 255));
+      policy.max_operations = memoryAwareOptionalRegridBudget(
+          context.state, m_memory_governor,
+          static_cast<std::size_t>(m_config.numerics.amr_regrid_max_operations));
+      m_last_regrid_optional_budget = policy.max_operations;
+      policy.pass = (epoch % 2U == 1U)
+          ? amr::AmrRegridPassKind::kRefineOnly
+          : amr::AmrRegridPassKind::kDerefineOnly;
+      policy.scale_factor = m_mode_policy.cosmological_comoving_frame
+          ? std::max(context.timeline_step.scale_factor_end, 1.0e-12)
+          : 1.0;
+      policy.periodic = amr_options.physical_boundary_kind == hydro::HydroBoundaryKind::kPeriodic;
+      policy.periodic_box_extent_comoving = amr_options.periodic_box_extent_comoving;
+      const double softening_kpc = m_config.numerics.gravity_softening_gas_kpc_comoving > 0.0
+          ? m_config.numerics.gravity_softening_gas_kpc_comoving
+          : m_config.numerics.gravity_softening_kpc_comoving;
+      const core::UnitSystem units = core::makeUnitSystem(
+          m_config.units.length_unit, m_config.units.mass_unit, m_config.units.velocity_unit);
+      constexpr double k_kpc_m = 3.0856775814913673e19;
+      policy.gravity_softening_code = softening_kpc > 0.0
+          ? softening_kpc * k_kpc_m / units.length_si_per_code : 0.0;
+    } catch (...) {
+      failure = std::current_exception();
+    }
+    m_mpi_context.rethrowCollectivePreparationFailure(
+        failure, "automatic AMR regrid policy preparation");
+
+    // Cooling-length refinement owns one dense-row cooling-time vector.  The
+    // reservation is collective-before-allocation; every later evaluation
+    // failure is reduced before predictive-AMR communication begins.
     if (policy.physics.cooling_length_cells > 0.0 && m_memory_governor != nullptr) {
-      std::exception_ptr admission_failure;
+      failure = nullptr;
       try {
         cooling_time_reservation = m_memory_governor->reserve(
             core::MemoryClass::kPhaseResident,
-            static_cast<std::uint64_t>(core::checkedSizeMultiply(context.state.cells.size(), sizeof(double),
-                                                                 "regrid cooling times")),
+            static_cast<std::uint64_t>(core::checkedSizeMultiply(
+                context.state.cells.size(), sizeof(double), "regrid cooling times")),
             "hydro.amr_regrid.cooling_times");
         cooling_time_reservation.commit();
       } catch (...) {
-        admission_failure = std::current_exception();
+        failure = std::current_exception();
       }
-      m_mpi_context.rethrowCollectivePreparationFailure(admission_failure, "regrid cooling-time admission");
+      m_mpi_context.rethrowCollectivePreparationFailure(
+          failure, "regrid cooling-time admission");
     }
     if (policy.physics.cooling_length_cells > 0.0) {
       std::exception_ptr cooling_time_failure;
@@ -3453,11 +3608,11 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
     m_mpi_context.rethrowCollectivePreparationFailure(
         v02_preparation_failure, "V02 AMR controller preparation");
 
-    // A04 predictive event-aware refinement: cells hosting young stars
-    // (pending CC SN / wind events) are refined BEFORE their deposition.
-    // Deterministic (host cell = leaf cell containing the star), bounded by
-    // the star count; the physical event budgets are unchanged.
-    std::vector<std::uint32_t> forced_rows;
+    // A04 predictive event-aware refinement.  Local event chronology is
+    // evaluated first; the resulting current/drifted positions are then
+    // all-gathered so every destination rank can force its own host cell.
+    // This removes the previous decomposition-dependent "drifted host on
+    // another rank is not forced" limitation.
     const double predictive_age = m_config.numerics.amr_predictive_feedback_age_years;
     const double lookahead_years = m_config.numerics.amr_predictive_event_lookahead_years;
     if (predictive_age > 0.0 || lookahead_years > 0.0) {
@@ -3534,11 +3689,15 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
         constexpr double k_year_s = 3.15576e7;
         const double msun_code = k_solar_mass_kg / m_units.mass_si_per_code;
         const double a = std::max(context.integrator_state.current_scale_factor, 1.0e-12);
-        const double drift_scale = m_config.units.coordinate_frame == core::CoordinateFrame::kComoving ? 1.0 / a : 1.0;
+        const double drift_scale = m_config.units.coordinate_frame == core::CoordinateFrame::kComoving
+            ? 1.0 / a : 1.0;
         const double lookahead_code = lookahead_years * k_year_s / m_units.timeSiPerCode();
         for (std::size_t s = 0; s < context.state.star_particles.size(); ++s) {
           const double age = context.state.star_particles.stellar_age_years_last[s];
           const std::uint32_t p = context.state.star_particles.particle_index[s];
+          if (p >= context.state.particles.size()) {
+            throw std::runtime_error("predictive AMR stellar particle index is outside particle storage");
+          }
           bool forced = predictive_age > 0.0 && age < predictive_age;
           if (!forced && ssp.has_value()) {
             const std::uint64_t pid = context.state.particle_sidecar.particle_id[p];
@@ -3548,141 +3707,312 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
                   *ssp, record, age, lookahead_years,
                   context.state.star_particles.birth_mass_code[s] / msun_code,
                   m_config.physics.ssp_stochastic_sn_events);
-              if (forced) ++forecast_events;
+              if (forced) ++local_forecast_events;
             }
           }
           if (!forced) continue;
-          const std::array<double, 3> position{
-              context.state.particles.position_x_comoving[p],
-              context.state.particles.position_y_comoving[p],
-              context.state.particles.position_z_comoving[p]};
-          forecast_positions.push_back(position);
+          PredictiveRefinementPoint position{
+              .x_comoving = context.state.particles.position_x_comoving[p],
+              .y_comoving = context.state.particles.position_y_comoving[p],
+              .z_comoving = context.state.particles.position_z_comoving[p]};
+          local_predictive_points.push_back(position);
           if (lookahead_code > 0.0) {
-            std::array<double, 3> drifted{
-                position[0] + context.state.particles.velocity_x_peculiar[p] * lookahead_code * drift_scale,
-                position[1] + context.state.particles.velocity_y_peculiar[p] * lookahead_code * drift_scale,
-                position[2] + context.state.particles.velocity_z_peculiar[p] * lookahead_code * drift_scale};
+            PredictiveRefinementPoint drifted{
+                .x_comoving = position.x_comoving +
+                    context.state.particles.velocity_x_peculiar[p] * lookahead_code * drift_scale,
+                .y_comoving = position.y_comoving +
+                    context.state.particles.velocity_y_peculiar[p] * lookahead_code * drift_scale,
+                .z_comoving = position.z_comoving +
+                    context.state.particles.velocity_z_peculiar[p] * lookahead_code * drift_scale};
             if (amr_options.physical_boundary_kind == hydro::HydroBoundaryKind::kPeriodic) {
+              double* coordinates[3] = {&drifted.x_comoving, &drifted.y_comoving, &drifted.z_comoving};
               for (std::size_t c = 0; c < 3U; ++c) {
                 const double box = amr_options.periodic_box_extent_comoving[c];
-                if (box > 0.0) drifted[c] -= box * std::floor(drifted[c] / box);
+                if (box > 0.0) {
+                  *coordinates[c] -= box * std::floor(*coordinates[c] / box);
+                }
               }
             }
-            forecast_positions.push_back(drifted);
+            local_predictive_points.push_back(drifted);
           }
         }
-      } catch (...) {
-        forecast_failure = std::current_exception();
       }
-      m_mpi_context.rethrowCollectivePreparationFailure(
-          forecast_failure, "predictive refinement event forecast");
-      m_last_predictive_forecast_events =
-          m_mpi_context.allreduceSumUint64(forecast_events);
-      // Every rank receives the bounded fixed-width forecast positions and
-      // resolves only positions covered by its authoritative leaf patches.
-      // Thus a drifted host crossing an MPI boundary is forced by its owner;
-      // no event timestamp, ordinal or physical budget moves with the hint.
-      const std::uint64_t global_position_count = m_mpi_context.allreduceSumUint64(
-          static_cast<std::uint64_t>(forecast_positions.size()));
-      core::MemoryReservation forecast_exchange_reservation;
-      std::exception_ptr forecast_admission_failure;
-      std::vector<std::uint8_t> local_position_wire;
-      try {
-        constexpr std::uint64_t k_position_bytes = 3U * sizeof(double);
-        static_assert(sizeof(std::array<double, 3>) == k_position_bytes);
-        if (global_position_count >
-            std::numeric_limits<std::uint64_t>::max() / k_position_bytes) {
-          throw std::overflow_error("predictive position exchange byte overflow");
-        }
-        const std::size_t local_wire_size = core::checkedSizeMultiply(
-            forecast_positions.size(), static_cast<std::size_t>(k_position_bytes),
-            "predictive refinement local position wire");
-        local_position_wire.resize(local_wire_size);
-        if (m_memory_governor != nullptr && global_position_count > 0U) {
-          const std::uint64_t global_bytes =
-              global_position_count * k_position_bytes;
-          const std::uint64_t local_bytes =
-              static_cast<std::uint64_t>(local_wire_size);
-          const std::uint64_t bytes = core::checkedMemoryBytesAdd(
-              global_bytes, local_bytes,
-              "predictive position allgather live set");
-          forecast_exchange_reservation = m_memory_governor->reserve(
-              core::MemoryClass::kCommunication, bytes,
-              "hydro.amr_regrid.predictive_positions");
-          forecast_exchange_reservation.commit();
-        }
-      } catch (...) {
-        forecast_admission_failure = std::current_exception();
-      }
-      m_mpi_context.rethrowCollectivePreparationFailure(
-          forecast_admission_failure, "predictive refinement position admission");
-      if (!forecast_positions.empty()) {
-        std::memcpy(local_position_wire.data(), forecast_positions.data(),
-                    local_position_wire.size());
-      }
-      const std::vector<std::uint8_t> global_position_wire =
-          m_mpi_context.allgatherBytesBounded(local_position_wire);
-      if (global_position_wire.size() % (3U * sizeof(double)) != 0U) {
-        throw std::runtime_error("predictive refinement position exchange is misaligned");
-      }
-      std::exception_ptr host_resolution_failure;
-      try {
-        for (std::size_t offset = 0; offset < global_position_wire.size();
-             offset += 3U * sizeof(double)) {
-          std::array<double, 3> position{};
-          std::memcpy(position.data(), global_position_wire.data() + offset,
-                      3U * sizeof(double));
-          host_row(position);
-        }
-        std::sort(forced_rows.begin(), forced_rows.end());
-        forced_rows.erase(
-            std::unique(forced_rows.begin(), forced_rows.end()),
-            forced_rows.end());
-        policy.forced_refine_rows = forced_rows;
-      } catch (...) {
-        host_resolution_failure = std::current_exception();
-      }
-      m_mpi_context.rethrowCollectivePreparationFailure(
-          host_resolution_failure, "predictive refinement host resolution");
-    }
-    std::exception_ptr failure;
-    amr::ProductionAmrRegridPlan plan;
-    try {
-      plan = amr::planProductionAmrRegrid(context.state, remote_neighbors, policy);
     } catch (...) {
       failure = std::current_exception();
     }
-    m_mpi_context.rethrowCollectivePreparationFailure(failure, "automatic AMR regrid planning");
-    const auto persist_v02_regrid_state = [&](core::SimulationState& state) {
-      if (!joint_v02) return;
-      if (v02_state.epoch == std::numeric_limits<std::uint64_t>::max()) {
-        throw std::overflow_error("V02 controller epoch overflow");
+    m_mpi_context.rethrowCollectivePreparationFailure(
+        failure, "predictive AMR local forecast preparation");
+
+    if (predictive_enabled) {
+      std::uint64_t local_point_count = 0U;
+      failure = nullptr;
+      try {
+        local_point_count = core::checkedIntegralNarrow<std::uint64_t>(
+            local_predictive_points.size(), "predictive AMR local point count");
+      } catch (...) {
+        failure = std::current_exception();
       }
-      v02_state.epoch += 1U;
-      const core::MemoryGovernorSnapshot memory = m_memory_governor != nullptr
-          ? m_memory_governor->snapshot()
-          : core::MemoryGovernorSnapshot{
-                .headroom_bytes = std::numeric_limits<std::uint64_t>::max()};
-      v02_state.last_headroom_bytes = memory.headroom_bytes;
-      v02_state.chemistry_growth_reserve_bytes = v02_chemistry_reserve;
-      v02_state.optional_amr_budget_bytes = v02_optional_memory_budget;
-      v02_state.optional_amr_requests = plan.optional_refine_requests;
-      v02_state.optional_amr_admitted = plan.optional_admitted_operations;
-      if (plan.optional_truncated_by_budget > 0U &&
-          std::isfinite(plan.optional_min_admitted_benefit) &&
-          plan.optional_min_admitted_benefit > 1.0) {
-        v02_state.optional_benefit_floor = std::max(
-            v02_state.optional_benefit_floor,
-            plan.optional_min_admitted_benefit);
-      } else {
-        v02_state.optional_benefit_floor = policy.optional_control.benefit_floor;
+      m_mpi_context.rethrowCollectivePreparationFailure(
+          failure, "predictive AMR local point-count preparation");
+      const std::uint64_t global_point_count =
+          m_mpi_context.allreduceSumUint64(local_point_count);
+      if (m_memory_governor != nullptr) {
+        failure = nullptr;
+        try {
+          const std::size_t global_points = core::checkedIntegralNarrow<std::size_t>(
+              global_point_count, "predictive AMR global point count");
+          const std::size_t point_bytes = core::checkedSizeMultiply(
+              global_points, sizeof(PredictiveRefinementPoint),
+              "predictive AMR global point bytes");
+          // allgatherPredictiveRefinementPoints briefly owns the gathered byte
+          // buffer and the typed point vector at the same time.
+          const std::size_t point_exchange_bytes = core::checkedSizeMultiply(
+              point_bytes, 2U, "predictive AMR point exchange coexistence bytes");
+          const std::size_t patch_count = context.state.patches.size();
+          const std::size_t descriptor_bytes = core::checkedSizeMultiply(
+              patch_count, sizeof(amr::PatchDescriptor),
+              "predictive AMR descriptor bytes");
+          struct PredictiveLookupBudgetEntry {
+            std::size_t descriptor_index;
+            double lower_x;
+            double upper_x;
+          };
+          const std::size_t lookup_bytes = core::checkedSizeMultiply(
+              patch_count, sizeof(PredictiveLookupBudgetEntry),
+              "predictive AMR lookup bytes");
+          const std::size_t prefix_bytes = core::checkedSizeMultiply(
+              patch_count, sizeof(double), "predictive AMR prefix bytes");
+          const std::size_t patch_id_index_bytes = core::checkedSizeMultiply(
+              patch_count, sizeof(std::pair<std::uint64_t, std::size_t>),
+              "predictive AMR patch-id index bytes");
+          const std::size_t offset_bytes = core::checkedSizeMultiply(
+              core::checkedSizeAdd(patch_count, 1U, "predictive AMR offset count"),
+              sizeof(std::size_t), "predictive AMR offset bytes");
+          const std::size_t row_cache_bytes = core::checkedSizeMultiply(
+              context.state.cells.size(), sizeof(std::uint32_t),
+              "predictive AMR row-cache bytes");
+          const std::size_t forced_bytes = core::checkedSizeMultiply(
+              std::min(global_points, context.state.cells.size()),
+              sizeof(std::uint32_t), "predictive AMR forced-row bytes");
+          std::size_t total = point_exchange_bytes;
+          for (const std::size_t bytes : {descriptor_bytes, lookup_bytes, prefix_bytes,
+                                         patch_id_index_bytes, offset_bytes,
+                                         row_cache_bytes, forced_bytes}) {
+            total = core::checkedSizeAdd(total, bytes,
+                                         "predictive AMR global scratch bytes");
+          }
+          // Bounded allowance for vector allocator bookkeeping and the small
+          // MPI count/displacement arrays used by the bounded all-gather.
+          total = core::checkedSizeAdd(
+              total,
+              core::checkedSizeMultiply(
+                  core::checkedSizeAdd(patch_count,
+                      static_cast<std::size_t>(std::max(1, m_mpi_context.worldSize())),
+                      "predictive AMR overhead item count"),
+                  64U, "predictive AMR allocator overhead bytes"),
+              "predictive AMR scratch plus allocator overhead");
+          const std::uint64_t total_u64 = core::checkedIntegralNarrow<std::uint64_t>(
+              total, "predictive AMR global scratch reservation");
+          if (total_u64 > 0U) {
+            predictive_global_reservation = m_memory_governor->reserve(
+                core::MemoryClass::kScratchArena, total_u64,
+                "hydro.amr_regrid.predictive_global_lookup");
+            predictive_global_reservation.commit();
+          }
+        } catch (...) {
+          failure = std::current_exception();
+        }
+        m_mpi_context.rethrowCollectivePreparationFailure(
+            failure, "predictive AMR global lookup admission");
       }
-      core::storeV02ControlState(state, v02_state);
-    };
+
+      global_predictive_points = allgatherPredictiveRefinementPoints(
+          m_mpi_context, local_predictive_points);
+      failure = nullptr;
+      try {
+        const std::vector<amr::PatchDescriptor> descriptors =
+            amr::buildProductionAmrPatchDescriptors(context.state);
+        struct PatchLookupEntry {
+          std::size_t descriptor_index = 0U;
+          double lower_x = 0.0;
+          double upper_x = 0.0;
+        };
+        std::vector<PatchLookupEntry> lookup;
+        lookup.reserve(descriptors.size());
+        for (std::size_t i = 0; i < descriptors.size(); ++i) {
+          lookup.push_back(PatchLookupEntry{
+              .descriptor_index = i,
+              .lower_x = descriptors[i].origin_comov[0],
+              .upper_x = descriptors[i].origin_comov[0] + descriptors[i].extent_comov[0]});
+        }
+        std::sort(lookup.begin(), lookup.end(), [&](const PatchLookupEntry& lhs, const PatchLookupEntry& rhs) {
+          if (lhs.lower_x != rhs.lower_x) return lhs.lower_x < rhs.lower_x;
+          return descriptors[lhs.descriptor_index].patch_id < descriptors[rhs.descriptor_index].patch_id;
+        });
+        std::vector<double> prefix_max_upper;
+        prefix_max_upper.reserve(lookup.size());
+        double max_upper = -std::numeric_limits<double>::infinity();
+        for (const PatchLookupEntry& entry : lookup) {
+          max_upper = std::max(max_upper, entry.upper_x);
+          prefix_max_upper.push_back(max_upper);
+        }
+        // Flat patch-local row cache: no unordered_map/node allocations and
+        // therefore an exact O(Npatch + Ncell) admitted workspace.
+        std::vector<std::pair<std::uint64_t, std::size_t>> descriptor_by_patch_id;
+        descriptor_by_patch_id.reserve(descriptors.size());
+        std::vector<std::size_t> row_offsets(descriptors.size() + 1U, 0U);
+        for (std::size_t i = 0; i < descriptors.size(); ++i) {
+          descriptor_by_patch_id.emplace_back(descriptors[i].patch_id, i);
+          row_offsets[i + 1U] = core::checkedSizeAdd(
+              row_offsets[i], amr::checkedPatchCellCount(
+                  descriptors[i], "predictive refinement row-cache size"),
+              "predictive refinement row-cache prefix");
+        }
+        if (row_offsets.back() != context.state.cells.size()) {
+          throw std::runtime_error(
+              "predictive AMR patch descriptors do not cover the local gas-cell extent exactly");
+        }
+        std::sort(descriptor_by_patch_id.begin(), descriptor_by_patch_id.end());
+        std::vector<std::uint32_t> row_cache(
+            row_offsets.back(), core::kInvalidGasCellRow);
+        for (std::uint32_t row = 0U; row < context.state.cells.size(); ++row) {
+          const auto* identity = context.state.gas_cell_identity.findByLocalRow(row);
+          if (identity == nullptr) {
+            throw std::runtime_error(
+                "predictive AMR row-cache construction found a gas row without identity");
+          }
+          const auto by_id = std::lower_bound(
+              descriptor_by_patch_id.begin(), descriptor_by_patch_id.end(),
+              std::pair<std::uint64_t, std::size_t>{identity->owning_patch_id, 0U},
+              [](const auto& lhs, const auto& rhs) { return lhs.first < rhs.first; });
+          if (by_id == descriptor_by_patch_id.end() ||
+              by_id->first != identity->owning_patch_id) {
+            throw std::runtime_error(
+                "predictive AMR row-cache construction found an unknown owning patch");
+          }
+          const std::size_t descriptor_index = by_id->second;
+          const auto cell = amr::patchLocalCellForRow(
+              context.state, descriptors[descriptor_index], row,
+              "predictive refinement row-cache mapping");
+          const std::size_t flat = core::checkedSizeAdd(
+              row_offsets[descriptor_index], cell.linear_index,
+              "predictive refinement flat row index");
+          if (flat >= row_cache.size() || row_cache[flat] != core::kInvalidGasCellRow) {
+            throw std::runtime_error(
+                "predictive AMR row-cache construction found a duplicate local cell");
+          }
+          row_cache[flat] = row;
+        }
+        if (std::find(row_cache.begin(), row_cache.end(), core::kInvalidGasCellRow) !=
+            row_cache.end()) {
+          throw std::runtime_error(
+              "predictive AMR row-cache construction found incomplete patch coverage");
+        }
+        forced_rows.reserve(std::min<std::size_t>(
+            global_predictive_points.size(), context.state.cells.size()));
+
+        const auto host_row = [&](const PredictiveRefinementPoint& point) {
+          const auto upper = std::upper_bound(
+              lookup.begin(), lookup.end(), point.x_comoving,
+              [](double x, const PatchLookupEntry& entry) { return x < entry.lower_x; });
+          std::size_t pos = static_cast<std::size_t>(std::distance(lookup.begin(), upper));
+          while (pos > 0U) {
+            if (prefix_max_upper[pos - 1U] <= point.x_comoving) break;
+            const PatchLookupEntry& entry = lookup[pos - 1U];
+            const amr::PatchDescriptor& patch = descriptors[entry.descriptor_index];
+            const bool inside_x = point.x_comoving >= patch.origin_comov[0] &&
+                point.x_comoving < patch.origin_comov[0] + patch.extent_comov[0];
+            const bool inside_y = point.y_comoving >= patch.origin_comov[1] &&
+                point.y_comoving < patch.origin_comov[1] + patch.extent_comov[1];
+            const bool inside_z = point.z_comoving >= patch.origin_comov[2] &&
+                point.z_comoving < patch.origin_comov[2] + patch.extent_comov[2];
+            if (inside_x && inside_y && inside_z) {
+              const auto cell = amr::patchLocalCellForPoint(
+                  patch,
+                  std::array<double, 3>{point.x_comoving, point.y_comoving, point.z_comoving},
+                  "predictive refinement host cell");
+              const std::size_t flat = core::checkedSizeAdd(
+                  row_offsets[entry.descriptor_index], cell.linear_index,
+                  "predictive refinement host row");
+              if (flat >= row_cache.size() || row_cache[flat] == core::kInvalidGasCellRow) {
+                throw std::runtime_error("predictive AMR host cell exceeds cached patch rows");
+              }
+              forced_rows.push_back(row_cache[flat]);
+              return;
+            }
+            --pos;
+          }
+        };
+        for (const PredictiveRefinementPoint& point : global_predictive_points) {
+          host_row(point);
+        }
+        std::sort(forced_rows.begin(), forced_rows.end());
+        forced_rows.erase(std::unique(forced_rows.begin(), forced_rows.end()), forced_rows.end());
+        policy.forced_refine_rows = forced_rows;
+      } catch (...) {
+        failure = std::current_exception();
+      }
+      m_mpi_context.rethrowCollectivePreparationFailure(
+          failure, "predictive AMR distributed host resolution");
+      m_last_predictive_forecast_events = m_mpi_context.allreduceSumUint64(local_forecast_events);
+    } else {
+      m_last_predictive_forecast_events = 0U;
+    }
+
+    amr::ProductionAmrRegridPlan plan;
+    failure = nullptr;
+    try {
+      plan = amr::planProductionAmrRegrid(context.state, remote_neighbors, policy);
+      if (plan.mandatory_truncated_by_budget != 0U) {
+        throw std::logic_error(
+            "automatic AMR planner truncated a mandatory refinement request; hard criteria must bypass the optional budget");
+      }
+    } catch (...) {
+      failure = std::current_exception();
+    }
+    m_mpi_context.rethrowCollectivePreparationFailure(
+        failure, "automatic AMR regrid planning");
+
+    // A hard criterion that has reached max_level cannot be repaired by a
+    // later balancing pass.  Fail collectively instead of silently continuing
+    // below the configured scientific resolution requirement.
+    std::uint64_t local_mandatory_max_level = 0U;
+    std::uint64_t local_mandatory_balance = 0U;
+    failure = nullptr;
+    try {
+      local_mandatory_max_level = core::checkedIntegralNarrow<std::uint64_t>(
+          plan.mandatory_blocked_by_max_level,
+          "mandatory AMR max-level block count");
+      local_mandatory_balance = core::checkedIntegralNarrow<std::uint64_t>(
+          plan.mandatory_blocked_by_balance,
+          "mandatory AMR balance block count");
+    } catch (...) {
+      failure = std::current_exception();
+    }
+    m_mpi_context.rethrowCollectivePreparationFailure(
+        failure, "mandatory AMR block-count preparation");
+    const std::uint64_t global_mandatory_max_level =
+        m_mpi_context.allreduceSumUint64(local_mandatory_max_level);
+    const std::uint64_t global_mandatory_balance =
+        m_mpi_context.allreduceSumUint64(local_mandatory_balance);
+    if (global_mandatory_max_level != 0U) {
+      throw std::runtime_error(
+          "automatic AMR cannot satisfy a mandatory refinement criterion because amr_max_level was reached");
+    }
+    if (global_mandatory_balance != 0U) {
+      throw std::runtime_error(
+          "automatic AMR cannot satisfy a mandatory refinement criterion without first restoring 2:1 balance; "
+          "refusing the step rather than advancing an under-resolved hierarchy");
+    }
+
     std::uint64_t local_max_patch = 0U;
-    for (const std::uint64_t id : context.state.patches.patch_id) local_max_patch = std::max(local_max_patch, id);
+    for (const std::uint64_t id : context.state.patches.patch_id) {
+      local_max_patch = std::max(local_max_patch, id);
+    }
     std::uint64_t local_max_cell = 0U;
-    for (const std::uint64_t id : context.state.gas_cells.gas_cell_id) local_max_cell = std::max(local_max_cell, id);
+    for (const std::uint64_t id : context.state.gas_cells.gas_cell_id) {
+      local_max_cell = std::max(local_max_cell, id);
+    }
     const std::uint64_t global_max_patch = m_mpi_context.allreduceMaxUint64(local_max_patch);
     const std::uint64_t global_max_cell = m_mpi_context.allreduceMaxUint64(local_max_cell);
     const std::uint64_t patch_window = m_mpi_context.allreduceMaxUint64(plan.required_patch_ids);
@@ -3719,45 +4049,15 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
     m_mpi_context.rethrowCollectivePreparationFailure(
         failure, "automatic AMR identity-window preparation");
     amr::ProductionAmrRegridSummary summary;
-    core::MemoryReservation regrid_transaction_reservation;
-    std::optional<core::SimulationState> regrid_candidate;
+    failure = nullptr;
     try {
-      // One collective topology transaction. The admitted candidate contains
-      // every old authoritative lane while its patch operations construct the
-      // new hierarchy. No rank publishes until every rank has prepared its
-      // complete candidate successfully.
-      if (m_memory_governor != nullptr) {
-        std::uint64_t admitted_growth_bytes = 0U;
-        for (const amr::ProductionAmrRegridOperation& operation :
-             plan.operations) {
-          admitted_growth_bytes = core::checkedMemoryBytesAdd(
-              admitted_growth_bytes, operation.estimated_memory_bytes,
-              "AMR admitted hierarchy growth");
-        }
-        const std::uint64_t candidate_bytes = core::checkedMemoryBytesAdd(
-            regrid_baseline_bytes, admitted_growth_bytes,
-            "AMR collective old/new hierarchy and admitted growth");
-        regrid_transaction_reservation = m_memory_governor->reserve(
-            core::MemoryClass::kPhaseResident,
-            core::checkedMemoryBytesAdd(
-                candidate_bytes,
-                joint_v02 ? 4096U : 0U,
-                "AMR collective candidate plus V02 controller state"),
-            "hydro.amr_regrid.collective_candidate");
-        regrid_transaction_reservation.commit();
-      }
-      regrid_candidate.emplace(context.state);
       summary = amr::applyProductionAmrRegridPlan(
-          *regrid_candidate, plan, window, amr_options);
-      persist_v02_regrid_state(*regrid_candidate);
+          context.state, plan, window, amr_options);
     } catch (...) {
       failure = std::current_exception();
     }
     m_mpi_context.rethrowCollectivePreparationFailure(
-        failure, "automatic AMR regrid candidate preparation");
-    static_assert(std::is_nothrow_move_assignable_v<core::SimulationState>,
-                  "collective AMR publication requires a no-throw state move");
-    context.state = std::move(*regrid_candidate);
+        failure, "automatic AMR regrid application");
     m_last_regrid_summary = summary;
     if (context.profiler_session != nullptr) {
       context.profiler_session->recordEvent(core::RuntimeEvent{
@@ -3776,10 +4076,13 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
                       {"blocked_by_balance", std::to_string(plan.blocked_by_balance)},
                       {"blocked_by_max_level", std::to_string(plan.blocked_by_max_level)},
                       {"skipped_remote_sibling", std::to_string(plan.skipped_remote_sibling)},
+                      {"optional_operation_budget", std::to_string(m_last_regrid_optional_budget)},
                       {"truncated_by_budget", std::to_string(plan.truncated_by_budget)},
                       {"mandatory_refine_requests", std::to_string(plan.mandatory_refine_requests)},
                       {"predictive_forecast_event_stars", std::to_string(m_last_predictive_forecast_events)},
                       {"optional_refine_requests", std::to_string(plan.optional_refine_requests)},
+                      {"mandatory_blocked_by_balance", std::to_string(plan.mandatory_blocked_by_balance)},
+                      {"mandatory_blocked_by_max_level", std::to_string(plan.mandatory_blocked_by_max_level)},
                       {"mandatory_truncated_by_budget", std::to_string(plan.mandatory_truncated_by_budget)},
                       {"optional_truncated_by_budget", std::to_string(plan.optional_truncated_by_budget)},
                       {"optional_blocked_by_force_resolution",
@@ -4094,10 +4397,12 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
   std::unique_ptr<physics::CoolingHeatingSource> m_cooling_source;
   std::optional<physics::CoolingRateProvider> m_cooling_rate_provider;
   std::uint64_t m_last_predictive_forecast_events = 0U;
+  std::size_t m_last_regrid_optional_budget = 0U;
   double m_cooling_specific_rate_cgs_to_code = 0.0;
   double m_cooling_temperature_per_energy_k = 0.0;
   double m_cooling_helium_mass_fraction = 0.24;
   physics::CompositionTransportCommitReport m_last_composition_transport{};
+  SourceRuntime* m_source_runtime = nullptr;  // non-owning, composition lifetime
   std::unique_ptr<physics::EffectiveIsmThermodynamicClosure> m_effective_ism_closure;
   std::unique_ptr<physics::EffectiveIsmEnergyRelaxationSource> m_effective_ism_energy_source;
   hydro::HydroConservedStateSoa m_conserved;

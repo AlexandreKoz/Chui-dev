@@ -103,7 +103,8 @@ void setCell(
       .patch_local_cell = 1U,
       .gas_cell_id = 9002U,
       .conserved = cosmosim::hydro::HydroCoreSolver::conservedFromPrimitive(
-          {.rho_comoving = 0.9, .vel_x_peculiar = 0.35, .pressure_comoving = 0.9}, k_gamma)});
+          {.rho_comoving = 0.9, .vel_x_peculiar = 0.35, .pressure_comoving = 0.9}, k_gamma),
+      .internal_energy_code = 0.9 / ((k_gamma - 1.0) * 0.9)});
   return remote;
 }
 
@@ -111,7 +112,12 @@ void testRemoteCoarseGhostProducesRemoteRefluxRegister() {
   cosmosim::core::SimulationState state = makeFineRankState();
   const cosmosim::amr::DistributedAmrRemotePatch remote = makeRemoteCoarsePatch();
   std::vector<cosmosim::amr::FluxRegisterEntry> outbound;
-  cosmosim::hydro::HydroCoreSolver solver(k_gamma);
+  cosmosim::hydro::HydroCoreSolver solver(
+      k_gamma,
+      cosmosim::hydro::HydroNumericsPolicy{
+          .dual_energy = cosmosim::hydro::HydroDualEnergyPolicy{
+              .mode = cosmosim::hydro::HydroDualEnergyMode::kThermalFraction,
+              .thermal_fraction_switch = 1.0e-3}});
   cosmosim::hydro::HlleRiemannSolver riemann;
   const cosmosim::hydro::HydroUpdateContext update{.dt_code = 1.0e-5, .scale_factor = 1.0};
   const cosmosim::hydro::HydroSourceContext source_context{.update = update};
@@ -140,6 +146,9 @@ void testRemoteCoarseGhostProducesRemoteRefluxRegister() {
 
   assert(diagnostics.advanced_patch_count == 1U);
   assert(diagnostics.ghost_fill.coarse_to_fine_ghosts_filled > 0U);
+  // H02: the imported coarse owner supplied canonical specific internal
+  // energy, so dual-energy ghost seeding must not fall back to E-K.
+  assert(diagnostics.dual_energy_unresolved_ghosts == 0U);
   assert(!outbound.empty());
   bool saw_remote_coarse_target = false;
   for (const auto& entry : outbound) {

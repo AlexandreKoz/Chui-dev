@@ -160,6 +160,48 @@ amr::ProductionAmrHydroDiagnostics step(core::SimulationState& state, bool recur
       : amr::advanceProductionAmrHydro(state, {}, update, source_context, solver, riemann, {}, options);
 }
 
+struct RecursiveSourceCallbackProbe {
+  std::array<std::uint32_t, 4> calls_by_level{};
+  std::array<std::uint64_t, 4> rows_by_level{};
+};
+
+void recordRecursiveSourceCallback(
+    void* user_data, core::SimulationState&,
+    std::span<const std::uint32_t> rows, int level,
+    const hy::HydroUpdateContext& update) {
+  auto* probe = static_cast<RecursiveSourceCallbackProbe*>(user_data);
+  CHUI_REQUIRE(probe != nullptr);
+  CHUI_REQUIRE(level >= 0 && level < static_cast<int>(probe->calls_by_level.size()));
+  CHUI_REQUIRE(update.dt_code > 0.0);
+  ++probe->calls_by_level[static_cast<std::size_t>(level)];
+  probe->rows_by_level[static_cast<std::size_t>(level)] += rows.size();
+}
+
+void testRecursiveLevelSourceCallbackFollowsLevelClocks() {
+  core::SimulationState state = makeThreeLevels(false);
+  core::MemoryGovernor governor;
+  auto options = baseOptions(state, governor);
+  RecursiveSourceCallbackProbe probe;
+  options.recursive_level_source_user_data = &probe;
+  options.recursive_level_source_callback = &recordRecursiveSourceCallback;
+  const hy::HydroCoreSolver solver(k_gamma);
+  hy::HllcRiemannSolver riemann;
+  const hy::HydroUpdateContext update{
+      .dt_code = 0.02, .time_begin_code = 0.0, .time_end_code = 0.02,
+      .scale_factor_begin = 1.0, .scale_factor = 1.0, .scale_factor_end = 1.0,
+      .hubble_rate_code = 0.0};
+  const hy::HydroSourceContext source_context{.update = update};
+  const auto diagnostics = amr::advanceProductionAmrHydroRecursive(
+      state, {}, update, source_context, solver, riemann, {}, options);
+  CHUI_REQUIRE(diagnostics.substeps_by_level.size() == 3U);
+  CHUI_REQUIRE(probe.calls_by_level[0] == 1U);
+  CHUI_REQUIRE(probe.calls_by_level[1] == 2U);
+  CHUI_REQUIRE(probe.calls_by_level[2] == 4U);
+  CHUI_REQUIRE(probe.rows_by_level[0] > 0U);
+  CHUI_REQUIRE(probe.rows_by_level[1] > 0U);
+  CHUI_REQUIRE(probe.rows_by_level[2] > 0U);
+}
+
 void testClockStructureAndUniformState() {
   core::SimulationState state = makeThreeLevels(false);
   const auto diagnostics = step(state, true, 0.02);
@@ -483,6 +525,7 @@ int main() {
   testRecursiveWorkingSetRefusalAndAllocationFailure();
   testCoverageRejectsOverlapAndMissingRows();
   testClockStructureAndUniformState();
+  testRecursiveLevelSourceCallbackFollowsLevelClocks();
   testConservationAcrossNestedInterfaces();
   testIllegalMidCycleStartRefused();
   testUnbalancedHierarchyRefused();

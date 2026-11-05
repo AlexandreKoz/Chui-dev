@@ -31,9 +31,9 @@
 //    at level > child level (else blocked). Octets split across ranks are
 //    skipped (`skipped_remote_sibling`) — migration consolidation is the
 //    balance runtime's job.
-//  * Refinements are ordered by ascending patch id. `max_operations` is the
-//    deterministic OPTIONAL-refinement budget; mandatory accuracy requests
-//    bypass it. Derefinement continues to use it as its operation budget.
+//  * Operations are ordered by ascending patch id. Mandatory refinement is
+//    emitted before optional requests and bypasses `max_operations`; only
+//    optional operations are truncated by that deterministic resource budget.
 //
 // Indicators (typed, A03 seam): cell mass, normalized density/pressure jump
 // (contact and shock), comoving Truelove-Jeans resolution
@@ -172,14 +172,14 @@ struct ProductionAmrRegridPlan {
   // R1: classification of refinement requests and budget outcome.
   std::size_t mandatory_refine_requests = 0;
   std::size_t optional_refine_requests = 0;
-  std::size_t mandatory_truncated_by_budget = 0;  // resolution requirement NOT met this pass (reported)
+  // Hard resolution requirements are never truncated by max_operations.
+  // These counters identify the two remaining reasons a mandatory request
+  // cannot be satisfied in the current pass; the runtime reports them and
+  // fails closed rather than advancing below a mandatory accuracy criterion.
+  std::size_t mandatory_truncated_by_budget = 0;  // retained for schema/telemetry compatibility; always zero
   std::size_t optional_truncated_by_budget = 0;
-  std::size_t optional_admitted_operations = 0;
-  std::uint64_t optional_admitted_cell_steps = 0U;
-  std::uint64_t optional_admitted_mpi_face_cells = 0U;
-  std::uint64_t optional_admitted_churn_cells = 0U;
-  std::uint64_t optional_admitted_memory_bytes = 0U;
-  double optional_min_admitted_benefit = 0.0;
+  std::size_t mandatory_blocked_by_max_level = 0;
+  std::size_t mandatory_blocked_by_balance = 0;
   std::size_t required_patch_ids = 0;
   std::size_t required_gas_cell_ids = 0;
 };

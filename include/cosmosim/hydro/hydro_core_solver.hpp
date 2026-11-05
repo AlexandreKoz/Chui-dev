@@ -475,14 +475,12 @@ struct HydroProfileEvent {
   // predictor used. This is an explicit interface fallback, never an
   // unreported high-order proxy.
   std::uint64_t ctu_transverse_degraded_states = 0;
-  // Imported/physical ghost side states corrected from a complete tangential
-  // ghost-slab stencil. The slab is an immutable step-start AMR/MPI snapshot;
-  // these increments are transient and never become conserved authority.
-  std::uint64_t ctu_transverse_ghost_corrected_states = 0;
-  // Tangential ghost-cell axes for which the full stencil required by the
-  // selected reconstruction was materialized and two transverse Riemann
-  // fluxes were evaluated. A face state may consume two such axes in 3-D.
-  std::uint64_t ctu_transverse_ghost_axes = 0;
+  // Imported AMR/MPI ghost side corrected with the adjacent owner's
+  // transverse increment. This one-sided CTU closure preserves temporal
+  // centering at a distributed/coarse-fine interface without pretending the
+  // remote ghost owns a local transverse-flux stencil. Qualification still
+  // requires the boundary convergence tests.
+  std::uint64_t ctu_transverse_boundary_proxy_states = 0;
   // Corrected state was inadmissible; normal-only predictor used.
   std::uint64_t ctu_transverse_inadmissible_states = 0;
   // Cells whose final thermal energy came from the auxiliary update.
