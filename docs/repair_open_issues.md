@@ -851,3 +851,21 @@ Record: `docs/repair/chui_part2_thermochemistry_stellar_physics_20261103.md`.
   feedback/SF gradients, regrid restart and rollback bit-identity not written.
 * See docs/repair/chui_part3_distributed_amr_multirate_20261103.md.
 
+
+## Patch 49 (2026-11-05) — open items after static source completion
+
+Static-only campaign; nothing below has been compiled or run.
+
+1. **T02 (partial):** element diffusion, SGS shear transfer and all discrete
+   events (SF, SSP, winds, SN, BH) remain globally synchronized at the coarse
+   Strang halves/endpoint under recursive AMR; only thermochemistry/ISM/dust/SGS
+   dissipation run per level clock. Level-local diffusion needs composition
+   diffusion flux registers across coarse/fine faces.
+2. **C02 (external data):** no licensed, source-verified
+   `chui_metal_ion_rates_v1` dataset exists; metal-ion runs are refused until
+   one is supplied. Charge exchange with H/He is not represented.
+3. **M01 (not exhaustively traced):** combined peak admission of rollback copy,
+   PM, HDF5 and MPI buffers; node-aggregate admission coverage.
+4. **Validation (owner-reserved):** build, unit/integration tests, Strang
+   convergence, exactly-once event counts under retry, recursive-vs-synchronized
+   source equivalence, restart round-trip with ion lanes.
