@@ -117,6 +117,11 @@ struct ThermochemistryStagedRow {
   double mean_molecular_weight = 0.0;
   double temperature_k = 0.0;
   NetworkState species_mass_code{};  // species lane masses (network backends)
+  // C02: staged ion-stage lane masses (packed stage order); written only
+  // when ion_stage_count != 0 (detailed rows of a metal-ion layout).
+  std::array<double, k_metal_ion_stage_capacity> ion_stage_mass_code{};
+  std::uint32_t ion_stage_count = 0U;
+  bool ion_state_initialized_from_equilibrium = false;
 };
 
 // Result of advancing one row (pure: no state mutation).
@@ -192,6 +197,27 @@ class ThermochemistryOperator {
       const SourceInterval& interval) const;
 
  private:
+  // C02: per-element ladder fractions of one row plus the gas-phase nuclei
+  // densities that own them (authoritative element lanes minus CO).
+  struct MetalIonRowState {
+    std::array<double, k_metal_ion_stage_capacity> fractions{};
+    std::array<double, k_metal_ion_element_count> nuclei_cm3{};
+    bool initialized_from_equilibrium = false;
+  };
+  [[nodiscard]] bool rowCarriesMetalIons(std::uint8_t chemistry_tag) const noexcept;
+  // Reads the ladder distribution of `row` (or initializes it from ionization
+  // equilibrium at T when the row has no ladder state) and attaches the
+  // frozen stage densities and electron correction to `input`.
+  void attachMetalIonState(const core::SimulationState& state, std::uint32_t row, double temperature_k,
+                           ThermochemistryCellInput& input, MetalIonRowState& ions,
+                           MetalIonAdvanceReport& report) const;
+  void refreshMetalIonInput(ThermochemistryCellInput& input, const MetalIonRowState& ions) const;
+  [[nodiscard]] double rowTemperatureK(const core::SimulationState& state, std::uint32_t row,
+                                       const ThermochemistryCellInput& input) const;
+  [[nodiscard]] ThermochemistryCellInput cellInputForTag(const core::SimulationState& state, std::uint32_t row,
+                                                         const SourceInterval& interval,
+                                                         std::uint8_t chemistry_tag) const;
+
   ThermochemistryOperatorConfig m_config;
   CompositionLayout m_layout;
   ThermochemistrySolver m_solver;

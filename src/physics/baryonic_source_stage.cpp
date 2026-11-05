@@ -134,6 +134,11 @@ void BaryonicSourceStage::prepare(const core::SimulationState& state, const Sour
       for (std::size_t s = 0; s < m_chemistry.solver().speciesCount(); ++s) {
         scratch.setValue(layout.speciesLane(s), 0, r.staged.species_mass_code[s]);
       }
+      // C02: ladder lanes of detailed rows (demoted rows keep them frozen).
+      for (std::uint32_t k = 0; k < r.staged.ion_stage_count; ++k) {
+        scratch.setValue(layout.ionStageLane(k), 0, r.staged.ion_stage_mass_code[k]);
+      }
+      if (r.staged.ion_state_initialized_from_equilibrium) ++m_pending.metal_ion_equilibrium_initializations;
     }
     // 4) Live dust on the private copy.
     if (m_config.dust.has_value() && scratch.descriptor().dust_lane_count > 0U) {

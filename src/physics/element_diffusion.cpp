@@ -90,6 +90,9 @@ ElementDiffusionReport advanceElementResolvedDiffusion(
     for (std::uint32_t l = 0; l < d.element_lane_count; ++l) lanes.push_back(d.element_lane_begin + l);
     for (std::uint32_t l = 0; l < d.species_lane_count; ++l) lanes.push_back(d.species_lane_begin + l);
     for (std::uint32_t l = 0; l < d.dust_lane_count; ++l) lanes.push_back(d.dust_lane_begin + l);
+    // C02 ion-stage lanes diffuse with their element so the ladder
+    // distribution travels with the nuclei (appended: dust offsets unchanged).
+    for (std::uint32_t l = 0; l < d.ion_lane_count; ++l) lanes.push_back(d.ion_lane_begin + l);
     n_lanes = lanes.size();
     workspace.assign((2U * n_lanes + 2U) * rows, 0.0);
     values = workspace.data();

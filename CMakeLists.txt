@@ -583,6 +583,7 @@ add_library(cosmosim_physics STATIC
   src/physics/chemical_network.cpp
   src/physics/radiation_background.cpp
   src/physics/metal_cooling_table.cpp
+  src/physics/metal_ion_network.cpp
   src/physics/thermochemistry.cpp
   src/physics/thermochemistry_operator.cpp
   src/physics/baryonic_source_stage.cpp

@@ -24,6 +24,10 @@ ThermochemistryOperator::ThermochemistryOperator(ThermochemistryOperatorConfig c
     }
     ThermochemistryConfig hybrid = m_config.solver;
     hybrid.backend = ThermochemistryBackend::kFixedHybrid;
+    // Demoted rows keep their ladder distribution frozen (like the C+/CO
+    // reservoir); the hybrid model owns no metal-ion state.
+    hybrid.metal_ion_table = nullptr;
+    hybrid.metal_ion_elements = {};
     m_hybrid_solver = std::make_unique<ThermochemistrySolver>(hybrid);
   }
   if (m_config.shadow.sample_fraction > 0.0 && m_config.shadow.max_cells > 0U &&
@@ -33,6 +37,12 @@ ThermochemistryOperator::ThermochemistryOperator(ThermochemistryOperatorConfig c
     reference.max_substeps = std::max<std::uint32_t>(reference.max_substeps, 4U * reference.max_substeps);
     m_reference_solver = std::make_unique<ThermochemistrySolver>(reference);
   }
+  if (m_layout.ionStageCount() != m_config.solver.metal_ion_elements.stageCount()) {
+    throw std::invalid_argument(
+        "ThermochemistryOperator: composition layout '" + m_layout.descriptor().layout_name +
+        "' carries " + std::to_string(m_layout.ionStageCount()) + " metal-ion stage lanes but the solver selects '" +
+        m_config.solver.metal_ion_elements.label() + "'");
+  }
   if (!(m_config.units.density_code_to_cgs > 0.0) || !(m_config.units.velocity_code_to_cm_s > 0.0) ||
       !(m_config.units.length_code_to_cm > 0.0) || !(m_config.units.mass_code_to_g > 0.0)) {
     throw std::invalid_argument("ThermochemistryOperator: unit bridge must be positive");
@@ -41,6 +51,106 @@ ThermochemistryOperator::ThermochemistryOperator(ThermochemistryOperatorConfig c
 
 ThermochemistryCellInput ThermochemistryOperator::cellInput(const core::SimulationState& state, std::uint32_t row,
                                                             const SourceInterval& interval) const {
+  const std::uint8_t tag = state.gas_composition.chemistry_model_tag.size() > row
+      ? state.gas_composition.chemistry_model_tag[row]
+      : k_chemistry_tag_detailed;
+  ThermochemistryCellInput input = cellInputForTag(state, row, interval, tag);
+  if (rowCarriesMetalIons(tag)) {
+    MetalIonRowState ions;
+    MetalIonAdvanceReport report;
+    attachMetalIonState(state, row, rowTemperatureK(state, row, input), input, ions, report);
+  }
+  return input;
+}
+
+bool ThermochemistryOperator::rowCarriesMetalIons(std::uint8_t chemistry_tag) const noexcept {
+  return m_solver.metalIonSolver() != nullptr &&
+      (m_hybrid_solver == nullptr || chemistry_tag == k_chemistry_tag_detailed);
+}
+
+double ThermochemistryOperator::rowTemperatureK(const core::SimulationState& state, std::uint32_t row,
+                                                const ThermochemistryCellInput& input) const {
+  double mu = state.gas_composition.mean_molecular_weight[row];
+  if (!(mu > 0.0) || !std::isfinite(mu)) mu = 1.22;
+  return std::max((m_config.solver.adiabatic_index - 1.0) * mu * k_amu_g * input.specific_internal_energy_erg_g /
+                      k_boltzmann_erg_per_k,
+                  m_config.solver.temperature_floor_k);
+}
+
+void ThermochemistryOperator::attachMetalIonState(const core::SimulationState& state, std::uint32_t row,
+                                                  double temperature_k, ThermochemistryCellInput& input,
+                                                  MetalIonRowState& ions, MetalIonAdvanceReport& report) const {
+  const MetalIonLadderSolver* solver = m_solver.metalIonSolver();
+  if (solver == nullptr) throw std::logic_error("metal-ion state requested without a metal-ion solver");
+  const auto& sidecar = state.gas_composition;
+  const MetalIonElementSet set = m_config.solver.metal_ion_elements;
+  const double n_co = m_solver.speciesCount() > static_cast<std::size_t>(ChemicalSpecies::kCO)
+      ? input.species_cm3[static_cast<std::size_t>(ChemicalSpecies::kCO)]
+      : 0.0;
+  MetalIonEnvironment env;
+  env.temperature_k = temperature_k;
+  env.electron_cm3 = m_solver.totalElectronDensity(input, input.species_cm3);
+  env.redshift = input.redshift;
+  for (std::size_t e = 0; e < k_metal_ion_element_count; ++e) {
+    const auto element = static_cast<MetalIonElement>(e);
+    if (!set.contains(element)) continue;
+    const ChemicalElement chemical = chemicalElementOf(element);
+    // Authoritative gas-phase nuclei: element lane (dust excluded) minus the
+    // nuclei bound in CO (C and O). The ladder lanes carry the DISTRIBUTION;
+    // nuclei added/removed by dust, feedback or star formation inherit the
+    // current distribution (conservative proportional mapping).
+    double nuclei = input.gas_element_mass_fraction[static_cast<std::size_t>(chemical)] * input.mass_density_cgs /
+        (chemicalElementInfo(chemical).atomic_mass_amu * k_amu_g);
+    if (chemical == ChemicalElement::kC || chemical == ChemicalElement::kO) nuclei -= n_co;
+    ions.nuclei_cm3[e] = std::max(nuclei, 0.0);
+    const std::size_t offset = set.stageOffset(element);
+    const std::size_t stages = metalIonStageCount(element);
+    double sum = 0.0;
+    for (std::size_t k = 0; k < stages; ++k) {
+      const double lane_mass = std::max(sidecar.value(m_layout.ionStageLane(offset + k), row), 0.0);
+      ions.fractions[offset + k] = lane_mass;
+      sum += lane_mass;
+    }
+    const std::span<double> fractions(ions.fractions.data() + offset, stages);
+    if (sum > 0.0 && std::isfinite(sum)) {
+      for (double& x : fractions) x /= sum;
+    } else {
+      // Row without ladder history (first detailed interval, promoted
+      // adaptive row, pre-ion restart): explicit equilibrium initialization.
+      solver->equilibrium(element, fractions, env, report);
+      ions.initialized_from_equilibrium = true;
+    }
+  }
+  refreshMetalIonInput(input, ions);
+}
+
+void ThermochemistryOperator::refreshMetalIonInput(ThermochemistryCellInput& input,
+                                                   const MetalIonRowState& ions) const {
+  const MetalIonElementSet set = m_config.solver.metal_ion_elements;
+  input.metal_ion_stage_cm3.fill(0.0);
+  double electrons = 0.0;
+  for (std::size_t e = 0; e < k_metal_ion_element_count; ++e) {
+    const auto element = static_cast<MetalIonElement>(e);
+    if (!set.contains(element)) continue;
+    const std::size_t offset = set.stageOffset(element);
+    const std::size_t stages = metalIonStageCount(element);
+    for (std::size_t k = 0; k < stages; ++k) {
+      input.metal_ion_stage_cm3[offset + k] = ions.nuclei_cm3[e] * ions.fractions[offset + k];
+    }
+    electrons += ions.nuclei_cm3[e] *
+        metalIonElectronsPerNucleus(std::span<const double>(ions.fractions.data() + offset, stages));
+    if (element == MetalIonElement::kC &&
+        m_solver.speciesCount() > static_cast<std::size_t>(ChemicalSpecies::kCII)) {
+      // The NL97 network already counts one electron per C+ particle.
+      electrons -= input.species_cm3[static_cast<std::size_t>(ChemicalSpecies::kCII)];
+    }
+  }
+  input.metal_ion_electron_cm3 = electrons;
+}
+
+ThermochemistryCellInput ThermochemistryOperator::cellInputForTag(const core::SimulationState& state,
+                                                                  std::uint32_t row, const SourceInterval& interval,
+                                                                  std::uint8_t /*chemistry_tag*/) const {
   const auto& sidecar = state.gas_composition;
   ThermochemistryCellInput input;
   const double a = interval.evaluation_scale_factor;
@@ -84,9 +194,58 @@ ThermochemistryRowResult ThermochemistryOperator::advanceRow(const core::Simulat
                                                              ChemistryShadowReport& shadow) const {
   ThermochemistryRowResult result;
   const auto& sidecar = state.gas_composition;
-  const ThermochemistryCellInput input = cellInput(state, row, interval);
+  ThermochemistryCellInput input = cellInputForTag(state, row, interval, chemistry_tag);
   const bool demoted = m_hybrid_solver != nullptr && chemistry_tag == k_chemistry_tag_hybrid;
   const ThermochemistrySolver& solver = demoted ? *m_hybrid_solver : m_solver;
+  // C02 operator split inside the source interval (Strang in the ladder):
+  // ions(dt/2) at the step-start (T, n_e) -> light network + energy over dt
+  // with the ion distribution frozen (ion losses evaluated implicitly at the
+  // Newton temperature) -> ions(dt/2) at the end (T, n_e).
+  const bool ions = !demoted && rowCarriesMetalIons(chemistry_tag);
+  MetalIonRowState ion_state;
+  MetalIonAdvanceReport ion_report;
+  const MetalIonLadderSolver* ion_solver = m_solver.metalIonSolver();
+  const MetalIonElementSet ion_set = m_config.solver.metal_ion_elements;
+  const auto advance_ions = [&](ThermochemistryCellInput& target, double temperature_k,
+                                double electron_cm3) -> bool {
+    MetalIonEnvironment env;
+    env.temperature_k = temperature_k;
+    env.electron_cm3 = electron_cm3;
+    env.redshift = input.redshift;
+    for (std::size_t e = 0; e < k_metal_ion_element_count; ++e) {
+      const auto element = static_cast<MetalIonElement>(e);
+      if (!ion_set.contains(element)) continue;
+      const std::span<double> fractions(ion_state.fractions.data() + ion_set.stageOffset(element),
+                                        metalIonStageCount(element));
+      if (ion_solver->advance(element, fractions, env, 0.5 * interval.physical_seconds, ion_report) !=
+          SourceAdvanceStatus::kCompleted) {
+        return false;
+      }
+    }
+    refreshMetalIonInput(target, ion_state);
+    return true;
+  };
+  const auto ion_failure = [&](const char* phase) {
+    result.status = SourceAdvanceStatus::kRetryShorterInterval;
+    result.suggested_retry_seconds = 0.5 * interval.physical_seconds;
+    result.diagnostic = "row " + std::to_string(row) + " (gas_cell_id " +
+        std::to_string(state.gas_cells.gas_cell_id[row]) + "): metal-ion ladder " + phase +
+        " half did not converge within the substep cap";
+    return result;
+  };
+  if (ions) {
+    try {
+      attachMetalIonState(state, row, rowTemperatureK(state, row, input), input, ion_state, ion_report);
+      if (!advance_ions(input, rowTemperatureK(state, row, input),
+                        m_solver.totalElectronDensity(input, input.species_cm3))) {
+        return ion_failure("first");
+      }
+    } catch (const std::range_error& error) {
+      result.status = SourceAdvanceStatus::kRejectedInvalid;
+      result.diagnostic = "row " + std::to_string(row) + ": metal-ion dataset range: " + error.what();
+      return result;
+    }
+  }
   ThermochemistryCellOutput output;
   SourceLedger per_volume;
   solver.advanceCell(input, interval.physical_seconds, output, per_volume);
@@ -96,6 +255,29 @@ ThermochemistryRowResult ThermochemistryOperator::advanceRow(const core::Simulat
     result.diagnostic = "row " + std::to_string(row) + " (gas_cell_id " +
         std::to_string(state.gas_cells.gas_cell_id[row]) + "): " + output.diagnostic;
     return result;
+  }
+  if (ions) {
+    // The light network's end species update the NL97 C+ correction before
+    // the closing half; the end electron density is the coupled total. The
+    // step-start `input` stays untouched for the shadow reference below.
+    ThermochemistryCellInput end_input = input;
+    end_input.species_cm3 = output.species_cm3;
+    refreshMetalIonInput(end_input, ion_state);
+    try {
+      if (!advance_ions(end_input, std::max(output.temperature_k, m_config.solver.temperature_floor_k),
+                        m_solver.totalElectronDensity(end_input, output.species_cm3))) {
+        return ion_failure("closing");
+      }
+    } catch (const std::range_error& error) {
+      result.status = SourceAdvanceStatus::kRejectedInvalid;
+      result.diagnostic = "row " + std::to_string(row) + ": metal-ion dataset range: " + error.what();
+      return result;
+    }
+    per_volume.accepted_substeps += ion_report.accepted_substeps;
+    per_volume.rejected_substeps += ion_report.rejected_substeps;
+    per_volume.max_error_estimate = std::max(per_volume.max_error_estimate, ion_report.max_error_estimate);
+    per_volume.charge_residual = std::max(per_volume.charge_residual, ion_report.normalization_residual);
+    per_volume.metal_table_clamps += ion_report.range_clamps;
   }
   if (m_reference_solver != nullptr && shadow.samples < m_config.shadow.max_cells) {
     // Deterministic sample keyed by stable id and accepted step.
@@ -162,6 +344,22 @@ ThermochemistryRowResult ThermochemistryOperator::advanceRow(const core::Simulat
     }
     const double amu = chemicalSpeciesInfo(static_cast<ChemicalSpecies>(s)).mass_amu;
     staged.species_mass_code[s] = output.species_cm3[s] * amu * k_amu_g / input.mass_density_cgs * mass;
+  }
+  if (ions) {
+    // Stage lanes = gas-phase nuclei mass of each stage, in code mass, from
+    // the authoritative nuclei density (element lane minus CO) at this row.
+    staged.ion_stage_count = static_cast<std::uint32_t>(ion_set.stageCount());
+    staged.ion_state_initialized_from_equilibrium = ion_state.initialized_from_equilibrium;
+    for (std::size_t e = 0; e < k_metal_ion_element_count; ++e) {
+      const auto element = static_cast<MetalIonElement>(e);
+      if (!ion_set.contains(element)) continue;
+      const double amu = chemicalElementInfo(chemicalElementOf(element)).atomic_mass_amu;
+      const std::size_t offset = ion_set.stageOffset(element);
+      for (std::size_t k = 0; k < metalIonStageCount(element); ++k) {
+        staged.ion_stage_mass_code[offset + k] = ion_state.nuclei_cm3[e] * ion_state.fractions[offset + k] *
+            amu * k_amu_g / input.mass_density_cgs * mass;
+      }
+    }
   }
   if (!std::isfinite(staged.internal_energy_code) || !(staged.internal_energy_code > 0.0)) {
     result.status = SourceAdvanceStatus::kRejectedInvalid;

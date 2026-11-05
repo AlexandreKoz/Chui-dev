@@ -282,3 +282,56 @@ unchanged**, because secondary verification never qualifies.
     temperature, density and spectrum.
   - No coefficient change is warranted.
   - The UV-pumping heating branch is not included.
+
+## §C02 — Fixed detailed metal-ion ladders (dataset schema `chui_metal_ion_rates_v1`)
+
+Species inventory (fixed by atomic number): C I–VII, O I–IX, Si I–XV, Fe I–XXVII;
+any subset selected by `physics.chemistry_metal_ion_elements`. Implementation:
+`include/cosmosim/physics/metal_ion_network.hpp`, `src/physics/metal_ion_network.cpp`.
+
+**No rate coefficient is compiled into CHUI.** Every collisional-ionization,
+recombination (radiative + dielectronic), per-ion radiative loss and optional
+UVB photoionization/photoheating coefficient is read from the external dataset,
+which must declare `provenance`, `license` and `verification`
+(`verified_against_source` | `unverified`). An `unverified` dataset runs only
+with `thermochemistry_allow_unqualified_rates = true`.
+
+File grammar (one record per line, `#` comments):
+
+```
+schema chui_metal_ion_rates_v1
+provenance <text>
+license <text>
+verification verified_against_source|unverified
+temperature_grid_log10_k <N> <t_0> ... <t_{N-1}>
+redshift_grid <M> <z_0> ... <z_{M-1}>            # only with photo lines
+rate <El> <stage> collisional_ionization <N log10 cm^3 s^-1>
+rate <El> <stage> recombination          <N log10 cm^3 s^-1>
+rate <El> <stage> cooling                <N log10 erg cm^3 s^-1, per n_e n_ion>
+photo <El> <stage> ionization <M log10 s^-1>
+photo <El> <stage> heating    <M log10 erg s^-1 per ion>
+```
+
+`-inf` is an exact zero. Validation refuses: missing processes for any stage of
+a present element, ionization of the bare nucleus, recombination of the neutral
+stage, non-monotone grids, value-count mismatches, duplicates, unknown keywords
+or processes, and a dataset that does not cover the selected elements.
+
+Coupling contract (per detailed row, inside one source interval): ions(dt/2) at
+the step-start (T, n_e) → light network + energy over dt with frozen ion
+distribution (per-ion losses evaluated at the Newton temperature; the frozen
+metal free electrons enter every n_e use) → ions(dt/2) at the end state. The
+ladder is backward Euler with step doubling + Richardson, exact element
+conservation (zero column sums) and non-negativity; exhaustion is a retry, never
+a partial advance. Ion lanes are a distribution carrier; nuclei totals are owned
+by the element lanes (minus CO-bound C/O). Rows without ladder state are
+initialized from ionization equilibrium (counted). Covered elements are removed
+from the element cooling-table query and their C+ 158 µm / O I 63 µm
+fine-structure terms are disabled (the dataset losses must include them).
+
+Named omitted channels (schema v1): charge exchange with H/He; metal ionization
+potential energy in the chemical-binding ledger (losses are radiative only);
+coupling of the NL97 C+ species to the C ladder beyond the frozen charge
+correction. **External data still required:** a licensed, source-verified
+dataset in this schema (e.g. assembled from published ionization/recombination
+compilations and an ion-by-ion cooling calculation). None is supplied.

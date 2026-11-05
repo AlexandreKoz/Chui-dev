@@ -1,6 +1,8 @@
 #include "cosmosim/core/config.hpp"
 
 #include <algorithm>
+#include <array>
+#include <string_view>
 #include <charconv>
 #include <cmath>
 #include <cctype>
@@ -1136,6 +1138,42 @@ parseInitialConditionMissingFieldPolicy(
   throw ConfigError("key 'physics.cooling_model': invalid value '" + value + "'");
 }
 
+// C02: canonical spelling of the metal-ion ladder selection. Core owns only
+// the syntax (catalog order C,O,Si,Fe; no duplicates); the physics layer
+// owns the species inventory derived from it.
+[[nodiscard]] std::string normalizeMetalIonElementList(const std::string& value) {
+  if (value == "none") return value;
+  static constexpr std::array<std::string_view, 4> k_order{"C", "O", "Si", "Fe"};
+  std::array<bool, 4> seen{};
+  std::size_t begin = 0U;
+  while (true) {
+    const std::size_t comma = value.find(',', begin);
+    const std::string token = value.substr(begin, comma == std::string::npos ? std::string::npos : comma - begin);
+    bool known = false;
+    for (std::size_t i = 0; i < k_order.size(); ++i) {
+      if (token == k_order[i]) {
+        if (seen[i]) throw ConfigError("physics.chemistry_metal_ion_elements lists '" + token + "' twice");
+        seen[i] = true;
+        known = true;
+      }
+    }
+    if (!known) {
+      throw ConfigError(
+          "physics.chemistry_metal_ion_elements must be 'none' or a comma-separated subset of C,O,Si,Fe (got '" +
+          value + "')");
+    }
+    if (comma == std::string::npos) break;
+    begin = comma + 1U;
+  }
+  std::string normalized;
+  for (std::size_t i = 0; i < k_order.size(); ++i) {
+    if (!seen[i]) continue;
+    if (!normalized.empty()) normalized += ",";
+    normalized += k_order[i];
+  }
+  return normalized;
+}
+
 [[nodiscard]] ThermochemistryBackendMode parseThermochemistryBackendMode(const std::string& value) {
   const std::string lower = toLower(trim(value));
   if (lower == "legacy_cooling") return ThermochemistryBackendMode::kLegacyCooling;
@@ -1659,6 +1697,9 @@ struct ConfigKeySpec {
       {"physics.uv_background_table_sha256", ""},
       {"physics.metal_cooling_table_path", ""},
       {"physics.metal_cooling_table_sha256", ""},
+      {"physics.chemistry_metal_ion_elements", "none"},
+      {"physics.metal_ion_rate_table_path", ""},
+      {"physics.metal_ion_rate_table_sha256", ""},
       {"physics.metal_cooling_accept_uv_background_mismatch", "false"},
       {"physics.ssp_yield_table_path", ""},
       {"physics.ssp_yield_table_sha256", ""},
@@ -1831,6 +1872,22 @@ void validatePart2BaryonicPhysics(const SimulationConfig& config) {
       p.metal_cooling_table_path.empty()) {
     throw ConfigError("element-table metal cooling requires physics.metal_cooling_table_path (no table is bundled)");
   }
+  if (p.chemistry_metal_ion_elements != "none") {
+    if (p.thermochemistry_backend != ThermochemistryBackendMode::kFixedDetailed) {
+      throw ConfigError(
+          "physics.chemistry_metal_ion_elements requires thermochemistry_backend=fixed_detailed "
+          "(the metal-ion ladders are part of the fixed detailed reference)");
+    }
+    if (p.metal_ion_rate_table_path.empty()) {
+      throw ConfigError(
+          "physics.chemistry_metal_ion_elements requires physics.metal_ion_rate_table_path "
+          "(schema chui_metal_ion_rates_v1; no metal-ion rate coefficients are bundled)");
+    }
+  } else if (!p.metal_ion_rate_table_path.empty()) {
+    throw ConfigError(
+        "physics.metal_ion_rate_table_path is set but physics.chemistry_metal_ion_elements = none "
+        "(no-op options are refused)");
+  }
   if (p.metal_cooling_accept_uv_background_mismatch &&
       p.metal_cooling_mode != MetalCoolingModeConfig::kElementTable &&
       p.metal_cooling_mode != MetalCoolingModeConfig::kElementTableAndFineStructure) {
@@ -1936,6 +1993,7 @@ void validatePart2BaryonicPhysics(const SimulationConfig& config) {
   };
   require_checksum(p.uv_background_table_path, p.uv_background_table_sha256, "uv_background_table");
   require_checksum(p.metal_cooling_table_path, p.metal_cooling_table_sha256, "metal_cooling_table");
+  require_checksum(p.metal_ion_rate_table_path, p.metal_ion_rate_table_sha256, "metal_ion_rate_table");
   require_checksum(p.ssp_yield_table_path, p.ssp_yield_table_sha256, "ssp_yield_table");
   if (p.stellar_population_model != StellarPopulationModelConfig::kLegacyTable && p.enable_feedback &&
       p.fb_supernova_model != SupernovaFeedbackModelConfig::kMechanicalResolvedUnresolved) {
@@ -3414,6 +3472,9 @@ class NormalizedConfigStream {
   stream << "uv_background_table_sha256 = " << frozen.config.physics.uv_background_table_sha256 << '\n';
   stream << "metal_cooling_table_path = " << frozen.config.physics.metal_cooling_table_path << '\n';
   stream << "metal_cooling_table_sha256 = " << frozen.config.physics.metal_cooling_table_sha256 << '\n';
+  stream << "chemistry_metal_ion_elements = " << frozen.config.physics.chemistry_metal_ion_elements << '\n';
+  stream << "metal_ion_rate_table_path = " << frozen.config.physics.metal_ion_rate_table_path << '\n';
+  stream << "metal_ion_rate_table_sha256 = " << frozen.config.physics.metal_ion_rate_table_sha256 << '\n';
   stream << "metal_cooling_accept_uv_background_mismatch = "
          << (frozen.config.physics.metal_cooling_accept_uv_background_mismatch ? "true" : "false") << '\n';
   stream << "ssp_yield_table_path = " << frozen.config.physics.ssp_yield_table_path << '\n';
@@ -4531,6 +4592,12 @@ class NormalizedConfigStream {
   frozen.config.physics.uv_background_table_sha256 = requireString(entries, consumed, "physics.uv_background_table_sha256", "");
   frozen.config.physics.metal_cooling_table_path = requireString(entries, consumed, "physics.metal_cooling_table_path", "");
   frozen.config.physics.metal_cooling_table_sha256 = requireString(entries, consumed, "physics.metal_cooling_table_sha256", "");
+  frozen.config.physics.chemistry_metal_ion_elements = normalizeMetalIonElementList(
+      requireString(entries, consumed, "physics.chemistry_metal_ion_elements", "none"));
+  frozen.config.physics.metal_ion_rate_table_path =
+      requireString(entries, consumed, "physics.metal_ion_rate_table_path", "");
+  frozen.config.physics.metal_ion_rate_table_sha256 =
+      requireString(entries, consumed, "physics.metal_ion_rate_table_sha256", "");
   frozen.config.physics.metal_cooling_accept_uv_background_mismatch = parseBool(
       requireString(entries, consumed, "physics.metal_cooling_accept_uv_background_mismatch", "false"),
       "physics.metal_cooling_accept_uv_background_mismatch");

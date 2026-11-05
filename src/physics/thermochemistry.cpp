@@ -126,6 +126,39 @@ ThermochemistrySolver::ThermochemistrySolver(ThermochemistryConfig config) : m_c
         "metal cooling mode requires an element-resolved metal cooling table (physics.metal_cooling_table_path); "
         "no production table is bundled");
   }
+  if (!m_config.metal_ion_elements.empty()) {
+    if (m_config.backend != ThermochemistryBackend::kFixedDetailed) {
+      throw std::invalid_argument("metal-ion ladders are part of the fixed_detailed backend only");
+    }
+    if (m_config.metal_ion_table == nullptr) {
+      throw SourceModelUnavailableError(
+          "fixed_detailed metal-ion ladders '" + m_config.metal_ion_elements.label() +
+          "' require a loaded metal-ion rate dataset (physics.metal_ion_rate_table_path); none is bundled");
+    }
+    if ((m_config.metal_ion_elements.mask() & ~m_config.metal_ion_table->elements().mask()) != 0U) {
+      throw SourceModelUnavailableError("metal-ion rate dataset '" + m_config.metal_ion_table->sourceLabel() +
+                                        "' does not cover the selected elements '" +
+                                        m_config.metal_ion_elements.label() + "'");
+    }
+    if (!m_config.metal_ion_table->declaredVerified() && !m_config.allow_unqualified_rates) {
+      throw SourceModelUnavailableError(
+          "metal-ion rate dataset '" + m_config.metal_ion_table->sourceLabel() +
+          "' declares verification = unverified; set physics.thermochemistry_allow_unqualified_rates = true to "
+          "run it as an explicitly unqualified research model");
+    }
+    m_metal_ion_solver = std::make_shared<const MetalIonLadderSolver>(
+        *m_config.metal_ion_table,
+        m_config.metal_table_range == MetalTableRangePolicy::kReject ? MetalIonRangePolicy::kReject
+                                                                     : MetalIonRangePolicy::kClampAndCount,
+        m_config.relative_tolerance, m_config.abundance_absolute_tolerance, m_config.max_substeps);
+  }
+}
+
+double ThermochemistrySolver::totalElectronDensity(const ThermochemistryCellInput& input,
+                                                   const NetworkState& n) const {
+  return std::max(electronDensity(n, std::max<std::size_t>(m_species_count, k_hybrid_species_count)) +
+                      input.metal_ion_electron_cm3,
+                  0.0);
 }
 
 double ThermochemistrySolver::meanMolecularWeight(double mass_density_cgs, double n_particles) noexcept {
@@ -167,7 +200,7 @@ RateEnvironment ThermochemistrySolver::environment(const ThermochemistryCellInpu
   env.g0_habing = m_config.isrf_g0_habing;
   // Local shielding length: Jeans length capped by shielding_length_max_cm
   // (Schaye 2001-type local approximation; NOT radiative transfer).
-  const double n_e = electronDensity(n, std::max<std::size_t>(m_species_count, k_hybrid_species_count));
+  const double n_e = totalElectronDensity(input, n);
   const double n_part = particleDensity(input, n, n_e);
   const double mu = meanMolecularWeight(rho, n_part);
   double length = m_config.shielding_length_max_cm;
@@ -233,7 +266,7 @@ CoolingHeatingTerms ThermochemistrySolver::coolingHeating(const ThermochemistryC
                                                           const NetworkState& n, double temperature_k) const {
   const std::size_t stored = std::max<std::size_t>(m_species_count, k_hybrid_species_count);
   const RateEnvironment env = environment(input, n, temperature_k);
-  const double n_e = electronDensity(n, stored);
+  const double n_e = totalElectronDensity(input, n);
   CoolingHeatingTerms terms = cooling::primordial(env, n, stored, n_e);
   if (!m_config.cosmological) {
     // Compton exchange with the CMB is a cosmological-frame term only.
@@ -248,6 +281,10 @@ CoolingHeatingTerms ThermochemistrySolver::coolingHeating(const ThermochemistryC
       m_config.metal_mode == MetalCoolingMode::kElementTableAndFineStructure;
   const bool use_table = m_config.metal_mode == MetalCoolingMode::kElementTable ||
       m_config.metal_mode == MetalCoolingMode::kElementTableAndFineStructure;
+  const bool ions_own_c = m_metal_ion_solver != nullptr &&
+      m_config.metal_ion_elements.contains(MetalIonElement::kC);
+  const bool ions_own_o = m_metal_ion_solver != nullptr &&
+      m_config.metal_ion_elements.contains(MetalIonElement::kO);
   if (use_fs && w_table < 1.0) {
     double n_cii = env.carbon_gas_nuclei_cm3;
     double n_oi = env.oxygen_gas_nuclei_cm3;
@@ -263,8 +300,10 @@ CoolingHeatingTerms ThermochemistrySolver::coolingHeating(const ThermochemistryC
       n_oi *= std::clamp(neutral_h, 0.0, 1.0);
     }
     const double n_h_collider = n[idx(S::kHI)] + n[idx(S::kH2)];
-    const double fs = cooling::fineStructureCII(env.temperature_k, n_cii, n_h_collider, n_e) +
-        cooling::fineStructureOI(env.temperature_k, n_oi, n_h_collider);
+    // C02: a covered element's fine-structure losses belong to its per-ion
+    // dataset losses below; never count both.
+    const double fs = (ions_own_c ? 0.0 : cooling::fineStructureCII(env.temperature_k, n_cii, n_h_collider, n_e)) +
+        (ions_own_o ? 0.0 : cooling::fineStructureOI(env.temperature_k, n_oi, n_h_collider));
     metal += (1.0 - w_table) * fs;
   }
   if (use_table && (m_config.metal_mode == MetalCoolingMode::kElementTable || w_table > 0.0)) {
@@ -274,11 +313,47 @@ CoolingHeatingTerms ThermochemistrySolver::coolingHeating(const ThermochemistryC
     query.redshift = env.redshift;
     query.electron_per_hydrogen = env.hydrogen_nuclei_cm3 > 0.0 ? n_e / env.hydrogen_nuclei_cm3 : -1.0;
     query.gas_mass_fraction = input.gas_element_mass_fraction;
+    if (m_metal_ion_solver != nullptr) {
+      // C02: elements carried by explicit ion ladders are removed from the
+      // element-table query (their losses are summed per ion below).
+      for (std::size_t e = 0; e < k_chemical_element_count; ++e) {
+        if (m_config.metal_ion_elements.containsChemicalElement(static_cast<ChemicalElement>(e))) {
+          query.gas_mass_fraction[e] = 0.0;
+        }
+      }
+    }
     query.hydrogen_mass_fraction = input.gas_element_mass_fraction[0];
     const double weight = m_config.metal_mode == MetalCoolingMode::kElementTable ? 1.0 : w_table;
     const MetalCoolingTable::Result table_result = m_config.metal_table->evaluate(query, m_config.metal_table_range);
     metal += weight * table_result.net_cooling_erg_cm3_s;
     terms.metal_table_clamped = table_result.clamped;
+  }
+  if (m_metal_ion_solver != nullptr) {
+    // Ion-resolved losses L_k(T) at the CURRENT Newton temperature with the
+    // operator-split frozen ion distribution; photoheating from the dataset
+    // UVB with the same local attenuation as the HI photo-rate.
+    MetalIonEnvironment ion_env;
+    ion_env.temperature_k = env.temperature_k;
+    ion_env.electron_cm3 = n_e;
+    ion_env.redshift = env.redshift;
+    ion_env.photo_attenuation = 1.0;
+    if (m_config.uv_background != nullptr) {
+      const UvBackgroundRates uvb = m_config.uv_background->ratesAtRedshift(input.redshift);
+      ion_env.photo_attenuation = uvb.gamma_hi_s > 0.0 ? std::clamp(env.gamma_hi_s / uvb.gamma_hi_s, 0.0, 1.0) : 1.0;
+    }
+    MetalIonAdvanceReport ion_report;
+    double ion_heating = 0.0;
+    for (std::size_t e = 0; e < k_metal_ion_element_count; ++e) {
+      const auto element = static_cast<MetalIonElement>(e);
+      if (!m_config.metal_ion_elements.contains(element)) continue;
+      const std::span<const double> stages(
+          input.metal_ion_stage_cm3.data() + m_config.metal_ion_elements.stageOffset(element),
+          metalIonStageCount(element));
+      metal += m_metal_ion_solver->cooling(element, stages, ion_env, ion_report);
+      ion_heating += m_metal_ion_solver->photoheating(element, stages, ion_env, ion_report);
+    }
+    metal -= ion_heating;
+    terms.metal_table_clamped = terms.metal_table_clamped || ion_report.range_clamps > 0U;
   }
   if (metal >= 0.0) {
     terms.radiative_cooling += metal;
@@ -320,7 +395,7 @@ void ThermochemistrySolver::advanceCell(const ThermochemistryCellInput& input, d
 
   // --- state <-> unknowns ---------------------------------------------------
   const auto temperature_of = [&](const NetworkState& n, double u) {
-    const double ne = electronDensity(n, std::max<std::size_t>(m_species_count, k_hybrid_species_count));
+    const double ne = totalElectronDensity(input, n);
     return gm1 * u * rho / (k_boltzmann_erg_per_k * particleDensity(input, n, ne));
   };
   // Equilibrium backend: T(u) solved with the equilibrium ionization state.
@@ -371,7 +446,7 @@ void ThermochemistrySolver::advanceCell(const ThermochemistryCellInput& input, d
     f[w_index] = du / (rho * u_scale);
     if (network) {
       const RateEnvironment env = environment(input, n, t);
-      const double ne = electronDensity(n, m_species_count);
+      const double ne = totalElectronDensity(input, n);
       for (const ReactionDefinition& reaction : m_manifest->reactions) {
         const double r = reaction.rate(env, n, ne);
         if (!std::isfinite(r)) { rhs_failed = true; return; }
@@ -610,7 +685,7 @@ void ThermochemistrySolver::advanceCell(const ThermochemistryCellInput& input, d
     output.temperature_k = gm1 * k_reference_mu_ionized * k_amu_g * u_end / k_boltzmann_erg_per_k;
   }
   const std::size_t stored = std::max<std::size_t>(m_species_count, k_hybrid_species_count);
-  const double ne_end = electronDensity(n_end, stored);
+  const double ne_end = totalElectronDensity(input, n_end);
   output.status = SourceAdvanceStatus::kCompleted;
   output.completed_seconds = dt_seconds;
   output.specific_internal_energy_erg_g = u_end;

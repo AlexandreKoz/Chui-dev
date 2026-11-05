@@ -3,11 +3,13 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <string>
 
 #include "cosmosim/physics/baryon_composition.hpp"
 #include "cosmosim/physics/chemical_network.hpp"
 #include "cosmosim/physics/metal_cooling_table.hpp"
+#include "cosmosim/physics/metal_ion_network.hpp"
 #include "cosmosim/physics/radiation_background.hpp"
 #include "cosmosim/physics/source_interval.hpp"
 
@@ -84,6 +86,14 @@ struct ThermochemistryConfig {
   // explicitly accepts UNQUALIFIED rates; results are then not
   // production-validated science.
   bool allow_unqualified_rates = false;
+  // C02 fixed detailed metal-ion reference (fixed_detailed only). When the
+  // element set is non-empty the dataset must cover it; the ion ladders own
+  // the radiative losses and free electrons of those elements: their
+  // contribution is removed from the element cooling table query and the
+  // C+ 158um / O I 63um fine-structure channels of covered C/O are replaced
+  // by the dataset's per-ion losses (no double counting).
+  const MetalIonRateTable* metal_ion_table = nullptr;
+  MetalIonElementSet metal_ion_elements{};
 };
 
 struct ThermochemistryCellInput {
@@ -96,6 +106,13 @@ struct ThermochemistryCellInput {
   NetworkState species_cm3{};
   double dust_to_gas_relative_mw = 0.0;
   double redshift = 0.0;
+  // C02 operator-split coupling: ion-stage number densities [cm^-3] of the
+  // selected ladders, frozen over this light-network/energy solve (packed in
+  // MetalIonElementSet::stageOffset order), and the free electrons they add
+  // beyond the light network's own charge count (for carbon this is the
+  // ladder charge minus the NL97 C+ charge already carried by kCII).
+  std::array<double, k_metal_ion_stage_capacity> metal_ion_stage_cm3{};
+  double metal_ion_electron_cm3 = 0.0;
 };
 
 struct ThermochemistryCellOutput {
@@ -135,11 +152,17 @@ class ThermochemistrySolver {
   // Volumetric net heating-cooling for diagnostics/tests.
   [[nodiscard]] CoolingHeatingTerms coolingHeating(const ThermochemistryCellInput& input,
                                                    const NetworkState& n, double temperature_k) const;
+  // C02 ladder kernel bound to this solver's dataset (null without ions).
+  [[nodiscard]] const MetalIonLadderSolver* metalIonSolver() const noexcept {
+    return m_metal_ion_solver.get();
+  }
+  [[nodiscard]] double totalElectronDensity(const ThermochemistryCellInput& input, const NetworkState& n) const;
 
  private:
   ThermochemistryConfig m_config;
   const NetworkManifest* m_manifest = nullptr;
   std::size_t m_species_count = 0;
+  std::shared_ptr<const MetalIonLadderSolver> m_metal_ion_solver;
 };
 
 }  // namespace cosmosim::physics

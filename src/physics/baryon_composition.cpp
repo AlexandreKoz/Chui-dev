@@ -9,6 +9,7 @@
 
 #include "cosmosim/core/simulation_state.hpp"
 #include "cosmosim/core/retained_capacity_transaction.hpp"
+#include "cosmosim/physics/metal_ion_network.hpp"
 
 namespace cosmosim::physics {
 namespace {
@@ -129,6 +130,23 @@ CompositionLayout CompositionLayout::make(const CompositionLayoutRequest& reques
   for (std::size_t s = 0; s < species_count; ++s) {
     layout.m_lanes.push_back({"species_" + std::string(k_species[s].name), "mass_code"});
   }
+  const auto ion_begin = static_cast<std::uint32_t>(layout.m_lanes.size());
+  const MetalIonElementSet ion_set = MetalIonElementSet::fromMask(request.metal_ion_element_mask);
+  if (!ion_set.empty()) {
+    if (request.network != CompositionNetworkKind::kDetailedCarbonOxygen) {
+      throw std::invalid_argument(
+          "metal-ion ladders require the detailed C/O composition network (fixed_detailed)");
+    }
+    for (std::size_t e = 0; e < k_metal_ion_element_count; ++e) {
+      const auto element = static_cast<MetalIonElement>(e);
+      if (!ion_set.contains(element)) continue;
+      for (std::size_t k = 0; k < metalIonStageCount(element); ++k) {
+        layout.m_lanes.push_back({"ion_" + metalIonStageName(element, k), "mass_code"});
+      }
+    }
+    name += "_ions_" + ion_set.label() + "_v1";
+  }
+  const auto ion_count = static_cast<std::uint32_t>(ion_set.stageCount());
   const auto dust_begin = static_cast<std::uint32_t>(layout.m_lanes.size());
   std::size_t dust_count = 0U;
   if (request.dust == CompositionDustKind::kTwoReservoirV1) {
@@ -158,11 +176,17 @@ CompositionLayout CompositionLayout::make(const CompositionLayoutRequest& reques
   d.species_lane_count = static_cast<std::uint32_t>(species_count);
   d.dust_lane_begin = dust_begin;
   d.dust_lane_count = static_cast<std::uint32_t>(dust_count);
+  d.ion_lane_begin = ion_count == 0U ? 0U : ion_begin;
+  d.ion_lane_count = ion_count;
   d.sgs_energy_lane = sgs_lane;
   if (request.adaptive_sparse_detailed) {
     layout.m_sparse_default_source_lanes = {
         d.element_lane_begin + static_cast<std::uint32_t>(ChemicalElement::kC),
         core::GasCompositionLayoutDescriptor::k_no_lane};
+    // Ion lanes follow C+/CO contiguously; implicit value zero.
+    layout.m_sparse_default_source_lanes.insert(
+        layout.m_sparse_default_source_lanes.end(), ion_count,
+        core::GasCompositionLayoutDescriptor::k_no_lane);
   }
   if (!d.isConsistent()) {
     throw std::logic_error("CompositionLayout::make produced an inconsistent descriptor");
@@ -177,6 +201,8 @@ CompositionLayout CompositionLayout::fromDescriptor(const core::GasCompositionLa
                                                                 : CompositionNetworkKind::kDetailedCarbonOxygen;
   request.dust = descriptor.dust_lane_count == 0U ? CompositionDustKind::kNone : CompositionDustKind::kTwoReservoirV1;
   request.sgs_energy = descriptor.sgs_energy_lane != core::GasCompositionLayoutDescriptor::k_no_lane;
+  request.metal_ion_element_mask =
+      MetalIonElementSet::fromStageCount(descriptor.ion_lane_count).mask();
   CompositionLayout layout = make(request);
   if (!(layout.descriptor() == descriptor)) {
     throw std::runtime_error("composition descriptor '" + descriptor.layout_name +
@@ -190,6 +216,13 @@ std::uint32_t CompositionLayout::speciesLane(std::size_t species_slot) const {
     throw std::out_of_range("CompositionLayout: species slot is not part of the active network");
   }
   return m_descriptor.species_lane_begin + static_cast<std::uint32_t>(species_slot);
+}
+
+std::uint32_t CompositionLayout::ionStageLane(std::size_t packed_stage) const {
+  if (packed_stage >= m_descriptor.ion_lane_count) {
+    throw std::out_of_range("CompositionLayout: metal-ion stage is not part of the active layout");
+  }
+  return m_descriptor.ion_lane_begin + static_cast<std::uint32_t>(packed_stage);
 }
 
 std::uint32_t CompositionLayout::dustLane(std::size_t dust_slot) const {

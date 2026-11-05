@@ -40,6 +40,8 @@ CompositionLayoutRequest compositionLayoutRequestFromConfig(const core::PhysicsC
   request.sgs_energy = physics.sgs_turbulence_model == core::SgsTurbulenceModelConfig::kBudgetedV1;
   request.adaptive_sparse_detailed =
       physics.chemistry_adaptive_selection == core::ChemistryAdaptiveSelectionConfig::kLocalV1;
+  request.metal_ion_element_mask =
+      MetalIonElementSet::parse(physics.chemistry_metal_ion_elements).mask();
   return request;
 }
 
@@ -80,6 +82,17 @@ BaryonicDataProducts loadBaryonicDataProducts(const core::PhysicsConfig& physics
         data.uv_background != nullptr ? data.uv_background->provenance().sha256_hex : std::string(),
         physics.metal_cooling_accept_uv_background_mismatch);
   }
+  const MetalIonElementSet ion_elements = MetalIonElementSet::parse(physics.chemistry_metal_ion_elements);
+  if (!ion_elements.empty()) {
+    const std::string actual_sha256 = sha256FileHex(physics.metal_ion_rate_table_path);
+    if (actual_sha256 != physics.metal_ion_rate_table_sha256) {
+      throw std::runtime_error(
+          "metal-ion rate table '" + physics.metal_ion_rate_table_path + "' has SHA-256 " + actual_sha256 +
+          " but physics.metal_ion_rate_table_sha256 = " + physics.metal_ion_rate_table_sha256);
+    }
+    data.metal_ion_rate_table = std::make_shared<const MetalIonRateTable>(
+        MetalIonRateTable::loadFromFile(physics.metal_ion_rate_table_path, ion_elements));
+  }
   return data;
 }
 
@@ -113,6 +126,8 @@ ThermochemistryOperatorConfig makeThermochemistryOperatorConfig(
       ? MetalTableRangePolicy::kReject
       : MetalTableRangePolicy::kClampDensityAndRedshift;
   s.fine_structure_switch_temperature_k = p.metal_cooling_switch_temperature_k;
+  s.metal_ion_table = data.metal_ion_rate_table.get();
+  s.metal_ion_elements = MetalIonElementSet::parse(p.chemistry_metal_ion_elements);
   s.allow_unqualified_rates = p.thermochemistry_allow_unqualified_rates;
   s.cosmological = config.mode.mode == core::SimulationMode::kCosmoCube ||
       config.mode.mode == core::SimulationMode::kZoomIn;
