@@ -4,6 +4,7 @@
 #include <cmath>
 #include <limits>
 #include <stdexcept>
+#include <string>
 
 #include "cosmosim/core/simulation_state.hpp"
 
@@ -11,6 +12,76 @@ namespace cosmosim::physics {
 namespace {
 constexpr double k_newton_g_cgs = 6.67430e-8;
 constexpr double k_pi = 3.14159265358979323846;
+
+[[nodiscard]] double harmonicMeanPositive(double left, double right) noexcept {
+  return left > 0.0 && right > 0.0 ? 2.0 * left * right / (left + right) : 0.0;
+}
+
+struct SgsFaceTransfer {
+  std::array<double, 3> momentum_to_lower{};
+  double energy_to_lower = 0.0;
+  double stable_dt = std::numeric_limits<double>::infinity();
+  bool active = false;
+};
+
+// Traceless viscous traction on a face normal to `axis`, oriented from the
+// lower-coordinate cell to the upper-coordinate cell. Only the normal
+// derivative is reconstructed at this face; the complete cell-centred
+// contraction used for production is supplied separately by the AMR topology.
+[[nodiscard]] SgsFaceTransfer sgsFaceTransfer(
+    const std::array<double, 3>& lower_velocity,
+    const std::array<double, 3>& upper_velocity,
+    double lower_density,
+    double upper_density,
+    std::uint8_t axis,
+    double area,
+    double distance,
+    double dt,
+    double coefficient) noexcept {
+  SgsFaceTransfer result;
+  if (axis >= 3U || !(area > 0.0) || !(distance > 0.0) || !(dt > 0.0) ||
+      !(coefficient > 0.0)) {
+    return result;
+  }
+  const double density = harmonicMeanPositive(lower_density, upper_density);
+  if (!(density > 0.0)) return result;
+
+  double strain[3][3]{};
+  for (std::size_t component = 0U; component < 3U; ++component) {
+    const double gradient =
+        (upper_velocity[component] - lower_velocity[component]) / distance;
+    strain[component][axis] += 0.5 * gradient;
+    strain[axis][component] += 0.5 * gradient;
+  }
+  const double trace_third =
+      (strain[0][0] + strain[1][1] + strain[2][2]) / 3.0;
+  double contraction = 0.0;
+  for (std::size_t i = 0U; i < 3U; ++i) {
+    strain[i][i] -= trace_third;
+    for (std::size_t j = 0U; j < 3U; ++j) {
+      contraction += strain[i][j] * strain[i][j];
+    }
+  }
+  const double magnitude = std::sqrt(std::max(2.0 * contraction, 0.0));
+  const double viscosity = coefficient * distance * distance * magnitude;
+  if (!(viscosity > 0.0) || !std::isfinite(viscosity)) return result;
+  result.stable_dt = 0.4 / (6.0 * coefficient * magnitude);
+
+  const std::array<double, 3> face_velocity{
+      0.5 * (lower_velocity[0] + upper_velocity[0]),
+      0.5 * (lower_velocity[1] + upper_velocity[1]),
+      0.5 * (lower_velocity[2] + upper_velocity[2])};
+  const double scale = area * dt;
+  for (std::size_t component = 0U; component < 3U; ++component) {
+    const double traction = 2.0 * density * viscosity * strain[component][axis];
+    result.momentum_to_lower[component] = scale * traction;
+    result.energy_to_lower += scale * face_velocity[component] * traction;
+  }
+  result.active = std::isfinite(result.energy_to_lower) &&
+      std::all_of(result.momentum_to_lower.begin(), result.momentum_to_lower.end(),
+                  [](double value) { return std::isfinite(value); });
+  return result;
+}
 }  // namespace
 
 // --------------------------------------------------------------------------
@@ -133,6 +204,8 @@ double condensableDustMass(const core::GasCompositionSidecar& sidecar, const Com
 void transferGasToDust(core::GasCompositionSidecar& sidecar, const CompositionLayout& layout, std::size_t row,
                        std::size_t d, double dust_mass_delta) {
   // dust_mass_delta > 0: gas -> dust; < 0: dust -> gas. Stoichiometric.
+  const bool detailed_row_was_explicit =
+      !sidecar.sparseStorageEnabled() || sidecar.hasExplicitSparseRow(row);
   const auto& fractions = dustElementMassFractions(static_cast<DustReservoir>(d));
   for (std::size_t e = 0; e < k_chemical_element_count; ++e) {
     if (fractions[e] <= 0.0) continue;
@@ -145,7 +218,8 @@ void transferGasToDust(core::GasCompositionSidecar& sidecar, const CompositionLa
   // transfers except carbon: C+ (and CO) track gas-phase carbon in the
   // detailed network, so the carbon removed/returned is applied to C+.
   if (fractions[static_cast<std::size_t>(ChemicalElement::kC)] > 0.0 &&
-      sidecar.descriptor().species_lane_count >= k_detailed_species_count) {
+      sidecar.descriptor().species_lane_count >= k_detailed_species_count &&
+      detailed_row_was_explicit) {
     const std::uint32_t cii = layout.speciesLane(static_cast<std::size_t>(ChemicalSpecies::kCII));
     const double delta_c = fractions[static_cast<std::size_t>(ChemicalElement::kC)] * dust_mass_delta;
     sidecar.setValue(cii, row, std::max(sidecar.value(cii, row) - delta_c, 0.0));
@@ -232,6 +306,242 @@ EjectaPartition partitionEjectaIntoDust(const std::array<double, k_chemical_elem
 // --------------------------------------------------------------------------
 // SGS
 // --------------------------------------------------------------------------
+std::uint64_t SgsShearTransferWorkspace::ownedCapacityBytes() const noexcept {
+  const std::uint64_t doubles = static_cast<std::uint64_t>(
+      velocity_x.capacity() + velocity_y.capacity() + velocity_z.capacity() +
+      internal_energy.capacity() + sgs_energy.capacity());
+  return doubles * sizeof(double) +
+      static_cast<std::uint64_t>(touched.capacity()) * sizeof(std::uint8_t);
+}
+
+std::uint64_t SgsShearTransferWorkspace::requiredBytes(std::size_t rows) noexcept {
+  constexpr std::uint64_t width = 5U * sizeof(double) + sizeof(std::uint8_t);
+  if (rows > std::numeric_limits<std::uint64_t>::max() / width) {
+    return std::numeric_limits<std::uint64_t>::max();
+  }
+  return static_cast<std::uint64_t>(rows) * width;
+}
+
+void SgsShearTransferWorkspace::clear() noexcept {
+  velocity_x.clear();
+  velocity_y.clear();
+  velocity_z.clear();
+  internal_energy.clear();
+  sgs_energy.clear();
+  touched.clear();
+  prepared = false;
+}
+
+SgsLedger prepareSgsShearTransfer(
+    const core::SimulationState& state,
+    std::span<const std::uint8_t> active_rows,
+    std::span<const double> trace_free_strain_magnitude_code,
+    std::span<const MetalDiffusionFace> local_faces,
+    std::span<const SgsRemoteShearFace> remote_faces,
+    double physical_length_per_stored_length,
+    double dt_code_time,
+    const SgsConfig& config,
+    SgsShearTransferWorkspace& workspace) {
+  workspace.clear();
+  const std::size_t rows = state.cells.size();
+  if (active_rows.size() != rows || trace_free_strain_magnitude_code.size() != rows ||
+      state.gas_cells.size() != rows || !(physical_length_per_stored_length > 0.0) ||
+      !std::isfinite(physical_length_per_stored_length) || !(dt_code_time > 0.0) ||
+      !std::isfinite(dt_code_time) || !(config.eddy_viscosity_coefficient > 0.0) ||
+      !std::isfinite(config.eddy_viscosity_coefficient)) {
+    throw std::invalid_argument("SGS shear transfer received inconsistent state, interval or closure coefficient");
+  }
+  const auto& sidecar = state.gas_composition;
+  if (!sidecar.enabled() ||
+      sidecar.descriptor().sgs_energy_lane == core::GasCompositionLayoutDescriptor::k_no_lane) {
+    throw std::invalid_argument("SGS shear transfer requires the authoritative SGS energy lane");
+  }
+  sidecar.requireAlignedWith(state.gas_cells.gas_cell_id, "prepareSgsShearTransfer");
+  const std::uint32_t sgs_lane = sidecar.descriptor().sgs_energy_lane;
+
+  workspace.velocity_x.assign(rows, 0.0);  // staged momentum delta x
+  workspace.velocity_y.assign(rows, 0.0);  // staged momentum delta y
+  workspace.velocity_z.assign(rows, 0.0);  // staged momentum delta z
+  workspace.internal_energy.assign(rows, 0.0);  // staged resolved-total energy delta
+  workspace.sgs_energy.assign(rows, 0.0);  // staged SGS production
+  workspace.touched.assign(rows, 0U);
+  SgsLedger ledger;
+
+  const auto velocity = [&state](std::uint32_t row) {
+    return std::array<double, 3>{
+        state.gas_cells.velocity_x_peculiar[row],
+        state.gas_cells.velocity_y_peculiar[row],
+        state.gas_cells.velocity_z_peculiar[row]};
+  };
+  const double volume_factor = physical_length_per_stored_length *
+      physical_length_per_stored_length * physical_length_per_stored_length;
+  const auto physicalDensity = [&state, volume_factor](std::uint32_t row) {
+    const double stored_density = state.gas_cells.density_code[row];
+    return stored_density > 0.0 ? stored_density / volume_factor : 0.0;
+  };
+  const auto accumulate = [&](std::uint32_t row, const SgsFaceTransfer& transfer,
+                              double sign) {
+    if (row >= rows || active_rows[row] == 0U || !transfer.active) return;
+    workspace.velocity_x[row] += sign * transfer.momentum_to_lower[0];
+    workspace.velocity_y[row] += sign * transfer.momentum_to_lower[1];
+    workspace.velocity_z[row] += sign * transfer.momentum_to_lower[2];
+    workspace.internal_energy[row] += sign * transfer.energy_to_lower;
+    workspace.touched[row] = 1U;
+    ledger.resolved_stress_work_code += sign * transfer.energy_to_lower;
+    ledger.momentum_impulse_l1_code +=
+        std::abs(transfer.momentum_to_lower[0]) +
+        std::abs(transfer.momentum_to_lower[1]) +
+        std::abs(transfer.momentum_to_lower[2]);
+  };
+
+  for (const MetalDiffusionFace& face : local_faces) {
+    if (face.left_cell >= rows || face.right_cell >= rows || face.axis >= 3U ||
+        active_rows[face.left_cell] == 0U || active_rows[face.right_cell] == 0U) {
+      continue;
+    }
+    const SgsFaceTransfer transfer = sgsFaceTransfer(
+        velocity(face.left_cell), velocity(face.right_cell),
+        physicalDensity(face.left_cell), physicalDensity(face.right_cell),
+        face.axis, face.area_code, face.center_distance_code, dt_code_time,
+        config.eddy_viscosity_coefficient);
+    if (!transfer.active) continue;
+    if (dt_code_time > transfer.stable_dt *
+            (1.0 + 16.0 * std::numeric_limits<double>::epsilon())) {
+      throw core::StageNumericalRetryRequest(
+          "SGS face stress exceeds its explicit viscous timestep (requested " +
+          std::to_string(dt_code_time) + ", stable " +
+          std::to_string(transfer.stable_dt) + ")");
+    }
+    accumulate(face.left_cell, transfer, +1.0);
+    accumulate(face.right_cell, transfer, -1.0);
+    ++ledger.shear_faces;
+  }
+  for (const SgsRemoteShearFace& face : remote_faces) {
+    if (face.local_row >= rows || face.axis >= 3U ||
+        active_rows[face.local_row] == 0U ||
+        (face.local_side != -1 && face.local_side != 1)) {
+      continue;
+    }
+    const std::array<double, 3> local_velocity = velocity(face.local_row);
+    const bool local_is_lower = face.local_side > 0;
+    const SgsFaceTransfer transfer = sgsFaceTransfer(
+        local_is_lower ? local_velocity : face.remote_velocity_peculiar,
+        local_is_lower ? face.remote_velocity_peculiar : local_velocity,
+        local_is_lower ? physicalDensity(face.local_row) : face.remote_density_physical_code,
+        local_is_lower ? face.remote_density_physical_code : physicalDensity(face.local_row),
+        face.axis, face.area_code, face.center_distance_code, dt_code_time,
+        config.eddy_viscosity_coefficient);
+    if (!transfer.active) continue;
+    if (dt_code_time > transfer.stable_dt *
+            (1.0 + 16.0 * std::numeric_limits<double>::epsilon())) {
+      throw core::StageNumericalRetryRequest(
+          "SGS remote-face stress exceeds its explicit viscous timestep (requested " +
+          std::to_string(dt_code_time) + ", stable " +
+          std::to_string(transfer.stable_dt) + ")");
+    }
+    accumulate(face.local_row, transfer, local_is_lower ? +1.0 : -1.0);
+    ++ledger.shear_faces;
+  }
+
+  for (std::uint32_t row = 0U; row < rows; ++row) {
+    if (active_rows[row] == 0U) continue;
+    const double mass = state.cells.mass_code[row];
+    const double density = state.gas_cells.density_code[row];
+    const double strain = trace_free_strain_magnitude_code[row];
+    if (!(mass > 0.0) || !(density > 0.0) || !(strain >= 0.0) ||
+        !std::isfinite(strain)) {
+      if (!std::isfinite(strain)) {
+        throw std::runtime_error("SGS shear transfer encountered a non-finite AMR strain estimate");
+      }
+      continue;
+    }
+    const double volume_physical = (mass / density) * volume_factor;
+    const double filter_length = std::cbrt(std::max(volume_physical, 0.0));
+    const double viscosity = config.eddy_viscosity_coefficient *
+        filter_length * filter_length * strain;
+    // Three-dimensional explicit viscous bound. The 0.4 safety factor is the
+    // same parabolic margin used by the repository's explicit diffusion
+    // reference; it is a numerical stability limit, not a fitted SGS rate.
+    constexpr double k_viscous_cfl = 0.4;
+    const double stable_dt = strain > 0.0
+        ? k_viscous_cfl /
+            (6.0 * config.eddy_viscosity_coefficient * strain)
+        : std::numeric_limits<double>::infinity();
+    if (dt_code_time > stable_dt *
+            (1.0 + 16.0 * std::numeric_limits<double>::epsilon())) {
+      throw core::StageNumericalRetryRequest(
+          "SGS shear transfer exceeds its explicit viscous timestep (requested " +
+          std::to_string(dt_code_time) + ", stable " +
+          std::to_string(stable_dt) + ")");
+    }
+    const double produced = mass * viscosity * strain * strain * dt_code_time;
+    if (!(produced >= 0.0) || !std::isfinite(produced)) {
+      throw std::runtime_error("SGS shear production is non-finite");
+    }
+    if (produced > 0.0) {
+      workspace.internal_energy[row] -= produced;
+      workspace.sgs_energy[row] += produced;
+      workspace.touched[row] = 1U;
+      ledger.produced_from_resolved_code += produced;
+      ++ledger.shear_cells;
+    }
+  }
+
+  for (std::uint32_t row = 0U; row < rows; ++row) {
+    if (workspace.touched[row] == 0U) continue;
+    const double mass = state.cells.mass_code[row];
+    if (!(mass > 0.0)) {
+      throw std::runtime_error("SGS shear transfer touched a non-positive-mass gas cell");
+    }
+    const std::array<double, 3> old_velocity = velocity(row);
+    const std::array<double, 3> new_momentum{
+        mass * old_velocity[0] + workspace.velocity_x[row],
+        mass * old_velocity[1] + workspace.velocity_y[row],
+        mass * old_velocity[2] + workspace.velocity_z[row]};
+    const double old_kinetic = 0.5 * mass *
+        (old_velocity[0] * old_velocity[0] +
+         old_velocity[1] * old_velocity[1] +
+         old_velocity[2] * old_velocity[2]);
+    const double new_kinetic = 0.5 *
+        (new_momentum[0] * new_momentum[0] +
+         new_momentum[1] * new_momentum[1] +
+         new_momentum[2] * new_momentum[2]) / mass;
+    const double new_resolved_total = mass * state.gas_cells.internal_energy_code[row] +
+        old_kinetic + workspace.internal_energy[row];
+    const double new_internal = (new_resolved_total - new_kinetic) / mass;
+    const double new_sgs = sidecar.value(sgs_lane, row) + workspace.sgs_energy[row];
+    if (!(new_internal > 0.0) || !std::isfinite(new_internal) ||
+        !(new_sgs >= 0.0) || !std::isfinite(new_sgs)) {
+      throw core::StageNumericalRetryRequest(
+          "SGS shear transfer would violate positive resolved/SGS energy; "
+          "retry with a shorter interval");
+    }
+    workspace.velocity_x[row] = new_momentum[0] / mass;
+    workspace.velocity_y[row] = new_momentum[1] / mass;
+    workspace.velocity_z[row] = new_momentum[2] / mass;
+    workspace.internal_energy[row] = new_internal;
+    workspace.sgs_energy[row] = new_sgs;
+  }
+  workspace.prepared = true;
+  return ledger;
+}
+
+void commitSgsShearTransfer(
+    core::SimulationState& state,
+    SgsShearTransferWorkspace& workspace) noexcept {
+  if (!workspace.prepared) return;
+  const std::uint32_t lane = state.gas_composition.descriptor().sgs_energy_lane;
+  for (std::uint32_t row = 0U; row < workspace.touched.size(); ++row) {
+    if (workspace.touched[row] == 0U) continue;
+    state.gas_cells.velocity_x_peculiar[row] = workspace.velocity_x[row];
+    state.gas_cells.velocity_y_peculiar[row] = workspace.velocity_y[row];
+    state.gas_cells.velocity_z_peculiar[row] = workspace.velocity_z[row];
+    state.gas_cells.internal_energy_code[row] = workspace.internal_energy[row];
+    state.gas_composition.setValue(lane, row, workspace.sgs_energy[row]);
+  }
+  workspace.prepared = false;
+}
+
 double sgsSpecificEnergyAfter(double k0, double dt, double dx, double c_eps) noexcept {
   if (!(k0 > 0.0) || !(dt > 0.0) || !(dx > 0.0)) return std::max(k0, 0.0);
   const double denom = 1.0 + c_eps * std::sqrt(k0) * dt / (2.0 * dx);

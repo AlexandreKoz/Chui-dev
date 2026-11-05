@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "cosmosim/physics/baryon_composition.hpp"
+#include "cosmosim/physics/metal_diffusion.hpp"
 #include "cosmosim/physics/source_interval.hpp"
 #include "cosmosim/physics/thermochemistry_operator.hpp"
 
@@ -134,19 +135,82 @@ struct EjectaPartition {
 //   with the composition transport. Sink: dissipation into heat,
 //     dK/dt = -C_eps K^{3/2} / dx   =>  K(t) = K0 / (1 + C_eps sqrt(K0) t/(2 dx))^2
 //   with the dissipated energy M (K0 - K) added to the canonical thermal e
-//   (exact transfer, ledgered). Pressure support: K enters ONLY the
+//   (exact transfer, ledgered). Resolved shear uses a traceless
+//   Smagorinsky stress nu_t = C_v Delta^2 |S*| on the authoritative AMR face
+//   graph. Its pairwise impulse and stress work update resolved momentum and
+//   energy; the positive production rho nu_t |S*|^2 is removed from resolved
+//   total energy and added to E_sgs in the same staged commit. Pressure
+//   support: K enters ONLY the
 //   star-formation Jeans/virial support as sigma^2 = (2/3) K; it is NOT added
-//   to the hydro EOS pressure (no double counting). Shear/compressive
-//   production from resolved flow (LES stress coupled to momentum) is NOT
-//   implemented (named) — it needs the Part 3 multi-level stencil.
+//   to the hydro EOS pressure (no double counting). The trace is excluded:
+//   isotropic SGS pressure remains deliberately outside this research model.
 // ===========================================================================
 struct SgsConfig {
   double dissipation_coefficient = 1.58;  // Schmidt, Niemeyer & Hillebrandt 2006
+  double eddy_viscosity_coefficient = 0.05;  // uncalibrated C_v (Smagorinsky form)
 };
 struct SgsLedger {
   double dissipated_to_heat_code = 0.0;
   double injected_from_feedback_code = 0.0;
+  double produced_from_resolved_code = 0.0;
+  double resolved_stress_work_code = 0.0;
+  double momentum_impulse_l1_code = 0.0;
+  std::uint64_t shear_faces = 0U;
+  std::uint64_t shear_cells = 0U;
 };
+
+// Local half of a face whose other authoritative cell resides on another
+// rank. Geometry is expressed in the same physical-code length convention as
+// MetalDiffusionFace. local_side is +1 when the remote cell is on the +axis
+// side. The stable ids/rank make the distributed topology agreement
+// auditable; the remote state is the owner's step-start payload.
+struct SgsRemoteShearFace {
+  std::uint32_t local_row = 0U;
+  std::uint32_t remote_index = 0U;
+  std::uint64_t local_gas_cell_id = 0U;
+  std::uint64_t remote_gas_cell_id = 0U;
+  int remote_rank = 0;
+  std::uint8_t axis = 0U;
+  std::int8_t local_side = 0;
+  bool periodic = false;
+  double area_code = 0.0;
+  double center_distance_code = 0.0;
+  double remote_density_physical_code = 0.0;
+  std::array<double, 3> remote_velocity_peculiar{};
+};
+
+// Five full-row staging lanes. prepareSgsShearTransfer never mutates state;
+// commitSgsShearTransfer is allocation-free and cannot fail after validation.
+// This split lets SourceRuntime coordinate the MPI accept/reject vote before
+// any rank publishes momentum, thermal energy, or E_sgs.
+struct SgsShearTransferWorkspace {
+  std::vector<double> velocity_x;
+  std::vector<double> velocity_y;
+  std::vector<double> velocity_z;
+  std::vector<double> internal_energy;
+  std::vector<double> sgs_energy;
+  std::vector<std::uint8_t> touched;
+  bool prepared = false;
+
+  [[nodiscard]] std::uint64_t ownedCapacityBytes() const noexcept;
+  [[nodiscard]] static std::uint64_t requiredBytes(std::size_t rows) noexcept;
+  void clear() noexcept;
+};
+
+[[nodiscard]] SgsLedger prepareSgsShearTransfer(
+    const core::SimulationState& state,
+    std::span<const std::uint8_t> active_rows,
+    std::span<const double> trace_free_strain_magnitude_code,
+    std::span<const MetalDiffusionFace> local_faces,
+    std::span<const SgsRemoteShearFace> remote_faces,
+    double physical_length_per_stored_length,
+    double dt_code_time,
+    const SgsConfig& config,
+    SgsShearTransferWorkspace& workspace);
+
+void commitSgsShearTransfer(
+    core::SimulationState& state,
+    SgsShearTransferWorkspace& workspace) noexcept;
 // Returns dissipated energy (code units) and updates e and the SGS lane.
 double advanceSgsCell(core::SimulationState& state, const CompositionLayout& layout, std::size_t row,
                       double dt_code_time, double cell_size_code, const SgsConfig& config, SgsLedger& ledger);

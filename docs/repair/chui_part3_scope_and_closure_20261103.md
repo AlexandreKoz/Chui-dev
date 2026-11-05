@@ -36,7 +36,7 @@ names the commit subject prefix (SHAs are listed in the final handoff
 | C03 | adaptive fidelity, hysteresis, global sync | Part 2 local tagging (`baryonic_source_stage.cpp`) | global legal-sync scheduling: open (Checkpoint F) | physics/workflows | — | open | — | F |
 | C04 | sampled shadow reference | — | open (Checkpoint F) | physics | — | open | — | F |
 | I01 | effective vs resolved ISM regimes | Part 2 | — | physics | Part 2 tests | IMPLEMENTED IN SOURCE (P2) | — | P2 |
-| I02 | SGS turbulence reservoir | Part 2 `budgeted_v1` | no shear production; refinement behaviour open (B/F) | physics | Part 2 | EXPERIMENTAL/UNQUALIFIED | — | P2, B, F |
+| I02 | SGS turbulence reservoir | Part 2 `budgeted_v1` plus resolved traceless shear/stress transfer on the production AMR/MPI face graph | source implementation closed; numerical closure calibration remains | physics/workflows | Part 2 + source-closure campaign | EXPERIMENTAL/UNQUALIFIED | — | P2, B, F |
 | S01 | SF eligibility, conservative births | Part 2 | remote SF gradients across ranks: open (C) | physics/workflows | `unit_star_formation_gradients` | IMPLEMENTED IN SOURCE (local); remote open | — | P2, C |
 | S02 | SSP returns, event timeline, associations (research) | Part 2 `stellar_population.cpp` | associations refused by config (open, C) | physics | Part 2 | IMPLEMENTED IN SOURCE; associations open | production yields need `chui_ssp_yield_table_v1` | P2, C |
 | F01 | mechanical SN deposition | Part 2 | cross-rank deposition refused (open, C) | physics/workflows | Part 2 | IMPLEMENTED IN SOURCE (local) | — | P2, C |

@@ -216,11 +216,28 @@ RuntimeCapabilityReport buildRuntimeCapabilityReport(
        .scientific_maturity = RuntimeScientificMaturity::kProvisional,
        .detail = "ReferenceWorkflow has no authoritative halo/candidate provider for black-hole seeding and fails closed when bh_enable_seeding=true; pre-seeded black-hole accretion/feedback remains available independently."},
       {.name = "distributed_metal_diffusion",
+#if COSMOSIM_ENABLE_MPI
+       .status = config.physics.metal_species_mode == core::MetalSpeciesMode::kCoreElements
+           ? RuntimeCapabilityStatus::kSupported
+           : RuntimeCapabilityStatus::kUnsupported,
+       .requested = config.physics.enable_metal_diffusion && config.parallel.mpi_ranks_expected > 1,
+       .compiled = true, .dependency_available = true,
+       .runtime_available = config.physics.metal_species_mode == core::MetalSpeciesMode::kCoreElements,
+       .active = config.physics.enable_metal_diffusion && config.parallel.mpi_ranks_expected > 1 &&
+           config.physics.metal_species_mode == core::MetalSpeciesMode::kCoreElements,
+       .implementation_maturity = RuntimeImplementationMaturity::kProductionScalable,
+       .scientific_maturity = RuntimeScientificMaturity::kProvisional,
+       .scalability = RuntimeScalabilityClass::kModerate,
+       .detail = config.physics.metal_species_mode == core::MetalSpeciesMode::kCoreElements
+           ? "Element-resolved MPI diffusion uses unique-owner remote faces, directed lane exchange, equal/opposite owner corrections, physical boundary topology and the configured explicit/RKL integration path."
+           : "Distributed diffusion requires physics.metal_species_mode=core_elements; the total_only scalar layout has no element-resolved conservative remote-face contract."},
+#else
        .status = RuntimeCapabilityStatus::kUnsupported,
        .requested = config.physics.enable_metal_diffusion && config.parallel.mpi_ranks_expected > 1,
        .compiled = false, .dependency_available = false, .runtime_available = false,
        .active = false, .scientific_maturity = RuntimeScientificMaturity::kProvisional,
-       .detail = "Local metal diffusion includes same-level and coarse/fine AMR interfaces, but multi-rank diffusion fails closed until directed remote-interface flux exchange and equal/opposite commit semantics are implemented."},
+       .detail = "Distributed element-resolved metal diffusion requires an MPI-enabled build."},
+#endif
       {.name = "rank_remappable_restart", .status = RuntimeCapabilityStatus::kUnsupported,
        .requested = false, .compiled = false, .dependency_available = true,
        .runtime_available = false, .active = false,

@@ -21,11 +21,14 @@
 #include <unordered_set>
 #include <vector>
 
+#include "cosmosim/amr/amr_hydro_orchestrator.hpp"
 #include "cosmosim/core/checked_arithmetic.hpp"
+#include "cosmosim/core/adaptive_resource_control.hpp"
 #include "cosmosim/core/memory_governor.hpp"
 #include "cosmosim/core/governed_scratch_arena.hpp"
 #include "cosmosim/core/memory_accounting.hpp"
 #include "cosmosim/core/profiling.hpp"
+#include "cosmosim/core/retained_capacity_transaction.hpp"
 #include "cosmosim/core/time_scheduler.hpp"
 #include "cosmosim/hydro/gas_thermodynamic_refresh.hpp"
 #include "cosmosim/hydro/hydro_core_solver.hpp"
@@ -1053,6 +1056,10 @@ class SourceRuntimeImpl final : public SourceRuntime {
     checkpoint.last_dust_ledger = m_last_dust_ledger;
     checkpoint.last_sgs_ledger = m_last_sgs_ledger;
     checkpoint.last_shadow_report = m_last_shadow_report;
+    checkpoint.multilevel_shadow_report = m_multilevel_shadow_report;
+    checkpoint.multilevel_chemistry_adaptive_report =
+        m_multilevel_chemistry_adaptive_report;
+    checkpoint.multilevel_source_step = m_multilevel_source_step;
     checkpoint.last_skipped_effective_rows = m_last_skipped_effective_rows;
     checkpoint.last_element_diffusion = m_last_element_diffusion;
     checkpoint.recursive_thermochemistry_completed_step =
@@ -1083,6 +1090,10 @@ class SourceRuntimeImpl final : public SourceRuntime {
     m_last_dust_ledger = c.last_dust_ledger;
     m_last_sgs_ledger = c.last_sgs_ledger;
     m_last_shadow_report = c.last_shadow_report;
+    m_multilevel_shadow_report = c.multilevel_shadow_report;
+    m_multilevel_chemistry_adaptive_report =
+        c.multilevel_chemistry_adaptive_report;
+    m_multilevel_source_step = c.multilevel_source_step;
     m_last_skipped_effective_rows = c.last_skipped_effective_rows;
     m_last_element_diffusion = c.last_element_diffusion;
     m_recursive_thermochemistry_completed_step =
@@ -1163,13 +1174,14 @@ class SourceRuntimeImpl final : public SourceRuntime {
         .estimate_only = false,
         .governed_commitment = m_particle_id_registry.occupiedCapacityGoverned(),
         .uncertainty_note = "one sorted immutable-ID cache per hash shard; no rank-global replication"});
-    const bool diffusion_governed = m_diffusion_phase_reservation.committed();
+    const bool smooth_transport_governed =
+        m_diffusion_phase_reservation.committed();
     add_container(
         core::MemorySubsystem::kScratch,
         core::MemoryClass::kPhaseResident,
         "sources.metal_diffusion.owned_leaf_mask",
         m_owned_leaf_mask,
-        diffusion_governed);
+        smooth_transport_governed);
     // These two containers are move-replaced by each topology rebuild. Report
     // historical retained-capacity high-water explicitly rather than letting a
     // smaller later topology erase the evidence of a larger residency peak.
@@ -1186,7 +1198,7 @@ class SourceRuntimeImpl final : public SourceRuntime {
             m_diffusion_rho_kappa_high_water_bytes,
             core::ownedCapacityBytesForContainer(m_diffusion_rho_kappa_code)),
         .estimate_only = false,
-        .governed_commitment = diffusion_governed,
+        .governed_commitment = smooth_transport_governed,
     });
     builder.addEntry(core::MemoryEntry{
         .subsystem = core::MemorySubsystem::kScratch,
@@ -1210,7 +1222,18 @@ class SourceRuntimeImpl final : public SourceRuntime {
         .owned_capacity_bytes = m_diffusion_workspace.ownedCapacityBytes(),
         .high_water_bytes = m_diffusion_workspace.highWaterBytes(),
         .estimate_only = false,
-        .governed_commitment = diffusion_governed,
+        .governed_commitment = smooth_transport_governed,
+    });
+    builder.addEntry(core::MemoryEntry{
+        .subsystem = core::MemorySubsystem::kScratch,
+        .lifetime = core::MemoryLifetime::kTransient,
+        .memory_class = core::MemoryClass::kPhaseResident,
+        .label = "sources.sgs_shear.staging",
+        .current_size_bytes = m_sgs_shear_workspace.ownedCapacityBytes(),
+        .owned_capacity_bytes = m_sgs_shear_workspace.ownedCapacityBytes(),
+        .high_water_bytes = m_sgs_shear_workspace.ownedCapacityBytes(),
+        .estimate_only = false,
+        .governed_commitment = smooth_transport_governed,
     });
     builder.addEntry(core::MemoryEntry{
         .subsystem = core::MemorySubsystem::kScratch,
@@ -1231,7 +1254,8 @@ class SourceRuntimeImpl final : public SourceRuntime {
       const core::SimulationState& state) const override {
     if (!m_star_formation.config().enabled &&
         !m_stellar_evolution.config().enabled &&
-        !m_metal_diffusion.config().enabled && !m_bh_enabled) {
+        !m_metal_diffusion.config().enabled &&
+        !m_source_stage_config.sgs.has_value() && !m_bh_enabled) {
       return {0U, true, {}};
     }
     const std::uint64_t cell_count = static_cast<std::uint64_t>(state.cells.size());
@@ -1281,18 +1305,126 @@ class SourceRuntimeImpl final : public SourceRuntime {
       // Sparse active rows have their own physical arena admission.
       peak = std::max(peak, evolution);
     }
-    if (m_metal_diffusion.config().enabled && cell_count != 0U) {
-      std::uint64_t diffusion = core::checkedMemoryBytesAdd(
-          m_metal_diffusion.requiredWorkspaceBytes(state.cells.size()),
-          multiply(cell_count, sizeof(std::uint8_t), "source diffusion mask"),
-          "source diffusion phase");
-      diffusion = core::checkedMemoryBytesAdd(diffusion,
-          multiply(cell_count, sizeof(double), "source diffusion rho-kappa"),
-          "source diffusion phase");
-      peak = std::max(peak, diffusion);
+    if ((m_metal_diffusion.config().enabled ||
+         m_source_stage_config.sgs.has_value()) && cell_count != 0U) {
+      std::uint64_t transport = core::checkedMemoryBytesAdd(
+          m_metal_diffusion.config().enabled
+              ? m_metal_diffusion.requiredWorkspaceBytes(state.cells.size())
+              : 0U,
+          multiply(cell_count, sizeof(std::uint8_t), "source transport mask"),
+          "source smooth transport phase");
+      transport = core::checkedMemoryBytesAdd(
+          transport,
+          multiply(cell_count, sizeof(double), "source transport strain/rho-kappa"),
+          "source smooth transport phase");
+      if (m_source_stage_config.sgs.has_value()) {
+        transport = core::checkedMemoryBytesAdd(
+            transport,
+            physics::SgsShearTransferWorkspace::requiredBytes(state.cells.size()),
+            "source SGS shear staging");
+      }
+      peak = std::max(peak, transport);
     }
     return {peak, false,
             "source staging modeled; population growth, ID coordination and topology scratch require owner-local admission"};
+  }
+
+  void setAmrLevelSourceCouplingEnabled(bool enabled) noexcept override {
+    m_amr_level_source_coupling_enabled = enabled;
+  }
+
+  void executeAmrLevelSmoothSources(
+      core::StepContext& parent_context,
+      std::span<const std::uint32_t> level_rows,
+      const hydro::HydroUpdateContext& level_update,
+      core::SourceSplitPhase phase) override {
+    if (!m_amr_level_source_coupling_enabled ||
+        m_full_config.numerics.amr_time_stepping !=
+            core::AmrTimeSteppingConfigMode::kRecursiveSubcycling) {
+      throw std::logic_error(
+          "recursive AMR smooth source execution was not enabled by composition");
+    }
+    if (phase == core::SourceSplitPhase::kUnsplitCompatibility) {
+      throw std::invalid_argument(
+          "recursive AMR smooth source execution requires a Strang half phase");
+    }
+    if (!(std::isfinite(level_update.dt_code) && level_update.dt_code > 0.0 &&
+          std::isfinite(level_update.time_begin_code) &&
+          std::isfinite(level_update.time_end_code) &&
+          level_update.time_end_code > level_update.time_begin_code &&
+          std::isfinite(level_update.scale_factor_begin) &&
+          std::isfinite(level_update.scale_factor) &&
+          std::isfinite(level_update.scale_factor_end) &&
+          level_update.scale_factor_begin > 0.0 &&
+          level_update.scale_factor > 0.0 &&
+          level_update.scale_factor_end > 0.0)) {
+      throw std::invalid_argument(
+          "recursive AMR smooth source execution received an invalid level interval");
+    }
+
+    core::IntegratorState level_integrator = parent_context.integrator_state;
+    level_integrator.current_time_code =
+        level_update.time_begin_code + 0.5 * level_update.dt_code;
+    level_integrator.current_scale_factor = level_update.scale_factor;
+    level_integrator.current_redshift = m_is_cosmological
+        ? std::max(0.0, 1.0 / level_update.scale_factor - 1.0)
+        : 0.0;
+    level_integrator.current_hubble_rate_code = level_update.hubble_rate_code;
+    level_integrator.dt_time_code = level_update.dt_code;
+
+    core::StepContext level_context{parent_context.state, level_integrator};
+    level_context.active_set = core::ActiveSetDescriptor{
+        .particle_indices = {},
+        .cell_indices = level_rows,
+        .particles_are_subset = true,
+        .cells_are_subset = true,
+        .particles_from_scheduler = false,
+        .cells_from_scheduler = false,
+        .has_generation_metadata = true,
+        .source_particle_index_generation =
+            parent_context.state.particleIndexGeneration(),
+        .source_cell_index_generation = parent_context.state.cellIndexGeneration(),
+        .source_scheduler_tick = parent_context.active_set.source_scheduler_tick,
+        .has_global_synchronization_metadata = true,
+        .globally_complete_active_set = false,
+    };
+    level_context.workspace = parent_context.workspace;
+    level_context.cosmology_background = parent_context.cosmology_background;
+    level_context.mode_policy = parent_context.mode_policy;
+    level_context.profiler_session = parent_context.profiler_session;
+    level_context.timeline_step = parent_context.timeline_step;
+    level_context.timeline_step.time_begin_code = level_update.time_begin_code;
+    level_context.timeline_step.time_end_code = level_update.time_end_code;
+    level_context.timeline_step.dt_time_code = level_update.dt_code;
+    level_context.timeline_step.scale_factor_begin = level_update.scale_factor_begin;
+    level_context.timeline_step.scale_factor_midpoint = level_update.scale_factor;
+    level_context.timeline_step.scale_factor_end = level_update.scale_factor_end;
+    level_context.timeline_step.redshift_begin = m_is_cosmological
+        ? std::max(0.0, 1.0 / level_update.scale_factor_begin - 1.0)
+        : 0.0;
+    level_context.timeline_step.redshift_end = m_is_cosmological
+        ? std::max(0.0, 1.0 / level_update.scale_factor_end - 1.0)
+        : 0.0;
+    level_context.timeline_step.hubble_begin_code =
+        level_update.hubble_rate_begin_code;
+    level_context.timeline_step.hubble_end_code = level_update.hubble_rate_end_code;
+    level_context.timeline_step.dt_time_si =
+        m_is_cosmological && parent_context.cosmology_background != nullptr
+        ? parent_context.cosmology_background->cosmicTimeIntervalSi(
+              level_update.scale_factor_begin, level_update.scale_factor_end)
+        : level_update.dt_code * m_units.timeSiPerCode();
+    level_context.boundary = parent_context.boundary;
+    level_context.stage = core::IntegrationStage::kSourceTerms;
+    level_context.source_split_phase = phase;
+
+    if (m_multilevel_source_step != parent_context.integrator_state.step_index) {
+      resetMultilevelSourceAggregation(parent_context.integrator_state.step_index);
+    }
+    const physics::ChemistryShadowReport shadow = executeThermochemistry(
+        level_context, sourceEvaluationScaleFactor(level_context), false);
+    accumulateMultilevelShadowReport(shadow);
+    accumulateMultilevelChemistryAdaptiveReport(
+        m_last_chemistry_adaptive_report);
   }
 
   void execute(SourceMutationStageView& view) override {
@@ -1314,15 +1446,13 @@ class SourceRuntimeImpl final : public SourceRuntime {
       throw std::logic_error("source runtime received a non-source stage");
     }
 
-    // SourceTerms executes after drift/hydro on the step-end state while the
-    // committed IntegratorState remains at the step beginning until commitStep().
-    // Make the physical evaluation epoch explicit so every source model sees
-    // the state and cosmological conversion from the same instant.
-    const double source_evaluation_scale_factor = m_is_cosmological
-        ? context.timeline_step.scale_factor_end
-        : 1.0;
-    if (!std::isfinite(source_evaluation_scale_factor) ||
-        source_evaluation_scale_factor <= 0.0) {
+    // Smooth source operators form the two halves of the deterministic
+    // Strang reference. Each half is evaluated at its physical midpoint;
+    // direct compatibility callers retain the historical end-of-step epoch.
+    const double smooth_source_evaluation_scale_factor =
+        sourceEvaluationScaleFactor(context);
+    if (!std::isfinite(smooth_source_evaluation_scale_factor) ||
+        smooth_source_evaluation_scale_factor <= 0.0) {
       throw std::runtime_error(
           "source runtime requires a finite positive source-stage scale factor");
     }
@@ -1626,7 +1756,8 @@ class SourceRuntimeImpl final : public SourceRuntime {
     } else {
       executeStellarEvolutionAndEnrichment(context, source_evaluation_scale_factor);
     }
-    executeMetalDiffusion(context, source_evaluation_scale_factor);
+    executeDiffusionAndSgsShear(
+        context, smooth_source_evaluation_scale_factor, smooth_source_dt_code);
 
     physics::BlackHoleAgnStepReport black_hole_report{};
     if (m_bh_enabled) {
@@ -1710,14 +1841,154 @@ class SourceRuntimeImpl final : public SourceRuntime {
   }
 
  private:
+  [[nodiscard]] bool recursiveAmrLevelSourcesActive(
+      const core::StepContext& context) const {
+    if (!m_amr_level_source_coupling_enabled ||
+        m_full_config.numerics.amr_time_stepping !=
+            core::AmrTimeSteppingConfigMode::kRecursiveSubcycling ||
+        context.source_split_phase ==
+            core::SourceSplitPhase::kUnsplitCompatibility) {
+      return false;
+    }
+    const std::uint64_t local_has_production_amr =
+        amr::hasProductionAmrHydroCoverage(context.state) ? 1ULL : 0ULL;
+    return m_mpi_context.allreduceSumUint64(local_has_production_amr) > 0U;
+  }
+
+  void resetMultilevelSourceAggregation(std::uint64_t step_index) noexcept {
+    m_multilevel_shadow_report = {};
+    m_multilevel_chemistry_adaptive_report = {};
+    m_multilevel_source_step = step_index;
+  }
+
+  void accumulateMultilevelChemistryAdaptiveReport(
+      const physics::ChemistryAdaptiveReport& report) noexcept {
+    const auto add = [](std::uint64_t& value, std::uint64_t increment) {
+      value = increment > std::numeric_limits<std::uint64_t>::max() - value
+          ? std::numeric_limits<std::uint64_t>::max()
+          : value + increment;
+    };
+    add(m_multilevel_chemistry_adaptive_report.promoted, report.promoted);
+    add(m_multilevel_chemistry_adaptive_report.demoted, report.demoted);
+    add(m_multilevel_chemistry_adaptive_report.held_by_dwell,
+        report.held_by_dwell);
+    add(m_multilevel_chemistry_adaptive_report.promoted_by_cooling_time,
+        report.promoted_by_cooling_time);
+    add(m_multilevel_chemistry_adaptive_report.promoted_by_error_history,
+        report.promoted_by_error_history);
+    add(m_multilevel_chemistry_adaptive_report.detailed_cells,
+        report.detailed_cells);
+    add(m_multilevel_chemistry_adaptive_report.hybrid_cells,
+        report.hybrid_cells);
+  }
+
+  void accumulateMultilevelShadowReport(
+      const physics::ChemistryShadowReport& report) noexcept {
+    const std::uint64_t previous_samples = m_multilevel_shadow_report.samples;
+    const long double weighted_cost =
+        static_cast<long double>(m_multilevel_shadow_report.mean_substep_cost_ratio) *
+            static_cast<long double>(previous_samples) +
+        static_cast<long double>(report.mean_substep_cost_ratio) *
+            static_cast<long double>(report.samples);
+    m_multilevel_shadow_report.samples += report.samples;
+    m_multilevel_shadow_report.max_relative_species_difference = std::max(
+        m_multilevel_shadow_report.max_relative_species_difference,
+        report.max_relative_species_difference);
+    m_multilevel_shadow_report.max_relative_electron_difference = std::max(
+        m_multilevel_shadow_report.max_relative_electron_difference,
+        report.max_relative_electron_difference);
+    m_multilevel_shadow_report.max_relative_energy_difference = std::max(
+        m_multilevel_shadow_report.max_relative_energy_difference,
+        report.max_relative_energy_difference);
+    m_multilevel_shadow_report.mean_substep_cost_ratio =
+        m_multilevel_shadow_report.samples == 0U
+        ? 0.0
+        : static_cast<double>(
+              weighted_cost /
+              static_cast<long double>(m_multilevel_shadow_report.samples));
+  }
+
+  [[nodiscard]] double scaleFactorAtPhysicalFraction(
+      const core::StepContext& context, double fraction) const {
+    if (!m_is_cosmological) return 1.0;
+    if (!(fraction >= 0.0 && fraction <= 1.0)) {
+      throw std::invalid_argument("source physical-time fraction must lie in [0,1]");
+    }
+    const double begin = context.timeline_step.scale_factor_begin;
+    const double end = context.timeline_step.scale_factor_end;
+    if (!(std::isfinite(begin) && std::isfinite(end) && begin > 0.0 && end >= begin)) {
+      throw std::runtime_error("source interval has invalid cosmological scale-factor bounds");
+    }
+    if (fraction == 0.0 || begin == end) return begin;
+    if (fraction == 1.0) return end;
+    if (context.cosmology_background == nullptr) {
+      return begin + fraction * (end - begin);
+    }
+    const double total_seconds =
+        context.cosmology_background->cosmicTimeIntervalSi(begin, end);
+    if (!(std::isfinite(total_seconds) && total_seconds >= 0.0)) {
+      throw std::runtime_error("source interval has invalid cosmological elapsed time");
+    }
+    const double target_seconds = fraction * total_seconds;
+    double lower = begin;
+    double upper = end;
+    // Fixed-iteration inversion of the same background integral used by the
+    // source interval keeps the physical-time split deterministic on all ranks.
+    for (std::uint32_t iteration = 0U; iteration < 64U; ++iteration) {
+      const double midpoint = lower + 0.5 * (upper - lower);
+      const double elapsed =
+          context.cosmology_background->cosmicTimeIntervalSi(begin, midpoint);
+      if (elapsed < target_seconds) {
+        lower = midpoint;
+      } else {
+        upper = midpoint;
+      }
+    }
+    return lower + 0.5 * (upper - lower);
+  }
+
+  [[nodiscard]] double sourceEvaluationScaleFactor(
+      const core::StepContext& context) const {
+    switch (context.source_split_phase) {
+      case core::SourceSplitPhase::kStrangPreHalf:
+        return scaleFactorAtPhysicalFraction(context, 0.25);
+      case core::SourceSplitPhase::kStrangPostHalf:
+        return scaleFactorAtPhysicalFraction(context, 0.75);
+      case core::SourceSplitPhase::kUnsplitCompatibility:
+        return m_is_cosmological ? context.timeline_step.scale_factor_end : 1.0;
+    }
+    throw std::logic_error("unknown source split phase");
+  }
+
   [[nodiscard]] physics::SourceInterval makeSourceInterval(
       const core::StepContext& context, double source_evaluation_scale_factor) const {
     physics::SourceInterval interval;
-    interval.time_begin_code = context.timeline_step.time_begin_code;
-    interval.time_end_code = context.timeline_step.time_end_code;
-    interval.scale_factor_begin = m_is_cosmological ? context.timeline_step.scale_factor_begin : 1.0;
-    interval.scale_factor_end = m_is_cosmological ? context.timeline_step.scale_factor_end : 1.0;
-    interval.physical_seconds = elapsedStellarEvolutionYears(context) * physics::k_seconds_per_year;
+    const bool pre_half =
+        context.source_split_phase == core::SourceSplitPhase::kStrangPreHalf;
+    const bool post_half =
+        context.source_split_phase == core::SourceSplitPhase::kStrangPostHalf;
+    const double fraction_begin = post_half ? 0.5 : 0.0;
+    const double fraction_end = pre_half ? 0.5 : 1.0;
+    const double code_begin = context.timeline_step.time_begin_code;
+    const double code_end = context.timeline_step.time_end_code;
+    interval.time_begin_code = code_begin + fraction_begin * (code_end - code_begin);
+    interval.time_end_code = code_begin + fraction_end * (code_end - code_begin);
+    interval.scale_factor_begin = scaleFactorAtPhysicalFraction(context, fraction_begin);
+    interval.scale_factor_end = scaleFactorAtPhysicalFraction(context, fraction_end);
+    if (m_is_cosmological && context.cosmology_background != nullptr) {
+      interval.physical_seconds = context.cosmology_background->cosmicTimeIntervalSi(
+          interval.scale_factor_begin, interval.scale_factor_end);
+    } else {
+      interval.physical_seconds =
+          (interval.time_end_code - interval.time_begin_code) * m_units.timeSiPerCode();
+      if (!(interval.physical_seconds > 0.0)) {
+        const double full_seconds =
+            elapsedStellarEvolutionYears(context) * physics::k_seconds_per_year;
+        interval.physical_seconds = (pre_half || post_half)
+            ? 0.5 * full_seconds
+            : full_seconds;
+      }
+    }
     interval.evaluation_scale_factor = source_evaluation_scale_factor;
     interval.evaluation_redshift = m_is_cosmological
         ? std::max(0.0, 1.0 / source_evaluation_scale_factor - 1.0)
@@ -1762,7 +2033,10 @@ class SourceRuntimeImpl final : public SourceRuntime {
   // rejects the stage on EVERY rank (kNumericalRetry) and nothing is
   // committed (audit F2 contract). Touched rows are refreshed before any CFL
   // or source consumer reads P, T or c_s (audit F4 contract).
-  void executeThermochemistry(core::StepContext& context, double source_evaluation_scale_factor) {
+  [[nodiscard]] physics::ChemistryShadowReport executeThermochemistry(
+      core::StepContext& context,
+      double source_evaluation_scale_factor,
+      bool update_chemistry_control) {
     (void)physics::ensureGasCompositionInitialized(context.state, m_physics_config);
     if (m_thermochemistry == nullptr) return;
     const physics::SourceInterval interval =
@@ -1803,7 +2077,20 @@ class SourceRuntimeImpl final : public SourceRuntime {
                               "sources.baryonic_stage.staged_rows");
     const bool local_work = row_count > 0U && interval.valid();
     if (local_work) {
-      (void)transaction.prepare([&] { stage.prepare(context.state, interval, rows); });
+      (void)transaction.prepare([&] {
+        stage.prepare(context.state, interval, rows);
+        auto& composition = context.state.gas_composition;
+        core::RetainedCapacityTransaction sparse_capacity(
+            [&composition] { return composition.ownedCapacityBytes(); });
+        composition.planSparseRowCapacity(
+            sparse_capacity,
+            core::checkedSizeAdd(composition.sparseActiveRowCount(),
+                                 stage.sparseRowsToActivate(),
+                                 "adaptive chemistry sparse row capacity"));
+        sparse_capacity.execute(
+            m_memory_governor, core::MemoryClass::kCanonicalPersistent,
+            "sources.baryonic_stage.adaptive_chemistry_rows");
+      });
     } else {
       (void)transaction.prepare([] {});
     }
@@ -1879,10 +2166,16 @@ class SourceRuntimeImpl final : public SourceRuntime {
                       {"fidelity_demoted", std::to_string(m_last_chemistry_adaptive_report.demoted)},
                       {"fidelity_promoted_by_cooling_time",
                        std::to_string(m_last_chemistry_adaptive_report.promoted_by_cooling_time)},
+                      {"fidelity_promoted_by_error_history",
+                       std::to_string(m_last_chemistry_adaptive_report.promoted_by_error_history)},
                       {"fidelity_held_by_dwell", std::to_string(m_last_chemistry_adaptive_report.held_by_dwell)},
                       {"dust_gas_to_dust_code", std::to_string(m_last_dust_ledger.gas_to_dust_code)},
                       {"dust_dust_to_gas_code", std::to_string(m_last_dust_ledger.dust_to_gas_code)},
                       {"sgs_dissipated_code", std::to_string(m_last_sgs_ledger.dissipated_to_heat_code)},
+                      {"sgs_produced_from_resolved_code",
+                       std::to_string(m_last_sgs_ledger.produced_from_resolved_code)},
+                      {"sgs_resolved_stress_work_code",
+                       std::to_string(m_last_sgs_ledger.resolved_stress_work_code)},
                       {"shadow_samples", std::to_string(m_last_shadow_report.samples)},
                       {"physical_seconds", std::to_string(interval.physical_seconds)},
                       {"recursive_level", std::to_string(recursive_level)},
@@ -1899,6 +2192,7 @@ class SourceRuntimeImpl final : public SourceRuntime {
                       {"element_projection_residual", std::to_string(l.element_mass_residual_code)},
                       {"charge_residual", std::to_string(l.charge_residual)}}});
     }
+    return current_shadow;
   }
 
   // CHUI Part 3 Checkpoint F (C03/C04): global error-aware fidelity control.
@@ -1927,7 +2221,19 @@ class SourceRuntimeImpl final : public SourceRuntime {
 
   void loadCommittedChemistryControl(const core::SimulationState& state) {
     if (m_thermochemistry == nullptr || !m_thermochemistry->config().adaptive.enabled) return;
-    m_thermochemistry->setGlobalPromotionBias(committedPromotionBias(state));
+    double bias = 0.0;
+    std::exception_ptr load_failure;
+    try {
+      bias = m_config.numerics.v02_control_mode ==
+                  core::V02ControlMode::kJointErrorResourceV1
+          ? core::loadV02ControlState(state).chemistry_promotion_bias
+          : committedPromotionBias(state);
+    } catch (...) {
+      load_failure = std::current_exception();
+    }
+    m_mpi_context.rethrowCollectivePreparationFailure(
+        load_failure, "adaptive chemistry controller load");
+    m_thermochemistry->setGlobalPromotionBias(bias);
   }
 
   void prepareRecursiveChemistryAccumulator(std::uint64_t step_index) {
@@ -1980,23 +2286,77 @@ class SourceRuntimeImpl final : public SourceRuntime {
     // Next value is a pure function of the COMMITTED bias and this stage's
     // collective shadow reduction; it becomes authoritative only by being
     // written to the canonical sidecar (restored on rollback/restart).
-    const double committed_bias = committedPromotionBias(context.state);
+    const bool joint =
+        m_config.numerics.v02_control_mode == core::V02ControlMode::kJointErrorResourceV1;
+    core::V02ControlState joint_state;
+    double committed_bias = 0.0;
+    std::exception_ptr load_failure;
+    try {
+      if (joint) {
+        joint_state = core::loadV02ControlState(context.state);
+        committed_bias = joint_state.chemistry_promotion_bias;
+      } else {
+        committed_bias = committedPromotionBias(context.state);
+      }
+    } catch (...) {
+      load_failure = std::current_exception();
+    }
+    m_mpi_context.rethrowCollectivePreparationFailure(
+        load_failure, "adaptive chemistry controller update load");
     const double global_max = -m_mpi_context.allreduceMinDouble(-current_shadow.max_relative_species_difference);
     const std::uint64_t global_samples = m_mpi_context.allreduceSumUint64(current_shadow.samples);
     const double bias = physics::nextChemistryPromotionBias(committed_bias, global_max, global_samples);
     m_thermochemistry->setGlobalPromotionBias(bias);
-    std::ostringstream text;
-    text.precision(17);
-    text << "module=chui_adaptive_chemistry_control\npromotion_bias=" << bias
-         << "\nlast_global_shadow_max_relative_species_difference=" << global_max
-         << "\nlast_global_shadow_samples=" << global_samples << "\n";
-    const std::string payload = text.str();
-    core::ModuleSidecarBlock block;
-    block.module_name = "chui_adaptive_chemistry_control_v1";
-    block.schema_version = 1U;
-    block.payload.resize(payload.size());
-    for (std::size_t i = 0; i < payload.size(); ++i) block.payload[i] = static_cast<std::byte>(payload[i]);
-    context.state.sidecars.upsert(std::move(block));
+    if (joint) {
+      std::uint64_t local_detailed = 0U;
+      for (const std::uint8_t tag : context.state.gas_composition.chemistry_model_tag) {
+        local_detailed += tag == physics::k_chemistry_tag_detailed ? 1U : 0U;
+      }
+      joint_state.chemistry_promotion_bias = bias;
+      joint_state.last_shadow_species_error = std::max(global_max, 0.0);
+      joint_state.last_shadow_samples = global_samples;
+      joint_state.chemistry_detailed_rows =
+          m_mpi_context.allreduceSumUint64(local_detailed);
+      joint_state.chemistry_total_rows =
+          m_mpi_context.allreduceSumUint64(
+              static_cast<std::uint64_t>(context.state.gas_composition.rowCount()));
+      joint_state.chemistry_promoted_last_interval =
+          m_mpi_context.allreduceSumUint64(m_last_chemistry_adaptive_report.promoted);
+      std::exception_ptr publication_failure;
+      try {
+        if (joint_state.epoch == std::numeric_limits<std::uint64_t>::max()) {
+          throw std::overflow_error("V02 controller epoch overflow");
+        }
+        joint_state.epoch += 1U;
+        core::storeV02ControlState(context.state, joint_state);
+      } catch (...) {
+        publication_failure = std::current_exception();
+      }
+      m_mpi_context.rethrowCollectivePreparationFailure(
+          publication_failure, "V02 chemistry controller publication");
+      return;
+    }
+    std::exception_ptr publication_failure;
+    try {
+      std::ostringstream text;
+      text.precision(17);
+      text << "module=chui_adaptive_chemistry_control\npromotion_bias=" << bias
+           << "\nlast_global_shadow_max_relative_species_difference=" << global_max
+           << "\nlast_global_shadow_samples=" << global_samples << "\n";
+      const std::string payload = text.str();
+      core::ModuleSidecarBlock block;
+      block.module_name = "chui_adaptive_chemistry_control_v1";
+      block.schema_version = 1U;
+      block.payload.resize(payload.size());
+      for (std::size_t i = 0; i < payload.size(); ++i) {
+        block.payload[i] = static_cast<std::byte>(payload[i]);
+      }
+      context.state.sidecars.upsert(std::move(block));
+    } catch (...) {
+      publication_failure = std::current_exception();
+    }
+    m_mpi_context.rethrowCollectivePreparationFailure(
+        publication_failure, "fixed chemistry controller publication");
   }
 
   // CHUI Part 3 Checkpoint C: remote star-formation neighbours. The directed
@@ -2298,6 +2658,17 @@ class SourceRuntimeImpl final : public SourceRuntime {
     if (!distributed_feedback && state.star_particles.size() == 0U) return;
     if (ranks_with_stars == 0U) return;
     const double elapsed_years = elapsedStellarEvolutionYears(context);
+    const bool explicit_event_interval =
+        std::isfinite(context.timeline_step.time_begin_code) &&
+        std::isfinite(context.timeline_step.time_end_code) &&
+        context.timeline_step.time_end_code > context.timeline_step.time_begin_code;
+    const double event_interval_begin_code = explicit_event_interval
+        ? context.timeline_step.time_begin_code
+        : context.integrator_state.current_time_code;
+    const double event_interval_end_code = explicit_event_interval
+        ? context.timeline_step.time_end_code
+        : context.integrator_state.current_time_code +
+              context.integrator_state.dt_time_code;
     const physics::ThermochemistryUnitBridge bridge =
         physics::makeThermochemistryOperatorConfig(m_full_config, m_units, m_baryonic_data).units;
     physics::FeedbackUnits units;
@@ -2387,8 +2758,17 @@ class SourceRuntimeImpl final : public SourceRuntime {
           const double z = std::clamp(state.star_particles.metallicity_mass_fraction[s], 0.0, 0.5);
           const auto masses = physics::initialElementMasses(1.0, z, physics::primordialPolicyFromConfig(m_physics_config));
           record = physics::makeStellarPopulationRecord(masses, 0.0, state.star_particles.birth_key[s]);
+          // A legacy star has no absolute event cursor. Its cumulative age
+          // lanes/ordinals remain authoritative for past evolution; the
+          // current interval establishes the first absolute boundary.
+          record.chronology_initialized = 0U;
           ++legacy_initialized;
         }
+        physics::advanceStellarPopulationChronology(
+            record,
+            event_interval_begin_code,
+            event_interval_end_code,
+            context.integrator_state.step_index);
         const double birth_mass = state.star_particles.birth_mass_code[s];
         const double birth_msun = birth_mass / msun_code;
         const double age_b = std::max(state.star_particles.stellar_age_years_last[s], 0.0);
@@ -3062,11 +3442,24 @@ class SourceRuntimeImpl final : public SourceRuntime {
     }
   }
 
-  void executeMetalDiffusion(
+  void executeDiffusionAndSgsShear(
       core::StepContext& context,
-      double source_evaluation_scale_factor) {
-    if (!m_metal_diffusion.config().enabled) {
+      double source_evaluation_scale_factor,
+      double source_dt_code) {
+    const bool diffusion_enabled = m_metal_diffusion.config().enabled;
+    // Configuration is rank-uniform. Do not derive collective participation
+    // from local row count/sidecar population (empty ranks must still enter).
+    const bool sgs_shear_enabled = m_source_stage_config.sgs.has_value();
+    if (!diffusion_enabled && !sgs_shear_enabled) {
       return;
+    }
+    if (!(std::isfinite(source_dt_code) && source_dt_code > 0.0)) {
+      throw std::invalid_argument(
+          "smooth diffusion/SGS transport requires a finite positive source subinterval");
+    }
+    if (sgs_shear_enabled) {
+      (void)physics::ensureGasCompositionInitialized(
+          context.state, m_physics_config);
     }
     // G2.1: on more than one rank every rank enters every collective of the
     // distributed element-resolved operator, including ranks without gas.
@@ -3074,7 +3467,7 @@ class SourceRuntimeImpl final : public SourceRuntime {
     if (!distributed && context.state.cells.size() == 0U) {
       return;
     }
-    if (distributed) {
+    if (distributed && diffusion_enabled) {
       const std::uint64_t local_composition = context.state.gas_composition.enabled() ? 1U : 0U;
       const std::uint64_t any_composition = m_mpi_context.allreduceMaxUint64(local_composition);
       const std::uint64_t all_composition = m_mpi_context.allreduceMinUint64(local_composition);
@@ -3090,8 +3483,9 @@ class SourceRuntimeImpl final : public SourceRuntime {
     }
 
     const std::size_t cell_count = context.state.cells.size();
-    const std::uint64_t workspace_bytes =
-        m_metal_diffusion.requiredWorkspaceBytes(cell_count);
+    const std::uint64_t workspace_bytes = diffusion_enabled
+        ? m_metal_diffusion.requiredWorkspaceBytes(cell_count)
+        : 0U;
     const std::size_t mask_bytes = core::checkedSizeMultiply(
         cell_count, sizeof(std::uint8_t), "metal-diffusion owned-leaf mask");
     const std::size_t rho_kappa_bytes = core::checkedSizeMultiply(
@@ -3104,6 +3498,12 @@ class SourceRuntimeImpl final : public SourceRuntime {
         phase_bytes,
         static_cast<std::uint64_t>(rho_kappa_bytes),
         "metal-diffusion phase plus rho-kappa field");
+    if (sgs_shear_enabled) {
+      phase_bytes = core::checkedMemoryBytesAdd(
+          phase_bytes,
+          physics::SgsShearTransferWorkspace::requiredBytes(cell_count),
+          "smooth transport phase plus SGS shear staging");
+    }
 
     core::MemoryReservation replacement_phase_reservation;
     std::exception_ptr reservation_failure;
@@ -3111,7 +3511,10 @@ class SourceRuntimeImpl final : public SourceRuntime {
       if (m_memory_governor != nullptr &&
           (m_owned_leaf_mask.capacity() < cell_count ||
            m_diffusion_rho_kappa_code.capacity() < cell_count ||
-           m_diffusion_workspace.ownedCapacityBytes() < workspace_bytes)) {
+           m_diffusion_workspace.ownedCapacityBytes() < workspace_bytes ||
+           (sgs_shear_enabled &&
+            m_sgs_shear_workspace.ownedCapacityBytes() <
+                physics::SgsShearTransferWorkspace::requiredBytes(cell_count)))) {
         replacement_phase_reservation = m_memory_governor->reserve(
             core::MemoryClass::kPhaseResident,
             phase_bytes,
@@ -3236,6 +3639,121 @@ class SourceRuntimeImpl final : public SourceRuntime {
           "metal diffusion topology returned the wrong strain-field extent");
     }
 
+    // I02: the same authoritative face graph now drives the resolved SGS
+    // stress. Local faces receive equal/opposite momentum and stress-work
+    // updates. For a remote face, both owners reconstruct the same canonical
+    // lower/upper traction from exchanged step-start state and publish only
+    // their local half. The existing distributed topology handshake is used
+    // with zero scalar lanes solely to prove one-to-one interface geometry
+    // before any rank commits a momentum/energy mutation.
+    if (sgs_shear_enabled) {
+      physics::SgsLedger shear_ledger;
+      if (distributed) {
+        internal::DistributedElementDiffusionCoupling topology_agreement(
+            m_mpi_context, m_memory_governor, context.state,
+            topology.remote_faces, m_diffusion_rho_kappa_code, 0U);
+        topology_agreement.setup();
+      }
+      const internal::MpiStageCollectiveDecision decision(m_mpi_context);
+      core::StageTransaction transaction(
+          "sources.sgs_resolved_shear", m_memory_governor, &decision);
+      (void)transaction.prepare([&] {
+        shear_ledger = physics::prepareSgsShearTransfer(
+            context.state,
+            m_owned_leaf_mask,
+            m_diffusion_rho_kappa_code,
+            m_diffusion_faces,
+            topology.remote_faces,
+            scale_factor,
+            source_dt_code,
+            *m_source_stage_config.sgs,
+            m_sgs_shear_workspace);
+      });
+      if (!transaction.validate(true, core::StageRejectionKind::kNone, {})) {
+        m_sgs_shear_workspace.clear();
+        throw core::StageTransactionRejected(
+            transaction.outcome().rejection,
+            "SGS resolved-shear stage rejected (" +
+                std::string(core::stageRejectionKindLabel(
+                    transaction.outcome().rejection)) +
+                "): " + transaction.outcome().reason);
+      }
+
+      const bool touched_thermodynamics = std::any_of(
+          m_sgs_shear_workspace.touched.begin(),
+          m_sgs_shear_workspace.touched.end(),
+          [](std::uint8_t value) { return value != 0U; });
+      (void)transaction.commit([&] {
+        physics::commitSgsShearTransfer(
+            context.state, m_sgs_shear_workspace);
+      });
+      if (touched_thermodynamics) {
+        context.state.notifyGasThermodynamicMutation();
+        std::unique_ptr<physics::EffectiveIsmThermodynamicClosure> closure;
+        if (m_effective_eos_table != nullptr) {
+          closure = std::make_unique<physics::EffectiveIsmThermodynamicClosure>(
+              m_effective_eos_table);
+        }
+        const hydro::GasThermodynamicRefreshPolicy refresh_policy{
+            .adiabatic_index = 5.0 / 3.0,
+            .density_floor_code = m_hydro_density_floor_code,
+            .pressure_floor_code = m_hydro_pressure_floor_code,
+            .scale_factor = source_evaluation_scale_factor,
+            .redshift = m_is_cosmological
+                ? std::max(0.0, 1.0 / source_evaluation_scale_factor - 1.0)
+                : 0.0,
+            .closure = closure.get(),
+            .temperature_k_per_internal_energy_code =
+                hydro::temperatureKelvinPerInternalEnergyCode(
+                    5.0 / 3.0, m_units.velocity_si_per_code)};
+        for (std::uint32_t row = 0U; row < cell_count; ++row) {
+          if (m_sgs_shear_workspace.touched[row] != 0U) {
+            (void)hydro::refreshGasThermodynamicCell(
+                context.state, row, refresh_policy);
+          }
+        }
+        context.state.markGasThermodynamicsRefreshed();
+      }
+      m_last_sgs_ledger.produced_from_resolved_code +=
+          shear_ledger.produced_from_resolved_code;
+      m_last_sgs_ledger.resolved_stress_work_code +=
+          shear_ledger.resolved_stress_work_code;
+      m_last_sgs_ledger.momentum_impulse_l1_code +=
+          shear_ledger.momentum_impulse_l1_code;
+      m_last_sgs_ledger.shear_faces += shear_ledger.shear_faces;
+      m_last_sgs_ledger.shear_cells += shear_ledger.shear_cells;
+      if (context.profiler_session != nullptr) {
+        context.profiler_session->recordEvent(core::RuntimeEvent{
+            .event_kind = "sources.sgs_shear",
+            .severity = core::RuntimeEventSeverity::kInfo,
+            .subsystem = "physics.sgs",
+            .step_index = context.integrator_state.step_index,
+            .simulation_time_code = context.integrator_state.current_time_code,
+            .scale_factor = source_evaluation_scale_factor,
+            .message = "conservative resolved-stress to SGS transfer",
+            .payload = {
+                {"faces", std::to_string(shear_ledger.shear_faces)},
+                {"cells", std::to_string(shear_ledger.shear_cells)},
+                {"produced_from_resolved_code",
+                 std::to_string(shear_ledger.produced_from_resolved_code)},
+                {"resolved_stress_work_code",
+                 std::to_string(shear_ledger.resolved_stress_work_code)},
+                {"momentum_impulse_l1_code",
+                 std::to_string(shear_ledger.momentum_impulse_l1_code)},
+                {"dt_code", std::to_string(source_dt_code)}}});
+      }
+    }
+
+    if (!diffusion_enabled) {
+      if (m_memory_governor != nullptr &&
+          replacement_phase_reservation.committed()) {
+        m_diffusion_phase_reservation.release();
+        m_diffusion_phase_reservation =
+            std::move(replacement_phase_reservation);
+      }
+      return;
+    }
+
     for (std::uint32_t cell_index = 0U; cell_index < cell_count; ++cell_index) {
       if (m_owned_leaf_mask[cell_index] == 0U) {
         m_diffusion_rho_kappa_code[cell_index] = 0.0;
@@ -3312,9 +3830,9 @@ class SourceRuntimeImpl final : public SourceRuntime {
           }
           element_report = physics::advanceElementResolvedDiffusion(
               context.state.gas_composition, m_diffusion_faces, m_diffusion_rho_kappa_code,
-              context.integrator_state.dt_time_code, m_metal_diffusion.config().parabolic_cfl,
+              source_dt_code, m_metal_diffusion.config().parabolic_cfl,
               m_metal_diffusion.config().max_subcycles, m_element_diffusion_workspace,
-              coupling.has_value() ? &*coupling : nullptr);
+              coupling.has_value() ? &*coupling : nullptr, m_memory_governor);
         } catch (...) {
           element_failure = std::current_exception();
         }
@@ -3343,7 +3861,7 @@ class SourceRuntimeImpl final : public SourceRuntime {
                 .rho_kappa_code = m_diffusion_rho_kappa_code,
             },
             m_diffusion_faces,
-            context.integrator_state.dt_time_code,
+            source_dt_code,
             m_diffusion_workspace);
     if (m_memory_governor != nullptr &&
         replacement_phase_reservation.committed()) {
@@ -3511,6 +4029,11 @@ class SourceRuntimeImpl final : public SourceRuntime {
   physics::DustUpdateLedger m_last_dust_ledger{};
   physics::SgsLedger m_last_sgs_ledger{};
   physics::ChemistryShadowReport m_last_shadow_report{};
+  physics::ChemistryShadowReport m_multilevel_shadow_report{};
+  physics::ChemistryAdaptiveReport m_multilevel_chemistry_adaptive_report{};
+  std::uint64_t m_multilevel_source_step =
+      std::numeric_limits<std::uint64_t>::max();
+  bool m_amr_level_source_coupling_enabled = false;
   std::uint64_t m_last_skipped_effective_rows = 0U;
   physics::BaryonicSourceStageConfig m_source_stage_config{};
   struct ControllerCheckpoint {
@@ -3528,6 +4051,10 @@ class SourceRuntimeImpl final : public SourceRuntime {
     physics::DustUpdateLedger last_dust_ledger{};
     physics::SgsLedger last_sgs_ledger{};
     physics::ChemistryShadowReport last_shadow_report{};
+    physics::ChemistryShadowReport multilevel_shadow_report{};
+    physics::ChemistryAdaptiveReport multilevel_chemistry_adaptive_report{};
+    std::uint64_t multilevel_source_step =
+        std::numeric_limits<std::uint64_t>::max();
     std::uint64_t last_skipped_effective_rows = 0U;
     physics::ElementDiffusionReport last_element_diffusion{};
     std::uint64_t recursive_thermochemistry_completed_step =
@@ -3582,6 +4109,7 @@ class SourceRuntimeImpl final : public SourceRuntime {
   std::vector<double> m_element_diffusion_workspace;
   physics::ElementDiffusionReport m_last_element_diffusion{};
   physics::MetalDiffusionWorkspace m_diffusion_workspace;
+  physics::SgsShearTransferWorkspace m_sgs_shear_workspace;
   std::uint64_t m_diffusion_rho_kappa_high_water_bytes = 0U;
   std::uint64_t m_diffusion_faces_high_water_bytes = 0U;
   std::uint64_t m_diffusion_topology_scratch_high_water_bytes = 0U;

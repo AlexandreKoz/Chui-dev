@@ -483,9 +483,9 @@ configuration (identical on every rank, required for collective single-file
 HDF5); an absent dataset means the physics is disabled, never zero.
 
 `/PartType0` (when the run carries a composition sidecar; attribute
-`CHUI_CompositionSchemaVersion = 1`, `CHUI_CompositionLayoutName`,
+`CHUI_CompositionSchemaVersion = 3`, `CHUI_CompositionLayoutName`,
 `CHUI_ElementNames`, `CHUI_SpeciesNames`, `CHUI_DustNames`,
-`CHUI_CompositionFractionBasis`):
+`CHUI_CompositionFractionBasis`, `CHUI_DetailedChemistryStorage`):
 
 | Dataset | Shape | Meaning |
 |---|---|---|
@@ -495,17 +495,26 @@ HDF5); an absent dataset means the physics is disabled, never zero.
 | `CHUI_SgsSpecificEnergy` | [N] | SGS energy / gas mass (code units), when the SGS lane exists |
 | `CHUI_MeanMolecularWeight` | [N] | cached mu (amu); NaN = unknown (rebuilt by chemistry) |
 | `CHUI_ChemistryModelTag`, `CHUI_IsmRegimeTag` | [N] u8 | adaptive chemistry fidelity / ISM regime tags |
+| `CHUI_DetailedChemistryStateMaterialized` | [N] u8 | 1 when the adaptive C+/CO history has an explicit stable-ID sparse row; 0 means the documented implicit C+=element-C, CO=0 projection (or dense-reference storage selected by the group attribute) |
 | `CHUI_ChemistryModelDwellYears`, `CHUI_IsmRegimeDwellYears` | [N] | hysteresis dwell |
+| `CHUI_ChemistryLastTemperatureK`, `CHUI_ChemistryLastCoolingTimeSeconds` | [N] | last accepted local thermal/timescale history; 0 means unavailable/no finite cooling time |
+| `CHUI_ChemistryLastErrorEstimate`, `CHUI_ChemistryLastElementFractionResidual`, `CHUI_ChemistryLastChargeResidual` | [N] | last accepted normalized integration error and dimensionless conservation residuals used by C03 selection |
+| `CHUI_ChemistryCumulativeRadiativeLossErg`, `CHUI_ChemistryCumulativeHeatingGainErg` | [N] | cumulative accepted per-cell radiative/heating ledger; extensive under AMR regrid |
 
 Per cell, sum(`CHUI_ElementMassFractions`) + sum(`CHUI_DustMassFractions`) = 1;
 `Metallicity` remains the derived total-metal mirror (gas + dust metals).
 
 `/PartType4` (Part 2 stellar population models; attribute
-`CHUI_StellarPopulationSchemaVersion = 1`, `CHUI_StellarChannelOrder = AGB,CC,Ia`):
+`CHUI_StellarPopulationSchemaVersion = 2`, `CHUI_StellarChannelOrder = AGB,CC,Ia`):
 `CHUI_StellarReturnedMassByChannel` [N, 3], `CHUI_StellarFeedbackEnergyByChannelErg`
 [N, 3], `CHUI_BirthElementMassFractions` [N, 11], `CHUI_BirthTimeCode`,
 `CHUI_SnCcRealized`, `CHUI_SnIaRealized` (u32), `CHUI_EventStreamKey` (u64),
-`CHUI_PopulationRecordInitialized` (u8; 0 = legacy star without a record).
+`CHUI_PopulationRecordInitialized` (u8; 0 = legacy star without a record),
+`CHUI_ChronologyTimeCode`, `CHUI_ChronologyStepIndex` (u64), and
+`CHUI_ChronologyInitialized` (u8). The chronology triplet identifies the last
+accepted SSP/event interval represented by the cumulative ordinals and is
+analysis provenance; checkpoint restart still uses the complete module
+sidecar rather than reconstructing it from a science snapshot.
 
 Restart-only transient state (flux registers, temporal histories, Jacobians,
 staged deltas) is never exported to science snapshots; it lives in the

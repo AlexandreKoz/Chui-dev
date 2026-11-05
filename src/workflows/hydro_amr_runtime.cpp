@@ -26,9 +26,11 @@
 #include "cosmosim/amr/amr_patch_indexing.hpp"
 #include "cosmosim/parallel/composition_exchange.hpp"
 #include "cosmosim/core/checked_arithmetic.hpp"
+#include "cosmosim/core/adaptive_resource_control.hpp"
 #include "cosmosim/core/memory_accounting.hpp"
 #include "cosmosim/core/memory_governor.hpp"
 #include "cosmosim/core/profiling.hpp"
+#include "cosmosim/core/retained_capacity_transaction.hpp"
 #include "cosmosim/core/units.hpp"
 #include "cosmosim/physics/cooling_heating.hpp"
 #include "cosmosim/physics/stellar_population.hpp"
@@ -773,6 +775,10 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
     }
   }
 
+  void setMultilevelSourceRuntime(SourceRuntime* source) noexcept override {
+    m_multilevel_source_runtime = source;
+  }
+
   [[nodiscard]] const hydro::HydroProfileEvent& lastHydroProfile() const noexcept { return m_last_hydro_profile; }
   [[nodiscard]] const internal::SolverGhostRefreshReport&
   lastGhostRefreshReport() const noexcept {
@@ -936,8 +942,8 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
     view.requireFresh();
     core::StepContext& context = internal::RuntimeStageAccess::hydroAmrContext(
         view,
-        {{RuntimeResourceKey::kSourceMutationState, RuntimeResourceAccessMode::kReadWrite},
-         {RuntimeResourceKey::kParticleVelocity, RuntimeResourceAccessMode::kReadWrite},
+        {{RuntimeResourceKey::kParticleVelocity, RuntimeResourceAccessMode::kReadWrite},
+         {RuntimeResourceKey::kSourceMutationState, RuntimeResourceAccessMode::kReadWrite},
          {RuntimeResourceKey::kHydroConservedState, RuntimeResourceAccessMode::kReadWrite},
          {RuntimeResourceKey::kHydroPrimitiveState, RuntimeResourceAccessMode::kReadWrite},
          {RuntimeResourceKey::kAmrPatchState, RuntimeResourceAccessMode::kReadWrite},
@@ -1239,8 +1245,8 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
                       {"stencil_degradation_count", std::to_string(m_last_hydro_profile.stencil_degradation_count)},
                       {"ctu_transverse_corrected_states", std::to_string(m_last_hydro_profile.ctu_transverse_corrected_states)},
                       {"ctu_transverse_degraded_states", std::to_string(m_last_hydro_profile.ctu_transverse_degraded_states)},
-                      {"ctu_transverse_boundary_proxy_states",
-                       std::to_string(m_last_hydro_profile.ctu_transverse_boundary_proxy_states)},
+                      {"ctu_transverse_ghost_corrected_states", std::to_string(m_last_hydro_profile.ctu_transverse_ghost_corrected_states)},
+                      {"ctu_transverse_ghost_axes", std::to_string(m_last_hydro_profile.ctu_transverse_ghost_axes)},
                       {"ctu_transverse_inadmissible_states", std::to_string(m_last_hydro_profile.ctu_transverse_inadmissible_states)},
                       {"mass_tolerance", "1e-10"},
                       {"momentum_tolerance", "1e-10"},
@@ -1347,6 +1353,13 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
       // post-hydro mass only for reconciliation inside commit().
       try {
         composition_flux->prepare(context.state);
+        admitCompositionSparseActivation(
+            context.state, *composition_flux, m_memory_governor,
+            "hydro.fixed_grid.adaptive_chemistry_rows");
+      } catch (const core::MemoryAdmissionError& error) {
+        staged_admissible = false;
+        staged_failure = std::string("composition sparse capacity: ") + error.what();
+        hydro_transaction.reject(core::StageRejectionKind::kResourceRefused, staged_failure);
       } catch (const std::exception& error) {
         staged_admissible = false;
         staged_failure = std::string("composition transport: ") + error.what();
@@ -2514,6 +2527,18 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
         // Deterministic merge order: source rank, then wire order.
         std::stable_sort(mine.begin(), mine.end(),
                          [](const auto& l, const auto& r) { return l.first < r.first; });
+        std::vector<std::pair<std::uint64_t, int>> received_keys;
+        received_keys.reserve(mine.size());
+        for (const auto& [rank, g] : mine) {
+          received_keys.emplace_back(global[g].register_key, rank);
+        }
+        std::sort(received_keys.begin(), received_keys.end());
+        for (std::size_t key = 1U; key < received_keys.size(); ++key) {
+          if (received_keys[key - 1U] == received_keys[key]) {
+            throw std::runtime_error(
+                "distributed recursive AMR received a duplicate reflux register key from one source rank");
+          }
+        }
         std::vector<amr::FluxRegisterEntry> inbound;
         inbound.reserve(mine.size());
         for (const auto& [rank, g] : mine) inbound.push_back(fluxRegisterEntryFromPayload(global[g]));
@@ -2831,14 +2856,13 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
     if (m_config.numerics.amr_time_stepping == core::AmrTimeSteppingConfigMode::kRecursiveSubcycling) {
       verifyAcceptedRecursiveAmrHydroCfl(context, amr::ProductionAmrHydroOptions{}.refinement_ratio);
     }
-    struct RecursiveSourceCallbackContext {
-      SourceRuntime* source = nullptr;
-      core::StepContext* step = nullptr;
-    };
-    RecursiveSourceCallbackContext recursive_source_callback_context{
-        .source = m_source_runtime, .step = &context};
-
-    amr::ProductionAmrHydroOptions amr_options{
+    std::optional<RecursiveAmrLevelSourceAdapter> recursive_source_adapter;
+    if (m_config.numerics.amr_time_stepping ==
+            core::AmrTimeSteppingConfigMode::kRecursiveSubcycling &&
+        m_multilevel_source_runtime != nullptr) {
+      recursive_source_adapter.emplace(*m_multilevel_source_runtime, context);
+    }
+    const amr::ProductionAmrHydroOptions amr_options{
         .physical_boundary_kind = hydroBoundaryKindFromModePolicy(m_mode_policy.hydro_boundary),
         .adiabatic_index = k_gamma_adiabatic,
         .density_floor = m_config.numerics.hydro_density_floor_code,
@@ -2848,6 +2872,9 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
         .active_batch_policy = active_batch_policy,
         .physical_density_cgs_per_density_code = physical_density_cgs_per_density_code,
         .regrid_memory_governor = m_memory_governor,
+        .recursive_level_source_operator = recursive_source_adapter.has_value()
+            ? &*recursive_source_adapter
+            : nullptr,
         .reconstruction_scheme = hydroReconstructionSchemeFromConfig(m_config),
         .slope_limiter = hydroSlopeLimiterFromConfig(m_config),
         // Patch coordinates share the comoving coordinate frame of the
@@ -3107,6 +3134,9 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
       // Single rank: the composition update is prepared (may throw = hard
       // stage failure) and committed immediately after the hydro sweep.
       composition_flux->prepare(context.state);
+      admitCompositionSparseActivation(
+          context.state, *composition_flux, m_memory_governor,
+          "hydro.amr.adaptive_chemistry_rows");
       m_last_composition_transport = composition_flux->commit(context.state);
       (void)physics::synchronizeMetalMirrorFromComposition(context.state, std::span<const std::uint32_t>{});
     }
@@ -3140,8 +3170,8 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
                       {"positivity_fallback_count", std::to_string(amr_diagnostics.positivity_fallback_count)},
                       {"stencil_degradation_count", std::to_string(amr_diagnostics.stencil_degradation_count)},
                       {"ctu_transverse_degraded_states", std::to_string(amr_diagnostics.ctu_transverse_degraded_states)},
-                      {"ctu_transverse_boundary_proxy_states",
-                       std::to_string(amr_diagnostics.ctu_transverse_boundary_proxy_states)},
+                      {"ctu_transverse_ghost_corrected_states", std::to_string(amr_diagnostics.ctu_transverse_ghost_corrected_states)},
+                      {"ctu_transverse_ghost_axes", std::to_string(amr_diagnostics.ctu_transverse_ghost_axes)},
                       {"dual_energy_auxiliary_cells", std::to_string(amr_diagnostics.dual_energy_auxiliary_cells)},
                       {"dual_energy_unresolved_ghosts", std::to_string(amr_diagnostics.dual_energy_unresolved_ghosts)},
                       {"dual_energy_thermal_correction_code",
@@ -3305,7 +3335,12 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
             context.state, record.gas_cell_id,
             std::span<const double>(record.lane_delta_code.data(), record.lane_count));
       }
-      if (composition_flux != nullptr) composition_flux->validatePrepared(context.state);
+      if (composition_flux != nullptr) {
+        composition_flux->validatePrepared(context.state);
+        admitCompositionSparseActivation(
+            context.state, *composition_flux, m_memory_governor,
+            "hydro.distributed_amr.adaptive_chemistry_rows");
+      }
     } catch (...) { failure = std::current_exception(); }
     m_mpi_context.rethrowCollectivePreparationFailure(failure, "distributed composition validation");
     if (composition_flux != nullptr) {
@@ -3412,66 +3447,166 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
       m_mpi_context.rethrowCollectivePreparationFailure(
           failure, "regrid cooling-time admission");
     }
-
-    failure = nullptr;
-    try {
-      if (policy.physics.cooling_length_cells > 0.0) {
-        cooling_time_code.assign(
-            context.state.cells.size(), std::numeric_limits<double>::infinity());
-        bool provided = false;
-        if (m_cooling_rate_provider.has_value()) {
-          // Legacy cooling: t_cool = e / (Lambda_net n_H^2 / rho). Net
-          // heating imposes no cooling-length constraint (+inf).
-          constexpr double k_proton_mass_g = 1.67262192369e-24;
-          const double a = std::max(policy.scale_factor, 1.0e-12);
-          const bool comoving =
-              m_config.units.coordinate_frame == core::CoordinateFrame::kComoving;
-          const double redshift = m_mode_policy.cosmological_comoving_frame
-              ? std::max(0.0, 1.0 / a - 1.0) : 0.0;
-          for (std::uint32_t row = 0; row < context.state.cells.size(); ++row) {
-            const double e = context.state.gas_cells.internal_energy_code[row];
-            const double rho_code = context.state.gas_cells.density_code[row] *
-                (comoving ? 1.0 / (a * a * a) : 1.0);
-            const double rho_cgs = m_units.densityCodeToCgs(rho_code);
-            if (!(e > 0.0) || !(rho_cgs > 0.0)) continue;
-            const double mass = context.state.cells.mass_code[row];
-            const double z = mass > 0.0
-                ? std::clamp(
-                      context.state.gas_cells.metal_mass_code[row] / mass, 0.0, 1.0)
-                : 0.0;
-            const double n_h =
-                (1.0 - m_cooling_helium_mass_fraction - z) * rho_cgs /
-                k_proton_mass_g;
-            const physics::CoolingRateResult rates =
-                m_cooling_rate_provider->lookupRates(physics::CoolingRateQuery{
-                    .temperature_k = e * m_cooling_temperature_per_energy_k,
-                    .hydrogen_number_density_cgs = n_h,
-                    .metallicity_mass_fraction = z,
-                    .redshift = redshift});
-            const double net = rates.netCoolingRateErgCm3S();
-            if (!(net > 0.0)) continue;
-            const double rate_code = net * n_h * n_h / rho_cgs *
-                m_cooling_specific_rate_cgs_to_code;
-            if (rate_code > 0.0) cooling_time_code[row] = e / rate_code;
+    if (policy.physics.cooling_length_cells > 0.0) {
+      std::exception_ptr cooling_time_failure;
+      try {
+        const bool chemistry_history = context.state.gas_composition.enabled() &&
+            context.state.gas_composition.chemistry_last_cooling_time_seconds.size() ==
+                context.state.cells.size();
+        // t_cool = e / (Lambda_net n_H^2 / rho) with physical density; net
+        // heating (Lambda_net <= 0) imposes no cooling-length constraint (+inf).
+        constexpr double k_proton_mass_g = 1.67262192369e-24;
+        const double a = std::max(context.integrator_state.current_scale_factor, 1.0e-12);
+        const bool comoving = m_config.units.coordinate_frame == core::CoordinateFrame::kComoving;
+        const double redshift = m_mode_policy.cosmological_comoving_frame ? std::max(0.0, 1.0 / a - 1.0) : 0.0;
+        cooling_time_code.assign(context.state.cells.size(), std::numeric_limits<double>::infinity());
+        for (std::uint32_t row = 0; row < context.state.cells.size(); ++row) {
+          if (chemistry_history) {
+            const double seconds =
+                context.state.gas_composition.chemistry_last_cooling_time_seconds[row];
+            if (seconds > 0.0 && std::isfinite(seconds)) {
+              cooling_time_code[row] = seconds / m_units.timeSiPerCode();
+            }
+            continue;
           }
-          provided = true;
-        } else if (m_source_runtime != nullptr) {
-          // Part-2 chemistry owns its exact rate set; use it rather than a
-          // duplicate cooling approximation in the AMR planner.
-          provided = m_source_runtime->fillAmrCoolingTimes(
-              context, cooling_time_code);
-        }
-        if (!provided) {
-          throw std::logic_error(
-              "cooling-length refinement requested without an available cooling-time provider");
+          if (!m_cooling_rate_provider.has_value()) {
+            throw std::logic_error(
+                "cooling-length refinement has neither accepted Part 2 cooling-time history "
+                "nor a legacy cooling-rate provider");
+          }
+          const double e = context.state.gas_cells.internal_energy_code[row];
+          const double rho_code = context.state.gas_cells.density_code[row] * (comoving ? 1.0 / (a * a * a) : 1.0);
+          const double rho_cgs = m_units.densityCodeToCgs(rho_code);
+          if (!(e > 0.0) || !(rho_cgs > 0.0)) continue;
+          const double mass = context.state.cells.mass_code[row];
+          const double z = mass > 0.0 ? std::clamp(context.state.gas_cells.metal_mass_code[row] / mass, 0.0, 1.0) : 0.0;
+          const double n_h = (1.0 - m_cooling_helium_mass_fraction - z) * rho_cgs / k_proton_mass_g;
+          const physics::CoolingRateResult rates = m_cooling_rate_provider->lookupRates(physics::CoolingRateQuery{
+              .temperature_k = e * m_cooling_temperature_per_energy_k,
+              .hydrogen_number_density_cgs = n_h,
+              .metallicity_mass_fraction = z,
+              .redshift = redshift});
+          const double net = rates.netCoolingRateErgCm3S();
+          if (!(net > 0.0)) continue;
+          const double rate_code = net * n_h * n_h / rho_cgs * m_cooling_specific_rate_cgs_to_code;
+          if (rate_code > 0.0) cooling_time_code[row] = e / rate_code;
         }
         policy.physics.cooling_time_code = cooling_time_code;
+      } catch (...) {
+        cooling_time_failure = std::current_exception();
+      }
+      m_mpi_context.rethrowCollectivePreparationFailure(
+          cooling_time_failure, "regrid cooling-time evaluation");
+    }
+    policy.max_level = static_cast<std::uint8_t>(std::clamp(m_config.numerics.amr_max_level, 0, 255));
+    policy.max_operations = static_cast<std::size_t>(m_config.numerics.amr_regrid_max_operations);
+    // Alternating passes keep the 2:1 balance without exchanging decisions.
+    policy.pass = (epoch % 2U == 1U) ? amr::AmrRegridPassKind::kRefineOnly : amr::AmrRegridPassKind::kDerefineOnly;
+    policy.scale_factor = context.integrator_state.current_scale_factor > 0.0
+        ? context.integrator_state.current_scale_factor : 1.0;
+    policy.periodic = amr_options.physical_boundary_kind == hydro::HydroBoundaryKind::kPeriodic;
+    policy.periodic_box_extent_comoving = amr_options.periodic_box_extent_comoving;
+    {
+      const double softening_kpc = m_config.numerics.gravity_softening_gas_kpc_comoving > 0.0
+          ? m_config.numerics.gravity_softening_gas_kpc_comoving
+          : m_config.numerics.gravity_softening_kpc_comoving;
+      const core::UnitSystem units = core::makeUnitSystem(
+          m_config.units.length_unit, m_config.units.mass_unit, m_config.units.velocity_unit);
+      constexpr double k_kpc_m = 3.0856775814913673e19;
+      policy.gravity_softening_code = softening_kpc > 0.0 ? softening_kpc * k_kpc_m / units.length_si_per_code : 0.0;
+    }
+    policy.force_resolution_action =
+        m_config.numerics.amr_force_resolution_policy ==
+                core::AmrForceResolutionPolicy::kAllowCountedReference
+        ? amr::AmrForceResolutionAction::kAllowCountedReference
+        : amr::AmrForceResolutionAction::kLimitOptionalRejectMandatory;
+
+    core::V02ControlState v02_state;
+    std::uint64_t v02_chemistry_reserve = 0U;
+    std::uint64_t v02_optional_memory_budget = 0U;
+    std::uint64_t regrid_baseline_bytes = 0U;
+    std::uint64_t regrid_estimated_bytes_per_cell = 0U;
+    const bool joint_v02 =
+        m_config.numerics.v02_control_mode == core::V02ControlMode::kJointErrorResourceV1;
+    std::exception_ptr v02_preparation_failure;
+    try {
+      regrid_baseline_bytes = core::memoryReportBaselineOwnedBytes(
+          core::collectSimulationMemoryReport(context.state));
+      regrid_estimated_bytes_per_cell =
+          context.state.cells.size() == 0U
+          ? 0U
+          : regrid_baseline_bytes / context.state.cells.size() +
+                (regrid_baseline_bytes % context.state.cells.size() != 0U
+                     ? 1U
+                     : 0U);
+      if (joint_v02) {
+        v02_state = core::loadV02ControlState(context.state);
+        const auto& composition = context.state.gas_composition;
+        const std::uint64_t inactive_rows = composition.sparseStorageEnabled()
+            ? static_cast<std::uint64_t>(composition.rowCount() - composition.sparseActiveRowCount())
+            : 0U;
+        const std::uint64_t sparse_row_bytes = sizeof(std::uint64_t) +
+            static_cast<std::uint64_t>(composition.sparseLaneCount()) * sizeof(double);
+        const std::uint64_t ranks = static_cast<std::uint64_t>(
+            std::max(1, m_mpi_context.worldSize()));
+        const std::uint64_t observed_growth_rows = std::min(
+            inactive_rows,
+            (v02_state.chemistry_promoted_last_interval + ranks - 1U) / ranks);
+        const std::uint64_t observed_growth_bytes =
+            observed_growth_rows > 0U && sparse_row_bytes >
+                    std::numeric_limits<std::uint64_t>::max() / observed_growth_rows
+            ? std::numeric_limits<std::uint64_t>::max()
+            : observed_growth_rows * sparse_row_bytes;
+        const std::uint64_t maximum_growth_bytes =
+            inactive_rows > 0U && sparse_row_bytes >
+                    std::numeric_limits<std::uint64_t>::max() / inactive_rows
+            ? std::numeric_limits<std::uint64_t>::max()
+            : inactive_rows * sparse_row_bytes;
+        v02_chemistry_reserve = std::min(
+            maximum_growth_bytes,
+            std::max(v02_state.chemistry_growth_reserve_bytes -
+                         v02_state.chemistry_growth_reserve_bytes / 10U,
+                     observed_growth_bytes));
+        const core::MemoryGovernorSnapshot memory = m_memory_governor != nullptr
+            ? m_memory_governor->snapshot()
+            : core::MemoryGovernorSnapshot{
+                  .headroom_bytes = std::numeric_limits<std::uint64_t>::max()};
+        const std::uint64_t fixed_reserve = regrid_baseline_bytes >
+                std::numeric_limits<std::uint64_t>::max() - v02_chemistry_reserve
+            ? std::numeric_limits<std::uint64_t>::max()
+            : regrid_baseline_bytes + v02_chemistry_reserve;
+        const std::uint64_t available = memory.headroom_bytes ==
+                std::numeric_limits<std::uint64_t>::max()
+            ? memory.headroom_bytes
+            : memory.headroom_bytes > fixed_reserve
+                ? memory.headroom_bytes - fixed_reserve
+                : 0U;
+        if (available == std::numeric_limits<std::uint64_t>::max()) {
+          v02_optional_memory_budget = available;
+        } else {
+          v02_optional_memory_budget = static_cast<std::uint64_t>(
+              static_cast<long double>(available) *
+              m_config.numerics.v02_optional_memory_headroom_fraction);
+        }
+        policy.optional_control = amr::OptionalRefinementControl{
+            .enabled = true,
+            .benefit_floor = std::max(
+                1.0, 1.0 + 0.9 * (v02_state.optional_benefit_floor - 1.0)),
+            .memory_budget_bytes = v02_optional_memory_budget,
+            .estimated_bytes_per_cell = regrid_estimated_bytes_per_cell,
+            .cell_step_budget = std::numeric_limits<std::uint64_t>::max(),
+            .mpi_face_cell_budget = std::numeric_limits<std::uint64_t>::max(),
+            .churn_cell_budget = std::numeric_limits<std::uint64_t>::max()};
+      }
+      if (!joint_v02) {
+        policy.optional_control.estimated_bytes_per_cell =
+            regrid_estimated_bytes_per_cell;
       }
     } catch (...) {
-      failure = std::current_exception();
+      v02_preparation_failure = std::current_exception();
     }
     m_mpi_context.rethrowCollectivePreparationFailure(
-        failure, "automatic AMR cooling-indicator preparation");
+        v02_preparation_failure, "V02 AMR controller preparation");
 
     // A04 predictive event-aware refinement.  Local event chronology is
     // evaluated first; the resulting current/drifted positions are then
@@ -3480,37 +3615,61 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
     // another rank is not forced" limitation.
     const double predictive_age = m_config.numerics.amr_predictive_feedback_age_years;
     const double lookahead_years = m_config.numerics.amr_predictive_event_lookahead_years;
-    const bool predictive_enabled = predictive_age > 0.0 || lookahead_years > 0.0;
-    if (predictive_enabled && m_memory_governor != nullptr) {
-      failure = nullptr;
+    if (predictive_age > 0.0 || lookahead_years > 0.0) {
+      std::vector<amr::PatchDescriptor> descriptors;
+      std::size_t maximum_forecast_positions = 0U;
+      core::MemoryReservation forecast_positions_reservation;
+      std::exception_ptr forecast_positions_admission_failure;
+      std::vector<std::array<double, 3>> forecast_positions;
       try {
-        const std::size_t max_points = core::checkedSizeMultiply(
-            context.state.star_particles.size(), 2U,
-            "predictive AMR maximum local points");
-        const std::uint64_t bytes = core::checkedIntegralNarrow<std::uint64_t>(
-            core::checkedSizeMultiply(
-                max_points, sizeof(PredictiveRefinementPoint),
-                "predictive AMR local point bytes"),
-            "predictive AMR local point reservation");
-        if (bytes > 0U) {
-          predictive_local_reservation = m_memory_governor->reserve(
-              core::MemoryClass::kScratchArena, bytes,
-              "hydro.amr_regrid.predictive_local_points");
-          predictive_local_reservation.commit();
+        descriptors = amr::buildProductionAmrPatchDescriptors(context.state);
+        maximum_forecast_positions = core::checkedSizeMultiply(
+            context.state.star_particles.size(),
+            lookahead_years > 0.0 ? 2U : 1U,
+            "predictive refinement local position capacity");
+        if (m_memory_governor != nullptr && maximum_forecast_positions > 0U) {
+          forecast_positions_reservation = m_memory_governor->reserve(
+              core::MemoryClass::kPhaseResident,
+              static_cast<std::uint64_t>(core::checkedSizeMultiply(
+                  maximum_forecast_positions, sizeof(std::array<double, 3>),
+                  "predictive refinement local positions")),
+              "hydro.amr_regrid.local_predictive_positions");
+          forecast_positions_reservation.commit();
+        }
+        forecast_positions.reserve(maximum_forecast_positions);
+        if (forecast_positions.capacity() > maximum_forecast_positions) {
+          throw std::length_error(
+              "predictive refinement position allocator exceeded admitted capacity");
         }
       } catch (...) {
-        failure = std::current_exception();
+        forecast_positions_admission_failure = std::current_exception();
       }
       m_mpi_context.rethrowCollectivePreparationFailure(
-          failure, "predictive AMR local-point admission");
-    }
-
-    failure = nullptr;
-    try {
-      if (predictive_enabled) {
-        local_predictive_points.reserve(core::checkedSizeMultiply(
-            context.state.star_particles.size(), 2U,
-            "predictive AMR local point reserve"));
+          forecast_positions_admission_failure,
+          "predictive refinement local position admission");
+      const auto host_row = [&](const std::array<double, 3>& position) {
+        for (const amr::PatchDescriptor& patch : descriptors) {
+          bool inside = true;
+          for (std::size_t c = 0; c < 3U && inside; ++c) {
+            inside = position[c] >= patch.origin_comov[c] && position[c] < patch.origin_comov[c] + patch.extent_comov[c];
+          }
+          if (!inside) continue;
+          const auto cell = amr::patchLocalCellForPoint(patch, position, "predictive refinement host cell");
+          const auto rows = amr::rowsForPatchLocalCellOrder(context.state, patch, "predictive refinement");
+          if (cell.linear_index < rows.size()) forced_rows.push_back(rows[cell.linear_index]);
+          return;
+        }
+      };
+      // R2 (A04) event-aware forecast. For every star the canonical
+      // population record (restart/rollback state) gives its deterministic
+      // event chronology; a COPY is advanced to the expected cumulative count
+      // at age + lookahead, so the forecast consumes no event ordinal and
+      // changes no budget. Expectation mode (no stochastic events) predicts
+      // an "event" when >= 0.5 expected SNe fall in the window (HEURISTIC).
+      // The host cell now and at the drifted position x + v dt / a are forced.
+      std::uint64_t forecast_events = 0U;
+      std::exception_ptr forecast_failure;
+      try {
         std::optional<physics::SspModel> ssp;
         std::optional<physics::StellarPopulationStore> store;
         if (lookahead_years > 0.0) {
@@ -3523,7 +3682,7 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
           ssp_config.snia_delay_min_years = m_config.physics.ssp_snia_delay_min_years;
           ssp_config.snia_delay_max_years = m_config.physics.ssp_snia_delay_max_years;
           ssp_config.stochastic_events = m_config.physics.ssp_stochastic_sn_events;
-          ssp.emplace(ssp_config);
+          ssp.emplace(ssp_config);  // event counts only (lifetimes + IMF); no yields used
           store.emplace(context.state);
         }
         constexpr double k_solar_mass_kg = 1.98847e30;
@@ -3859,11 +4018,36 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
     const std::uint64_t patch_window = m_mpi_context.allreduceMaxUint64(plan.required_patch_ids);
     const std::uint64_t cell_window = m_mpi_context.allreduceMaxUint64(plan.required_gas_cell_ids);
     if (patch_window == 0U && cell_window == 0U) {
+      // Persist rejected/no-op decisions as well: otherwise the controller's
+      // hysteresis and resource history would only advance when topology did.
+      core::MemoryReservation v02_state_reservation;
+      failure = nullptr;
+      try {
+        if (joint_v02 && m_memory_governor != nullptr) {
+          v02_state_reservation = m_memory_governor->reserve(
+              core::MemoryClass::kPhaseResident, 4096U,
+              "hydro.amr_regrid.v02_controller_state");
+          v02_state_reservation.commit();
+        }
+        persist_v02_regrid_state(context.state);
+      } catch (...) {
+        failure = std::current_exception();
+      }
+      m_mpi_context.rethrowCollectivePreparationFailure(
+          failure, "automatic AMR V02 no-op state publication");
       return;
     }
-    const amr::ProductionAmrRegridIdWindow window = amr::rankStripedAmrRegridIdWindow(
-        global_max_patch, global_max_cell, m_mpi_context.worldRank(),
-        std::max(1, m_mpi_context.worldSize()), patch_window, cell_window);
+    amr::ProductionAmrRegridIdWindow window;
+    failure = nullptr;
+    try {
+      window = amr::rankStripedAmrRegridIdWindow(
+          global_max_patch, global_max_cell, m_mpi_context.worldRank(),
+          std::max(1, m_mpi_context.worldSize()), patch_window, cell_window);
+    } catch (...) {
+      failure = std::current_exception();
+    }
+    m_mpi_context.rethrowCollectivePreparationFailure(
+        failure, "automatic AMR identity-window preparation");
     amr::ProductionAmrRegridSummary summary;
     failure = nullptr;
     try {
@@ -3901,6 +4085,20 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
                       {"mandatory_blocked_by_max_level", std::to_string(plan.mandatory_blocked_by_max_level)},
                       {"mandatory_truncated_by_budget", std::to_string(plan.mandatory_truncated_by_budget)},
                       {"optional_truncated_by_budget", std::to_string(plan.optional_truncated_by_budget)},
+                      {"optional_blocked_by_force_resolution",
+                       std::to_string(plan.optional_blocked_by_force_resolution)},
+                      {"optional_admitted_cell_steps",
+                       std::to_string(plan.optional_admitted_cell_steps)},
+                      {"optional_admitted_mpi_face_cells",
+                       std::to_string(plan.optional_admitted_mpi_face_cells)},
+                      {"optional_admitted_churn_cells",
+                       std::to_string(plan.optional_admitted_churn_cells)},
+                      {"optional_admitted_memory_bytes",
+                       std::to_string(plan.optional_admitted_memory_bytes)},
+                      {"v02_chemistry_growth_reserve_bytes",
+                       std::to_string(v02_chemistry_reserve)},
+                      {"v02_optional_memory_budget_bytes",
+                       std::to_string(v02_optional_memory_budget)},
                       {"refined_below_gravity_softening_unqualified",
                        std::to_string(plan.refined_below_gravity_softening)},
                       {"skipped_not_quiescent", plan.skipped_not_quiescent ? "true" : "false"},
@@ -4188,6 +4386,7 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
   const core::SimulationConfig& m_config;
   const core::ModePolicy& m_mode_policy;
   const parallel::MpiContext& m_mpi_context;
+  SourceRuntime* m_multilevel_source_runtime = nullptr;
   core::MemoryGovernor* m_memory_governor = nullptr;
   core::UnitSystem m_units;
   std::uint32_t m_current_world_rank = 0;

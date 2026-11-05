@@ -725,6 +725,27 @@ parseInitialConditionMissingFieldPolicy(
                     "' (expected off or automatic)");
 }
 
+[[nodiscard]] AmrForceResolutionPolicy parseAmrForceResolutionPolicy(
+    const std::string& value) {
+  const std::string lower = toLower(trim(value));
+  if (lower == "allow_counted_reference") {
+    return AmrForceResolutionPolicy::kAllowCountedReference;
+  }
+  if (lower == "limit_optional_reject_mandatory") {
+    return AmrForceResolutionPolicy::kLimitOptionalRejectMandatory;
+  }
+  throw ConfigError("key 'numerics.amr_force_resolution_policy': invalid value '" + value +
+                    "' (expected allow_counted_reference or limit_optional_reject_mandatory)");
+}
+
+[[nodiscard]] V02ControlMode parseV02ControlMode(const std::string& value) {
+  const std::string lower = toLower(trim(value));
+  if (lower == "fixed_reference") return V02ControlMode::kFixedReference;
+  if (lower == "joint_error_resource_v1") return V02ControlMode::kJointErrorResourceV1;
+  throw ConfigError("key 'numerics.v02_control_mode': invalid value '" + value +
+                    "' (expected fixed_reference or joint_error_resource_v1)");
+}
+
 [[nodiscard]] NodeMemoryAdmissionMode parseNodeMemoryAdmissionMode(const std::string& value) {
   const std::string lower = toLower(trim(value));
   if (lower == "off") return NodeMemoryAdmissionMode::kOff;
@@ -1431,6 +1452,9 @@ struct ConfigKeySpec {
       {"numerics.gravity_timestep_eta", "0.2"},
       {"numerics.amr_max_level", "10"},
       {"numerics.amr_regrid_mode", "off"},
+      {"numerics.amr_force_resolution_policy", "limit_optional_reject_mandatory"},
+      {"numerics.v02_control_mode", "fixed_reference"},
+      {"numerics.v02_optional_memory_headroom_fraction", "0.5"},
       {"numerics.global_step_max_retries", "0"},
       {"numerics.amr_time_stepping", "synchronized"},
       {"numerics.amr_predictive_feedback_age_years", "0.0"},
@@ -1614,6 +1638,8 @@ struct ConfigKeySpec {
       {"physics.chemistry_adaptive_min_dwell_years", "1.0e6"},
       {"physics.chemistry_adaptive_cold_temperature_k", "3.0e3"},
       {"physics.chemistry_adaptive_cooling_time_ratio", "0.0"},
+      {"physics.chemistry_adaptive_error_estimate_threshold", "0.0"},
+      {"physics.chemistry_adaptive_residual_fraction_threshold", "0.0"},
       {"physics.chemistry_adaptive_dense_nh_cm3", "1.0"},
       {"physics.chemistry_shadow_sample_fraction", "0.0"},
       {"physics.ssp_imf_mass_min_msun", "0.1"},
@@ -1868,7 +1894,9 @@ void validatePart2BaryonicPhysics(const SimulationConfig& config) {
   }
   if (!(p.chemistry_adaptive_hysteresis_fraction >= 0.0) || p.chemistry_adaptive_hysteresis_fraction >= 1.0 ||
       p.chemistry_adaptive_min_dwell_years < 0.0 || !(p.chemistry_adaptive_cold_temperature_k > 10.0) ||
-      !(p.chemistry_adaptive_dense_nh_cm3 > 0.0) || !(p.chemistry_adaptive_cooling_time_ratio >= 0.0)) {
+      !(p.chemistry_adaptive_dense_nh_cm3 > 0.0) || !(p.chemistry_adaptive_cooling_time_ratio >= 0.0) ||
+      !(p.chemistry_adaptive_error_estimate_threshold >= 0.0) ||
+      !(p.chemistry_adaptive_residual_fraction_threshold >= 0.0)) {
     throw ConfigError("invalid chemistry_adaptive_* parameters");
   }
   if (!(p.ssp_imf_mass_min_msun > 0.0) || !(p.ssp_imf_mass_max_msun > p.ssp_imf_mass_min_msun) ||
@@ -2064,6 +2092,10 @@ void validateConfig(const SimulationConfig& config) {
       {config.physics.chemistry_adaptive_min_dwell_years, "physics.chemistry_adaptive_min_dwell_years"},
       {config.physics.chemistry_adaptive_cold_temperature_k, "physics.chemistry_adaptive_cold_temperature_k"},
       {config.physics.chemistry_adaptive_cooling_time_ratio, "physics.chemistry_adaptive_cooling_time_ratio"},
+      {config.physics.chemistry_adaptive_error_estimate_threshold,
+       "physics.chemistry_adaptive_error_estimate_threshold"},
+      {config.physics.chemistry_adaptive_residual_fraction_threshold,
+       "physics.chemistry_adaptive_residual_fraction_threshold"},
       {config.physics.chemistry_adaptive_dense_nh_cm3, "physics.chemistry_adaptive_dense_nh_cm3"},
       {config.physics.chemistry_shadow_sample_fraction, "physics.chemistry_shadow_sample_fraction"},
       {config.physics.ssp_imf_mass_min_msun, "physics.ssp_imf_mass_min_msun"},
@@ -2147,6 +2179,19 @@ void validateConfig(const SimulationConfig& config) {
   // CHUI Part 3 automatic AMR regrid.
   if (config.numerics.amr_regrid_interval_steps < 1 || config.numerics.amr_regrid_max_operations < 1) {
     throw ConfigError("numerics.amr_regrid_interval_steps and numerics.amr_regrid_max_operations must be >= 1");
+  }
+  if (!std::isfinite(config.numerics.v02_optional_memory_headroom_fraction) ||
+      !(config.numerics.v02_optional_memory_headroom_fraction > 0.0) ||
+      config.numerics.v02_optional_memory_headroom_fraction > 1.0) {
+    throw ConfigError(
+        "numerics.v02_optional_memory_headroom_fraction must be finite and in (0, 1]");
+  }
+  if (config.numerics.v02_control_mode == V02ControlMode::kJointErrorResourceV1 &&
+      (config.numerics.amr_regrid_mode != AmrRegridConfigMode::kAutomatic ||
+       config.physics.chemistry_adaptive_selection != ChemistryAdaptiveSelectionConfig::kLocalV1)) {
+    throw ConfigError(
+        "numerics.v02_control_mode=joint_error_resource_v1 requires automatic AMR and "
+        "physics.chemistry_adaptive_selection=local_v1");
   }
   if (!std::isfinite(config.numerics.amr_refine_cell_mass_code) || config.numerics.amr_refine_cell_mass_code < 0.0 ||
       !std::isfinite(config.numerics.amr_refine_jump_threshold) || config.numerics.amr_refine_jump_threshold < 0.0 ||
@@ -3088,6 +3133,12 @@ class NormalizedConfigStream {
   stream << "gravity_timestep_eta = " << frozen.config.numerics.gravity_timestep_eta << '\n';
   stream << "amr_max_level = " << frozen.config.numerics.amr_max_level << '\n';
   stream << "amr_regrid_mode = " << amrRegridConfigModeToString(frozen.config.numerics.amr_regrid_mode) << '\n';
+  stream << "amr_force_resolution_policy = "
+         << amrForceResolutionPolicyToString(frozen.config.numerics.amr_force_resolution_policy) << '\n';
+  stream << "v02_control_mode = "
+         << v02ControlModeToString(frozen.config.numerics.v02_control_mode) << '\n';
+  stream << "v02_optional_memory_headroom_fraction = "
+         << frozen.config.numerics.v02_optional_memory_headroom_fraction << '\n';
   stream << "global_step_max_retries = " << frozen.config.numerics.global_step_max_retries << '\n';
   stream << "amr_time_stepping = " << amrTimeSteppingConfigModeToString(frozen.config.numerics.amr_time_stepping) << '\n';
   stream << "amr_predictive_feedback_age_years = " << frozen.config.numerics.amr_predictive_feedback_age_years << '\n';
@@ -3340,6 +3391,10 @@ class NormalizedConfigStream {
   stream << "chemistry_adaptive_min_dwell_years = " << frozen.config.physics.chemistry_adaptive_min_dwell_years << '\n';
   stream << "chemistry_adaptive_cold_temperature_k = " << frozen.config.physics.chemistry_adaptive_cold_temperature_k << '\n';
   stream << "chemistry_adaptive_cooling_time_ratio = " << frozen.config.physics.chemistry_adaptive_cooling_time_ratio << '\n';
+  stream << "chemistry_adaptive_error_estimate_threshold = "
+         << frozen.config.physics.chemistry_adaptive_error_estimate_threshold << '\n';
+  stream << "chemistry_adaptive_residual_fraction_threshold = "
+         << frozen.config.physics.chemistry_adaptive_residual_fraction_threshold << '\n';
   stream << "chemistry_adaptive_dense_nh_cm3 = " << frozen.config.physics.chemistry_adaptive_dense_nh_cm3 << '\n';
   stream << "chemistry_shadow_sample_fraction = " << frozen.config.physics.chemistry_shadow_sample_fraction << '\n';
   stream << "ssp_imf_mass_min_msun = " << frozen.config.physics.ssp_imf_mass_min_msun << '\n';
@@ -3871,6 +3926,15 @@ class NormalizedConfigStream {
       requireString(entries, consumed, "numerics.amr_max_level", "10"), "numerics.amr_max_level");
   frozen.config.numerics.amr_regrid_mode = parseAmrRegridConfigMode(requireString(
       entries, consumed, "numerics.amr_regrid_mode", defaultFor("numerics.amr_regrid_mode")));
+  frozen.config.numerics.amr_force_resolution_policy = parseAmrForceResolutionPolicy(requireString(
+      entries, consumed, "numerics.amr_force_resolution_policy",
+      defaultFor("numerics.amr_force_resolution_policy")));
+  frozen.config.numerics.v02_control_mode = parseV02ControlMode(requireString(
+      entries, consumed, "numerics.v02_control_mode", defaultFor("numerics.v02_control_mode")));
+  frozen.config.numerics.v02_optional_memory_headroom_fraction = parseFloating(
+      requireString(entries, consumed, "numerics.v02_optional_memory_headroom_fraction",
+                    defaultFor("numerics.v02_optional_memory_headroom_fraction")),
+      "numerics.v02_optional_memory_headroom_fraction");
   frozen.config.numerics.amr_predictive_feedback_age_years = parseFloating(
       requireString(entries, consumed, "numerics.amr_predictive_feedback_age_years",
                     defaultFor("numerics.amr_predictive_feedback_age_years")), "numerics.amr_predictive_feedback_age_years");
@@ -4427,6 +4491,12 @@ class NormalizedConfigStream {
   frozen.config.physics.chemistry_adaptive_cooling_time_ratio = parseFloating(
       requireString(entries, consumed, "physics.chemistry_adaptive_cooling_time_ratio", "0.0"),
       "physics.chemistry_adaptive_cooling_time_ratio");
+  frozen.config.physics.chemistry_adaptive_error_estimate_threshold = parseFloating(
+      requireString(entries, consumed, "physics.chemistry_adaptive_error_estimate_threshold", "0.0"),
+      "physics.chemistry_adaptive_error_estimate_threshold");
+  frozen.config.physics.chemistry_adaptive_residual_fraction_threshold = parseFloating(
+      requireString(entries, consumed, "physics.chemistry_adaptive_residual_fraction_threshold", "0.0"),
+      "physics.chemistry_adaptive_residual_fraction_threshold");
   frozen.config.physics.chemistry_adaptive_dense_nh_cm3 = parseFloating(
       requireString(entries, consumed, "physics.chemistry_adaptive_dense_nh_cm3", "1.0"), "physics.chemistry_adaptive_dense_nh_cm3");
   frozen.config.physics.chemistry_shadow_sample_fraction = parseFloating(
@@ -5112,6 +5182,24 @@ std::string amrRegridConfigModeToString(AmrRegridConfigMode mode) {
     case AmrRegridConfigMode::kAutomatic: return "automatic";
   }
   throw ConfigError("unhandled AmrRegridConfigMode enum value during serialization");
+}
+
+std::string amrForceResolutionPolicyToString(AmrForceResolutionPolicy mode) {
+  switch (mode) {
+    case AmrForceResolutionPolicy::kAllowCountedReference:
+      return "allow_counted_reference";
+    case AmrForceResolutionPolicy::kLimitOptionalRejectMandatory:
+      return "limit_optional_reject_mandatory";
+  }
+  throw ConfigError("unhandled AmrForceResolutionPolicy enum value during serialization");
+}
+
+std::string v02ControlModeToString(V02ControlMode mode) {
+  switch (mode) {
+    case V02ControlMode::kFixedReference: return "fixed_reference";
+    case V02ControlMode::kJointErrorResourceV1: return "joint_error_resource_v1";
+  }
+  throw ConfigError("unhandled V02ControlMode enum value during serialization");
 }
 
 std::string nodeMemoryAdmissionModeToString(NodeMemoryAdmissionMode mode) {

@@ -64,6 +64,11 @@ struct ChemistryAdaptiveConfig {
   // followed); demotion additionally requires t_cool > ratio dt (1 + h).
   // 0 disables. EXPERIMENTAL/UNQUALIFIED (uncalibrated).
   double cooling_time_ratio = 0.0;
+  // Previous accepted, normalized integrator-error and conservative residual
+  // history. Zero disables. These use persisted per-cell history and thus do
+  // not depend on row order, rank, retry, or restart.
+  double error_estimate_threshold = 0.0;
+  double residual_fraction_threshold = 0.0;
 };
 
 struct ChemistryAdaptiveReport {
@@ -71,6 +76,7 @@ struct ChemistryAdaptiveReport {
   std::uint64_t demoted = 0U;
   std::uint64_t held_by_dwell = 0U;
   std::uint64_t promoted_by_cooling_time = 0U;  // R3: promotions where the timescale criterion fired
+  std::uint64_t promoted_by_error_history = 0U;
   std::uint64_t detailed_cells = 0U;
   std::uint64_t hybrid_cells = 0U;
 };
@@ -130,6 +136,7 @@ struct ChemistryFidelityDecision {
   bool demoted = false;
   bool held_by_dwell = false;
   bool cooling_time_trigger = false;  // R3: the timescale criterion requested detailed chemistry
+  bool error_history_trigger = false;
   double cooling_time_seconds = 0.0;  // diagnostic (+inf when net heating)
 };
 

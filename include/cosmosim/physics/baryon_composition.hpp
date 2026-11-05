@@ -107,6 +107,9 @@ struct CompositionLayoutRequest {
   CompositionNetworkKind network = CompositionNetworkKind::kElementsOnly;
   CompositionDustKind dust = CompositionDustKind::kNone;
   bool sgs_energy = false;
+  // Storage policy only: preserve the scientific lane manifest/signature,
+  // but materialize the detailed C+/CO suffix only for adaptive rows.
+  bool adaptive_sparse_detailed = false;
 };
 
 struct CompositionLane {
@@ -137,11 +140,23 @@ class CompositionLayout {
   [[nodiscard]] bool hasSgs() const noexcept {
     return m_descriptor.sgs_energy_lane != core::GasCompositionLayoutDescriptor::k_no_lane;
   }
+  [[nodiscard]] bool sparseDetailedStorage() const noexcept {
+    return !m_sparse_default_source_lanes.empty();
+  }
+  [[nodiscard]] std::uint32_t sparseLaneBegin() const noexcept {
+    return sparseDetailedStorage()
+        ? m_descriptor.species_lane_begin + static_cast<std::uint32_t>(k_hybrid_species_count)
+        : core::GasCompositionLayoutDescriptor::k_no_lane;
+  }
+  [[nodiscard]] std::span<const std::uint32_t> sparseDefaultSourceLanes() const noexcept {
+    return m_sparse_default_source_lanes;
+  }
 
  private:
   CompositionLayoutRequest m_request{};
   core::GasCompositionLayoutDescriptor m_descriptor{};
   std::vector<CompositionLane> m_lanes;
+  std::vector<std::uint32_t> m_sparse_default_source_lanes;
 };
 
 // Dust reservoir stoichiometry (mass fraction of each element in the solid).
@@ -212,7 +227,7 @@ std::array<double, k_chemical_element_count> removeGasFractionFromComposition(
 
 // ---------------------------------------------------------------------------
 // Restart persistence (CHUI Part 2). The composition sidecar is checkpointed
-// as the run-persistent module block "chui_gas_composition_v1" (schema 1):
+// as the run-persistent module block "chui_gas_composition_v1" (schema 3):
 //   u32 layout_version, u64 layout_signature, u32 lane_count,
 //   u64 row_count, then per row: u64 gas_cell_id, f64 x packedRowWidth().
 // The block is refreshed immediately before each restart write (it is a
@@ -222,6 +237,7 @@ std::array<double, k_chemical_element_count> removeGasFractionFromComposition(
 // layout signature mismatch or a width mismatch is refused.
 // ---------------------------------------------------------------------------
 inline constexpr const char* k_gas_composition_module = "chui_gas_composition_v1";
+inline constexpr std::uint32_t k_gas_composition_schema = 3U;
 void packGasCompositionIntoModuleSidecar(core::SimulationState& state);
 // Returns true when the sidecar was restored from the module block.
 bool restoreGasCompositionFromModuleSidecar(core::SimulationState& state, const CompositionLayout& layout);

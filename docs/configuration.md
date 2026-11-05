@@ -815,10 +815,12 @@ Handoff: `docs/repair/chui_part2_thermochemistry_stellar_physics_20261103.md`.
 | `ism_regime_model` | `legacy` \| `effective_or_resolved` | required with Part 2 + effective SF |
 | `ism_jeans_resolution_cells`, `ism_regime_hysteresis_fraction`, `ism_regime_min_dwell_years` | 4, 0.2, 1e6 | regime criterion |
 | `sgs_turbulence_model` | `none` \| `budgeted_v1` | research closure |
-| `sgs_dissipation_coefficient`, `sgs_eddy_viscosity_coefficient`, `sgs_feedback_energy_fraction` | 1.58, 0.05, 0 | |
+| `sgs_dissipation_coefficient`, `sgs_eddy_viscosity_coefficient`, `sgs_feedback_energy_fraction` | 1.58, 0.05, 0 | `budgeted_v1`: exact SGS-to-thermal decay; traceless resolved stress with `nu_t = C_v Delta^2 |S*|`, conservative momentum/stress-work update and equal resolved-to-SGS production transfer; exclusive feedback share. The explicit stress stage enforces its parabolic stability bound. EXPERIMENTAL/UNQUALIFIED. |
 | `chemistry_adaptive_selection` | `off` \| `local_v1` | requires `fixed_detailed` |
 | `chemistry_adaptive_hysteresis_fraction`, `chemistry_adaptive_min_dwell_years`, `chemistry_adaptive_cold_temperature_k`, `chemistry_adaptive_dense_nh_cm3` | 0.3, 1e6, 3e3, 1 | |
 | `chemistry_adaptive_cooling_time_ratio` | 0 | R3, EXPERIMENTAL/UNQUALIFIED. Promotes a row to detailed chemistry when the network's net cooling time `u / (Lambda + chemical - Gamma)` is shorter than `ratio x interval` (stiff, rapidly cooling gas). Demotion additionally requires `t_cool > ratio x interval x (1 + h)`. The global promotion bias scales the ratio. 0 disables. Counted in the source event as `fidelity_promoted_by_cooling_time`. |
+| `chemistry_adaptive_error_estimate_threshold` | 0 | C03, EXPERIMENTAL/UNQUALIFIED. Promotes from the previous accepted normalized local solver-error estimate; demotion requires the stored value below the hysteretic lower threshold. 0 disables. |
+| `chemistry_adaptive_residual_fraction_threshold` | 0 | C03, EXPERIMENTAL/UNQUALIFIED. Promotes from the maximum of the previous dimensionless element-projection and charge residuals; demotion uses the hysteretic lower threshold. 0 disables. |
 | `chemistry_shadow_sample_fraction`, `chemistry_shadow_max_cells` | 0, 0 | bounded shadow reference sampling |
 | `stellar_population_model` | `legacy_table` \| `chabrier_reference_v1` \| `chabrier_yield_table_v1` | Part 2 SSP; table mode needs `ssp_yield_table_path` |
 | `ssp_yield_table_path`, `ssp_yield_table_sha256` | "" | `chui_ssp_yield_table_v1` |
@@ -844,15 +846,18 @@ with every key at its default (exact restart projection).
 |---|---|---|---|
 | `amr_regrid_mode` | `off` \| `automatic` | `off` | `automatic` refines/derefines production AMR at synchronized hierarchy boundaries (after hydro sweep, reflux and composition commit). `off` keeps the static hierarchy. |
 | `amr_regrid_interval_steps` | int >= 1 | `1` | Regrid every N accepted steps. Passes alternate refine-only / derefine-only (2:1 face balance without exchanging decisions across ranks). |
-| `amr_regrid_max_operations` | int >= 1 | `64` | Deterministic per-pass budget (ascending patch id). |
+| `amr_regrid_max_operations` | int >= 1 | `64` | Deterministic optional-operation budget per pass. Fixed-reference mode uses ascending patch id; joint V02 mode uses the documented typed benefit/cost order with patch id as its final tie-breaker. |
+| `amr_force_resolution_policy` | enum | `limit_optional_reject_mandatory` | A03 force-resolution action. `limit_optional_reject_mandatory` refuses optional refinement below gas softening and fails explicitly if a mandatory mass/Jeans/cooling request would cross it; `allow_counted_reference` preserves the historical counted/unqualified reference. |
+| `v02_control_mode` | enum | `fixed_reference` | `fixed_reference` keeps chemistry shadow control and AMR operation budgets independent. `joint_error_resource_v1` persists their shared controller state, reserves observed sparse-chemistry growth, and ranks optional AMR by typed benefit/cell-step, MPI-face, churn and RAM costs. Requires automatic AMR and adaptive chemistry. |
+| `v02_optional_memory_headroom_fraction` | double in (0,1] | `0.5` | Fraction of remaining governor headroom available to optional AMR in joint V02 mode after the collective old/new hierarchy copy and observed chemistry-growth reserve. Mandatory refinement is never reduced by this budget. |
 | `amr_refine_cell_mass_code` | double >= 0 | `0.0` | Refine when the comoving cell mass `rho_com dx^3` exceeds it (0 disables). |
 | `amr_refine_jump_threshold` | double >= 0 | `0.0` | Refine when `max(|drho|/rho_min, |dP|/P_min)` over in-patch face neighbours exceeds it (contact/shock indicator; 0 disables). |
 | `amr_refine_jeans_cells` | double >= 0 | `4.0` | Truelove criterion on the comoving Jeans length `c_s sqrt(pi a/(G rho_com))` (0 disables). |
 | `amr_derefine_hysteresis` | (0, 1] | `0.5` | Derefinement requires every criterion to be below `hysteresis x threshold` (Jeans: above `threshold / hysteresis`). |
-| `amr_refine_cooling_length_cells` | double >= 0 | `0.0` | **Mandatory** (2026-11-04). Refine when the cooling length `c_s t_cool` spans fewer than N cells (physical lengths). Legacy cooling evaluates `t_cool = e / (Lambda_net n_H^2 / rho)` from its in-solver provider; Part-2 backends publish `t_cool` from the same thermochemistry solver/rate set that evolves the gas. Net heating imposes no constraint. Requires `enable_cooling = true`. |
+| `amr_refine_cooling_length_cells` | double >= 0 | `0.0` | **Mandatory** (2026-11-04). Refine when the cooling length `c_s t_cool` spans fewer than N cells (physical lengths). Legacy cooling evaluates `t_cool = e / (Lambda_net n_H^2 / rho)` through its in-solver provider; Part 2 backends publish the accepted per-cell `t_cool` from their owning rate set in `GasCompositionSidecar`. Net heating imposes no constraint. Requires `enable_cooling = true`. |
 | `amr_refine_metallicity_jump` | double >= 0 | `0.0` | Optional. Refine when `max |Z_a - Z_b| / max(Z_a, Z_b, 1e-6)` over in-patch face neighbours exceeds it. |
 | `amr_refine_species_jump` | double >= 0 | `0.0` | Optional. Refine when the maximum absolute jump of a species mass fraction (composition gas mass) over in-patch face neighbours exceeds it. Requires `fixed_hybrid` or `fixed_detailed`. |
-| `amr_predictive_event_lookahead_years` | double >= 0 | `0.0` | R2 (RESEARCH). A star's host cell, both now and at its drifted position `x + v dt / a`, is refined when that star's own event chronology produces a core-collapse or Ia event within this window. The chronology is the cumulative-Poisson thresholds of its population record, evaluated on a copy; no ordinal is consumed and no budget changes. In expectation mode (no stochastic events) the criterion is at least 0.5 expected events, which is a heuristic. Requires `amr_regrid_mode = automatic` and a Part 2 population model. Forced rows are optional-priority refinements, and they also block derefinement. Limitation: a drifted host cell on another rank is not forced. |
+| `amr_predictive_event_lookahead_years` | double >= 0 | `0.0` | R2 (RESEARCH). A star's host cell, both now and at its drifted position `x + v dt / a`, is refined when that star's own event chronology produces a core-collapse or Ia event within this window. The chronology is the cumulative-Poisson thresholds of its population record, evaluated on a copy; no ordinal is consumed and no budget changes. In expectation mode (no stochastic events) the criterion is at least 0.5 expected events, which is a heuristic. Requires `amr_regrid_mode = automatic` and a Part 2 population model. Forecast positions are exchanged collectively, so a host crossing an MPI boundary is forced by its owning rank. Forced rows are optional-priority refinements, and they also block derefinement. |
 | `amr_refine_vorticity` | double >= 0 | `0.0` | Optional. Refine when `|curl v| dx / c_s` (comoving gradients and widths, so the value is scale-free) exceeds it. |
 
 **Mandatory versus optional (R1).**
@@ -861,8 +866,11 @@ with every key at its default (exact restart projection).
   is never derefined.
 - Optional criteria: the jump indicator, metallicity, species and vorticity.
   The per-pass budget truncates these first.
-- A truncated mandatory request is reported in the
-  `hydro.amr_automatic_regrid` event as `mandatory_truncated_by_budget`.
+- Mandatory requests bypass operation/RAM budgets. If `amr_max_level`, the
+  current 2:1 hierarchy, or the selected force-resolution policy prevents
+  them, planning fails explicitly and collectively instead of silently
+  accepting an under-resolved state. The legacy
+  `mandatory_truncated_by_budget` telemetry field therefore remains zero.
 - Every stencil uses in-patch neighbours, so decisions are identical on any
   MPI decomposition.
 

@@ -1444,7 +1444,7 @@ void writeScienceSnapshotHdf5(
       add_double("Pressure");
     }
     // CHUI Part 3 Checkpoint G: science-state export of the composition
-    // sidecar (schema CHUI_CompositionSchemaVersion = 1, see
+    // sidecar (schema CHUI_CompositionSchemaVersion = 3, see
     // docs/output_schema.md). Present iff the run carries a composition
     // sidecar (identical decision on every rank: the layout is part of the
     // configuration); absent datasets mean "physics disabled", never zero.
@@ -1468,10 +1468,16 @@ void writeScienceSnapshotHdf5(
         }
         return joined;
       };
-      writeScalarUint32Attribute(type_group.get(), "CHUI_CompositionSchemaVersion", 1U);
+      writeScalarUint32Attribute(type_group.get(), "CHUI_CompositionSchemaVersion",
+                                 physics::k_gas_composition_schema);
       writeScalarStringAttribute(type_group.get(), "CHUI_CompositionLayoutName", composition_descriptor.layout_name);
       writeScalarStringAttribute(type_group.get(), "CHUI_CompositionFractionBasis",
                                  "lane_mass / (sum(element lanes) + sum(dust lanes))");
+      writeScalarStringAttribute(
+          type_group.get(), "CHUI_DetailedChemistryStorage",
+          state.gas_composition.sparseStorageEnabled()
+              ? "adaptive_sparse_by_gas_cell_id"
+              : "dense_reference");
       writeScalarStringAttribute(type_group.get(), "CHUI_ElementNames",
                                  names(composition_descriptor.element_lane_begin, composition_descriptor.element_lane_count));
       composition_elements_ds.emplace(createStreamingDataset(
@@ -1494,9 +1500,17 @@ void writeScienceSnapshotHdf5(
       if (composition_sgs) add_double("CHUI_SgsSpecificEnergy");
       add_double("CHUI_MeanMolecularWeight");
       add_u8("CHUI_ChemistryModelTag");
+      add_u8("CHUI_DetailedChemistryStateMaterialized");
       add_u8("CHUI_IsmRegimeTag");
       add_double("CHUI_ChemistryModelDwellYears");
       add_double("CHUI_IsmRegimeDwellYears");
+      add_double("CHUI_ChemistryLastTemperatureK");
+      add_double("CHUI_ChemistryLastCoolingTimeSeconds");
+      add_double("CHUI_ChemistryLastErrorEstimate");
+      add_double("CHUI_ChemistryLastElementFractionResidual");
+      add_double("CHUI_ChemistryLastChargeResidual");
+      add_double("CHUI_ChemistryCumulativeRadiativeLossErg");
+      add_double("CHUI_ChemistryCumulativeHeatingGainErg");
     }
     // Stellar population science state (PartType4), present iff a Part 2
     // stellar population model is configured (rank-uniform decision).
@@ -1507,7 +1521,9 @@ void writeScienceSnapshotHdf5(
         config.physics.stellar_population_model != core::StellarPopulationModelConfig::kLegacyTable;
     std::optional<physics::StellarPopulationStore> population_store;
     if (population_out) {
-      writeScalarUint32Attribute(type_group.get(), "CHUI_StellarPopulationSchemaVersion", 1U);
+      writeScalarUint32Attribute(
+          type_group.get(), "CHUI_StellarPopulationSchemaVersion",
+          physics::k_stellar_population_schema);
       writeScalarStringAttribute(type_group.get(), "CHUI_StellarChannelOrder", "AGB,CC,Ia");
       star_channel_mass_ds.emplace(createStreamingDataset(
           type_group.get(), "CHUI_StellarReturnedMassByChannel", H5T_IEEE_F64LE, file_row_count, 3U, policy));
@@ -1521,6 +1537,9 @@ void writeScienceSnapshotHdf5(
       add_u32("CHUI_SnIaRealized");
       add_u64("CHUI_EventStreamKey");
       add_u8("CHUI_PopulationRecordInitialized");
+      add_double("CHUI_ChronologyTimeCode");
+      add_u64("CHUI_ChronologyStepIndex");
+      add_u8("CHUI_ChronologyInitialized");
       population_store.emplace(state);
     }
 
@@ -1695,10 +1714,32 @@ void writeScienceSnapshotHdf5(
           write_double_extra("CHUI_IsmRegimeDwellYears", d3.data(), offset, count);
           write_u8_extra("CHUI_ChemistryModelTag", u80.data(), offset, count);
           write_u8_extra("CHUI_IsmRegimeTag", u81.data(), offset, count);
+          for (std::size_t j = 0; j < count; ++j) {
+            u80[j] = sidecar.hasExplicitSparseRow(offset + j) ? 1U : 0U;
+          }
+          write_u8_extra(
+              "CHUI_DetailedChemistryStateMaterialized", u80.data(), offset, count);
+          for (std::size_t j = 0; j < count; ++j) {
+            const std::size_t row = offset + j;
+            d0[j] = sidecar.chemistry_last_temperature_k[row];
+            d1[j] = sidecar.chemistry_last_cooling_time_seconds[row];
+            d2[j] = sidecar.chemistry_last_error_estimate[row];
+            d3[j] = sidecar.chemistry_last_element_fraction_residual[row];
+            d4[j] = sidecar.chemistry_last_charge_residual[row];
+            d5[j] = sidecar.chemistry_cumulative_radiative_loss_erg[row];
+            d6[j] = sidecar.chemistry_cumulative_heating_gain_erg[row];
+          }
+          write_double_extra("CHUI_ChemistryLastTemperatureK", d0.data(), offset, count);
+          write_double_extra("CHUI_ChemistryLastCoolingTimeSeconds", d1.data(), offset, count);
+          write_double_extra("CHUI_ChemistryLastErrorEstimate", d2.data(), offset, count);
+          write_double_extra("CHUI_ChemistryLastElementFractionResidual", d3.data(), offset, count);
+          write_double_extra("CHUI_ChemistryLastChargeResidual", d4.data(), offset, count);
+          write_double_extra("CHUI_ChemistryCumulativeRadiativeLossErg", d5.data(), offset, count);
+          write_double_extra("CHUI_ChemistryCumulativeHeatingGainErg", d6.data(), offset, count);
         }
         const std::uint64_t staging_bytes = static_cast<std::uint64_t>(
             count * (6U * sizeof(double) + sizeof(double) + sizeof(std::uint64_t) +
-                     10U * sizeof(double) + 3U * sizeof(std::uint64_t) + 2U * sizeof(std::uint8_t)));
+                     17U * sizeof(double) + 3U * sizeof(std::uint64_t) + 3U * sizeof(std::uint8_t)));
         const std::uint64_t logical_bytes = staging_bytes;
         write_metrics.observe(staging_bytes, logical_bytes);
       }
@@ -1816,6 +1857,9 @@ void writeScienceSnapshotHdf5(
               u321[j] = record.ia_realized;
               u640[j] = record.event_stream_key;
               u80[j] = has && record.initialized != 0U ? 1U : 0U;
+              d1[j] = record.chronology_time_code;
+              u641[j] = record.chronology_step_index;
+              u81[j] = has && record.chronology_initialized != 0U ? 1U : 0U;
             }
             writeStreamingChunk(*star_channel_mass_ds, H5T_NATIVE_DOUBLE, channel.data(), file_row_base + output_offset, count);
             writeStreamingChunk(*star_channel_energy_ds, H5T_NATIVE_DOUBLE, energy.data(), file_row_base + output_offset, count);
@@ -1825,6 +1869,9 @@ void writeScienceSnapshotHdf5(
             write_u32_extra("CHUI_SnIaRealized", u321.data(), output_offset, count);
             write_u64_extra("CHUI_EventStreamKey", u640.data(), output_offset, count);
             write_u8_extra("CHUI_PopulationRecordInitialized", u80.data(), output_offset, count);
+            write_double_extra("CHUI_ChronologyTimeCode", d1.data(), output_offset, count);
+            write_u64_extra("CHUI_ChronologyStepIndex", u641.data(), output_offset, count);
+            write_u8_extra("CHUI_ChronologyInitialized", u81.data(), output_offset, count);
           }
         } else if (type_index == 3U) {
           write_u64_extra("TracerParentParticleID", u640.data(), output_offset, count);

@@ -7,6 +7,7 @@
 #include "amr/internal/amr_periodic_topology.hpp"
 #include "cosmosim/core/memory_accounting.hpp"
 #include "cosmosim/core/governed_scratch_arena.hpp"
+#include "cosmosim/core/retained_capacity_transaction.hpp"
 
 #include <algorithm>
 #include <array>
@@ -230,7 +231,11 @@ constexpr double k_geometry_tol = 1.0e-10;
 }
 
 [[nodiscard]] bool intervalsOverlap(double a0, double a1, double b0, double b1) {
-  return std::max(a0, b0) < std::min(a1, b1) + k_geometry_tol;
+  const double overlap = std::min(a1, b1) - std::max(a0, b0);
+  const double scale = std::max({1.0, std::abs(a0), std::abs(a1), std::abs(b0), std::abs(b1)});
+  // A face neighbour must share positive transverse area. Edge/corner-only
+  // contact is not a hydro face and must not create ghosts or flux registers.
+  return overlap > k_geometry_tol * scale;
 }
 
 [[nodiscard]] bool touchesOnSide(
@@ -842,18 +847,47 @@ struct CompositionRegridPlan {
 };
 
 [[nodiscard]] std::uint64_t compositionCandidateBytes(
-    const core::SimulationState& state, std::size_t candidate_rows, std::size_t plan_entries) {
+    const core::SimulationState& state, std::size_t candidate_rows,
+    std::size_t sparse_candidate_rows, std::size_t plan_entries) {
   if (!state.gas_composition.enabled()) {
     return 0U;
   }
+  const std::size_t dense_lanes = state.gas_composition.laneCount() -
+      state.gas_composition.sparseLaneCount();
   const std::size_t per_row = core::checkedSizeAdd(
-      core::checkedSizeMultiply(state.gas_composition.laneCount(), sizeof(double), "composition lanes"),
-      sizeof(std::uint64_t) + 2U * sizeof(std::uint8_t) + 3U * sizeof(double),
+      core::checkedSizeMultiply(dense_lanes, sizeof(double), "dense composition lanes"),
+      sizeof(std::uint64_t) + 2U * sizeof(std::uint8_t) + 10U * sizeof(double),
       "composition row bytes");
-  return core::checkedMemoryBytesAdd(
+  const std::uint64_t dense_bytes = core::checkedMemoryBytesAdd(
       static_cast<std::uint64_t>(core::checkedSizeMultiply(candidate_rows, per_row, "composition candidate bytes")),
       CompositionRegridPlan::workspaceBytes(candidate_rows, plan_entries),
       "composition regrid bytes");
+  const std::size_t sparse_row_bytes = core::checkedSizeAdd(
+      sizeof(std::uint64_t),
+      core::checkedSizeMultiply(state.gas_composition.sparseLaneCount(), sizeof(double),
+                                "sparse composition values"),
+      "sparse composition row bytes");
+  return core::checkedMemoryBytesAdd(
+      dense_bytes,
+      static_cast<std::uint64_t>(core::checkedSizeMultiply(
+          sparse_candidate_rows, sparse_row_bytes, "sparse composition candidate bytes")),
+      "composition regrid sparse bytes");
+}
+
+[[nodiscard]] std::size_t sparseRowsForRegridPlan(
+    const core::GasCompositionSidecar& old,
+    const CompositionRegridPlan& plan) {
+  if (!old.sparseStorageEnabled()) return 0U;
+  std::size_t count = 0U;
+  for (std::size_t row = 0; row < plan.rowCount(); ++row) {
+    for (std::uint32_t entry = plan.offsets[row]; entry < plan.offsets[row + 1U]; ++entry) {
+      if (old.hasExplicitSparseRow(plan.source_rows[entry])) {
+        ++count;
+        break;
+      }
+    }
+  }
+  return count;
 }
 
 // Build the candidate composition sidecar aligned to candidate rows.
@@ -862,8 +896,11 @@ struct CompositionRegridPlan {
 // restriction takes the most detailed chemistry tag among the children (no
 // tracked species is ever discarded by a demotion at regrid), the ISM regime
 // of the most massive child (lowest source row on ties: deterministic), the
-// minimum dwell (hysteresis restarts conservatively) and an unknown (NaN)
-// mean molecular weight that the next chemistry/refresh rebuilds.
+// minimum dwell (hysteresis restarts conservatively), maximum accepted error
+// and residuals, minimum finite cooling time, the heaviest child's last
+// temperature, and an unknown (NaN) mean molecular weight that the next
+// chemistry/refresh rebuilds. Cumulative radiative/heating energies use the
+// same conservative weights as extensive composition lanes.
 [[nodiscard]] core::GasCompositionSidecar buildRegriddedComposition(
     const core::SimulationState& old_state,
     const core::SimulationState& candidate,
@@ -874,11 +911,19 @@ struct CompositionRegridPlan {
   }
   old.requireAlignedWith(old_state.gas_cells.gas_cell_id, "composition regrid source");
   core::GasCompositionSidecar result = old.emptyLike(candidate.cells.size());
+  if (result.sparseStorageEnabled()) {
+    core::RetainedCapacityTransaction sparse_capacity(
+        [&result] { return result.ownedCapacityBytes(); });
+    result.planSparseRowCapacity(sparse_capacity, sparseRowsForRegridPlan(old, plan));
+    sparse_capacity.execute(nullptr, core::MemoryClass::kCanonicalPersistent,
+                            "amr.regrid.adaptive_chemistry_rows");
+  }
   const std::size_t lanes = old.laneCount();
   std::vector<double> before(lanes, 0.0);
   std::vector<double> scale(lanes, 0.0);
   for (std::size_t lane = 0; lane < lanes; ++lane) {
-    for (const double value : old.lane(lane)) {
+    for (std::size_t row = 0; row < old.rowCount(); ++row) {
+      const double value = old.value(lane, row);
       before[lane] += value;
       scale[lane] += std::abs(value);
     }
@@ -890,6 +935,12 @@ struct CompositionRegridPlan {
       throw std::logic_error("composition regrid plan row has no source");
     }
     result.gas_cell_id[row] = candidate.gas_cells.gas_cell_id[row];
+    for (std::uint32_t entry = begin; entry < end; ++entry) {
+      if (old.hasExplicitSparseRow(plan.source_rows[entry])) {
+        result.activateSparseRow(row);
+        break;
+      }
+    }
     for (std::size_t lane = 0; lane < lanes; ++lane) {
       double value = 0.0;
       for (std::uint32_t entry = begin; entry < end; ++entry) {
@@ -907,18 +958,55 @@ struct CompositionRegridPlan {
       result.ism_regime_tag[row] = old.ism_regime_tag[src];
       result.model_dwell_years[row] = old.model_dwell_years[src];
       result.ism_regime_dwell_years[row] = old.ism_regime_dwell_years[src];
+      result.chemistry_last_temperature_k[row] =
+          old.chemistry_last_temperature_k[src];
+      result.chemistry_last_cooling_time_seconds[row] =
+          old.chemistry_last_cooling_time_seconds[src];
+      result.chemistry_last_error_estimate[row] =
+          old.chemistry_last_error_estimate[src];
+      result.chemistry_last_element_fraction_residual[row] =
+          old.chemistry_last_element_fraction_residual[src];
+      result.chemistry_last_charge_residual[row] =
+          old.chemistry_last_charge_residual[src];
+      result.chemistry_cumulative_radiative_loss_erg[row] =
+          plan.weights[begin] * old.chemistry_cumulative_radiative_loss_erg[src];
+      result.chemistry_cumulative_heating_gain_erg[row] =
+          plan.weights[begin] * old.chemistry_cumulative_heating_gain_erg[src];
       result.mean_molecular_weight[row] = old.mean_molecular_weight[src];
       continue;
     }
-    std::uint8_t tag = 0U;
+    std::uint8_t tag = old.chemistry_model_tag[plan.source_rows[begin]];
     double dwell = std::numeric_limits<double>::infinity();
     double regime_dwell = std::numeric_limits<double>::infinity();
+    double minimum_cooling_time = std::numeric_limits<double>::infinity();
+    double maximum_error = 0.0;
+    double maximum_element_residual = 0.0;
+    double maximum_charge_residual = 0.0;
+    double cumulative_radiative_loss = 0.0;
+    double cumulative_heating_gain = 0.0;
     std::uint32_t heaviest = plan.source_rows[begin];
     for (std::uint32_t entry = begin; entry < end; ++entry) {
       const std::uint32_t src = plan.source_rows[entry];
-      tag = std::max(tag, old.chemistry_model_tag[src]);
+      // Tag 0 is detailed and tag 1 is hybrid: restriction retains the most
+      // detailed source so an explicit molecular history is never hidden.
+      tag = std::min(tag, old.chemistry_model_tag[src]);
       dwell = std::min(dwell, old.model_dwell_years[src]);
       regime_dwell = std::min(regime_dwell, old.ism_regime_dwell_years[src]);
+      const double cooling_time = old.chemistry_last_cooling_time_seconds[src];
+      if (cooling_time > 0.0) {
+        minimum_cooling_time = std::min(minimum_cooling_time, cooling_time);
+      }
+      maximum_error = std::max(maximum_error,
+                               old.chemistry_last_error_estimate[src]);
+      maximum_element_residual = std::max(
+          maximum_element_residual,
+          old.chemistry_last_element_fraction_residual[src]);
+      maximum_charge_residual = std::max(
+          maximum_charge_residual, old.chemistry_last_charge_residual[src]);
+      cumulative_radiative_loss += plan.weights[entry] *
+          old.chemistry_cumulative_radiative_loss_erg[src];
+      cumulative_heating_gain += plan.weights[entry] *
+          old.chemistry_cumulative_heating_gain_erg[src];
       const double mass = old_state.cells.mass_code[src];
       const double best = old_state.cells.mass_code[heaviest];
       if (mass > best || (mass == best && src < heaviest)) heaviest = src;
@@ -927,11 +1015,24 @@ struct CompositionRegridPlan {
     result.ism_regime_tag[row] = old.ism_regime_tag[heaviest];
     result.model_dwell_years[row] = std::isfinite(dwell) ? dwell : 0.0;
     result.ism_regime_dwell_years[row] = std::isfinite(regime_dwell) ? regime_dwell : 0.0;
+    result.chemistry_last_temperature_k[row] =
+        old.chemistry_last_temperature_k[heaviest];
+    result.chemistry_last_cooling_time_seconds[row] =
+        std::isfinite(minimum_cooling_time) ? minimum_cooling_time : 0.0;
+    result.chemistry_last_error_estimate[row] = maximum_error;
+    result.chemistry_last_element_fraction_residual[row] =
+        maximum_element_residual;
+    result.chemistry_last_charge_residual[row] = maximum_charge_residual;
+    result.chemistry_cumulative_radiative_loss_erg[row] =
+        cumulative_radiative_loss;
+    result.chemistry_cumulative_heating_gain_erg[row] =
+        cumulative_heating_gain;
     result.mean_molecular_weight[row] = std::numeric_limits<double>::quiet_NaN();
   }
   for (std::size_t lane = 0; lane < lanes; ++lane) {
     double after = 0.0;
-    for (const double value : result.lane(lane)) {
+    for (std::size_t row = 0; row < result.rowCount(); ++row) {
+      const double value = result.value(lane, row);
       if (value < 0.0 || !std::isfinite(value)) {
         throw std::runtime_error("composition regrid produced a negative or non-finite lane value");
       }
@@ -2004,8 +2105,22 @@ std::size_t mergeFluxRegistersIntoPendingStore(
       ++created_count;
     } else {
       validatePendingCompatible(*pending, entry);
-      pending->expected_fine_substeps = std::max(
-          pending->expected_fine_substeps, refluxIntervalForEntry(entry, options).substeps_per_interval);
+      const AmrLevelRefluxInterval interval = refluxIntervalForEntry(entry, options);
+      const double incoming_start = interval.interval_start_code;
+      const double incoming_dt = interval.coarse_dt_code > 0.0
+          ? interval.coarse_dt_code : entry.dt_code;
+      const double incoming_end = interval.interval_end_code > incoming_start
+          ? interval.interval_end_code : incoming_start + incoming_dt;
+      const double time_scale = std::max({1.0, std::abs(pending->interval_start_code),
+          std::abs(pending->interval_end_code), std::abs(incoming_start), std::abs(incoming_end)});
+      if (std::abs(pending->interval_start_code - incoming_start) > 1.0e-12 * time_scale ||
+          std::abs(pending->interval_end_code - incoming_end) > 1.0e-12 * time_scale ||
+          std::abs(pending->coarse_dt_code - incoming_dt) > 1.0e-12 * time_scale ||
+          pending->expected_fine_substeps !=
+              std::max<std::uint32_t>(1U, interval.substeps_per_interval)) {
+        throw std::runtime_error(
+            "pending AMR flux register key was reused across incompatible temporal intervals");
+      }
       pending->expected_area_comov = std::max({pending->expected_area_comov, entry.face_area_comov, entry.coarse_area_comov, entry.fine_area_comov});
     }
 
@@ -2025,7 +2140,6 @@ std::size_t mergeFluxRegistersIntoPendingStore(
     }
     if (entry.fine_face_count > 0U && entry.fine_area_comov > 0.0) {
       pending->fine_face_count += entry.fine_face_count;
-      pending->fine_area_accumulated_comov = std::max(pending->fine_area_accumulated_comov, entry.fine_area_comov);
       addFluxIntegral(
           pending->fine_mass_flux_integral_code,
           pending->fine_momentum_x_flux_integral_code,
@@ -2044,9 +2158,16 @@ std::size_t mergeFluxRegistersIntoPendingStore(
         if ((pending->fine_substep_coverage_mask & bit) == 0U) {
           pending->fine_substep_coverage_mask |= bit;
           pending->completed_fine_substeps += 1U;
+          // Area is a spatial coverage for one temporal substep, not a sum
+          // across time. Start the new substep, then add any other rank's
+          // disjoint portion when it arrives with the same coverage bit.
+          pending->fine_area_accumulated_comov = entry.fine_area_comov;
+        } else {
+          pending->fine_area_accumulated_comov += entry.fine_area_comov;
         }
       } else {
         pending->completed_fine_substeps += 1U;
+        pending->fine_area_accumulated_comov = entry.fine_area_comov;
       }
     }
   }
@@ -2268,10 +2389,6 @@ struct AmrSynchronizedSweepWorkspace {
     const DistributedAmrHydroExchange* distributed_exchange) {
   if (!hasProductionAmrHydroCoverage(state)) {
     throw std::runtime_error("advanceProductionAmrHydro requires complete AMR patch coverage in SimulationState");
-  }
-  if (distributed_exchange != nullptr && options.persist_incomplete_flux_registers) {
-    throw std::runtime_error(
-        "distributed AMR pending flux-register accumulation is gated off; synchronized remote reflux must complete in-step");
   }
   ProductionAmrHydroDiagnostics diagnostics;
   // The recursive driver calls this sweep repeatedly. Its own descriptor
@@ -3415,8 +3532,6 @@ ProductionAmrHydroDiagnostics advanceProductionAmrHydroRecursiveImpl(
     std::exception_ptr level_failure;
     try {
       if (has_finer) {
-        captureAmrTemporalBoundaryHistoryStartForLevel(
-            state, descriptors, level, t_begin, options.adiabatic_index, options.regrid_memory_governor);
         intervals[static_cast<std::size_t>(level)] = AmrLevelRefluxInterval{
             .interval_start_code = t_begin, .interval_end_code = t_end, .coarse_dt_code = update.dt_code,
             .substeps_per_interval = ratio_to_next[i], .substep_index = 0U, .valid = true};
@@ -3428,6 +3543,28 @@ ProductionAmrHydroDiagnostics advanceProductionAmrHydroRecursiveImpl(
       level_failure = std::current_exception();
     }
     reduce(level_failure, "recursive AMR level interval open");
+    try {
+      if (options.recursive_level_source_operator != nullptr) {
+        options.recursive_level_source_operator->apply(
+            state, rows_by_level[i], update,
+            RecursiveAmrSourcePhase::kPreHydroHalf);
+      }
+    } catch (...) {
+      level_failure = std::current_exception();
+    }
+    reduce(level_failure, "recursive AMR level pre-source half");
+    try {
+      if (has_finer) {
+        // Temporal endpoints include the source half-steps. Fine ghosts then
+        // interpolate between complete coarse Strang boundary states.
+        captureAmrTemporalBoundaryHistoryStartForLevel(
+            state, descriptors, level, t_begin, options.adiabatic_index,
+            options.regrid_memory_governor);
+      }
+    } catch (...) {
+      level_failure = std::current_exception();
+    }
+    reduce(level_failure, "recursive AMR level history start");
     ProductionAmrHydroOptions level_options = options;
     level_options.sweep_mode = ProductionAmrHydroSweepMode::kSynchronized;
     level_options.persist_incomplete_flux_registers = true;
@@ -3808,7 +3945,12 @@ ProductionAmrRegridDiagnostics refineProductionPatchInSimulationState(
           "production AMR refine diagnostic row scratch bytes"),
       "production AMR refine row scratch bytes");
   const std::uint64_t refine_composition_bytes =
-      compositionCandidateBytes(state, new_cell_count, new_cell_count);
+      compositionCandidateBytes(
+          state, new_cell_count,
+          std::min(new_cell_count,
+                   core::checkedSizeMultiply(state.gas_composition.sparseActiveRowCount(), 8U,
+                                             "refine sparse composition row bound")),
+          new_cell_count);
   ProductionAmrRegridAdmission admission = admitProductionAmrRegrid(
       state, options,
       productionAmrCandidateReservationBytes(new_cell_count, new_patch_count,
@@ -4022,7 +4164,10 @@ ProductionAmrRegridDiagnostics derefineProductionPatchInSimulationState(
   const std::size_t derefine_plan_entries = core::checkedSizeAdd(
       kept_cell_count, child_cell_count, "production AMR derefine composition entries");
   const std::uint64_t derefine_composition_bytes =
-      compositionCandidateBytes(state, kept_cell_count, derefine_plan_entries);
+      compositionCandidateBytes(
+          state, kept_cell_count,
+          std::min(kept_cell_count, state.gas_composition.sparseActiveRowCount()),
+          derefine_plan_entries);
   ProductionAmrRegridAdmission admission = admitProductionAmrRegrid(
       state, options,
       productionAmrCandidateReservationBytes(kept_cell_count, kept_patch_count,

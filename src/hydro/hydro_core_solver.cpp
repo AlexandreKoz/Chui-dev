@@ -727,6 +727,7 @@ struct HydroScratchCapacityPlan {
   std::size_t stencil_staging = 0;
   std::size_t stencil_unique = 0;
   std::size_t ctu_cells = 0;
+  std::size_t ctu_ghost_cells = 0;
   std::size_t dual_energy_cells = 0;
 };
 
@@ -750,6 +751,7 @@ struct HydroScratchCapacityPlan {
       std::min(total_cells, touched), face_batch, stencil,
       std::min(total_cells, stencil),
       policy.ctu_transverse_workspace ? touched_unique : 0U,
+      policy.ctu_transverse_workspace ? total_cells - real_cells : 0U,
       policy.dual_energy_workspace ? touched_unique : 0U};
 }
 
@@ -779,6 +781,8 @@ void reserveHydroVector(std::vector<T>& values, std::size_t count) {
   add(plan.stencil_staging, sizeof(HydroPrimitiveState));
   add(plan.full_active, sizeof(std::size_t));
   add(plan.ctu_cells, sizeof(std::array<HydroConservedState, 3>));
+  add(plan.ctu_ghost_cells, sizeof(std::array<HydroConservedState, 3>));
+  add(plan.ctu_ghost_cells, sizeof(std::uint8_t));
   add(plan.dual_energy_cells, 2U * sizeof(double));
   return bytes;
 }
@@ -808,6 +812,8 @@ std::uint64_t HydroScratchBuffers::prepareForActiveSet(
   reserveHydroVector(primitive_stencil_states, plan.stencil_staging);
   reserveHydroVector(full_active_cells, plan.full_active);
   reserveHydroVector(ctu_transverse_delta, plan.ctu_cells);
+  reserveHydroVector(ctu_ghost_transverse_delta, plan.ctu_ghost_cells);
+  reserveHydroVector(ctu_ghost_transverse_axis_mask, plan.ctu_ghost_cells);
   reserveHydroVector(aux_internal_energy_advection, plan.dual_energy_cells);
   reserveHydroVector(aux_velocity_divergence, plan.dual_energy_cells);
   // full_active_faces is a compatibility lane unused by the sparse solver.
@@ -859,6 +865,8 @@ std::uint64_t HydroScratchBuffers::ownedCapacityBytes() const {
   add(vectorCapacityBytes(full_active_cells));
   add(vectorCapacityBytes(full_active_faces));
   add(vectorCapacityBytes(ctu_transverse_delta));
+  add(vectorCapacityBytes(ctu_ghost_transverse_delta));
+  add(vectorCapacityBytes(ctu_ghost_transverse_axis_mask));
   add(vectorCapacityBytes(aux_internal_energy_advection));
   add(vectorCapacityBytes(aux_velocity_divergence));
   return total;
@@ -1114,9 +1122,88 @@ constexpr std::size_t k_invalid_touched_slot = static_cast<std::size_t>(-1);
   return 0U;
 }
 
+[[nodiscard]] std::size_t axisCellCount(
+    const HydroPatchGeometry& geometry, std::size_t axis) {
+  switch (axis) {
+    case 0U: return geometry.nx;
+    case 1U: return geometry.ny;
+    case 2U: return geometry.nz;
+    default: return 0U;
+  }
+}
+
+[[nodiscard]] double transverseFaceArea(
+    const HydroPatchGeometry& geometry, std::size_t axis) {
+  switch (axis) {
+    case 0U: return geometry.cell_width_y_comoving * geometry.cell_width_z_comoving;
+    case 1U: return geometry.cell_width_x_comoving * geometry.cell_width_z_comoving;
+    case 2U: return geometry.cell_width_x_comoving * geometry.cell_width_y_comoving;
+    default: return 0.0;
+  }
+}
+
+void setPositiveAxisNormal(HydroFace& face, std::size_t axis) {
+  face.normal_x = axis == 0U ? 1.0 : 0.0;
+  face.normal_y = axis == 1U ? 1.0 : 0.0;
+  face.normal_z = axis == 2U ? 1.0 : 0.0;
+  face.axis = axis == 0U ? HydroFaceAxis::kX :
+      (axis == 1U ? HydroFaceAxis::kY : HydroFaceAxis::kZ);
+}
+
+// Resolve a layer-1 boundary ghost in the same normal face slab as `ghost`,
+// displaced along a tangential axis. AMR geometry emits the standard shell in
+// deterministic X/Y/Z, lower/upper order before its deep normal layers. The
+// metadata checks make this fail closed for custom geometries that do not use
+// that layout; those faces retain the explicit normal-only CTU fallback.
+[[nodiscard]] std::size_t tangentialGhostCell(
+    const HydroPatchGeometry& geometry,
+    const HydroGhostCell& ghost,
+    std::size_t transverse_axis,
+    std::ptrdiff_t displacement) {
+  const std::size_t real_cells = geometry.cellCount();
+  if (ghost.owner_real_cell >= real_cells ||
+      transverse_axis == faceAxisIndex(ghost.axis) || transverse_axis > 2U) {
+    return k_invalid_cell_index;
+  }
+  std::array<std::size_t, 3> ijk = geometry.cellIjk(ghost.owner_real_cell);
+  const std::size_t extent = axisCellCount(geometry, transverse_axis);
+  const std::ptrdiff_t shifted = static_cast<std::ptrdiff_t>(ijk[transverse_axis]) + displacement;
+  if (shifted < 0 || shifted >= static_cast<std::ptrdiff_t>(extent)) {
+    return k_invalid_cell_index;
+  }
+  ijk[transverse_axis] = static_cast<std::size_t>(shifted);
+  const std::size_t shifted_owner = geometry.linearCellIndex(ijk[0], ijk[1], ijk[2]);
+  const std::size_t side = ghost.side == HydroFaceSide::kLower ? 0U : 1U;
+  std::size_t slot = 0U;
+  switch (ghost.axis) {
+    case HydroFaceAxis::kX:
+      slot = 2U * (ijk[2] * geometry.ny + ijk[1]) + side;
+      break;
+    case HydroFaceAxis::kY:
+      slot = 2U * geometry.ny * geometry.nz +
+          2U * (ijk[2] * geometry.nx + ijk[0]) + side;
+      break;
+    case HydroFaceAxis::kZ:
+      slot = 2U * (geometry.ny * geometry.nz + geometry.nx * geometry.nz) +
+          2U * (ijk[1] * geometry.nx + ijk[0]) + side;
+      break;
+  }
+  if (slot >= geometry.ghost_cells.size()) {
+    return k_invalid_cell_index;
+  }
+  const HydroGhostCell& candidate = geometry.ghost_cells[slot];
+  if (candidate.axis != ghost.axis || candidate.side != ghost.side ||
+      candidate.owner_real_cell != shifted_owner || candidate.ghost_slot != slot ||
+      candidate.ghost_cell != real_cells + slot) {
+    return k_invalid_cell_index;
+  }
+  return candidate.ghost_cell;
+}
+
 // Real cell whose CTU transverse increment describes the given face side.
-// Periodic ghosts map to their wrapped source cell; open/reflective/imported
-// ghosts carry no transverse information (returns k_invalid_cell_index).
+// Periodic ghosts map to their wrapped source cell. Open/reflective/imported
+// ghosts return invalid here and are resolved separately from the immutable
+// tangential ghost slab when its selected-order stencil is complete.
 [[nodiscard]] std::size_t transverseSourceCell(
     const HydroPatchGeometry& geometry,
     std::size_t cell_index,
@@ -1267,6 +1354,9 @@ void HydroCoreSolver::advancePatchActiveSetBatchedWithScratch(
   scratch.cell_delta.assign(scratch.touched_cells.size(), HydroConservedState{});
   if (use_ctu) {
     scratch.ctu_transverse_delta.assign(scratch.touched_cells.size(), std::array<HydroConservedState, 3>{});
+    scratch.ctu_ghost_transverse_delta.assign(
+        geometry.ghost_cells.size(), std::array<HydroConservedState, 3>{});
+    scratch.ctu_ghost_transverse_axis_mask.assign(geometry.ghost_cells.size(), 0U);
   }
   if (use_dual_energy) {
     scratch.aux_internal_energy_advection.assign(scratch.touched_cells.size(), 0.0);
@@ -1306,6 +1396,8 @@ void HydroCoreSolver::advancePatchActiveSetBatchedWithScratch(
   std::uint64_t ctu_degraded = 0U;
   std::uint64_t ctu_boundary_proxy = 0U;
   std::uint64_t ctu_inadmissible = 0U;
+  std::uint64_t ctu_ghost_corrected = 0U;
+  std::uint64_t ctu_ghost_axes = 0U;
   const double flux_scale = update.dt_code / (update.scale_factor * geometry.cell_volume_comoving);
   // Floors used only to judge admissibility of CTU-corrected face states.
   constexpr double k_state_floor = 1.0e-30;
@@ -1388,26 +1480,178 @@ void HydroCoreSolver::advancePatchActiveSetBatchedWithScratch(
     }
   };
 
+  // Complete the transverse predictor on non-periodic interface ghosts from
+  // their immutable face slab. For a ghost cell g and transverse direction t,
+  // evaluate F_{g-1/2} and F_{g+1/2} with the SAME reconstruction and Riemann
+  // solver as the normal pass, then retain dt/(a V) A (F_- - F_+). This is
+  // valid for same-level, restricted/prolongated coarse-fine and MPI slabs
+  // because ghost fill has already represented them on the target control
+  // volume. A full selected-order stencil is mandatory: where it crosses a
+  // second patch interface (the face edge/corner region), no unilateral proxy
+  // is manufactured and the final face state takes the counted fallback.
+  if (use_ctu) {
+    const int stencil_radius = reconstruction.requiredStencilHalfWidth();
+    if (stencil_radius < 1 || stencil_radius > 3) {
+      throw std::invalid_argument(
+          "CTU ghost-slab completion supports reconstruction stencil half-widths 1..3");
+    }
+    constexpr std::size_t k_center = 3U;
+    for (const std::size_t face_index : active_set.active_faces) {
+      const HydroFace& interface_face = geometry.faces[face_index];
+      if (interface_face.ghost_cell_slot == k_invalid_ghost_cell_slot ||
+          interface_face.ghost_cell_slot >= geometry.ghost_cells.size()) {
+        continue;
+      }
+      const std::size_t ghost_slot = interface_face.ghost_cell_slot;
+      const HydroGhostCell& ghost = geometry.ghost_cells[ghost_slot];
+      if (ghost.boundary_kind == HydroBoundaryKind::kPeriodic) {
+        continue;
+      }
+      const std::size_t normal_axis = faceAxisIndex(interface_face.axis);
+      for (std::size_t transverse_axis = 0U; transverse_axis < 3U; ++transverse_axis) {
+        if (transverse_axis == normal_axis) {
+          continue;
+        }
+        const std::uint8_t axis_bit = static_cast<std::uint8_t>(1U << transverse_axis);
+        if ((scratch.ctu_ghost_transverse_axis_mask[ghost_slot] & axis_bit) != 0U) {
+          continue;
+        }
+        if (axisCellCount(geometry, transverse_axis) == 1U) {
+          // A suppressed Cartesian dimension has identically zero transverse
+          // divergence and is complete without a numerical face solve.
+          scratch.ctu_ghost_transverse_axis_mask[ghost_slot] |= axis_bit;
+          continue;
+        }
+
+        std::array<std::size_t, 7> slab_cells{};
+        bool complete = true;
+        for (int offset = -stencil_radius; offset <= stencil_radius; ++offset) {
+          const std::size_t cell = tangentialGhostCell(
+              geometry, ghost, transverse_axis, static_cast<std::ptrdiff_t>(offset));
+          if (cell == k_invalid_cell_index || cell >= conserved.size()) {
+            complete = false;
+            break;
+          }
+          slab_cells[static_cast<std::size_t>(static_cast<int>(k_center) + offset)] = cell;
+        }
+        if (!complete) {
+          continue;
+        }
+        std::array<HydroPrimitiveState, 7> slab_primitives{};
+        for (int offset = -stencil_radius; offset <= stencil_radius; ++offset) {
+          const std::size_t slot = static_cast<std::size_t>(static_cast<int>(k_center) + offset);
+          slab_primitives[slot] = closedPrimitiveForCell(
+              conserved, slab_cells[slot], m_adiabatic_index,
+              source_context, m_numerics.dual_energy);
+        }
+        const auto primitiveAt = [&](int offset) -> const HydroPrimitiveState* {
+          if (offset < -stencil_radius || offset > stencil_radius) {
+            return nullptr;
+          }
+          return &slab_primitives[static_cast<std::size_t>(static_cast<int>(k_center) + offset)];
+        };
+        HydroFace lower_face{
+            .owner_cell = slab_cells[k_center - 1U],
+            .neighbor_cell = slab_cells[k_center],
+            .area_comoving = transverseFaceArea(geometry, transverse_axis)};
+        HydroFace upper_face{
+            .owner_cell = slab_cells[k_center],
+            .neighbor_cell = slab_cells[k_center + 1U],
+            .area_comoving = transverseFaceArea(geometry, transverse_axis)};
+        setPositiveAxisNormal(lower_face, transverse_axis);
+        setPositiveAxisNormal(upper_face, transverse_axis);
+
+        HydroPrimitiveState lower_left;
+        HydroPrimitiveState lower_right;
+        HydroPrimitiveState upper_left;
+        HydroPrimitiveState upper_right;
+        const auto ghost_reconstruct_start = std::chrono::steady_clock::now();
+        const bool lower_reconstructed = reconstruction.reconstructFaceFromStencil(
+            HydroFaceStencilStates{
+                .owner_minus2 = primitiveAt(-3),
+                .owner_minus = primitiveAt(-2),
+                .owner = primitiveAt(-1),
+                .neighbor = primitiveAt(0),
+                .neighbor_plus = primitiveAt(1),
+                .neighbor_plus2 = primitiveAt(2)},
+            lower_face, lower_left, lower_right);
+        const bool upper_reconstructed = reconstruction.reconstructFaceFromStencil(
+            HydroFaceStencilStates{
+                .owner_minus2 = primitiveAt(-2),
+                .owner_minus = primitiveAt(-1),
+                .owner = primitiveAt(0),
+                .neighbor = primitiveAt(1),
+                .neighbor_plus = primitiveAt(2),
+                .neighbor_plus2 = primitiveAt(3)},
+            upper_face, upper_left, upper_right);
+        const auto ghost_riemann_start = std::chrono::steady_clock::now();
+        if (!lower_reconstructed || !upper_reconstructed) {
+          continue;
+        }
+        const HydroConservedState lower_flux = riemann_solver.computeFlux(
+            lower_left, lower_right, lower_face, m_adiabatic_index);
+        const HydroConservedState upper_flux = riemann_solver.computeFlux(
+            upper_left, upper_right, upper_face, m_adiabatic_index);
+        const auto ghost_riemann_stop = std::chrono::steady_clock::now();
+        const double face_scale = flux_scale * transverseFaceArea(geometry, transverse_axis);
+        scratch.ctu_ghost_transverse_delta[ghost_slot][transverse_axis] =
+            face_scale * (lower_flux - upper_flux);
+        scratch.ctu_ghost_transverse_axis_mask[ghost_slot] |= axis_bit;
+        ++ctu_ghost_axes;
+        riemann_solve_count += 2U;
+        reconstruct_ms += std::chrono::duration<double, std::milli>(
+            ghost_riemann_start - ghost_reconstruct_start).count();
+        riemann_ms += std::chrono::duration<double, std::milli>(
+            ghost_riemann_stop - ghost_riemann_start).count();
+      }
+    }
+  }
+
   // Half of the CTU transverse increment of `cell` excluding `face_axis`.
+  // imported_ghost is true only when the correction was reconstructed from a
+  // complete non-periodic ghost slab rather than an authoritative real cell.
   const auto halfTransverse = [&](std::size_t cell, std::size_t face_axis,
                                   HydroConservedState& out,
+                                  bool& imported_ghost) -> bool {
+    imported_ghost = false;
+    const std::size_t source_cell = transverseSourceCell(geometry, cell, real_cell_count);
+    if (source_cell != k_invalid_cell_index) {
+      const std::size_t touched = findTouchedSlot(scratch, source_cell);
+      if (touched == k_invalid_touched_slot) {
+        return false;
+      }
+      out = HydroConservedState{};
+      for (std::size_t axis = 0; axis < 3U; ++axis) {
+        if (axis != face_axis) {
+          out += scratch.ctu_transverse_delta[touched][axis];
+        }
+      }
+      out = 0.5 * out;
+      return true;
                                   bool& used_boundary_proxy) -> bool {
     const std::size_t source_cell = transverseSourceCell(
         geometry, cell, real_cell_count, used_boundary_proxy);
     if (source_cell == k_invalid_cell_index) {
       return false;
     }
-    const std::size_t touched = findTouchedSlot(scratch, source_cell);
-    if (touched == k_invalid_touched_slot) {
+    if (cell == k_invalid_cell_index || cell < real_cell_count ||
+        cell - real_cell_count >= geometry.ghost_cells.size()) {
       return false;
     }
+    const std::size_t ghost_slot = cell - real_cell_count;
     out = HydroConservedState{};
     for (std::size_t axis = 0; axis < 3U; ++axis) {
-      if (axis != face_axis) {
-        out += scratch.ctu_transverse_delta[touched][axis];
+      if (axis == face_axis || axisCellCount(geometry, axis) == 1U) {
+        continue;
       }
+      const std::uint8_t axis_bit = static_cast<std::uint8_t>(1U << axis);
+      if ((scratch.ctu_ghost_transverse_axis_mask[ghost_slot] & axis_bit) == 0U) {
+        return false;
+      }
+      out += scratch.ctu_ghost_transverse_delta[ghost_slot][axis];
     }
     out = 0.5 * out;
+    imported_ghost = true;
     return true;
   };
 
@@ -1464,12 +1708,15 @@ void HydroCoreSolver::advancePatchActiveSetBatchedWithScratch(
         const HydroFace& face = geometry.faces[active_set.active_faces[batch_begin + slot]];
         const std::size_t axis = faceAxisIndex(face.axis);
         HydroConservedState half_transverse;
+        bool imported_ghost = false;
+        if (halfTransverse(face.owner_cell, axis, half_transverse, imported_ghost)) {
         bool boundary_proxy = false;
         if (halfTransverse(face.owner_cell, axis, half_transverse, boundary_proxy)) {
           if (boundary_proxy) ++ctu_boundary_proxy;
           if (applyTransverseCorrection(scratch.left_states[slot], half_transverse,
                   m_adiabatic_index, k_state_floor, k_state_floor)) {
             ++ctu_corrected;
+            ctu_ghost_corrected += imported_ghost ? 1U : 0U;
           } else {
             ++ctu_inadmissible;
           }
@@ -1478,11 +1725,13 @@ void HydroCoreSolver::advancePatchActiveSetBatchedWithScratch(
         }
         boundary_proxy = false;
         if (face.neighbor_cell != k_invalid_cell_index &&
+            halfTransverse(face.neighbor_cell, axis, half_transverse, imported_ghost)) {
             halfTransverse(face.neighbor_cell, axis, half_transverse, boundary_proxy)) {
           if (boundary_proxy) ++ctu_boundary_proxy;
           if (applyTransverseCorrection(scratch.right_states[slot], half_transverse,
                   m_adiabatic_index, k_state_floor, k_state_floor)) {
             ++ctu_corrected;
+            ctu_ghost_corrected += imported_ghost ? 1U : 0U;
           } else {
             ++ctu_inadmissible;
           }
@@ -1725,6 +1974,8 @@ void HydroCoreSolver::advancePatchActiveSetBatchedWithScratch(
     profile->riemann_solve_count += riemann_solve_count;
     profile->ctu_transverse_corrected_states += ctu_corrected;
     profile->ctu_transverse_degraded_states += ctu_degraded;
+    profile->ctu_transverse_ghost_corrected_states += ctu_ghost_corrected;
+    profile->ctu_transverse_ghost_axes += ctu_ghost_axes;
     profile->ctu_transverse_boundary_proxy_states += ctu_boundary_proxy;
     profile->ctu_transverse_inadmissible_states += ctu_inadmissible;
     profile->dual_energy_auxiliary_cells += dual_energy_auxiliary_cells;

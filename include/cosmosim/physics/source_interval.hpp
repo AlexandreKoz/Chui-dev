@@ -37,7 +37,9 @@ struct SourceInterval {
   double scale_factor_end = 1.0;
   // Physical elapsed time of the interval in seconds (> 0 for a real step).
   double physical_seconds = 0.0;
-  // Epoch at which densities/radiation are evaluated (Lie split: step end).
+  // Epoch at which densities/radiation are evaluated.  The canonical runtime
+  // uses the physical midpoint of each Strang half interval; compatibility
+  // callers that dispatch an unsplit source stage use the step-end epoch.
   double evaluation_scale_factor = 1.0;
   double evaluation_redshift = 0.0;
   bool cosmological = false;
@@ -66,7 +68,9 @@ struct SourceLedger {
   double chemical_binding_delta_erg = 0.0;  // change of chemical potential energy
   double floor_injection_erg = 0.0;         // energy added by temperature floors
   double thermal_energy_delta_erg = 0.0;    // net change of thermal energy
-  double element_mass_residual_code = 0.0;  // max |sum element after - before|
+  // Historical field name retained for ABI: dimensionless max relative
+  // element-nuclei projection residual, not a code-mass quantity.
+  double element_mass_residual_code = 0.0;
   double charge_residual = 0.0;             // max |sum charge| per H nucleus
   double dust_to_gas_transfer_code = 0.0;   // + = solids returned to gas
   double gas_to_dust_transfer_code = 0.0;   // + = gas locked into solids

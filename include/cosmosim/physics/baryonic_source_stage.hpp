@@ -32,7 +32,7 @@ namespace cosmosim::physics {
 //   pending diagnostics/ledgers and returns the rows whose P/T/c_s must be
 //   refreshed. It is only called after the StageTransaction collective vote.
 // discard(): drops staging and pending diagnostics (rejected interval).
-// Memory: (lanes + 8) doubles per active row, admitted by the caller through
+// Memory: (lanes + 16) doubles per active row, admitted by the caller through
 // the StageTransaction before prepare(); no full-state copy.
 // Scope: this is LOCAL source-stage atomicity. A rejection after other
 // stages of the same step have committed (hydro, AMR sweep) is the global
@@ -59,7 +59,8 @@ class BaryonicSourceStage {
   BaryonicSourceStage(const ThermochemistryOperator& chemistry, BaryonicSourceStageConfig config);
 
   [[nodiscard]] static std::uint64_t stagingBytes(std::size_t rows, std::size_t lanes) noexcept {
-    return static_cast<std::uint64_t>(rows) * (static_cast<std::uint64_t>(lanes) + 8U) * sizeof(double);
+    return static_cast<std::uint64_t>(rows) *
+        (static_cast<std::uint64_t>(lanes) + 16U) * sizeof(double);
   }
 
   // rows empty => all gas rows.
@@ -69,6 +70,9 @@ class BaryonicSourceStage {
   void discard() noexcept;
 
   [[nodiscard]] bool prepared() const noexcept { return m_prepared; }
+  [[nodiscard]] std::size_t sparseRowsToActivate() const noexcept {
+    return m_sparse_rows_to_activate;
+  }
   // Published only by commit(); unchanged by a rejected interval.
   [[nodiscard]] const BaryonicSourceStageReport& lastCommittedReport() const noexcept { return m_committed; }
 
@@ -83,6 +87,13 @@ class BaryonicSourceStage {
     double chemistry_dwell_years = 0.0;
     double internal_energy_code = 0.0;
     double mean_molecular_weight = 0.0;
+    double last_temperature_k = 0.0;
+    double last_cooling_time_seconds = 0.0;
+    double last_error_estimate = 0.0;
+    double last_element_fraction_residual = 0.0;
+    double last_charge_residual = 0.0;
+    double cumulative_radiative_loss_erg = 0.0;
+    double cumulative_heating_gain_erg = 0.0;
   };
 
   const ThermochemistryOperator& m_chemistry;
@@ -90,6 +101,7 @@ class BaryonicSourceStage {
   std::vector<StagedMeta> m_meta;
   std::vector<double> m_lanes;  // row-major: staged row x lane
   std::size_t m_lane_count = 0;
+  std::size_t m_sparse_rows_to_activate = 0U;
   BaryonicSourceStageReport m_pending{};
   BaryonicSourceStageReport m_committed{};
   bool m_prepared = false;

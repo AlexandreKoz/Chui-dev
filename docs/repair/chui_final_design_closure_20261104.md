@@ -38,7 +38,7 @@ numerical validity or scientific qualification.
 | C03 adaptive chemistry control | **IMPLEMENTED IN SOURCE — NOT RUN** (transaction); control law **EXPERIMENTAL/UNQUALIFIED** | G0.4: the single authority is the `chui_adaptive_chemistry_control_v1` sidecar. It is re-read before every fidelity decision. Empty ranks contribute zero current samples, and a malformed sidecar is an error. Rollback and restart restore it with `SimulationState`. Timescale/stiffness indicators are still heuristic (G4.3 PARTIAL). |
 | C04 shadow verification | **EXPERIMENTAL/UNQUALIFIED** | The bounded sampled shadow never mutates state (unchanged). |
 | I01 effective/resolved ISM | **EXPERIMENTAL/UNQUALIFIED** | Unchanged. |
-| I02 dust/SGS | **EXPERIMENTAL/UNQUALIFIED** | Unchanged. Dust lanes are diffused by the distributed operator. |
+| I02 dust/SGS | **EXPERIMENTAL/UNQUALIFIED** | Dust lanes use the distributed operator. SGS now includes staged traceless resolved-stress production/transfer on the same AMR/MPI face topology; calibration and numerical qualification remain pending. |
 | S01 star formation | **IMPLEMENTED IN SOURCE — NOT RUN** | Unchanged. The particle-ID occupancy cache is invalidated on rollback (G1.6). |
 | S02 SSP / events | **IMPLEMENTED IN SOURCE — NOT RUN** (yields **BLOCKED BY EXTERNAL DATA**) | G3.2: the fixed-node non-negative linear interpolant makes C(age) monotone by construction and lets interval returns telescope. The clamp is now only a counted round-off guard. Behaviour change: returns move at the quadrature-error level. |
 | F01 mechanical feedback | **IMPLEMENTED IN SOURCE — NOT RUN** | G0.3 (see §4). The remote stencil query now also covers wind-only and dispersion-only sources. |
@@ -93,7 +93,7 @@ SourceRuntime
   executeThermochemistry: loadCommittedChemistryControl(state) before staging
   executePart2StellarPopulation: budgets -> mergeAssociationsDistributed
                                  -> importRemoteFeedbackCandidates -> stage -> remote deltas
-  executeMetalDiffusion: gatherRemoteDiffusionCells -> topology (remote faces, global envelope)
+  executeDiffusionAndSgsShear: gatherRemoteDiffusionCells -> topology (remote faces, global envelope)
                          -> DistributedElementDiffusionCoupling::setup -> advanceElementResolvedDiffusion
 MigrationBalanceRuntime::applyMeasuredRuntimeRebalancePlan
   -> enforceAmrFamilyColocation (also runs when load rebalance is disabled)

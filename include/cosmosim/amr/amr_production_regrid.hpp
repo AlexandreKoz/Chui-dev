@@ -95,10 +95,32 @@ struct PhysicsRefinementIndicators {
   double vorticity = 0.0;
 };
 
+enum class AmrForceResolutionAction : std::uint8_t {
+  kAllowCountedReference = 0,
+  kLimitOptionalRejectMandatory = 1,
+};
+
+// V02 keeps unlike quantities typed. Candidates are ordered by normalized
+// indicator benefit per incremental cell-step, then MPI surface and churn;
+// no scalar "universal physical error" is invented. When enabled, ceilings
+// are exact (UINT64_MAX means unlimited). Mandatory refinements bypass every
+// optional ceiling.
+struct OptionalRefinementControl {
+  bool enabled = false;
+  double benefit_floor = 1.0;
+  std::uint64_t memory_budget_bytes = 0U;
+  std::uint64_t estimated_bytes_per_cell = 0U;
+  std::uint64_t cell_step_budget = 0U;
+  std::uint64_t mpi_face_cell_budget = 0U;
+  std::uint64_t churn_cell_budget = 0U;
+};
+
 struct ProductionAmrRegridPolicy {
   RefinementCriteria criteria{};
   PhysicsRefinementIndicators physics{};
   std::uint8_t max_level = 10;
+  // Optional-refinement budget (refine pass); total operation budget for the
+  // derefine pass. Mandatory accuracy refinements are never charged here.
   std::size_t max_operations = 64;
   AmrRegridPassKind pass = AmrRegridPassKind::kRefineOnly;
   double scale_factor = 1.0;
@@ -113,6 +135,9 @@ struct ProductionAmrRegridPolicy {
   // width falls below it are COUNTED as the unqualified regime "hydro
   // resolution finer than the gravitational force resolution". 0 disables.
   double gravity_softening_code = 0.0;
+  AmrForceResolutionAction force_resolution_action =
+      AmrForceResolutionAction::kLimitOptionalRejectMandatory;
+  OptionalRefinementControl optional_control{};
 };
 
 enum class AmrRegridOperationKind : std::uint8_t {
@@ -126,6 +151,11 @@ struct ProductionAmrRegridOperation {
   PatchDescriptor patch{};
   std::size_t new_patch_ids = 0;
   std::size_t new_gas_cell_ids = 0;
+  double optional_benefit = 0.0;
+  std::uint64_t incremental_cell_steps = 0U;
+  std::uint64_t mpi_face_cells = 0U;
+  std::uint64_t churn_cells = 0U;
+  std::uint64_t estimated_memory_bytes = 0U;
 };
 
 struct ProductionAmrRegridPlan {
@@ -138,6 +168,7 @@ struct ProductionAmrRegridPlan {
   std::size_t skipped_remote_sibling = 0;
   std::size_t truncated_by_budget = 0;
   std::size_t refined_below_gravity_softening = 0;
+  std::size_t optional_blocked_by_force_resolution = 0;
   // R1: classification of refinement requests and budget outcome.
   std::size_t mandatory_refine_requests = 0;
   std::size_t optional_refine_requests = 0;

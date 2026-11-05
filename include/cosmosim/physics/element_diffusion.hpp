@@ -42,6 +42,10 @@
 #include "cosmosim/core/gas_composition_sidecar.hpp"
 #include "cosmosim/physics/metal_diffusion.hpp"
 
+namespace cosmosim::core {
+class MemoryGovernor;
+}
+
 namespace cosmosim::physics {
 
 struct ElementDiffusionReport {
@@ -101,6 +105,7 @@ class ElementDiffusionRemoteCoupling {
     double parabolic_cfl,
     std::uint32_t max_subcycles,
     std::vector<double>& workspace,
-    ElementDiffusionRemoteCoupling* coupling = nullptr);
+    ElementDiffusionRemoteCoupling* coupling = nullptr,
+    core::MemoryGovernor* memory_governor = nullptr);
 
 }  // namespace cosmosim::physics

@@ -12,6 +12,8 @@
 
 namespace cosmosim::core {
 
+class RetainedCapacityTransaction;
+
 // CHUI Part 2: optional per-gas-cell composition sidecar.
 //
 // Ownership contract
@@ -33,8 +35,9 @@ namespace cosmosim::core {
 //   permutation). A mismatch is a hard error, never a silent remap.
 // * Disabled (layout_version == 0) means ZERO allocation: DMO and plain hydro
 //   runs carry no lanes.
-// * chemistry_model_tag / ism_regime_tag / model_dwell_years are persistent
-//   history for local model switching and regime hysteresis.
+// * chemistry/ISM tags and dwell counters plus the accepted local
+//   temperature, cooling-time, integration-error, conservation-residual and
+//   radiative/heating ledgers are persistent history for model selection.
 // * mean_molecular_weight is a DERIVED cache (NaN = unknown) refreshed by the
 //   thermochemistry commit and consumed by the gas thermodynamic refresh to
 //   convert specific internal energy into kelvin. It is not restart truth;
@@ -69,10 +72,21 @@ struct GasCompositionLayoutDescriptor {
 
 class GasCompositionSidecar {
  public:
-  // Number of trailing metadata values appended by packRow().
-  static constexpr std::size_t k_packed_metadata_count = 4U;
+  // Number of trailing metadata values appended by packRow(). The first four
+  // retain the schema-1 order; schema-2 adaptive-history values and the
+  // schema-3 explicit sparse-history marker follow.
+  static constexpr std::size_t k_packed_metadata_count = 12U;
 
-  void configure(const GasCompositionLayoutDescriptor& descriptor, std::size_t row_count);
+  // sparse_default_source_lanes selects a contiguous sparse lane suffix-like
+  // range beginning at sparse_lane_begin. Each entry is either a dense lane
+  // whose current row value is the implicit value of an inactive sparse row,
+  // or k_no_lane for implicit zero. This keeps adaptive detailed chemistry
+  // sparse without discarding its physically defined C+/CO projection.
+  void configure(
+      const GasCompositionLayoutDescriptor& descriptor,
+      std::size_t row_count,
+      std::uint32_t sparse_lane_begin = GasCompositionLayoutDescriptor::k_no_lane,
+      std::span<const std::uint32_t> sparse_default_source_lanes = {});
   void clear() noexcept;
   [[nodiscard]] bool enabled() const noexcept { return m_descriptor.enabled(); }
   [[nodiscard]] const GasCompositionLayoutDescriptor& descriptor() const noexcept {
@@ -85,6 +99,7 @@ class GasCompositionSidecar {
 
   [[nodiscard]] std::span<double> lane(std::size_t lane_index);
   [[nodiscard]] std::span<const double> lane(std::size_t lane_index) const;
+  [[nodiscard]] bool laneStoredDensely(std::size_t lane_index) const noexcept;
   [[nodiscard]] double value(std::size_t lane_index, std::size_t row) const;
   void setValue(std::size_t lane_index, std::size_t row, double value);
   void addValue(std::size_t lane_index, std::size_t row, double delta);
@@ -95,7 +110,7 @@ class GasCompositionSidecar {
   // e.g. star formation or accretion). factor must be in [0, 1].
   void scaleRow(std::size_t row, double factor);
 
-  // Migration payload: lane values followed by the three metadata values
+  // Migration payload: lane values followed by metadata values
   // (chemistry_model_tag, ism_regime_tag, model_dwell_years,
   // ism_regime_dwell_years). Empty when the
   // sidecar is disabled.
@@ -106,7 +121,36 @@ class GasCompositionSidecar {
   }
 
   // Same layout, row_count zero-initialized rows (used by rebuilds).
-  [[nodiscard]] GasCompositionSidecar emptyLike(std::size_t row_count) const;
+  [[nodiscard]] GasCompositionSidecar emptyLike(
+      std::size_t row_count, bool preserve_sparse_storage = true) const;
+
+  // Adaptive detailed-state storage. Entries are sorted by stable gas_cell_id
+  // and share one packed row-major value allocation (never a map/vector per
+  // gas cell). Capacity growth must be planned before a no-fail commit.
+  [[nodiscard]] bool sparseStorageEnabled() const noexcept {
+    return m_sparse_lane_count != 0U;
+  }
+  [[nodiscard]] std::uint32_t sparseLaneBegin() const noexcept {
+    return m_sparse_lane_begin;
+  }
+  [[nodiscard]] std::uint32_t sparseLaneCount() const noexcept {
+    return m_sparse_lane_count;
+  }
+  [[nodiscard]] std::size_t sparseActiveRowCount() const noexcept {
+    return m_sparse_gas_cell_id.size();
+  }
+  [[nodiscard]] std::size_t sparseRowCapacity() const noexcept {
+    if (m_sparse_lane_count == 0U) return 0U;
+    const std::size_t value_rows = m_sparse_values.capacity() / m_sparse_lane_count;
+    return m_sparse_gas_cell_id.capacity() < value_rows
+        ? m_sparse_gas_cell_id.capacity()
+        : value_rows;
+  }
+  [[nodiscard]] bool hasExplicitSparseRow(std::size_t row) const;
+  [[nodiscard]] double implicitSparseValue(std::size_t lane_index, std::size_t row) const;
+  [[nodiscard]] std::uint32_t sparseDefaultSourceLane(std::size_t lane_index) const;
+  void activateSparseRow(std::size_t row);
+  void planSparseRowCapacity(RetainedCapacityTransaction& plan, std::size_t target_rows);
 
   // Row identity guard: throws std::runtime_error with a precise diagnostic
   // when gas_cell_id mirrors differ from expected (row permutation defect).
@@ -124,12 +168,31 @@ class GasCompositionSidecar {
   AlignedVector<double> model_dwell_years;
   // Physical time spent in the current ISM regime (hysteresis / dwell rule).
   AlignedVector<double> ism_regime_dwell_years;
+  // C03 local, restart-authoritative solver history. Zero means unavailable
+  // for the last-* fields. Cumulative radiative/heating energies are
+  // extensive and follow conservative AMR prolongation/restriction.
+  AlignedVector<double> chemistry_last_temperature_k;
+  AlignedVector<double> chemistry_last_cooling_time_seconds;
+  AlignedVector<double> chemistry_last_error_estimate;
+  AlignedVector<double> chemistry_last_element_fraction_residual;
+  AlignedVector<double> chemistry_last_charge_residual;
+  AlignedVector<double> chemistry_cumulative_radiative_loss_erg;
+  AlignedVector<double> chemistry_cumulative_heating_gain_erg;
   AlignedVector<double> mean_molecular_weight;
 
  private:
+  [[nodiscard]] bool isSparseLane(std::size_t lane_index) const noexcept;
+  [[nodiscard]] std::size_t sparseEntryForId(std::uint64_t id) const noexcept;
+  [[nodiscard]] std::size_t requireRow(std::size_t row) const;
   GasCompositionLayoutDescriptor m_descriptor;
-  // One allocation per lane, never per cell.
+  // One allocation per DENSE lane, never per cell. Sparse lanes retain an
+  // empty vector at their manifest index so lane numbers never change.
   std::vector<AlignedVector<double>> m_lanes;
+  std::uint32_t m_sparse_lane_begin = GasCompositionLayoutDescriptor::k_no_lane;
+  std::uint32_t m_sparse_lane_count = 0U;
+  std::vector<std::uint32_t> m_sparse_default_source_lanes;
+  AlignedVector<std::uint64_t> m_sparse_gas_cell_id;
+  AlignedVector<double> m_sparse_values;
 };
 
 // FNV-1a 64-bit over a byte string: used for layout signatures only (not a

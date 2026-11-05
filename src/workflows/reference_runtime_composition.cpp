@@ -459,7 +459,10 @@ namespace {
                         read(RuntimeResourceKey::kEffectiveIsmThermodynamics),
                         readWrite(RuntimeResourceKey::kMigrationOwnership),
                         read(RuntimeResourceKey::kIntegratorTruth)},
-          .dependencies = {"hydro_amr::hydro_amr.update"},
+          // The integrator invokes this task at both Strang source surfaces.
+          // A static hydro dependency would contradict the pre-hydro half;
+          // phase order is owned by the time integrator.
+          .dependencies = {},
           .scheduling = schedulingProfile(
               0U, RuntimeTaskPressureClass::kHigh, RuntimeTaskPressureClass::kHigh,
               RuntimeTaskPressureClass::kModerate),

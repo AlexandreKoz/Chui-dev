@@ -8,6 +8,7 @@
 #include <string>
 
 #include "cosmosim/core/simulation_state.hpp"
+#include "cosmosim/core/retained_capacity_transaction.hpp"
 
 namespace cosmosim::physics {
 namespace {
@@ -101,6 +102,11 @@ const ChemicalSpeciesInfo& chemicalSpeciesInfo(ChemicalSpecies species) {
 }
 
 CompositionLayout CompositionLayout::make(const CompositionLayoutRequest& request) {
+  if (request.adaptive_sparse_detailed &&
+      request.network != CompositionNetworkKind::kDetailedCarbonOxygen) {
+    throw std::invalid_argument(
+        "adaptive sparse chemistry storage requires the detailed C/O network");
+  }
   CompositionLayout layout;
   layout.m_request = request;
   for (const auto& element : k_elements) {
@@ -153,6 +159,11 @@ CompositionLayout CompositionLayout::make(const CompositionLayoutRequest& reques
   d.dust_lane_begin = dust_begin;
   d.dust_lane_count = static_cast<std::uint32_t>(dust_count);
   d.sgs_energy_lane = sgs_lane;
+  if (request.adaptive_sparse_detailed) {
+    layout.m_sparse_default_source_lanes = {
+        d.element_lane_begin + static_cast<std::uint32_t>(ChemicalElement::kC),
+        core::GasCompositionLayoutDescriptor::k_no_lane};
+  }
   if (!d.isConsistent()) {
     throw std::logic_error("CompositionLayout::make produced an inconsistent descriptor");
   }
@@ -316,18 +327,24 @@ void enableGasComposition(core::SimulationState& state, const CompositionLayout&
                           const PrimordialCompositionPolicy& policy) {
   auto& sidecar = state.gas_composition;
   if (sidecar.enabled()) {
-    if (!(sidecar.descriptor() == layout.descriptor())) {
+    if (!(sidecar.descriptor() == layout.descriptor()) ||
+        sidecar.sparseStorageEnabled() != layout.sparseDetailedStorage()) {
       throw std::runtime_error(
           "enableGasComposition: state already carries composition layout '" +
           sidecar.descriptor().layout_name + "' but '" + layout.descriptor().layout_name +
-          "' was requested; an explicit, versioned conversion is required");
+          "' with a different adaptive storage policy was requested; an explicit, "
+          "versioned conversion is required");
     }
     return;
   }
   const std::size_t rows = state.cells.size();
-  sidecar.configure(layout.descriptor(), rows);
+  sidecar.configure(layout.descriptor(), rows, layout.sparseLaneBegin(),
+                    layout.sparseDefaultSourceLanes());
   for (std::size_t row = 0; row < rows; ++row) {
     sidecar.gas_cell_id[row] = state.gas_cells.gas_cell_id[row];
+    if (sidecar.sparseStorageEnabled()) {
+      sidecar.chemistry_model_tag[row] = k_chemistry_tag_hybrid;
+    }
     const double mass = std::max(state.cells.mass_code[row], 0.0);
     const double metals = std::clamp(state.gas_cells.metal_mass_code[row], 0.0, mass);
     const auto elements = initialElementMasses(mass, metals, policy);
@@ -344,7 +361,7 @@ void enableGasComposition(core::SimulationState& state, const CompositionLayout&
       sidecar.setValue(layout.speciesLane(static_cast<std::size_t>(ChemicalSpecies::kHeI)), row,
                        elements[static_cast<std::size_t>(ChemicalElement::kHe)]);
     }
-    if (species >= k_detailed_species_count) {
+    if (species >= k_detailed_species_count && !sidecar.sparseStorageEnabled()) {
       sidecar.setValue(layout.speciesLane(static_cast<std::size_t>(ChemicalSpecies::kCII)), row,
                        elements[static_cast<std::size_t>(ChemicalElement::kC)]);
     }
@@ -393,7 +410,7 @@ void packGasCompositionIntoModuleSidecar(core::SimulationState& state) {
   sidecar.requireAlignedWith(state.gas_cells.gas_cell_id, "packGasCompositionIntoModuleSidecar");
   core::ModuleSidecarBlock block;
   block.module_name = k_gas_composition_module;
-  block.schema_version = 1U;
+  block.schema_version = k_gas_composition_schema;
   const auto& d = sidecar.descriptor();
   appendPod(block.payload, d.layout_version);
   appendPod(block.payload, d.layout_signature);
@@ -409,7 +426,10 @@ void packGasCompositionIntoModuleSidecar(core::SimulationState& state) {
 bool restoreGasCompositionFromModuleSidecar(core::SimulationState& state, const CompositionLayout& layout) {
   const core::ModuleSidecarBlock* block = state.sidecars.find(k_gas_composition_module);
   if (block == nullptr) return false;
-  if (block->schema_version != 1U) throw std::runtime_error("unsupported chui_gas_composition schema version");
+  if (block->schema_version != 1U && block->schema_version != 2U &&
+      block->schema_version != k_gas_composition_schema) {
+    throw std::runtime_error("unsupported chui_gas_composition schema version");
+  }
   std::size_t offset = 0;
   const auto version = readPod<std::uint32_t>(block->payload, offset);
   const auto signature = readPod<std::uint64_t>(block->payload, offset);
@@ -425,22 +445,77 @@ bool restoreGasCompositionFromModuleSidecar(core::SimulationState& state, const 
     throw std::runtime_error("checkpointed gas composition row count differs from the restored gas cells");
   }
   core::GasCompositionSidecar restored;
-  restored.configure(d, state.cells.size());
+  restored.configure(d, state.cells.size(), layout.sparseLaneBegin(),
+                     layout.sparseDefaultSourceLanes());
   std::unordered_map<std::uint64_t, std::uint32_t> row_by_id;
   row_by_id.reserve(state.cells.size());
   for (std::uint32_t r = 0; r < state.cells.size(); ++r) row_by_id.emplace(state.gas_cells.gas_cell_id[r], r);
-  std::vector<double> payload(restored.packedRowWidth());
+  const std::size_t stored_width = block->schema_version == 1U
+      ? restored.laneCount() + 4U
+      : block->schema_version == 2U
+          ? restored.laneCount() + 11U
+          : restored.packedRowWidth();
+  if (restored.sparseStorageEnabled()) {
+    std::size_t scan = offset;
+    std::size_t active_rows = 0U;
+    for (std::uint64_t i = 0; i < rows; ++i) {
+      (void)readPod<std::uint64_t>(block->payload, scan);
+      double carbon = 0.0;
+      double cii = 0.0;
+      double co = 0.0;
+      double chemistry_tag = static_cast<double>(k_chemistry_tag_hybrid);
+      double explicit_marker = 0.0;
+      for (std::size_t value_index = 0; value_index < stored_width; ++value_index) {
+        const double value = readPod<double>(block->payload, scan);
+        if (value_index == layout.elementLane(ChemicalElement::kC)) carbon = value;
+        if (value_index == restored.sparseLaneBegin()) cii = value;
+        if (value_index == restored.sparseLaneBegin() + 1U) co = value;
+        if (value_index == restored.laneCount()) chemistry_tag = value;
+        if (block->schema_version == 3U && value_index + 1U == stored_width) {
+          explicit_marker = value;
+        }
+      }
+      const bool active = explicit_marker != 0.0 || cii != carbon || co != 0.0 ||
+          (block->schema_version < 3U &&
+           chemistry_tag == static_cast<double>(k_chemistry_tag_detailed));
+      if (active) ++active_rows;
+    }
+    core::RetainedCapacityTransaction sparse_capacity(
+        [&restored] { return restored.ownedCapacityBytes(); });
+    restored.planSparseRowCapacity(sparse_capacity, active_rows);
+    sparse_capacity.execute(nullptr, core::MemoryClass::kCanonicalPersistent,
+                            "restart.adaptive_chemistry_rows");
+  }
+  std::vector<double> stored_payload(stored_width);
+  std::vector<double> payload(restored.packedRowWidth(), 0.0);
   std::vector<std::uint8_t> filled(state.cells.size(), 0U);
   for (std::uint64_t i = 0; i < rows; ++i) {
     const auto id = readPod<std::uint64_t>(block->payload, offset);
-    for (double& v : payload) v = readPod<double>(block->payload, offset);
+    for (double& v : stored_payload) v = readPod<double>(block->payload, offset);
+    std::fill(payload.begin(), payload.end(), 0.0);
+    std::copy(stored_payload.begin(), stored_payload.end(), payload.begin());
     const auto it = row_by_id.find(id);
     if (it == row_by_id.end() || filled[it->second] != 0U) {
       throw std::runtime_error("checkpointed gas composition row " + std::to_string(id) +
                                " has no unique restored gas cell");
     }
+    // Schema 1/2 stored every lane densely. Preserve a detailed row whenever
+    // its values differ from the sparse projection; schema 3 carries the
+    // explicit-history marker even when the current values equal defaults.
+    if (block->schema_version < 3U && restored.sparseStorageEnabled()) {
+      const std::size_t cii = restored.sparseLaneBegin();
+      const double implicit_cii = payload[layout.elementLane(ChemicalElement::kC)];
+      if (payload[cii] != implicit_cii || payload[cii + 1U] != 0.0 ||
+          payload[restored.laneCount()] == static_cast<double>(k_chemistry_tag_detailed)) {
+        payload.back() = 1.0;
+      }
+    }
     restored.unpackRow(it->second, payload, id);
     filled[it->second] = 1U;
+  }
+  if (offset != block->payload.size()) {
+    throw std::runtime_error(
+        "checkpointed gas composition block has trailing bytes for its schema");
   }
   state.gas_composition = std::move(restored);
   return true;

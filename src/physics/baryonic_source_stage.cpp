@@ -17,6 +17,7 @@ void BaryonicSourceStage::discard() noexcept {
   m_meta.clear();
   m_lanes.clear();
   m_pending = BaryonicSourceStageReport{};
+  m_sparse_rows_to_activate = 0U;
   m_prepared = false;
 }
 
@@ -36,7 +37,9 @@ void BaryonicSourceStage::prepare(const core::SimulationState& state, const Sour
   const std::size_t row_count = rows.empty() ? state.cells.size() : rows.size();
   m_meta.reserve(row_count);
   m_lanes.reserve(row_count * m_lane_count);
-  core::GasCompositionSidecar scratch = sidecar.emptyLike(1U);  // one row of private scratch
+  // The private row is deliberately dense: it is transient staging, has no
+  // stable gas-cell identity and must never grow retained sparse storage.
+  core::GasCompositionSidecar scratch = sidecar.emptyLike(1U, false);
   const double a = interval.evaluation_scale_factor;
   const double time_code_s = units.length_code_to_cm / units.velocity_code_to_cm_s;
   const double dt_code_time = interval.physical_seconds / time_code_s;
@@ -51,6 +54,19 @@ void BaryonicSourceStage::prepare(const core::SimulationState& state, const Sour
     meta.row = row;
     meta.internal_energy_code = state.gas_cells.internal_energy_code[row];
     meta.mean_molecular_weight = sidecar.mean_molecular_weight[row];
+    meta.last_temperature_k = std::isfinite(state.gas_cells.temperature_code[row])
+        ? std::max(state.gas_cells.temperature_code[row], 0.0)
+        : sidecar.chemistry_last_temperature_k[row];
+    meta.last_cooling_time_seconds =
+        sidecar.chemistry_last_cooling_time_seconds[row];
+    meta.last_error_estimate = sidecar.chemistry_last_error_estimate[row];
+    meta.last_element_fraction_residual =
+        sidecar.chemistry_last_element_fraction_residual[row];
+    meta.last_charge_residual = sidecar.chemistry_last_charge_residual[row];
+    meta.cumulative_radiative_loss_erg =
+        sidecar.chemistry_cumulative_radiative_loss_erg[row];
+    meta.cumulative_heating_gain_erg =
+        sidecar.chemistry_cumulative_heating_gain_erg[row];
     // 1) ISM regime (provisional).
     meta.ism_tag = sidecar.ism_regime_tag[row];
     meta.ism_dwell_years = sidecar.ism_regime_dwell_years[row];
@@ -72,8 +88,15 @@ void BaryonicSourceStage::prepare(const core::SimulationState& state, const Sour
     const ChemistryFidelityDecision fidelity = m_chemistry.decideChemistryFidelity(state, interval, row);
     meta.chemistry_tag = fidelity.tag;
     meta.chemistry_dwell_years = fidelity.dwell_years;
+    meta.last_cooling_time_seconds =
+        std::isfinite(fidelity.cooling_time_seconds)
+        ? std::max(fidelity.cooling_time_seconds, 0.0)
+        : 0.0;
     if (fidelity.promoted) ++m_pending.adaptive.promoted;
     if (fidelity.promoted && fidelity.cooling_time_trigger) ++m_pending.adaptive.promoted_by_cooling_time;
+    if (fidelity.promoted && fidelity.error_history_trigger) {
+      ++m_pending.adaptive.promoted_by_error_history;
+    }
     if (fidelity.demoted) ++m_pending.adaptive.demoted;
     if (fidelity.held_by_dwell) ++m_pending.adaptive.held_by_dwell;
     if (fidelity.tag == k_chemistry_tag_detailed) ++m_pending.adaptive.detailed_cells;
@@ -99,6 +122,15 @@ void BaryonicSourceStage::prepare(const core::SimulationState& state, const Sour
       meta.internal_energy_code = r.staged.internal_energy_code;
       meta.mean_molecular_weight = r.staged.mean_molecular_weight;
       temperature_k = r.staged.temperature_k;
+      meta.last_temperature_k = std::max(r.staged.temperature_k, 0.0);
+      meta.last_error_estimate = std::max(r.ledger.max_error_estimate, 0.0);
+      meta.last_element_fraction_residual =
+          std::abs(r.ledger.element_mass_residual_code);
+      meta.last_charge_residual = std::abs(r.ledger.charge_residual);
+      meta.cumulative_radiative_loss_erg +=
+          std::max(r.ledger.radiative_loss_erg, 0.0);
+      meta.cumulative_heating_gain_erg +=
+          std::max(r.ledger.heating_gain_erg, 0.0);
       for (std::size_t s = 0; s < m_chemistry.solver().speciesCount(); ++s) {
         scratch.setValue(layout.speciesLane(s), 0, r.staged.species_mass_code[s]);
       }
@@ -127,6 +159,10 @@ void BaryonicSourceStage::prepare(const core::SimulationState& state, const Sour
         meta.refresh = true;
       }
     }
+    if (sidecar.sparseStorageEnabled() && meta.chemistry_tag == k_chemistry_tag_detailed &&
+        !sidecar.hasExplicitSparseRow(row)) {
+      ++m_sparse_rows_to_activate;
+    }
     m_meta.push_back(meta);
     for (std::size_t l = 0; l < m_lane_count; ++l) m_lanes.push_back(scratch.value(l, 0));
   }
@@ -149,6 +185,9 @@ std::vector<std::uint32_t> BaryonicSourceStage::commit(core::SimulationState& st
   rows.reserve(m_meta.size());
   for (std::size_t i = 0; i < m_meta.size(); ++i) {
     const StagedMeta& meta = m_meta[i];
+    if (sidecar.sparseStorageEnabled() && meta.chemistry_tag == k_chemistry_tag_detailed) {
+      sidecar.activateSparseRow(meta.row);
+    }
     for (std::size_t l = 0; l < m_lane_count; ++l) sidecar.setValue(l, meta.row, m_lanes[i * m_lane_count + l]);
     state.gas_cells.internal_energy_code[meta.row] = meta.internal_energy_code;
     sidecar.mean_molecular_weight[meta.row] = meta.mean_molecular_weight;
@@ -156,6 +195,18 @@ std::vector<std::uint32_t> BaryonicSourceStage::commit(core::SimulationState& st
     sidecar.ism_regime_dwell_years[meta.row] = meta.ism_dwell_years;
     sidecar.chemistry_model_tag[meta.row] = meta.chemistry_tag;
     sidecar.model_dwell_years[meta.row] = meta.chemistry_dwell_years;
+    sidecar.chemistry_last_temperature_k[meta.row] = meta.last_temperature_k;
+    sidecar.chemistry_last_cooling_time_seconds[meta.row] =
+        meta.last_cooling_time_seconds;
+    sidecar.chemistry_last_error_estimate[meta.row] = meta.last_error_estimate;
+    sidecar.chemistry_last_element_fraction_residual[meta.row] =
+        meta.last_element_fraction_residual;
+    sidecar.chemistry_last_charge_residual[meta.row] =
+        meta.last_charge_residual;
+    sidecar.chemistry_cumulative_radiative_loss_erg[meta.row] =
+        meta.cumulative_radiative_loss_erg;
+    sidecar.chemistry_cumulative_heating_gain_erg[meta.row] =
+        meta.cumulative_heating_gain_erg;
     rows.push_back(meta.row);
     if (meta.refresh) refresh.push_back(meta.row);
   }
@@ -164,6 +215,7 @@ std::vector<std::uint32_t> BaryonicSourceStage::commit(core::SimulationState& st
   m_meta.clear();
   m_lanes.clear();
   m_pending = BaryonicSourceStageReport{};
+  m_sparse_rows_to_activate = 0U;
   m_prepared = false;
   return refresh;
 }

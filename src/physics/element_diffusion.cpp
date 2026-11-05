@@ -6,6 +6,8 @@
 #include <stdexcept>
 #include <string>
 
+#include "cosmosim/core/retained_capacity_transaction.hpp"
+
 namespace cosmosim::physics {
 namespace {
 
@@ -51,7 +53,8 @@ ElementDiffusionReport advanceElementResolvedDiffusion(
     double parabolic_cfl,
     std::uint32_t max_subcycles,
     std::vector<double>& workspace,
-    ElementDiffusionRemoteCoupling* coupling) {
+    ElementDiffusionRemoteCoupling* coupling,
+    core::MemoryGovernor* memory_governor) {
   ElementDiffusionReport report;
   // Arguments that are identical on every rank (config / global dt) may
   // return before any collective; data-dependent exits may not.
@@ -93,8 +96,9 @@ ElementDiffusionReport advanceElementResolvedDiffusion(
     gas_mass = workspace.data() + n_lanes * rows;
     conductance_sum = gas_mass + rows;
     for (std::size_t k = 0; k < n_lanes; ++k) {
-      const auto lane = sidecar.lane(lanes[k]);
-      std::copy(lane.begin(), lane.end(), values + k * rows);
+      for (std::size_t row = 0; row < rows; ++row) {
+        values[k * rows + row] = sidecar.value(lanes[k], row);
+      }
     }
     for (std::size_t row = 0; row < rows; ++row) {
       double m = 0.0;
@@ -215,11 +219,69 @@ ElementDiffusionReport advanceElementResolvedDiffusion(
         report.max_relative_lane_residual,
         std::abs(after[k] - before_scale[k]) / std::max(before_scale[n_lanes + k], 1.0e-300));
   }
+  std::size_t sparse_rows_to_activate = 0U;
+  try {
+    if (sidecar.sparseStorageEnabled()) {
+      for (std::size_t row = 0; row < rows; ++row) {
+        if (sidecar.hasExplicitSparseRow(row)) continue;
+        bool needs_explicit = false;
+        for (std::size_t lane = sidecar.sparseLaneBegin();
+             lane < static_cast<std::size_t>(sidecar.sparseLaneBegin()) + sidecar.sparseLaneCount();
+             ++lane) {
+          const auto sparse_it = std::find(lanes.begin(), lanes.end(), lane);
+          if (sparse_it == lanes.end()) {
+            throw std::logic_error("element diffusion sparse lane is absent from mixed lanes");
+          }
+          const std::size_t sparse_k = static_cast<std::size_t>(sparse_it - lanes.begin());
+          const std::uint32_t source = sidecar.sparseDefaultSourceLane(lane);
+          double implicit_after = 0.0;
+          if (source != core::GasCompositionLayoutDescriptor::k_no_lane) {
+            const auto source_it = std::find(lanes.begin(), lanes.end(), source);
+            if (source_it == lanes.end()) {
+              throw std::logic_error("element diffusion sparse source lane is absent from mixed lanes");
+            }
+            implicit_after = values[static_cast<std::size_t>(source_it - lanes.begin()) * rows + row];
+          }
+          needs_explicit = needs_explicit || values[sparse_k * rows + row] != implicit_after;
+        }
+        if (needs_explicit) ++sparse_rows_to_activate;
+      }
+      core::RetainedCapacityTransaction sparse_capacity(
+          [&sidecar] { return sidecar.ownedCapacityBytes(); });
+      sidecar.planSparseRowCapacity(
+          sparse_capacity, sidecar.sparseActiveRowCount() + sparse_rows_to_activate);
+      sparse_capacity.execute(memory_governor, core::MemoryClass::kCanonicalPersistent,
+                              "element_diffusion.adaptive_chemistry_rows");
+    }
+  } catch (...) {
+    failure = std::current_exception();
+  }
+  reduce(failure, "element diffusion sparse capacity");
   // Commit (no exception past this point).
-  for (std::size_t k = 0; k < n_lanes; ++k) {
-    auto lane = sidecar.lane(lanes[k]);
+  if (sidecar.sparseStorageEnabled()) {
     for (std::size_t row = 0; row < rows; ++row) {
-      lane[row] = std::max(values[k * rows + row], 0.0);
+      if (sidecar.hasExplicitSparseRow(row)) continue;
+      for (std::size_t lane = sidecar.sparseLaneBegin();
+           lane < static_cast<std::size_t>(sidecar.sparseLaneBegin()) + sidecar.sparseLaneCount();
+           ++lane) {
+        const std::size_t sparse_k = static_cast<std::size_t>(
+            std::find(lanes.begin(), lanes.end(), lane) - lanes.begin());
+        const std::uint32_t source = sidecar.sparseDefaultSourceLane(lane);
+        double implicit_after = 0.0;
+        if (source != core::GasCompositionLayoutDescriptor::k_no_lane) {
+          implicit_after = values[static_cast<std::size_t>(
+              std::find(lanes.begin(), lanes.end(), source) - lanes.begin()) * rows + row];
+        }
+        if (values[sparse_k * rows + row] != implicit_after) {
+          sidecar.activateSparseRow(row);
+          break;
+        }
+      }
+    }
+  }
+  for (std::size_t k = 0; k < n_lanes; ++k) {
+    for (std::size_t row = 0; row < rows; ++row) {
+      sidecar.setValue(lanes[k], row, std::max(values[k * rows + row], 0.0));
     }
   }
   report.subcycles = subcycles;
