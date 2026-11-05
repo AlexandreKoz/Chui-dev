@@ -684,6 +684,37 @@ struct HydroBoundaryCellAdvertisement {
 
 
 
+// T02 bridge between the AMR library's level-clock seam and the workflow
+// source owner. Owns no state: it forwards each level half to
+// SourceRuntime::executeAmrLevelSmoothSources() with the coarse StepContext
+// that owns the accepted interval. Lifetime: one hydro stage (stack object);
+// both references outlive it.
+class RecursiveAmrLevelSourceAdapter final : public amr::RecursiveAmrLevelSourceOperator {
+ public:
+  RecursiveAmrLevelSourceAdapter(SourceRuntime& source, core::StepContext& step) noexcept
+      : m_source(source), m_step(step) {}
+
+  void apply(core::SimulationState& state,
+             std::span<const std::uint32_t> level_rows,
+             const hydro::HydroUpdateContext& level_update,
+             int level,
+             amr::RecursiveAmrSourcePhase phase) override {
+    if (&state != &m_step.state) {
+      throw std::logic_error(
+          "recursive AMR level source adapter received a foreign SimulationState");
+    }
+    const core::SourceSplitPhase split_phase =
+        phase == amr::RecursiveAmrSourcePhase::kPreHydroHalf
+        ? core::SourceSplitPhase::kStrangPreHalf
+        : core::SourceSplitPhase::kStrangPostHalf;
+    m_source.executeAmrLevelSmoothSources(m_step, level_rows, level_update, level, split_phase);
+  }
+
+ private:
+  SourceRuntime& m_source;
+  core::StepContext& m_step;
+};
+
 class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
  public:
   HydroAmrRuntimeImpl(
@@ -773,10 +804,6 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
       m_effective_ism_energy_source =
           std::make_unique<physics::EffectiveIsmEnergyRelaxationSource>(*m_effective_ism_closure);
     }
-  }
-
-  void setMultilevelSourceRuntime(SourceRuntime* source) noexcept override {
-    m_multilevel_source_runtime = source;
   }
 
   [[nodiscard]] const hydro::HydroProfileEvent& lastHydroProfile() const noexcept { return m_last_hydro_profile; }
@@ -917,7 +944,19 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
   }
 
   void bindSourceRuntime(SourceRuntime* source_runtime) noexcept override {
+    if (m_source_runtime != nullptr && m_source_runtime != source_runtime) {
+      m_source_runtime->setAmrLevelSourceCouplingEnabled(false);
+    }
     m_source_runtime = source_runtime;
+    // T02 composition contract: under recursive subcycling the AMR level
+    // clocks own the smooth baryonic halves. The same predicate installs the
+    // RecursiveAmrLevelSourceAdapter in runProductionAmrHydroPath(), so the
+    // source owner's global smooth halves are skipped iff levels run them.
+    if (m_source_runtime != nullptr) {
+      m_source_runtime->setAmrLevelSourceCouplingEnabled(
+          m_config.numerics.amr_time_stepping ==
+          core::AmrTimeSteppingConfigMode::kRecursiveSubcycling);
+    }
   }
 
   [[nodiscard]] RuntimeTaskMemoryEstimate estimateMemory(
@@ -2856,13 +2895,15 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
     if (m_config.numerics.amr_time_stepping == core::AmrTimeSteppingConfigMode::kRecursiveSubcycling) {
       verifyAcceptedRecursiveAmrHydroCfl(context, amr::ProductionAmrHydroOptions{}.refinement_ratio);
     }
+    // T02: the adapter lives on this stack frame for the whole recursive
+    // advance; the AMR driver holds only a non-owning pointer to it.
     std::optional<RecursiveAmrLevelSourceAdapter> recursive_source_adapter;
     if (m_config.numerics.amr_time_stepping ==
             core::AmrTimeSteppingConfigMode::kRecursiveSubcycling &&
-        m_multilevel_source_runtime != nullptr) {
-      recursive_source_adapter.emplace(*m_multilevel_source_runtime, context);
+        m_source_runtime != nullptr) {
+      recursive_source_adapter.emplace(*m_source_runtime, context);
     }
-    const amr::ProductionAmrHydroOptions amr_options{
+    amr::ProductionAmrHydroOptions amr_options{
         .physical_boundary_kind = hydroBoundaryKindFromModePolicy(m_mode_policy.hydro_boundary),
         .adiabatic_index = k_gamma_adiabatic,
         .density_floor = m_config.numerics.hydro_density_floor_code,
@@ -2884,26 +2925,6 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
             m_config.cosmology.box_size_y_mpc_comoving,
             m_config.cosmology.box_size_z_mpc_comoving},
         .thermodynamic_cache = amrThermodynamicCachePolicy(update.scale_factor, source_context.redshift)};
-    if (m_config.numerics.amr_time_stepping ==
-            core::AmrTimeSteppingConfigMode::kRecursiveSubcycling &&
-        m_source_runtime != nullptr &&
-        m_source_runtime->recursiveAmrThermochemistryEnabled()) {
-      amr_options.recursive_level_source_user_data =
-          &recursive_source_callback_context;
-      amr_options.recursive_level_source_callback =
-          +[](void* user_data, core::SimulationState& state,
-              std::span<const std::uint32_t> rows, int level,
-              const hydro::HydroUpdateContext& level_update) {
-            auto* callback = static_cast<RecursiveSourceCallbackContext*>(user_data);
-            if (callback == nullptr || callback->source == nullptr ||
-                callback->step == nullptr || &callback->step->state != &state) {
-              throw std::logic_error(
-                  "recursive AMR source callback has invalid workflow ownership");
-            }
-            callback->source->executeRecursiveAmrThermochemistry(
-                *callback->step, rows, level_update, level);
-          };
-    }
     amr::ProductionAmrHydroDiagnostics amr_diagnostics;
     std::size_t remote_patch_count = 0;
     std::size_t remote_flux_register_count = 0;
@@ -3155,6 +3176,21 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
         "production AMR hydro parent compatibility mirror");
     m_last_directed_amr_diagnostics = directed_amr_diagnostics;
     runAutomaticAmrRegrid(context, amr_options, regrid_remote_neighbors);
+    // H01 telemetry: CTU interface outcomes summed over ranks (the per-rank
+    // values above are summed over patches and recursive level clocks). The
+    // reductions are rank-uniform and independent of profiler availability.
+    const std::uint64_t global_ctu_corrected =
+        m_mpi_context.allreduceSumUint64(amr_diagnostics.ctu_transverse_corrected_states);
+    const std::uint64_t global_ctu_degraded =
+        m_mpi_context.allreduceSumUint64(amr_diagnostics.ctu_transverse_degraded_states);
+    const std::uint64_t global_ctu_ghost_corrected =
+        m_mpi_context.allreduceSumUint64(amr_diagnostics.ctu_transverse_ghost_corrected_states);
+    const std::uint64_t global_ctu_ghost_axes =
+        m_mpi_context.allreduceSumUint64(amr_diagnostics.ctu_transverse_ghost_axes);
+    const std::uint64_t global_ctu_boundary_proxy =
+        m_mpi_context.allreduceSumUint64(amr_diagnostics.ctu_transverse_boundary_proxy_states);
+    const std::uint64_t global_ctu_inadmissible =
+        m_mpi_context.allreduceSumUint64(amr_diagnostics.ctu_transverse_inadmissible_states);
     if (context.profiler_session != nullptr) {
       context.profiler_session->recordEvent(core::RuntimeEvent{
           .event_kind = "hydro.amr_production_stage",
@@ -3172,6 +3208,17 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
                       {"ctu_transverse_degraded_states", std::to_string(amr_diagnostics.ctu_transverse_degraded_states)},
                       {"ctu_transverse_ghost_corrected_states", std::to_string(amr_diagnostics.ctu_transverse_ghost_corrected_states)},
                       {"ctu_transverse_ghost_axes", std::to_string(amr_diagnostics.ctu_transverse_ghost_axes)},
+                      {"ctu_transverse_corrected_states", std::to_string(amr_diagnostics.ctu_transverse_corrected_states)},
+                      {"ctu_transverse_boundary_proxy_states",
+                       std::to_string(amr_diagnostics.ctu_transverse_boundary_proxy_states)},
+                      {"ctu_transverse_inadmissible_states",
+                       std::to_string(amr_diagnostics.ctu_transverse_inadmissible_states)},
+                      {"global_ctu_transverse_corrected_states", std::to_string(global_ctu_corrected)},
+                      {"global_ctu_transverse_degraded_states", std::to_string(global_ctu_degraded)},
+                      {"global_ctu_transverse_ghost_corrected_states", std::to_string(global_ctu_ghost_corrected)},
+                      {"global_ctu_transverse_ghost_axes", std::to_string(global_ctu_ghost_axes)},
+                      {"global_ctu_transverse_boundary_proxy_states", std::to_string(global_ctu_boundary_proxy)},
+                      {"global_ctu_transverse_inadmissible_states", std::to_string(global_ctu_inadmissible)},
                       {"dual_energy_auxiliary_cells", std::to_string(amr_diagnostics.dual_energy_auxiliary_cells)},
                       {"dual_energy_unresolved_ghosts", std::to_string(amr_diagnostics.dual_energy_unresolved_ghosts)},
                       {"dual_energy_thermal_correction_code",
@@ -3460,7 +3507,15 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
         const bool comoving = m_config.units.coordinate_frame == core::CoordinateFrame::kComoving;
         const double redshift = m_mode_policy.cosmological_comoving_frame ? std::max(0.0, 1.0 / a - 1.0) : 0.0;
         cooling_time_code.assign(context.state.cells.size(), std::numeric_limits<double>::infinity());
-        for (std::uint32_t row = 0; row < context.state.cells.size(); ++row) {
+        // A03: Part 2 thermochemistry without an accepted per-row history
+        // (first interval, restart of a pre-history schema, regridded rows)
+        // evaluates the SAME thermochemistry model's cooling time through the
+        // source owner instead of refusing the mandatory criterion.
+        const bool source_cooling_times = !chemistry_history &&
+            !m_cooling_rate_provider.has_value() && m_source_runtime != nullptr &&
+            m_source_runtime->fillAmrCoolingTimes(context, cooling_time_code);
+        for (std::uint32_t row = 0;
+             !source_cooling_times && row < context.state.cells.size(); ++row) {
           if (chemistry_history) {
             const double seconds =
                 context.state.gas_composition.chemistry_last_cooling_time_seconds[row];
@@ -4386,7 +4441,6 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
   const core::SimulationConfig& m_config;
   const core::ModePolicy& m_mode_policy;
   const parallel::MpiContext& m_mpi_context;
-  SourceRuntime* m_multilevel_source_runtime = nullptr;
   core::MemoryGovernor* m_memory_governor = nullptr;
   core::UnitSystem m_units;
   std::uint32_t m_current_world_rank = 0;

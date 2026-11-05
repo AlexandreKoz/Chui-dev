@@ -75,6 +75,7 @@ class RecursiveAmrLevelSourceOperator {
       core::SimulationState& state,
       std::span<const std::uint32_t> level_rows,
       const hydro::HydroUpdateContext& level_update,
+      int level,
       RecursiveAmrSourcePhase phase) = 0;
 };
 
@@ -138,19 +139,6 @@ struct ProductionAmrHydroOptions {
   // coarse/fine and rank interfaces. A non-zero value overrides (tests).
   std::uint8_t ghost_layers = 0;
   AmrThermodynamicCachePolicy thermodynamic_cache{};
-
-  // T02 closure: optional workflow-owned stiff-source callback invoked after
-  // every recursive level hydro sweep and before the level end-state history
-  // is published. It is invoked on every rank for every global level clock,
-  // including ranks with an empty row span, so callback collectives have a
-  // deterministic ordering. The callback must either commit its whole row
-  // subset or throw; the recursive driver reduces failures before advancing.
-  using RecursiveLevelSourceCallback = void (*)(
-      void* user_data, core::SimulationState& state,
-      std::span<const std::uint32_t> level_rows, int level,
-      const hydro::HydroUpdateContext& update);
-  void* recursive_level_source_user_data = nullptr;
-  RecursiveLevelSourceCallback recursive_level_source_callback = nullptr;
 };
 
 // Complete physical workspace for immutable step-start ghost snapshots.
@@ -163,8 +151,14 @@ struct ProductionAmrHydroDiagnostics {
   std::uint64_t riemann_solve_count = 0;
   std::uint64_t positivity_fallback_count = 0;
   std::uint64_t stencil_degradation_count = 0;
+  std::uint64_t ctu_transverse_corrected_states = 0;
   std::uint64_t ctu_transverse_degraded_states = 0;
   std::uint64_t ctu_transverse_boundary_proxy_states = 0;
+  // Ghost-side CTU states corrected from a complete tangential ghost-slab
+  // stencil, and the count of such complete ghost-slab axes (H01 telemetry).
+  std::uint64_t ctu_transverse_ghost_corrected_states = 0;
+  std::uint64_t ctu_transverse_ghost_axes = 0;
+  std::uint64_t ctu_transverse_inadmissible_states = 0;
   std::uint64_t dual_energy_auxiliary_cells = 0;
   // Ghost rows whose auxiliary energy could not be resolved from a local
   // source cell (remote sources): dual-energy protection degraded there.

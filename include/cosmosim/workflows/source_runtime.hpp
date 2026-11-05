@@ -35,17 +35,45 @@ class SourceRuntime {
  public:
   virtual ~SourceRuntime() = default;
 
+  // T01 deterministic Strang reference S(dt/2) H(dt) S(dt/2). The time
+  // integrator dispatches this stage twice per (block) interval with
+  // StepContext::source_split_phase = kStrangPreHalf, then kStrangPostHalf.
+  //   * Smooth operators (thermochemistry/ISM/dust/SGS, element diffusion
+  //     and SGS shear transfer) advance the physical half interval
+  //     [t_begin, t_mid] or [t_mid, t_end] at that half's physical midpoint.
+  //   * Discrete/stochastic events (star birth, SSP/stellar returns, winds,
+  //     SN/feedback deposition, BH seeding/accretion/feedback) execute ONLY in
+  //     kStrangPostHalf, once, at the absolute end-of-interval epoch with the
+  //     full interval duration (never twice per coarse step).
+  //   * The adaptive chemistry controller accumulates shadow observations from
+  //     every half/level of one interval and publishes exactly once when the
+  //     post half closes the interval. A rejected trial is rolled back through
+  //     capture/restoreRollbackCheckpoint() and SimulationState restoration.
+  // kUnsplitCompatibility (direct low-level dispatch) runs smooth sources over
+  // the full interval, then events, then publishes; it opens and closes the
+  // interval in one call.
   virtual void execute(SourceMutationStageView& view) = 0;
-  // T02: smooth thermochemistry/dust/SGS on one recursive AMR level
-  // subinterval. The caller is the AMR clock owner and invokes both phases on
-  // every rank, including empty local spans. Discrete sources and diffusion
-  // retain their separate global chronology until their dedicated contracts
-  // are connected; this method must never execute them implicitly.
+  // T02: smooth thermochemistry/ISM/dust/SGS on one recursive AMR level
+  // subinterval [level t_begin, t_end], for the pre-hydro or post-hydro half
+  // of that level's own Strang split. The AMR clock owner calls both phases on
+  // every rank for every level clock, including empty local spans (the stage
+  // vote is collective). Observations accumulate into the open coarse source
+  // interval; nothing is published here. Discrete events, element diffusion
+  // and SGS shear transfer keep their globally synchronized coarse chronology
+  // in execute() and are never executed implicitly by this method. Throws
+  // std::logic_error when composition did not enable the coupling or when no
+  // coarse source interval is open.
   virtual void executeAmrLevelSmoothSources(
       core::StepContext& parent_context,
       std::span<const std::uint32_t> level_rows,
       const hydro::HydroUpdateContext& level_update,
+      int level,
       core::SourceSplitPhase phase) = 0;
+  // Composition-root switch, set by HydroAmrRuntime::bindSourceRuntime() when
+  // the configured AMR stepping is recursive subcycling. While enabled and the
+  // hierarchy has production AMR coverage, execute() skips its global smooth
+  // thermochemistry halves (the AMR levels own them) and verifies at interval
+  // close that every level pre half had a matching post half.
   virtual void setAmrLevelSourceCouplingEnabled(bool enabled) noexcept = 0;
   [[nodiscard]] virtual RuntimeTaskMemoryEstimate estimateMemory(
       const core::SimulationState&) const {
@@ -53,15 +81,10 @@ class SourceRuntime {
   }
   [[nodiscard]] virtual core::MemoryReport memoryReport() const = 0;
 
-  // T02/A03 bridge: the hydro owner may ask the source owner to advance the
-  // stiff baryonic stage on one recursive AMR level after that level's hydro
-  // sweep, and to expose the same thermochemistry model's cooling time to the
-  // production regrid planner. The default implementation preserves legacy
-  // runtimes that do not own Part-2 thermochemistry.
-  [[nodiscard]] virtual bool recursiveAmrThermochemistryEnabled() const noexcept { return false; }
-  virtual void executeRecursiveAmrThermochemistry(
-      core::StepContext&, std::span<const std::uint32_t>,
-      const hydro::HydroUpdateContext&, int) {}
+  // A03 bridge: the production regrid planner may ask the source owner for
+  // the same thermochemistry model's cooling time (code units, +inf where no
+  // cooling) on every dense gas row. Returns false when the owner has no
+  // Part-2 thermochemistry; the caller then has no cooling-length criterion.
   [[nodiscard]] virtual bool fillAmrCoolingTimes(
       core::StepContext&, std::span<double>) { return false; }
 
