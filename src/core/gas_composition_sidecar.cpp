@@ -19,7 +19,8 @@ bool GasCompositionLayoutDescriptor::isConsistent() const noexcept {
   };
   if (!within(element_lane_begin, element_lane_count) ||
       !within(species_lane_begin, species_lane_count) ||
-      !within(dust_lane_begin, dust_lane_count)) {
+      !within(dust_lane_begin, dust_lane_count) ||
+      !within(ion_lane_begin, ion_lane_count)) {
     return false;
   }
   if (sgs_energy_lane != k_no_lane && sgs_energy_lane >= lane_count) {
@@ -35,6 +36,7 @@ bool GasCompositionLayoutDescriptor::operator==(
       element_lane_begin == rhs.element_lane_begin && element_lane_count == rhs.element_lane_count &&
       species_lane_begin == rhs.species_lane_begin && species_lane_count == rhs.species_lane_count &&
       dust_lane_begin == rhs.dust_lane_begin && dust_lane_count == rhs.dust_lane_count &&
+      ion_lane_begin == rhs.ion_lane_begin && ion_lane_count == rhs.ion_lane_count &&
       sgs_energy_lane == rhs.sgs_energy_lane;
 }
 

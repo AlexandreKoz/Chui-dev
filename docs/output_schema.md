@@ -492,6 +492,7 @@ HDF5); an absent dataset means the physics is disabled, never zero.
 | `CHUI_ElementMassFractions` | [N, 11] | gas-phase element lane mass / (elements + dust) (H, He, C, N, O, Ne, Mg, Si, S, Ca, Fe) |
 | `CHUI_SpeciesMassFractions` | [N, S] | species lane mass / same basis (hybrid/detailed networks only) |
 | `CHUI_DustMassFractions` | [N, D] | dust reservoir mass / same basis |
+| `CHUI_IonStageMassFractions` | [N, I] | C02 metal-ion ladders only (`physics.chemistry_metal_ion_elements != none`): gas-phase nuclei mass of each ionization stage / same basis; stage names in `CHUI_IonStageNames` (`ion_C_I` .. `ion_Fe_XXVII`, selected elements only). Distribution carrier: the authoritative element total is `CHUI_ElementMassFractions` (minus CO-bound C/O) |
 | `CHUI_SgsSpecificEnergy` | [N] | SGS energy / gas mass (code units), when the SGS lane exists |
 | `CHUI_MeanMolecularWeight` | [N] | cached mu (amu); NaN = unknown (rebuilt by chemistry) |
 | `CHUI_ChemistryModelTag`, `CHUI_IsmRegimeTag` | [N] u8 | adaptive chemistry fidelity / ISM regime tags |

@@ -8,6 +8,7 @@
 #include "cosmosim/physics/chemical_network.hpp"
 #include "cosmosim/physics/ism_dust_sgs.hpp"
 #include "cosmosim/physics/metal_cooling_table.hpp"
+#include "cosmosim/physics/metal_ion_network.hpp"
 #include "cosmosim/physics/radiation_background.hpp"
 #include "cosmosim/physics/thermochemistry_operator.hpp"
 
@@ -37,6 +38,9 @@ bool ensureGasCompositionInitialized(core::SimulationState& state, const core::P
 struct BaryonicDataProducts {
   std::shared_ptr<const UvBackgroundTable> uv_background;
   std::shared_ptr<const MetalCoolingTable> metal_cooling_table;
+  // C02 metal-ion ladder dataset (schema chui_metal_ion_rates_v1), loaded
+  // only when physics.chemistry_metal_ion_elements != none.
+  std::shared_ptr<const MetalIonRateTable> metal_ion_rate_table;
   // Part 2.5: metal-table / CHUI UVB compatibility decision (only meaningful
   // when metal_cooling_table is loaded). An accepted mismatch is recorded in
   // the normalized configuration (metal_cooling_accept_uv_background_mismatch

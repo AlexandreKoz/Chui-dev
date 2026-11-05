@@ -110,6 +110,13 @@ struct CompositionLayoutRequest {
   // Storage policy only: preserve the scientific lane manifest/signature,
   // but materialize the detailed C+/CO suffix only for adaptive rows.
   bool adaptive_sparse_detailed = false;
+  // C02: bitmask of MetalIonElement ladders (bit e = C, O, Si, Fe) carried
+  // after the detailed species lanes. Requires kDetailedCarbonOxygen. Under
+  // adaptive sparse storage the ion lanes join the sparse detailed suffix
+  // with implicit value zero (rows that were never detailed carry no ladder
+  // state; the operator initializes a promoted row from ionization
+  // equilibrium, an explicit counted mapping).
+  std::uint8_t metal_ion_element_mask = 0U;
 };
 
 struct CompositionLane {
@@ -137,6 +144,10 @@ class CompositionLayout {
   // Species lane index for network species slot (see chemical_network.hpp).
   [[nodiscard]] std::uint32_t speciesLane(std::size_t species_slot) const;
   [[nodiscard]] std::uint32_t dustLane(std::size_t dust_slot) const;
+  // C02: lane of stage `stage` of ion ladder `ion_offset` (packed stage
+  // index from MetalIonElementSet::stageOffset()).
+  [[nodiscard]] std::uint32_t ionStageLane(std::size_t packed_stage) const;
+  [[nodiscard]] std::uint32_t ionStageCount() const noexcept { return m_descriptor.ion_lane_count; }
   [[nodiscard]] bool hasSgs() const noexcept {
     return m_descriptor.sgs_energy_lane != core::GasCompositionLayoutDescriptor::k_no_lane;
   }

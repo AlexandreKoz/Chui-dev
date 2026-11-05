@@ -665,3 +665,25 @@ it; no schema or config migration is involved, and the old per-axis rule
 cannot be selected for MUSCL-Hancock because it is linearly unstable for
 diagonal 3D flow. Reproducibility against pre-stabilization runs is not
 bitwise.
+
+## C02/T01 source-chronology and metal-ion lane note (2026-11-05)
+
+* **No restart schema version change.** The composition block remains
+  `chui_gas_composition_v1` schema 3; the composition layout descriptor gains an
+  ion-stage lane range (`ion_lane_begin`, `ion_lane_count`) that is reconstructed
+  from the configuration, and the layout *signature* (FNV-1a over lane names)
+  now includes `ion_<El>_<stage>` lanes when
+  `physics.chemistry_metal_ion_elements != none`. A checkpoint written with a
+  different ion selection is refused by the existing signature check (explicit,
+  never silent). Selecting `none` reproduces the previous signature exactly.
+* The Strang `SourceIntervalAccumulator` is runtime controller state, not
+  restart state: restart/output boundaries are only legal after the post half,
+  where the interval is always closed. It is captured/restored by the
+  whole-step rollback checkpoint, so a retried step replays from a closed
+  interval. The V02 joint controller sidecar
+  (`chui_v02_joint_error_resource_control_v1`) now receives the AMR half of its
+  fields on every regrid pass (previously only the chemistry half was written).
+* Reproducibility impact: discrete source events now execute once per
+  interval (post half) instead of being reachable in both halves; runs from
+  patch 48 are not bit-comparable (patch 48 could not have produced a valid
+  run in any case — see `docs/repair/chui_source_implementation_closure.md`).

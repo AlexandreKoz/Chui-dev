@@ -481,6 +481,12 @@ struct HydroProfileEvent {
   // remote ghost owns a local transverse-flux stencil. Qualification still
   // requires the boundary convergence tests.
   std::uint64_t ctu_transverse_boundary_proxy_states = 0;
+  // Imported/physical ghost side states whose transverse increment was
+  // reconstructed from a complete tangential face-slab stencil (subset of
+  // ctu_transverse_corrected_states), and the number of tangential ghost-slab
+  // axes for which that stencil was complete (each adds 2 Riemann solves).
+  std::uint64_t ctu_transverse_ghost_corrected_states = 0;
+  std::uint64_t ctu_transverse_ghost_axes = 0;
   // Corrected state was inadmissible; normal-only predictor used.
   std::uint64_t ctu_transverse_inadmissible_states = 0;
   // Cells whose final thermal energy came from the auxiliary update.

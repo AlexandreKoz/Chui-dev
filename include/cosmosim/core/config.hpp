@@ -705,6 +705,13 @@ struct PhysicsConfig {
   std::string uv_background_table_sha256 = "";
   std::string metal_cooling_table_path = "";
   std::string metal_cooling_table_sha256 = "";
+  // C02 fixed detailed metal-ion reference: "none" or a comma-separated
+  // subset of C,O,Si,Fe (normalized to catalog order). Requires
+  // thermochemistry_backend=fixed_detailed and an external rate dataset
+  // (schema chui_metal_ion_rates_v1) bound by SHA-256; no rates are bundled.
+  std::string chemistry_metal_ion_elements = "none";
+  std::string metal_ion_rate_table_path = "";
+  std::string metal_ion_rate_table_sha256 = "";
   std::string ssp_yield_table_path = "";
   std::string ssp_yield_table_sha256 = "";
   bool chemistry_metallicity_scaled_dust_proxy = false;

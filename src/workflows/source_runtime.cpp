@@ -491,6 +491,18 @@ class DistributedParticleIdRegistry final : public physics::ParticleIdPrecommit 
   }
   void finishPrecommit() noexcept override { m_result_reservation.release(); }
 
+  // G1.6 rollback entry point (the only public invalidation path). The
+  // whole-step coordinator restores SimulationState on every rank, so every
+  // rank calls this together; the occupied shard is then rebuilt by the
+  // collective initializeOccupiedShard() at the next precommit, from the
+  // restored authoritative particle IDs. Any precommit result lease of the
+  // rejected trial has no surviving consumer and is released here so the
+  // next precommit's "no live consumer" guard holds on every rank.
+  void invalidateForRollback() noexcept {
+    m_result_reservation.release();
+    invalidateOccupancyCache();
+  }
+
   void preparePopulationGrowth(core::SimulationState& state, std::size_t count,
                                core::ParticleSpecies species) override {
     if (m_growth_handler != nullptr) m_growth_handler(m_growth_owner, state, count, species);
@@ -890,6 +902,56 @@ class FeedbackCellVolumeProvider final
   const core::SimulationState& m_state;
 };
 
+// T01 source-interval contract. One plan is derived per source dispatch from
+// the integrator-owned CosmologicalStepFactors (coarse/block interval) and the
+// dispatch's SourceSplitPhase; every source operator reads its clock from
+// here, never from an ad-hoc local. Code time is linear in cosmic time
+// (time_si_per_code), so code-time halves are physical-time halves; the
+// half-interval scale factors are obtained by inverting the same background
+// integral. Proper-coordinate (non-cosmological) runs use a == 1 throughout.
+struct SourceStagePlan {
+  core::SourceSplitPhase phase = core::SourceSplitPhase::kUnsplitCompatibility;
+  // Coarse (or hierarchical-block) interval owned by the time integrator.
+  double coarse_time_begin_code = 0.0;
+  double coarse_time_end_code = 0.0;
+  double coarse_dt_code = 0.0;
+  // Smooth sub-interval advanced by this dispatch.
+  double smooth_fraction_begin = 0.0;
+  double smooth_fraction_end = 1.0;
+  double smooth_time_begin_code = 0.0;
+  double smooth_time_end_code = 0.0;
+  double smooth_dt_code = 0.0;
+  double smooth_scale_factor_begin = 1.0;
+  double smooth_scale_factor_end = 1.0;
+  // Physical-time midpoint of the smooth sub-interval (compatibility: end).
+  double smooth_evaluation_scale_factor = 1.0;
+  // Discrete event epoch: absolute end of the coarse interval, full duration.
+  double event_time_code = 0.0;
+  double event_scale_factor = 1.0;
+  double event_dt_code = 0.0;
+  // Ownership of this dispatch.
+  bool global_smooth_thermochemistry = true;  // false: AMR levels own it
+  bool smooth_transport = true;               // element diffusion + SGS shear
+  bool discrete_events = false;
+  bool opens_interval = false;
+  bool closes_interval = false;
+};
+
+// Accumulates the observations of one Strang source interval (both global
+// halves and every recursive level half) for the single controller
+// publication at interval close. Plain values: rollback restores it.
+struct SourceIntervalAccumulator {
+  bool open = false;
+  std::uint64_t sequence = 0U;            // intervals opened so far
+  std::uint64_t step_index = std::numeric_limits<std::uint64_t>::max();
+  bool recursive_levels = false;          // AMR levels own smooth thermochemistry
+  std::uint64_t global_smooth_halves = 0U;
+  std::uint64_t level_pre_halves = 0U;
+  std::uint64_t level_post_halves = 0U;
+  physics::ChemistryShadowReport shadow{};
+  physics::ChemistryAdaptiveReport adaptive{};
+};
+
 class SourceRuntimeImpl final : public SourceRuntime {
  public:
   SourceRuntimeImpl(
@@ -994,23 +1056,6 @@ class SourceRuntimeImpl final : public SourceRuntime {
     }
   }
 
-  [[nodiscard]] bool recursiveAmrThermochemistryEnabled() const noexcept override {
-    return m_thermochemistry != nullptr &&
-        m_full_config.numerics.amr_time_stepping ==
-            core::AmrTimeSteppingConfigMode::kRecursiveSubcycling;
-  }
-
-  void executeRecursiveAmrThermochemistry(
-      core::StepContext& context, std::span<const std::uint32_t> rows,
-      const hydro::HydroUpdateContext& update, int level) override {
-    if (!recursiveAmrThermochemistryEnabled()) return;
-    (void)physics::ensureGasCompositionInitialized(context.state, m_physics_config);
-    prepareRecursiveChemistryAccumulator(context.integrator_state.step_index);
-    const physics::SourceInterval interval = makeSourceInterval(context, update);
-    executeThermochemistryInterval(context, interval, rows, false, level, true);
-    m_recursive_thermochemistry_completed_step = context.integrator_state.step_index;
-  }
-
   [[nodiscard]] bool fillAmrCoolingTimes(
       core::StepContext& context, std::span<double> cooling_time_code) override {
     if (m_thermochemistry == nullptr) return false;
@@ -1056,16 +1101,9 @@ class SourceRuntimeImpl final : public SourceRuntime {
     checkpoint.last_dust_ledger = m_last_dust_ledger;
     checkpoint.last_sgs_ledger = m_last_sgs_ledger;
     checkpoint.last_shadow_report = m_last_shadow_report;
-    checkpoint.multilevel_shadow_report = m_multilevel_shadow_report;
-    checkpoint.multilevel_chemistry_adaptive_report =
-        m_multilevel_chemistry_adaptive_report;
-    checkpoint.multilevel_source_step = m_multilevel_source_step;
+    checkpoint.source_interval = m_source_interval;
     checkpoint.last_skipped_effective_rows = m_last_skipped_effective_rows;
     checkpoint.last_element_diffusion = m_last_element_diffusion;
-    checkpoint.recursive_thermochemistry_completed_step =
-        m_recursive_thermochemistry_completed_step;
-    checkpoint.recursive_chemistry_shadow = m_recursive_chemistry_shadow;
-    checkpoint.recursive_chemistry_shadow_step = m_recursive_chemistry_shadow_step;
     m_rollback_checkpoint = std::move(checkpoint);
   }
 
@@ -1090,17 +1128,13 @@ class SourceRuntimeImpl final : public SourceRuntime {
     m_last_dust_ledger = c.last_dust_ledger;
     m_last_sgs_ledger = c.last_sgs_ledger;
     m_last_shadow_report = c.last_shadow_report;
-    m_multilevel_shadow_report = c.multilevel_shadow_report;
-    m_multilevel_chemistry_adaptive_report =
-        c.multilevel_chemistry_adaptive_report;
-    m_multilevel_source_step = c.multilevel_source_step;
+    // A rejected trial may have died between the pre and post halves with an
+    // open interval; the checkpoint was taken at the step rollback point, so
+    // restoring it also discards every partial shadow/adaptive observation.
+    m_source_interval = c.source_interval;
     m_last_skipped_effective_rows = c.last_skipped_effective_rows;
     m_last_element_diffusion = c.last_element_diffusion;
-    m_recursive_thermochemistry_completed_step =
-        c.recursive_thermochemistry_completed_step;
-    m_recursive_chemistry_shadow = c.recursive_chemistry_shadow;
-    m_recursive_chemistry_shadow_step = c.recursive_chemistry_shadow_step;
-    m_particle_id_registry.invalidateOccupancyCache();
+    m_particle_id_registry.invalidateForRollback();
     // The chemistry promotion bias is re-derived from the restored sidecar
     // before the next fidelity decision (G0.4); nothing to restore here.
   }
@@ -1337,6 +1371,7 @@ class SourceRuntimeImpl final : public SourceRuntime {
       core::StepContext& parent_context,
       std::span<const std::uint32_t> level_rows,
       const hydro::HydroUpdateContext& level_update,
+      int level,
       core::SourceSplitPhase phase) override {
     if (!m_amr_level_source_coupling_enabled ||
         m_full_config.numerics.amr_time_stepping !=
@@ -1417,14 +1452,33 @@ class SourceRuntimeImpl final : public SourceRuntime {
     level_context.stage = core::IntegrationStage::kSourceTerms;
     level_context.source_split_phase = phase;
 
-    if (m_multilevel_source_step != parent_context.integrator_state.step_index) {
-      resetMultilevelSourceAggregation(parent_context.integrator_state.step_index);
+    if (!m_source_interval.open || !m_source_interval.recursive_levels) {
+      throw std::logic_error(
+          "recursive AMR level source half invoked outside an open coarse source "
+          "interval owned by AMR levels (composition/scheduler mismatch)");
     }
-    const physics::ChemistryShadowReport shadow = executeThermochemistry(
-        level_context, sourceEvaluationScaleFactor(level_context), false);
-    accumulateMultilevelShadowReport(shadow);
-    accumulateMultilevelChemistryAdaptiveReport(
-        m_last_chemistry_adaptive_report);
+    if (phase == core::SourceSplitPhase::kStrangPreHalf) {
+      if (m_source_interval.level_pre_halves ==
+          std::numeric_limits<std::uint64_t>::max()) {
+        throw std::overflow_error("recursive AMR level pre-half counter overflow");
+      }
+      ++m_source_interval.level_pre_halves;
+    } else {
+      if (m_source_interval.level_post_halves >= m_source_interval.level_pre_halves) {
+        throw std::logic_error(
+            "recursive AMR level post-half without a matching pre-half");
+      }
+      ++m_source_interval.level_post_halves;
+    }
+    // The level half interval is [t_begin, t_mid] (pre) or [t_mid, t_end]
+    // (post) of THIS level clock, evaluated at its physical midpoint. The
+    // controller observation is accumulated; publication happens once at the
+    // coarse post-half close (C03/C04: never per level, never per half).
+    (void)physics::ensureGasCompositionInitialized(level_context.state, m_physics_config);
+    const physics::SourceInterval interval = makeSourceInterval(
+        level_context, sourceEvaluationScaleFactor(level_context));
+    executeThermochemistryInterval(
+        level_context, interval, level_rows, false, level);
   }
 
   void execute(SourceMutationStageView& view) override {
@@ -1446,16 +1500,13 @@ class SourceRuntimeImpl final : public SourceRuntime {
       throw std::logic_error("source runtime received a non-source stage");
     }
 
-    // Smooth source operators form the two halves of the deterministic
-    // Strang reference. Each half is evaluated at its physical midpoint;
-    // direct compatibility callers retain the historical end-of-step epoch.
-    const double smooth_source_evaluation_scale_factor =
-        sourceEvaluationScaleFactor(context);
-    if (!std::isfinite(smooth_source_evaluation_scale_factor) ||
-        smooth_source_evaluation_scale_factor <= 0.0) {
-      throw std::runtime_error(
-          "source runtime requires a finite positive source-stage scale factor");
-    }
+    // T01: one explicit plan per dispatch (see SourceStagePlan). Smooth
+    // operators advance only this dispatch's half interval; discrete events
+    // are owned by the post half (or the compatibility dispatch) alone.
+    const SourceStagePlan plan =
+        makeSourceStagePlan(context, recursiveAmrLevelSourcesActive(context));
+    if (plan.opens_interval) openSourceInterval(context, plan);
+    requireOpenSourceInterval(context, plan);
 
     // Only the current source stage may borrow the scheduler. The hook itself
     // was installed once at owner construction and performs no allocation here.
@@ -1465,21 +1516,48 @@ class SourceRuntimeImpl final : public SourceRuntime {
       ~GrowthSchedulerReset() { slot = nullptr; }
     } growth_scheduler_reset{m_growth_scheduler};
 
-    // CHUI Part 2 operator order inside the accepted interval (Lie split,
-    // hydro already done): thermochemistry -> star formation -> stellar
-    // evolution/feedback -> metal diffusion -> BH. Each source term has one
-    // owner; cooling is never also applied inside the hydro solver.
-    if (m_recursive_thermochemistry_completed_step !=
-        context.integrator_state.step_index) {
-      executeThermochemistry(context, source_evaluation_scale_factor);
+    // Symmetric smooth split: the pre half applies transport then
+    // thermochemistry, the post half thermochemistry then transport, so the
+    // composition S_pre H S_post is palindromic in its smooth sub-operators.
+    // Cooling is never also applied inside the hydro solver.
+    if (plan.phase == core::SourceSplitPhase::kStrangPreHalf) {
+      if (plan.smooth_transport) {
+        executeDiffusionAndSgsShear(
+            context, plan.smooth_evaluation_scale_factor, plan.smooth_dt_code);
+      }
+      if (plan.global_smooth_thermochemistry) executeThermochemistry(context, plan);
     } else {
-      // Recursive AMR evaluates thermochemistry/ISM/dust/SGS at each level
-      // clock. Keep the adaptive chemistry controller fixed throughout that
-      // accepted coarse interval, then publish exactly one collective update
-      // at the synchronization barrier.
-      finalizeRecursiveChemistryControl(context);
+      if (plan.global_smooth_thermochemistry) executeThermochemistry(context, plan);
+      if (plan.smooth_transport) {
+        executeDiffusionAndSgsShear(
+            context, plan.smooth_evaluation_scale_factor, plan.smooth_dt_code);
+      }
     }
 
+    if (plan.discrete_events) {
+      executeDiscreteSourceEvents(context, plan);
+    }
+    // The controller publishes exactly once per Strang interval, after every
+    // half (and every AMR level half) contributed its observations.
+    if (plan.closes_interval) closeSourceInterval(context);
+  }
+
+ private:
+  // Discrete/stochastic source chronology (S01/S02/F01/F02/BH): executed once
+  // per source interval at the absolute end-of-interval epoch with the full
+  // interval duration. Ordering is fixed: star birth -> SSP/stellar returns,
+  // winds/pre-SN and SN feedback -> BH seeding/accretion/feedback.
+  void executeDiscreteSourceEvents(core::StepContext& context,
+                                   const SourceStagePlan& plan) {
+    if (!plan.discrete_events) {
+      throw std::logic_error("discrete source events requested by a smooth-only plan");
+    }
+    const double source_evaluation_scale_factor = plan.event_scale_factor;
+    if (!std::isfinite(source_evaluation_scale_factor) ||
+        source_evaluation_scale_factor <= 0.0) {
+      throw std::runtime_error(
+          "source runtime requires a finite positive discrete-event scale factor");
+    }
     const std::size_t cell_count = context.state.cells.size();
     const bool local_has_mutable_gravity_sources =
         cell_count > 0U || context.state.star_particles.size() > 0U ||
@@ -1680,12 +1758,12 @@ class SourceRuntimeImpl final : public SourceRuntime {
         m_mpi_context.rethrowCollectivePreparationFailure(
             metadata_failure, "source birth/report metadata admission");
         if (report_reservation.pending()) report_reservation.commit();
-        m_star_formation.setBirthTimeCode(context.timeline_step.time_end_code);
+        m_star_formation.setBirthTimeCode(plan.event_time_code);
         const physics::StarFormationStepReport batch_report =
             m_star_formation.applyFromInputs(
                 context.state,
                 m_star_formation_inputs,
-                context.integrator_state.dt_time_code,
+                plan.event_dt_code,
                 source_evaluation_scale_factor,
                 context.integrator_state.step_index,
                 &m_particle_id_registry,
@@ -1756,15 +1834,12 @@ class SourceRuntimeImpl final : public SourceRuntime {
     } else {
       executeStellarEvolutionAndEnrichment(context, source_evaluation_scale_factor);
     }
-    executeDiffusionAndSgsShear(
-        context, smooth_source_evaluation_scale_factor, smooth_source_dt_code);
-
     physics::BlackHoleAgnStepReport black_hole_report{};
     if (m_bh_enabled) {
       black_hole_report = m_black_hole.apply(
           context.state,
           {},
-          context.integrator_state.dt_time_code,
+          plan.event_dt_code,
           source_evaluation_scale_factor,
           m_coordinate_frame == core::CoordinateFrame::kComoving,
           context.integrator_state.step_index,
@@ -1840,7 +1915,6 @@ class SourceRuntimeImpl final : public SourceRuntime {
     }
   }
 
- private:
   [[nodiscard]] bool recursiveAmrLevelSourcesActive(
       const core::StepContext& context) const {
     if (!m_amr_level_source_coupling_enabled ||
@@ -1855,57 +1929,158 @@ class SourceRuntimeImpl final : public SourceRuntime {
     return m_mpi_context.allreduceSumUint64(local_has_production_amr) > 0U;
   }
 
-  void resetMultilevelSourceAggregation(std::uint64_t step_index) noexcept {
-    m_multilevel_shadow_report = {};
-    m_multilevel_chemistry_adaptive_report = {};
-    m_multilevel_source_step = step_index;
+  [[nodiscard]] SourceStagePlan makeSourceStagePlan(
+      const core::StepContext& context, bool recursive_levels_active) const {
+    SourceStagePlan plan;
+    plan.phase = context.source_split_phase;
+    plan.coarse_time_begin_code = context.timeline_step.time_begin_code;
+    plan.coarse_time_end_code = context.timeline_step.time_end_code;
+    plan.coarse_dt_code = plan.coarse_time_end_code - plan.coarse_time_begin_code;
+    if (!(std::isfinite(plan.coarse_dt_code) && plan.coarse_dt_code > 0.0)) {
+      // Legacy direct callers may omit explicit endpoints; the integrator's
+      // accepted dt is then the only interval authority.
+      plan.coarse_time_begin_code = context.integrator_state.current_time_code;
+      plan.coarse_dt_code = context.integrator_state.dt_time_code;
+      plan.coarse_time_end_code = plan.coarse_time_begin_code + plan.coarse_dt_code;
+    }
+    if (!(std::isfinite(plan.coarse_dt_code) && plan.coarse_dt_code > 0.0)) {
+      throw std::invalid_argument("source stage requires a finite positive interval");
+    }
+    switch (plan.phase) {
+      case core::SourceSplitPhase::kStrangPreHalf:
+        plan.smooth_fraction_begin = 0.0;
+        plan.smooth_fraction_end = 0.5;
+        plan.opens_interval = true;
+        break;
+      case core::SourceSplitPhase::kStrangPostHalf:
+        plan.smooth_fraction_begin = 0.5;
+        plan.smooth_fraction_end = 1.0;
+        plan.discrete_events = true;
+        plan.closes_interval = true;
+        break;
+      case core::SourceSplitPhase::kUnsplitCompatibility:
+        plan.smooth_fraction_begin = 0.0;
+        plan.smooth_fraction_end = 1.0;
+        plan.discrete_events = true;
+        plan.opens_interval = true;
+        plan.closes_interval = true;
+        break;
+    }
+    plan.smooth_time_begin_code =
+        plan.coarse_time_begin_code + plan.smooth_fraction_begin * plan.coarse_dt_code;
+    plan.smooth_time_end_code =
+        plan.coarse_time_begin_code + plan.smooth_fraction_end * plan.coarse_dt_code;
+    plan.smooth_dt_code = plan.smooth_time_end_code - plan.smooth_time_begin_code;
+    plan.smooth_scale_factor_begin =
+        scaleFactorAtPhysicalFraction(context, plan.smooth_fraction_begin);
+    plan.smooth_scale_factor_end =
+        scaleFactorAtPhysicalFraction(context, plan.smooth_fraction_end);
+    plan.smooth_evaluation_scale_factor = sourceEvaluationScaleFactor(context);
+    plan.event_time_code = plan.coarse_time_end_code;
+    plan.event_scale_factor = m_is_cosmological
+        ? context.timeline_step.scale_factor_end
+        : 1.0;
+    plan.event_dt_code = context.integrator_state.dt_time_code;
+    if (!(std::isfinite(plan.event_dt_code) && plan.event_dt_code > 0.0)) {
+      plan.event_dt_code = plan.coarse_dt_code;
+    }
+    plan.global_smooth_thermochemistry = !recursive_levels_active;
+    plan.smooth_transport = true;
+    if (!(std::isfinite(plan.smooth_dt_code) && plan.smooth_dt_code > 0.0 &&
+          std::isfinite(plan.smooth_evaluation_scale_factor) &&
+          plan.smooth_evaluation_scale_factor > 0.0)) {
+      throw std::runtime_error(
+          "source stage plan has an invalid smooth half interval or evaluation epoch");
+    }
+    return plan;
   }
 
-  void accumulateMultilevelChemistryAdaptiveReport(
-      const physics::ChemistryAdaptiveReport& report) noexcept {
+  void openSourceInterval(const core::StepContext& context,
+                          const SourceStagePlan& plan) {
+    if (m_source_interval.open) {
+      // A pre half after an unclosed interval means a post half was skipped:
+      // the previous interval's events and controller update never ran.
+      throw std::logic_error(
+          "source interval opened while the previous Strang interval is still open");
+    }
+    if (m_source_interval.sequence == std::numeric_limits<std::uint64_t>::max()) {
+      throw std::overflow_error("source interval sequence overflow");
+    }
+    const std::uint64_t sequence = m_source_interval.sequence + 1U;
+    m_source_interval = SourceIntervalAccumulator{};
+    m_source_interval.open = true;
+    m_source_interval.sequence = sequence;
+    m_source_interval.step_index = context.integrator_state.step_index;
+    m_source_interval.recursive_levels = !plan.global_smooth_thermochemistry;
+  }
+
+  void requireOpenSourceInterval(const core::StepContext& context,
+                                 const SourceStagePlan& plan) const {
+    if (!m_source_interval.open ||
+        m_source_interval.step_index != context.integrator_state.step_index) {
+      throw std::logic_error(
+          "source half dispatched outside its Strang interval (missing pre half)");
+    }
+    if (m_source_interval.recursive_levels != !plan.global_smooth_thermochemistry) {
+      throw std::logic_error(
+          "AMR-level smooth-source ownership changed inside one Strang interval");
+    }
+  }
+
+  void accumulateSourceIntervalObservation(
+      const physics::ChemistryShadowReport& shadow,
+      const physics::ChemistryAdaptiveReport& adaptive) noexcept {
     const auto add = [](std::uint64_t& value, std::uint64_t increment) {
       value = increment > std::numeric_limits<std::uint64_t>::max() - value
           ? std::numeric_limits<std::uint64_t>::max()
           : value + increment;
     };
-    add(m_multilevel_chemistry_adaptive_report.promoted, report.promoted);
-    add(m_multilevel_chemistry_adaptive_report.demoted, report.demoted);
-    add(m_multilevel_chemistry_adaptive_report.held_by_dwell,
-        report.held_by_dwell);
-    add(m_multilevel_chemistry_adaptive_report.promoted_by_cooling_time,
-        report.promoted_by_cooling_time);
-    add(m_multilevel_chemistry_adaptive_report.promoted_by_error_history,
-        report.promoted_by_error_history);
-    add(m_multilevel_chemistry_adaptive_report.detailed_cells,
-        report.detailed_cells);
-    add(m_multilevel_chemistry_adaptive_report.hybrid_cells,
-        report.hybrid_cells);
+    physics::ChemistryShadowReport& total = m_source_interval.shadow;
+    const std::uint64_t previous_samples = total.samples;
+    const long double weighted_cost =
+        static_cast<long double>(total.mean_substep_cost_ratio) *
+            static_cast<long double>(previous_samples) +
+        static_cast<long double>(shadow.mean_substep_cost_ratio) *
+            static_cast<long double>(shadow.samples);
+    add(total.samples, shadow.samples);
+    total.max_relative_species_difference = std::max(
+        total.max_relative_species_difference, shadow.max_relative_species_difference);
+    total.max_relative_electron_difference = std::max(
+        total.max_relative_electron_difference, shadow.max_relative_electron_difference);
+    total.max_relative_energy_difference = std::max(
+        total.max_relative_energy_difference, shadow.max_relative_energy_difference);
+    total.mean_substep_cost_ratio = total.samples == 0U
+        ? 0.0
+        : static_cast<double>(weighted_cost / static_cast<long double>(total.samples));
+    physics::ChemistryAdaptiveReport& a = m_source_interval.adaptive;
+    add(a.promoted, adaptive.promoted);
+    add(a.demoted, adaptive.demoted);
+    add(a.held_by_dwell, adaptive.held_by_dwell);
+    add(a.promoted_by_cooling_time, adaptive.promoted_by_cooling_time);
+    add(a.promoted_by_error_history, adaptive.promoted_by_error_history);
+    // Cell-population counts are state snapshots, not increments: keep the
+    // latest committed population rather than summing halves/levels.
+    a.detailed_cells = adaptive.detailed_cells;
+    a.hybrid_cells = adaptive.hybrid_cells;
   }
 
-  void accumulateMultilevelShadowReport(
-      const physics::ChemistryShadowReport& report) noexcept {
-    const std::uint64_t previous_samples = m_multilevel_shadow_report.samples;
-    const long double weighted_cost =
-        static_cast<long double>(m_multilevel_shadow_report.mean_substep_cost_ratio) *
-            static_cast<long double>(previous_samples) +
-        static_cast<long double>(report.mean_substep_cost_ratio) *
-            static_cast<long double>(report.samples);
-    m_multilevel_shadow_report.samples += report.samples;
-    m_multilevel_shadow_report.max_relative_species_difference = std::max(
-        m_multilevel_shadow_report.max_relative_species_difference,
-        report.max_relative_species_difference);
-    m_multilevel_shadow_report.max_relative_electron_difference = std::max(
-        m_multilevel_shadow_report.max_relative_electron_difference,
-        report.max_relative_electron_difference);
-    m_multilevel_shadow_report.max_relative_energy_difference = std::max(
-        m_multilevel_shadow_report.max_relative_energy_difference,
-        report.max_relative_energy_difference);
-    m_multilevel_shadow_report.mean_substep_cost_ratio =
-        m_multilevel_shadow_report.samples == 0U
-        ? 0.0
-        : static_cast<double>(
-              weighted_cost /
-              static_cast<long double>(m_multilevel_shadow_report.samples));
+  // Exactly one collective controller publication per Strang interval. All
+  // ranks reach this point together (the post-half dispatch is rank-uniform).
+  void closeSourceInterval(core::StepContext& context) {
+    if (!m_source_interval.open) {
+      throw std::logic_error("source interval closed without being opened");
+    }
+    if (m_source_interval.recursive_levels &&
+        m_source_interval.level_pre_halves != m_source_interval.level_post_halves) {
+      throw std::logic_error(
+          "recursive AMR level sources left an unmatched pre half at interval close");
+    }
+    m_last_shadow_report = m_source_interval.shadow;
+    updateGlobalChemistryControl(
+        context, m_source_interval.shadow, m_source_interval.adaptive);
+    m_source_interval.open = false;
+    m_source_interval.shadow = {};
+    m_source_interval.adaptive = {};
   }
 
   [[nodiscard]] double scaleFactorAtPhysicalFraction(
@@ -2033,26 +2208,51 @@ class SourceRuntimeImpl final : public SourceRuntime {
   // rejects the stage on EVERY rank (kNumericalRetry) and nothing is
   // committed (audit F2 contract). Touched rows are refreshed before any CFL
   // or source consumer reads P, T or c_s (audit F4 contract).
-  [[nodiscard]] physics::ChemistryShadowReport executeThermochemistry(
-      core::StepContext& context,
-      double source_evaluation_scale_factor,
-      bool update_chemistry_control) {
+  void executeThermochemistry(core::StepContext& context, const SourceStagePlan& plan) {
     (void)physics::ensureGasCompositionInitialized(context.state, m_physics_config);
     if (m_thermochemistry == nullptr) return;
-    const physics::SourceInterval interval =
-        makeSourceInterval(context, source_evaluation_scale_factor);
+    const physics::SourceInterval interval = makeSourceInterval(context, plan);
     const bool all_cells_active =
         !context.active_set.cells_are_subset && context.active_set.cell_indices.empty();
     const std::span<const std::uint32_t> rows = all_cells_active
         ? std::span<const std::uint32_t>{}
         : std::span<const std::uint32_t>(context.active_set.cell_indices);
-    executeThermochemistryInterval(context, interval, rows, all_cells_active, -1, false);
+    if (m_source_interval.global_smooth_halves ==
+        std::numeric_limits<std::uint64_t>::max()) {
+      throw std::overflow_error("global smooth source half counter overflow");
+    }
+    ++m_source_interval.global_smooth_halves;
+    executeThermochemistryInterval(context, interval, rows, all_cells_active, -1);
+  }
+
+  // Builds the physical sub-interval of one global smooth dispatch from the
+  // T01 plan (half interval for Strang phases, full for compatibility).
+  [[nodiscard]] physics::SourceInterval makeSourceInterval(
+      const core::StepContext& context, const SourceStagePlan& plan) const {
+    physics::SourceInterval interval;
+    interval.time_begin_code = plan.smooth_time_begin_code;
+    interval.time_end_code = plan.smooth_time_end_code;
+    interval.scale_factor_begin = plan.smooth_scale_factor_begin;
+    interval.scale_factor_end = plan.smooth_scale_factor_end;
+    if (m_is_cosmological && context.cosmology_background != nullptr) {
+      interval.physical_seconds = context.cosmology_background->cosmicTimeIntervalSi(
+          interval.scale_factor_begin, interval.scale_factor_end);
+    } else {
+      interval.physical_seconds = plan.smooth_dt_code * m_units.timeSiPerCode();
+    }
+    interval.evaluation_scale_factor = plan.smooth_evaluation_scale_factor;
+    interval.evaluation_redshift = m_is_cosmological
+        ? std::max(0.0, 1.0 / plan.smooth_evaluation_scale_factor - 1.0)
+        : 0.0;
+    interval.cosmological = m_is_cosmological;
+    interval.accepted_step_index = context.integrator_state.step_index;
+    return interval;
   }
 
   void executeThermochemistryInterval(
       core::StepContext& context, const physics::SourceInterval& interval,
       std::span<const std::uint32_t> rows, bool all_cells_active,
-      int recursive_level, bool defer_adaptive_control) {
+      int recursive_level) {
     if (m_thermochemistry == nullptr) return;
     const std::size_t row_count =
         all_cells_active ? context.state.cells.size() : rows.size();
@@ -2117,14 +2317,13 @@ class SourceRuntimeImpl final : public SourceRuntime {
       m_last_skipped_effective_rows = report.skipped_effective_rows;
     }
     // Ranks without local work contribute zero current samples (never a stale
-    // report from a previous stage) to the collective control reduction.
-    const physics::ChemistryShadowReport current_shadow =
-        local_work ? m_last_shadow_report : physics::ChemistryShadowReport{};
-    if (!local_work) m_last_shadow_report = current_shadow;
-    if (defer_adaptive_control) {
-      accumulateRecursiveChemistryShadow(current_shadow);
-    } else {
-      updateGlobalChemistryControl(context, current_shadow);
+    // report from a previous stage). Observations are only ACCUMULATED here;
+    // the collective controller update happens once at interval close
+    // (closeSourceInterval), so neither a half step nor a level clock nor a
+    // rejected trial can publish a controller state on its own.
+    if (local_work) {
+      accumulateSourceIntervalObservation(m_last_shadow_report,
+                                          m_last_chemistry_adaptive_report);
     }
     if (!touched.empty()) {
       context.state.notifyGasThermodynamicMutation();
@@ -2192,7 +2391,6 @@ class SourceRuntimeImpl final : public SourceRuntime {
                       {"element_projection_residual", std::to_string(l.element_mass_residual_code)},
                       {"charge_residual", std::to_string(l.charge_residual)}}});
     }
-    return current_shadow;
   }
 
   // CHUI Part 3 Checkpoint F (C03/C04): global error-aware fidelity control.
@@ -2236,52 +2434,10 @@ class SourceRuntimeImpl final : public SourceRuntime {
     m_thermochemistry->setGlobalPromotionBias(bias);
   }
 
-  void prepareRecursiveChemistryAccumulator(std::uint64_t step_index) {
-    if (m_recursive_chemistry_shadow_step == step_index) return;
-    m_recursive_chemistry_shadow = physics::ChemistryShadowReport{};
-    m_recursive_chemistry_shadow_step = step_index;
-  }
-
-  void accumulateRecursiveChemistryShadow(const physics::ChemistryShadowReport& current) {
-    const std::uint64_t old_samples = m_recursive_chemistry_shadow.samples;
-    const std::uint64_t new_samples = old_samples + current.samples;
-    m_recursive_chemistry_shadow.max_relative_species_difference =
-        std::max(m_recursive_chemistry_shadow.max_relative_species_difference,
-                 current.max_relative_species_difference);
-    m_recursive_chemistry_shadow.max_relative_electron_difference =
-        std::max(m_recursive_chemistry_shadow.max_relative_electron_difference,
-                 current.max_relative_electron_difference);
-    m_recursive_chemistry_shadow.max_relative_energy_difference =
-        std::max(m_recursive_chemistry_shadow.max_relative_energy_difference,
-                 current.max_relative_energy_difference);
-    if (new_samples > 0U) {
-      const double weighted =
-          m_recursive_chemistry_shadow.mean_substep_cost_ratio *
-              static_cast<double>(old_samples) +
-          current.mean_substep_cost_ratio * static_cast<double>(current.samples);
-      m_recursive_chemistry_shadow.mean_substep_cost_ratio =
-          weighted / static_cast<double>(new_samples);
-    }
-    m_recursive_chemistry_shadow.samples = new_samples;
-  }
-
-  void finalizeRecursiveChemistryControl(core::StepContext& context) {
-    const std::uint64_t step_index = context.integrator_state.step_index;
-    if (m_recursive_chemistry_shadow_step != step_index) {
-      // A recursively covered rank may have no local rows on every level.
-      // It still participates in the one synchronization-barrier reduction
-      // with a zero local report.
-      m_recursive_chemistry_shadow = physics::ChemistryShadowReport{};
-      m_recursive_chemistry_shadow_step = step_index;
-    }
-    m_last_shadow_report = m_recursive_chemistry_shadow;
-    updateGlobalChemistryControl(context, m_recursive_chemistry_shadow);
-    m_recursive_chemistry_shadow = physics::ChemistryShadowReport{};
-    m_recursive_chemistry_shadow_step = std::numeric_limits<std::uint64_t>::max();
-  }
-
-  void updateGlobalChemistryControl(core::StepContext& context,
-                                    const physics::ChemistryShadowReport& current_shadow) {
+  void updateGlobalChemistryControl(
+      core::StepContext& context,
+      const physics::ChemistryShadowReport& current_shadow,
+      const physics::ChemistryAdaptiveReport& interval_adaptive) {
     if (m_thermochemistry == nullptr || !m_thermochemistry->config().adaptive.enabled) return;
     // Next value is a pure function of the COMMITTED bias and this stage's
     // collective shadow reduction; it becomes authoritative only by being
@@ -2321,7 +2477,7 @@ class SourceRuntimeImpl final : public SourceRuntime {
           m_mpi_context.allreduceSumUint64(
               static_cast<std::uint64_t>(context.state.gas_composition.rowCount()));
       joint_state.chemistry_promoted_last_interval =
-          m_mpi_context.allreduceSumUint64(m_last_chemistry_adaptive_report.promoted);
+          m_mpi_context.allreduceSumUint64(interval_adaptive.promoted);
       std::exception_ptr publication_failure;
       try {
         if (joint_state.epoch == std::numeric_limits<std::uint64_t>::max()) {
@@ -4029,11 +4185,10 @@ class SourceRuntimeImpl final : public SourceRuntime {
   physics::DustUpdateLedger m_last_dust_ledger{};
   physics::SgsLedger m_last_sgs_ledger{};
   physics::ChemistryShadowReport m_last_shadow_report{};
-  physics::ChemistryShadowReport m_multilevel_shadow_report{};
-  physics::ChemistryAdaptiveReport m_multilevel_chemistry_adaptive_report{};
-  std::uint64_t m_multilevel_source_step =
-      std::numeric_limits<std::uint64_t>::max();
   bool m_amr_level_source_coupling_enabled = false;
+  // T01/T02 single authority for the open Strang source interval. Plain
+  // value state: captured/restored by the whole-step rollback checkpoint.
+  SourceIntervalAccumulator m_source_interval{};
   std::uint64_t m_last_skipped_effective_rows = 0U;
   physics::BaryonicSourceStageConfig m_source_stage_config{};
   struct ControllerCheckpoint {
@@ -4051,24 +4206,11 @@ class SourceRuntimeImpl final : public SourceRuntime {
     physics::DustUpdateLedger last_dust_ledger{};
     physics::SgsLedger last_sgs_ledger{};
     physics::ChemistryShadowReport last_shadow_report{};
-    physics::ChemistryShadowReport multilevel_shadow_report{};
-    physics::ChemistryAdaptiveReport multilevel_chemistry_adaptive_report{};
-    std::uint64_t multilevel_source_step =
-        std::numeric_limits<std::uint64_t>::max();
+    SourceIntervalAccumulator source_interval{};
     std::uint64_t last_skipped_effective_rows = 0U;
     physics::ElementDiffusionReport last_element_diffusion{};
-    std::uint64_t recursive_thermochemistry_completed_step =
-        std::numeric_limits<std::uint64_t>::max();
-    physics::ChemistryShadowReport recursive_chemistry_shadow{};
-    std::uint64_t recursive_chemistry_shadow_step =
-        std::numeric_limits<std::uint64_t>::max();
   };
   std::optional<ControllerCheckpoint> m_rollback_checkpoint;
-  std::uint64_t m_recursive_thermochemistry_completed_step =
-      std::numeric_limits<std::uint64_t>::max();
-  physics::ChemistryShadowReport m_recursive_chemistry_shadow{};
-  std::uint64_t m_recursive_chemistry_shadow_step =
-      std::numeric_limits<std::uint64_t>::max();
   DistributedParticleIdRegistry m_particle_id_registry;
   const parallel::MpiContext& m_mpi_context;
   const RuntimeServices* m_runtime_services = nullptr;

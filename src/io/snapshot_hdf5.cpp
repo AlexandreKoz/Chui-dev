@@ -1453,6 +1453,7 @@ void writeScienceSnapshotHdf5(
     std::optional<StreamingDataset> composition_elements_ds;
     std::optional<StreamingDataset> composition_species_ds;
     std::optional<StreamingDataset> composition_dust_ds;
+    std::optional<StreamingDataset> composition_ion_ds;
     const bool composition_out = type_index == 0U && state.gas_composition.enabled();
     const core::GasCompositionLayoutDescriptor composition_descriptor =
         composition_out ? state.gas_composition.descriptor() : core::GasCompositionLayoutDescriptor{};
@@ -1496,6 +1497,15 @@ void writeScienceSnapshotHdf5(
         composition_dust_ds.emplace(createStreamingDataset(
             type_group.get(), "CHUI_DustMassFractions", H5T_IEEE_F64LE, file_row_count,
             composition_descriptor.dust_lane_count, policy));
+      }
+      if (composition_descriptor.ion_lane_count != 0U) {
+        // C02 metal-ion ladders: nuclei mass in each ionization stage per
+        // unit gas mass (same fraction basis as the other composition lanes).
+        writeScalarStringAttribute(type_group.get(), "CHUI_IonStageNames",
+                                   names(composition_descriptor.ion_lane_begin, composition_descriptor.ion_lane_count));
+        composition_ion_ds.emplace(createStreamingDataset(
+            type_group.get(), "CHUI_IonStageMassFractions", H5T_IEEE_F64LE, file_row_count,
+            composition_descriptor.ion_lane_count, policy));
       }
       if (composition_sgs) add_double("CHUI_SgsSpecificEnergy");
       add_double("CHUI_MeanMolecularWeight");
@@ -1698,6 +1708,7 @@ void writeScienceSnapshotHdf5(
           write_lanes(*composition_elements_ds, cd.element_lane_begin, cd.element_lane_count);
           if (composition_species_ds.has_value()) write_lanes(*composition_species_ds, cd.species_lane_begin, cd.species_lane_count);
           if (composition_dust_ds.has_value()) write_lanes(*composition_dust_ds, cd.dust_lane_begin, cd.dust_lane_count);
+          if (composition_ion_ds.has_value()) write_lanes(*composition_ion_ds, cd.ion_lane_begin, cd.ion_lane_count);
           for (std::size_t j = 0; j < count; ++j) {
             const std::size_t row = offset + j;
             const double gas = physics::compositionGasMass(sidecar, row);

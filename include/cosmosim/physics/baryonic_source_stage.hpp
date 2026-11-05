@@ -52,6 +52,9 @@ struct BaryonicSourceStageReport {
   DustUpdateLedger dust{};
   SgsLedger sgs{};
   std::uint64_t skipped_effective_rows = 0U;
+  // C02: detailed rows whose metal-ion ladders had no state and were
+  // initialized from ionization equilibrium (explicit counted mapping).
+  std::uint64_t metal_ion_equilibrium_initializations = 0U;
 };
 
 class BaryonicSourceStage {

@@ -62,6 +62,11 @@ struct GasCompositionLayoutDescriptor {
   std::uint32_t species_lane_count = 0;
   std::uint32_t dust_lane_begin = 0;
   std::uint32_t dust_lane_count = 0;
+  // C02 metal-ion ladder lanes (extensive nuclei mass of each ionization
+  // stage, physics-owned ordering). Count 0 = no ion ladders. The layout
+  // signature covers the lane names, so restart/migration refuse a mismatch.
+  std::uint32_t ion_lane_begin = 0;
+  std::uint32_t ion_lane_count = 0;
   static constexpr std::uint32_t k_no_lane = std::numeric_limits<std::uint32_t>::max();
   std::uint32_t sgs_energy_lane = k_no_lane;
 

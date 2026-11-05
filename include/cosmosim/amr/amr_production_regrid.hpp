@@ -178,6 +178,15 @@ struct ProductionAmrRegridPlan {
   // fails closed rather than advancing below a mandatory accuracy criterion.
   std::size_t mandatory_truncated_by_budget = 0;  // retained for schema/telemetry compatibility; always zero
   std::size_t optional_truncated_by_budget = 0;
+  // A01/A04/V02: admitted optional operations and their summed proxy costs
+  // (cell-steps, MPI interface cells, regrid churn, memory) and the smallest
+  // admitted normalized benefit (0 when none was admitted).
+  std::size_t optional_admitted_operations = 0;
+  std::uint64_t optional_admitted_cell_steps = 0U;
+  std::uint64_t optional_admitted_mpi_face_cells = 0U;
+  std::uint64_t optional_admitted_churn_cells = 0U;
+  std::uint64_t optional_admitted_memory_bytes = 0U;
+  double optional_min_admitted_benefit = 0.0;
   std::size_t mandatory_blocked_by_max_level = 0;
   std::size_t mandatory_blocked_by_balance = 0;
   std::size_t required_patch_ids = 0;

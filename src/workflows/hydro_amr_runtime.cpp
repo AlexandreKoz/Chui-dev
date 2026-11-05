@@ -68,6 +68,28 @@ constexpr double k_gamma_adiabatic = 5.0 / 3.0;
 // patches, so a star predicted to cross a decomposition boundary refines the
 // destination rank as well as the source rank.  This keeps the prediction
 // independent of MPI ownership without introducing a second patch authority.
+// M01: composition transport may turn implicit adaptive-sparse rows into
+// explicit ones (a transported C+/CO/ion value that no longer equals its
+// implicit default). That retained growth is admitted against the canonical
+// memory class BEFORE commit, exactly as the source stage does; a refusal is
+// a MemoryAdmissionError raised before any canonical mutation.
+void admitCompositionSparseActivation(core::SimulationState& state,
+                                      const physics::CompositionFluxAccumulator& flux,
+                                      core::MemoryGovernor* governor,
+                                      std::string_view owner_label) {
+  auto& composition = state.gas_composition;
+  if (!composition.sparseStorageEnabled()) return;
+  const std::size_t activate = flux.sparseRowsToActivate(state);
+  if (activate == 0U) return;
+  core::RetainedCapacityTransaction sparse_capacity(
+      [&composition] { return composition.ownedCapacityBytes(); });
+  composition.planSparseRowCapacity(
+      sparse_capacity,
+      core::checkedSizeAdd(composition.sparseActiveRowCount(), activate,
+                           "transport sparse composition row capacity"));
+  sparse_capacity.execute(governor, core::MemoryClass::kCanonicalPersistent, owner_label);
+}
+
 struct PredictiveRefinementPoint {
   double x_comoving = 0.0;
   double y_comoving = 0.0;
@@ -684,6 +706,37 @@ struct HydroBoundaryCellAdvertisement {
 
 
 
+// T02 bridge between the AMR library's level-clock seam and the workflow
+// source owner. Owns no state: it forwards each level half to
+// SourceRuntime::executeAmrLevelSmoothSources() with the coarse StepContext
+// that owns the accepted interval. Lifetime: one hydro stage (stack object);
+// both references outlive it.
+class RecursiveAmrLevelSourceAdapter final : public amr::RecursiveAmrLevelSourceOperator {
+ public:
+  RecursiveAmrLevelSourceAdapter(SourceRuntime& source, core::StepContext& step) noexcept
+      : m_source(source), m_step(step) {}
+
+  void apply(core::SimulationState& state,
+             std::span<const std::uint32_t> level_rows,
+             const hydro::HydroUpdateContext& level_update,
+             int level,
+             amr::RecursiveAmrSourcePhase phase) override {
+    if (&state != &m_step.state) {
+      throw std::logic_error(
+          "recursive AMR level source adapter received a foreign SimulationState");
+    }
+    const core::SourceSplitPhase split_phase =
+        phase == amr::RecursiveAmrSourcePhase::kPreHydroHalf
+        ? core::SourceSplitPhase::kStrangPreHalf
+        : core::SourceSplitPhase::kStrangPostHalf;
+    m_source.executeAmrLevelSmoothSources(m_step, level_rows, level_update, level, split_phase);
+  }
+
+ private:
+  SourceRuntime& m_source;
+  core::StepContext& m_step;
+};
+
 class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
  public:
   HydroAmrRuntimeImpl(
@@ -773,10 +826,6 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
       m_effective_ism_energy_source =
           std::make_unique<physics::EffectiveIsmEnergyRelaxationSource>(*m_effective_ism_closure);
     }
-  }
-
-  void setMultilevelSourceRuntime(SourceRuntime* source) noexcept override {
-    m_multilevel_source_runtime = source;
   }
 
   [[nodiscard]] const hydro::HydroProfileEvent& lastHydroProfile() const noexcept { return m_last_hydro_profile; }
@@ -917,7 +966,19 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
   }
 
   void bindSourceRuntime(SourceRuntime* source_runtime) noexcept override {
+    if (m_source_runtime != nullptr && m_source_runtime != source_runtime) {
+      m_source_runtime->setAmrLevelSourceCouplingEnabled(false);
+    }
     m_source_runtime = source_runtime;
+    // T02 composition contract: under recursive subcycling the AMR level
+    // clocks own the smooth baryonic halves. The same predicate installs the
+    // RecursiveAmrLevelSourceAdapter in runProductionAmrHydroPath(), so the
+    // source owner's global smooth halves are skipped iff levels run them.
+    if (m_source_runtime != nullptr) {
+      m_source_runtime->setAmrLevelSourceCouplingEnabled(
+          m_config.numerics.amr_time_stepping ==
+          core::AmrTimeSteppingConfigMode::kRecursiveSubcycling);
+    }
   }
 
   [[nodiscard]] RuntimeTaskMemoryEstimate estimateMemory(
@@ -2856,13 +2917,15 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
     if (m_config.numerics.amr_time_stepping == core::AmrTimeSteppingConfigMode::kRecursiveSubcycling) {
       verifyAcceptedRecursiveAmrHydroCfl(context, amr::ProductionAmrHydroOptions{}.refinement_ratio);
     }
+    // T02: the adapter lives on this stack frame for the whole recursive
+    // advance; the AMR driver holds only a non-owning pointer to it.
     std::optional<RecursiveAmrLevelSourceAdapter> recursive_source_adapter;
     if (m_config.numerics.amr_time_stepping ==
             core::AmrTimeSteppingConfigMode::kRecursiveSubcycling &&
-        m_multilevel_source_runtime != nullptr) {
-      recursive_source_adapter.emplace(*m_multilevel_source_runtime, context);
+        m_source_runtime != nullptr) {
+      recursive_source_adapter.emplace(*m_source_runtime, context);
     }
-    const amr::ProductionAmrHydroOptions amr_options{
+    amr::ProductionAmrHydroOptions amr_options{
         .physical_boundary_kind = hydroBoundaryKindFromModePolicy(m_mode_policy.hydro_boundary),
         .adiabatic_index = k_gamma_adiabatic,
         .density_floor = m_config.numerics.hydro_density_floor_code,
@@ -2884,26 +2947,6 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
             m_config.cosmology.box_size_y_mpc_comoving,
             m_config.cosmology.box_size_z_mpc_comoving},
         .thermodynamic_cache = amrThermodynamicCachePolicy(update.scale_factor, source_context.redshift)};
-    if (m_config.numerics.amr_time_stepping ==
-            core::AmrTimeSteppingConfigMode::kRecursiveSubcycling &&
-        m_source_runtime != nullptr &&
-        m_source_runtime->recursiveAmrThermochemistryEnabled()) {
-      amr_options.recursive_level_source_user_data =
-          &recursive_source_callback_context;
-      amr_options.recursive_level_source_callback =
-          +[](void* user_data, core::SimulationState& state,
-              std::span<const std::uint32_t> rows, int level,
-              const hydro::HydroUpdateContext& level_update) {
-            auto* callback = static_cast<RecursiveSourceCallbackContext*>(user_data);
-            if (callback == nullptr || callback->source == nullptr ||
-                callback->step == nullptr || &callback->step->state != &state) {
-              throw std::logic_error(
-                  "recursive AMR source callback has invalid workflow ownership");
-            }
-            callback->source->executeRecursiveAmrThermochemistry(
-                *callback->step, rows, level_update, level);
-          };
-    }
     amr::ProductionAmrHydroDiagnostics amr_diagnostics;
     std::size_t remote_patch_count = 0;
     std::size_t remote_flux_register_count = 0;
@@ -3155,6 +3198,21 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
         "production AMR hydro parent compatibility mirror");
     m_last_directed_amr_diagnostics = directed_amr_diagnostics;
     runAutomaticAmrRegrid(context, amr_options, regrid_remote_neighbors);
+    // H01 telemetry: CTU interface outcomes summed over ranks (the per-rank
+    // values above are summed over patches and recursive level clocks). The
+    // reductions are rank-uniform and independent of profiler availability.
+    const std::uint64_t global_ctu_corrected =
+        m_mpi_context.allreduceSumUint64(amr_diagnostics.ctu_transverse_corrected_states);
+    const std::uint64_t global_ctu_degraded =
+        m_mpi_context.allreduceSumUint64(amr_diagnostics.ctu_transverse_degraded_states);
+    const std::uint64_t global_ctu_ghost_corrected =
+        m_mpi_context.allreduceSumUint64(amr_diagnostics.ctu_transverse_ghost_corrected_states);
+    const std::uint64_t global_ctu_ghost_axes =
+        m_mpi_context.allreduceSumUint64(amr_diagnostics.ctu_transverse_ghost_axes);
+    const std::uint64_t global_ctu_boundary_proxy =
+        m_mpi_context.allreduceSumUint64(amr_diagnostics.ctu_transverse_boundary_proxy_states);
+    const std::uint64_t global_ctu_inadmissible =
+        m_mpi_context.allreduceSumUint64(amr_diagnostics.ctu_transverse_inadmissible_states);
     if (context.profiler_session != nullptr) {
       context.profiler_session->recordEvent(core::RuntimeEvent{
           .event_kind = "hydro.amr_production_stage",
@@ -3172,6 +3230,17 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
                       {"ctu_transverse_degraded_states", std::to_string(amr_diagnostics.ctu_transverse_degraded_states)},
                       {"ctu_transverse_ghost_corrected_states", std::to_string(amr_diagnostics.ctu_transverse_ghost_corrected_states)},
                       {"ctu_transverse_ghost_axes", std::to_string(amr_diagnostics.ctu_transverse_ghost_axes)},
+                      {"ctu_transverse_corrected_states", std::to_string(amr_diagnostics.ctu_transverse_corrected_states)},
+                      {"ctu_transverse_boundary_proxy_states",
+                       std::to_string(amr_diagnostics.ctu_transverse_boundary_proxy_states)},
+                      {"ctu_transverse_inadmissible_states",
+                       std::to_string(amr_diagnostics.ctu_transverse_inadmissible_states)},
+                      {"global_ctu_transverse_corrected_states", std::to_string(global_ctu_corrected)},
+                      {"global_ctu_transverse_degraded_states", std::to_string(global_ctu_degraded)},
+                      {"global_ctu_transverse_ghost_corrected_states", std::to_string(global_ctu_ghost_corrected)},
+                      {"global_ctu_transverse_ghost_axes", std::to_string(global_ctu_ghost_axes)},
+                      {"global_ctu_transverse_boundary_proxy_states", std::to_string(global_ctu_boundary_proxy)},
+                      {"global_ctu_transverse_inadmissible_states", std::to_string(global_ctu_inadmissible)},
                       {"dual_energy_auxiliary_cells", std::to_string(amr_diagnostics.dual_energy_auxiliary_cells)},
                       {"dual_energy_unresolved_ghosts", std::to_string(amr_diagnostics.dual_energy_unresolved_ghosts)},
                       {"dual_energy_thermal_correction_code",
@@ -3460,7 +3529,15 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
         const bool comoving = m_config.units.coordinate_frame == core::CoordinateFrame::kComoving;
         const double redshift = m_mode_policy.cosmological_comoving_frame ? std::max(0.0, 1.0 / a - 1.0) : 0.0;
         cooling_time_code.assign(context.state.cells.size(), std::numeric_limits<double>::infinity());
-        for (std::uint32_t row = 0; row < context.state.cells.size(); ++row) {
+        // A03: Part 2 thermochemistry without an accepted per-row history
+        // (first interval, restart of a pre-history schema, regridded rows)
+        // evaluates the SAME thermochemistry model's cooling time through the
+        // source owner instead of refusing the mandatory criterion.
+        const bool source_cooling_times = !chemistry_history &&
+            !m_cooling_rate_provider.has_value() && m_source_runtime != nullptr &&
+            m_source_runtime->fillAmrCoolingTimes(context, cooling_time_code);
+        for (std::uint32_t row = 0;
+             !source_cooling_times && row < context.state.cells.size(); ++row) {
           if (chemistry_history) {
             const double seconds =
                 context.state.gas_composition.chemistry_last_cooling_time_seconds[row];
@@ -3615,61 +3692,29 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
     // another rank is not forced" limitation.
     const double predictive_age = m_config.numerics.amr_predictive_feedback_age_years;
     const double lookahead_years = m_config.numerics.amr_predictive_event_lookahead_years;
-    if (predictive_age > 0.0 || lookahead_years > 0.0) {
-      std::vector<amr::PatchDescriptor> descriptors;
-      std::size_t maximum_forecast_positions = 0U;
-      core::MemoryReservation forecast_positions_reservation;
-      std::exception_ptr forecast_positions_admission_failure;
-      std::vector<std::array<double, 3>> forecast_positions;
-      try {
-        descriptors = amr::buildProductionAmrPatchDescriptors(context.state);
-        maximum_forecast_positions = core::checkedSizeMultiply(
-            context.state.star_particles.size(),
-            lookahead_years > 0.0 ? 2U : 1U,
+    const bool predictive_enabled = predictive_age > 0.0 || lookahead_years > 0.0;
+    failure = nullptr;
+    try {
+      if (predictive_enabled) {
+        // Local current/drifted event positions: one or two per star,
+        // admitted before allocation (no hidden growth in the loop below).
+        const std::size_t maximum_points = core::checkedSizeMultiply(
+            context.state.star_particles.size(), lookahead_years > 0.0 ? 2U : 1U,
             "predictive refinement local position capacity");
-        if (m_memory_governor != nullptr && maximum_forecast_positions > 0U) {
-          forecast_positions_reservation = m_memory_governor->reserve(
+        if (m_memory_governor != nullptr && maximum_points > 0U) {
+          predictive_local_reservation = m_memory_governor->reserve(
               core::MemoryClass::kPhaseResident,
               static_cast<std::uint64_t>(core::checkedSizeMultiply(
-                  maximum_forecast_positions, sizeof(std::array<double, 3>),
+                  maximum_points, sizeof(PredictiveRefinementPoint),
                   "predictive refinement local positions")),
               "hydro.amr_regrid.local_predictive_positions");
-          forecast_positions_reservation.commit();
+          predictive_local_reservation.commit();
         }
-        forecast_positions.reserve(maximum_forecast_positions);
-        if (forecast_positions.capacity() > maximum_forecast_positions) {
+        local_predictive_points.reserve(maximum_points);
+        if (local_predictive_points.capacity() > maximum_points) {
           throw std::length_error(
               "predictive refinement position allocator exceeded admitted capacity");
         }
-      } catch (...) {
-        forecast_positions_admission_failure = std::current_exception();
-      }
-      m_mpi_context.rethrowCollectivePreparationFailure(
-          forecast_positions_admission_failure,
-          "predictive refinement local position admission");
-      const auto host_row = [&](const std::array<double, 3>& position) {
-        for (const amr::PatchDescriptor& patch : descriptors) {
-          bool inside = true;
-          for (std::size_t c = 0; c < 3U && inside; ++c) {
-            inside = position[c] >= patch.origin_comov[c] && position[c] < patch.origin_comov[c] + patch.extent_comov[c];
-          }
-          if (!inside) continue;
-          const auto cell = amr::patchLocalCellForPoint(patch, position, "predictive refinement host cell");
-          const auto rows = amr::rowsForPatchLocalCellOrder(context.state, patch, "predictive refinement");
-          if (cell.linear_index < rows.size()) forced_rows.push_back(rows[cell.linear_index]);
-          return;
-        }
-      };
-      // R2 (A04) event-aware forecast. For every star the canonical
-      // population record (restart/rollback state) gives its deterministic
-      // event chronology; a COPY is advanced to the expected cumulative count
-      // at age + lookahead, so the forecast consumes no event ordinal and
-      // changes no budget. Expectation mode (no stochastic events) predicts
-      // an "event" when >= 0.5 expected SNe fall in the window (HEURISTIC).
-      // The host cell now and at the drifted position x + v dt / a are forced.
-      std::uint64_t forecast_events = 0U;
-      std::exception_ptr forecast_failure;
-      try {
         std::optional<physics::SspModel> ssp;
         std::optional<physics::StellarPopulationStore> store;
         if (lookahead_years > 0.0) {
@@ -4005,6 +4050,59 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
           "refusing the step rather than advancing an under-resolved hierarchy");
     }
 
+    // V02 feedback loop: the AMR half of the joint controller publishes its
+    // observed optional-refinement outcome once per regrid pass, on every
+    // rank with identical (globally reduced) values, into the canonical
+    // restart/rollback sidecar. Mandatory refinements are never part of
+    // these counts or budgets (they bypass the optional budget above).
+    core::V02ControlState v02_next = v02_state;
+    if (joint_v02) {
+      std::uint64_t local_requests = 0U;
+      std::uint64_t local_rejected = 0U;
+      failure = nullptr;
+      try {
+        local_requests = core::checkedIntegralNarrow<std::uint64_t>(
+            plan.optional_refine_requests, "V02 optional refinement requests");
+        local_rejected = core::checkedIntegralNarrow<std::uint64_t>(
+            plan.optional_truncated_by_budget + plan.optional_blocked_by_force_resolution,
+            "V02 optional refinement rejections");
+        local_rejected = std::min(local_rejected, local_requests);
+      } catch (...) {
+        failure = std::current_exception();
+      }
+      m_mpi_context.rethrowCollectivePreparationFailure(failure, "V02 optional outcome preparation");
+      const std::uint64_t global_requests = m_mpi_context.allreduceSumUint64(local_requests);
+      const std::uint64_t global_rejected = m_mpi_context.allreduceSumUint64(local_rejected);
+      const std::uint64_t global_budget_truncated = m_mpi_context.allreduceSumUint64(
+          static_cast<std::uint64_t>(plan.optional_truncated_by_budget));
+      const std::uint64_t local_headroom = m_memory_governor != nullptr
+          ? m_memory_governor->snapshot().headroom_bytes
+          : std::numeric_limits<std::uint64_t>::max();
+      const std::uint64_t global_headroom = m_mpi_context.allreduceMinUint64(local_headroom);
+      v02_next.optional_amr_requests = global_requests;
+      const std::uint64_t global_admitted = m_mpi_context.allreduceSumUint64(
+          static_cast<std::uint64_t>(plan.optional_admitted_operations));
+      v02_next.optional_amr_admitted = std::min(global_admitted, global_requests - global_rejected);
+      v02_next.last_headroom_bytes = global_headroom;
+      v02_next.chemistry_growth_reserve_bytes = m_mpi_context.allreduceMaxUint64(v02_chemistry_reserve);
+      v02_next.optional_amr_budget_bytes = m_mpi_context.allreduceMinUint64(v02_optional_memory_budget);
+      // Deterministic selectivity law: a binding optional budget raises the
+      // benefit floor (x1.25, capped at 16); otherwise the 10%-per-pass decay
+      // toward 1 applied at load is the only change.
+      const double floor_used = policy.optional_control.enabled ? policy.optional_control.benefit_floor : 1.0;
+      v02_next.optional_benefit_floor = global_budget_truncated > 0U
+          ? std::min(16.0, std::max(1.0, floor_used) * 1.25)
+          : std::max(1.0, floor_used);
+      if (v02_next.epoch == std::numeric_limits<std::uint64_t>::max()) {
+        throw std::overflow_error("V02 controller epoch overflow");
+      }
+      v02_next.epoch += 1U;
+    }
+    const auto persist_v02_regrid_state = [&](core::SimulationState& target) {
+      if (!joint_v02) return;
+      core::storeV02ControlState(target, v02_next);
+    };
+
     std::uint64_t local_max_patch = 0U;
     for (const std::uint64_t id : context.state.patches.patch_id) {
       local_max_patch = std::max(local_max_patch, id);
@@ -4058,6 +4156,14 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
     }
     m_mpi_context.rethrowCollectivePreparationFailure(
         failure, "automatic AMR regrid application");
+    failure = nullptr;
+    try {
+      persist_v02_regrid_state(context.state);
+    } catch (...) {
+      failure = std::current_exception();
+    }
+    m_mpi_context.rethrowCollectivePreparationFailure(
+        failure, "automatic AMR V02 state publication");
     m_last_regrid_summary = summary;
     if (context.profiler_session != nullptr) {
       context.profiler_session->recordEvent(core::RuntimeEvent{
@@ -4386,7 +4492,6 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
   const core::SimulationConfig& m_config;
   const core::ModePolicy& m_mode_policy;
   const parallel::MpiContext& m_mpi_context;
-  SourceRuntime* m_multilevel_source_runtime = nullptr;
   core::MemoryGovernor* m_memory_governor = nullptr;
   core::UnitSystem m_units;
   std::uint32_t m_current_world_rank = 0;

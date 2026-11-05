@@ -1838,8 +1838,12 @@ void accumulateDiagnostics(ProductionAmrHydroDiagnostics& lhs, const ProductionA
   lhs.riemann_solve_count += rhs.riemann_solve_count;
   lhs.positivity_fallback_count += rhs.positivity_fallback_count;
   lhs.stencil_degradation_count += rhs.stencil_degradation_count;
+  lhs.ctu_transverse_corrected_states += rhs.ctu_transverse_corrected_states;
   lhs.ctu_transverse_degraded_states += rhs.ctu_transverse_degraded_states;
   lhs.ctu_transverse_boundary_proxy_states += rhs.ctu_transverse_boundary_proxy_states;
+  lhs.ctu_transverse_ghost_corrected_states += rhs.ctu_transverse_ghost_corrected_states;
+  lhs.ctu_transverse_ghost_axes += rhs.ctu_transverse_ghost_axes;
+  lhs.ctu_transverse_inadmissible_states += rhs.ctu_transverse_inadmissible_states;
   lhs.dual_energy_auxiliary_cells += rhs.dual_energy_auxiliary_cells;
   lhs.dual_energy_unresolved_ghosts += rhs.dual_energy_unresolved_ghosts;
   lhs.dual_energy_thermal_correction_code += rhs.dual_energy_thermal_correction_code;
@@ -3077,9 +3081,15 @@ struct AmrSynchronizedSweepWorkspace {
     diagnostics.riemann_solve_count += profile.riemann_solve_count;
     diagnostics.positivity_fallback_count += profile.positivity_fallback_count;
     diagnostics.stencil_degradation_count += profile.stencil_degradation_count;
+    diagnostics.ctu_transverse_corrected_states += profile.ctu_transverse_corrected_states;
     diagnostics.ctu_transverse_degraded_states += profile.ctu_transverse_degraded_states;
     diagnostics.ctu_transverse_boundary_proxy_states +=
         profile.ctu_transverse_boundary_proxy_states;
+    diagnostics.ctu_transverse_ghost_corrected_states +=
+        profile.ctu_transverse_ghost_corrected_states;
+    diagnostics.ctu_transverse_ghost_axes += profile.ctu_transverse_ghost_axes;
+    diagnostics.ctu_transverse_inadmissible_states +=
+        profile.ctu_transverse_inadmissible_states;
     diagnostics.dual_energy_auxiliary_cells += profile.dual_energy_auxiliary_cells;
     diagnostics.dual_energy_thermal_correction_code += profile.conservation.dual_energy_sync_delta.total_energy;
     diagnostics.active_cell_count += active_patch_cells.size();
@@ -3546,7 +3556,7 @@ ProductionAmrHydroDiagnostics advanceProductionAmrHydroRecursiveImpl(
     try {
       if (options.recursive_level_source_operator != nullptr) {
         options.recursive_level_source_operator->apply(
-            state, rows_by_level[i], update,
+            state, rows_by_level[i], update, level,
             RecursiveAmrSourcePhase::kPreHydroHalf);
       }
     } catch (...) {
@@ -3614,21 +3624,23 @@ ProductionAmrHydroDiagnostics advanceProductionAmrHydroRecursiveImpl(
       hooks->exchangeLevelFluxRegisters(state, outbound, level_options);
     }
 
-    // T02: stiff baryonic sources advance on the same physical clock as this
-    // level's hydro state. Source mutation precedes capture of the level end
-    // history, so finer children interpolate a coarse state that already
-    // includes thermochemistry/dust/SGS over the parent's accepted interval.
-    // Empty ranks still invoke the callback to preserve collective ordering.
-    if (options.recursive_level_source_callback != nullptr) {
+    // T02 level-local Strang: S_L(dt_L/2) H_L(dt_L) S_L(dt_L/2). The post half
+    // follows this level's sweep (and its remote register exchange) and
+    // precedes capture of the level end history, so finer children
+    // interpolate between complete coarse Strang boundary states. Reflux and
+    // restriction from finer levels are committed after the children, so the
+    // smooth source of a covered coarse cell is superseded by its fine data,
+    // never added to it. Empty ranks still call to keep collective ordering.
+    if (options.recursive_level_source_operator != nullptr) {
       level_failure = nullptr;
       try {
-        options.recursive_level_source_callback(
-            options.recursive_level_source_user_data, state, rows_by_level[i],
-            level, update);
+        options.recursive_level_source_operator->apply(
+            state, rows_by_level[i], update, level,
+            RecursiveAmrSourcePhase::kPostHydroHalf);
       } catch (...) {
         level_failure = std::current_exception();
       }
-      reduce(level_failure, "recursive AMR level source stage");
+      reduce(level_failure, "recursive AMR level post-source half");
     }
 
     diagnostics.substeps_by_level[static_cast<std::size_t>(level)] += 1U;
