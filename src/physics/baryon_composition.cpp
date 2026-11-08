@@ -161,6 +161,10 @@ CompositionLayout CompositionLayout::make(const CompositionLayoutRequest& reques
     layout.m_lanes.push_back({"sgs_turbulent_energy", "energy_code"});
     name += "_sgs_v1";
   }
+  static_assert(k_metal_ion_stage_capacity == 7U + 9U + 15U + 27U);
+  if (layout.m_lanes.size() > k_max_constructible_composition_lane_count) {
+    throw std::logic_error("CompositionLayout::make exceeded the constructible composition lane bound");
+  }
   std::string signature_text = name;
   for (const auto& lane : layout.m_lanes) {
     signature_text += "|" + lane.name + ":" + lane.unit;
