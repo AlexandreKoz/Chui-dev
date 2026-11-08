@@ -2734,24 +2734,33 @@ class SourceRuntimeImpl final : public SourceRuntime {
             .periodic_box_extent_comoving = m_hydro_boundary == core::BoundaryCondition::kPeriodic
                 ? m_box_extent_comoving : std::array<double, 3>{0.0, 0.0, 0.0},
             .ghost_layers = 1U});
-    std::unordered_map<std::uint64_t, parallel::AmrPatchPayloadRecord> patch_by_id;
-    for (const auto& record : exchange.patch_payloads_received) patch_by_id.emplace(record.patch_id, record);
-    std::vector<internal::StarFormationNeighborIndex::RemoteCell> remote;
-    remote.reserve(received.size());
-    for (const auto& cell : received) {
-      const auto it = patch_by_id.find(cell.patch_id);
-      if (it == patch_by_id.end()) {
-        throw std::runtime_error("star-formation remote neighbour has no patch metadata (fail closed)");
+    // Patch 52 (P1-51-01): the decode and index import are a guarded phase
+    // with a collective vote, because the star-formation batch rounds that
+    // follow enter collectives; a local failure must not strand peers there.
+    std::exception_ptr failure;
+    try {
+      std::unordered_map<std::uint64_t, parallel::AmrPatchPayloadRecord> patch_by_id;
+      for (const auto& record : exchange.patch_payloads_received) patch_by_id.emplace(record.patch_id, record);
+      std::vector<internal::StarFormationNeighborIndex::RemoteCell> remote;
+      remote.reserve(received.size());
+      for (const auto& cell : received) {
+        const auto it = patch_by_id.find(cell.patch_id);
+        if (it == patch_by_id.end()) {
+          throw std::runtime_error("star-formation remote neighbour has no patch metadata (fail closed)");
+        }
+        const auto& patch = it->second;
+        remote.push_back(internal::StarFormationNeighborIndex::RemoteCell{
+            .center = {cell.center_x_comoving, cell.center_y_comoving, cell.center_z_comoving},
+            .width = {patch.extent_x_comoving / patch.cell_dim_x, patch.extent_y_comoving / patch.cell_dim_y,
+                      patch.extent_z_comoving / patch.cell_dim_z},
+            .level = patch.level,
+            .velocity = {cell.velocity_x_peculiar, cell.velocity_y_peculiar, cell.velocity_z_peculiar}});
       }
-      const auto& patch = it->second;
-      remote.push_back(internal::StarFormationNeighborIndex::RemoteCell{
-          .center = {cell.center_x_comoving, cell.center_y_comoving, cell.center_z_comoving},
-          .width = {patch.extent_x_comoving / patch.cell_dim_x, patch.extent_y_comoving / patch.cell_dim_y,
-                    patch.extent_z_comoving / patch.cell_dim_z},
-          .level = patch.level,
-          .velocity = {cell.velocity_x_peculiar, cell.velocity_y_peculiar, cell.velocity_z_peculiar}});
+      if (m_sf_neighbor_index != nullptr) m_sf_neighbor_index->addRemoteCells(std::move(remote));
+    } catch (...) {
+      failure = std::current_exception();
     }
-    if (m_sf_neighbor_index != nullptr) m_sf_neighbor_index->addRemoteCells(std::move(remote));
+    m_mpi_context.rethrowCollectivePreparationFailure(failure, "star-formation remote neighbour import");
   }
 
   // CHUI Part 3 Checkpoint C: remote feedback halo. For every staged source
@@ -2760,7 +2769,14 @@ class SourceRuntimeImpl final : public SourceRuntime {
   // properties), so the source owner sees the exact global k-NN stencil and
   // normalizes its weights over local AND remote cells (never a rank-local
   // renormalization). Query volume: O(active sources x ranks) small records.
-  void importRemoteFeedbackCandidates(
+  //
+  // Patch 52 (P1-51-01/02): every rank-local preparation (query build,
+  // response build, candidate import) runs in a guarded phase followed by a
+  // collective vote, and both streams are received directly into governed
+  // typed buffers (no ungoverned byte buffer + second typed copy). The
+  // returned lease covers the remote candidate storage now owned by
+  // `deposition`; the caller keeps it alive at least as long as that object.
+  [[nodiscard]] core::MemoryReservation importRemoteFeedbackCandidates(
       const core::SimulationState& state,
       physics::MechanicalFeedbackDeposition& deposition,
       std::span<const physics::FeedbackSourceBudget> budgets,
@@ -2771,37 +2787,70 @@ class SourceRuntimeImpl final : public SourceRuntime {
       int requester_rank = 0;
       int pad = 0;
     };
+    static_assert(std::is_trivially_copyable_v<Query>);
     const int rank = m_mpi_context.worldRank();
     const int ranks = m_mpi_context.worldSize();
-    std::vector<Query> queries;
-    std::vector<int> destinations;
-    for (const auto& budget : budgets) {
+    const auto active = [](const physics::FeedbackSourceBudget& budget) {
       // Same activity predicate as MechanicalFeedbackDeposition::stage: a
       // wind-only or dispersion-only source still deposits, so it must see the
       // global stencil (previously skipped => rank-local stencil).
-      if (budget.ejecta_mass_code == 0.0 && budget.supernova_energy_erg == 0.0 && budget.presn_momentum_code == 0.0 &&
-          budget.wind_energy_erg == 0.0 && budget.wind_momentum_code == 0.0 &&
-          budget.association_dispersion_energy_code == 0.0) {
-        continue;
-      }
-      const double r2 = deposition.localStencilRadius2(state, budget.position_comoving);
-      for (int peer = 0; peer < ranks; ++peer) {
-        if (peer == rank) continue;
-        queries.push_back(Query{.position = budget.position_comoving, .radius2 = r2, .requester_rank = rank});
-        destinations.push_back(peer);
-      }
-    }
-    const auto query_bytes = parallel::executeBlockingDestinationRecordExchange(
-        m_mpi_context,
-        std::span<const std::byte>(reinterpret_cast<const std::byte*>(queries.data()), queries.size() * sizeof(Query)),
-        sizeof(Query), destinations, sequence);
-    std::vector<Query> inbound(query_bytes.size() / sizeof(Query));
-    if (!inbound.empty()) std::memcpy(inbound.data(), query_bytes.data(), query_bytes.size());
-    std::vector<physics::FeedbackRemoteCandidate> responses;
-    std::vector<int> response_destinations;
+      return !(budget.ejecta_mass_code == 0.0 && budget.supernova_energy_erg == 0.0 &&
+               budget.presn_momentum_code == 0.0 && budget.wind_energy_erg == 0.0 &&
+               budget.wind_momentum_code == 0.0 && budget.association_dispersion_energy_code == 0.0);
+    };
+    core::MemoryReservation query_lease;  // outbound queries + destinations
+    std::vector<Query> queries;
+    std::vector<int> destinations;
     std::exception_ptr failure;
     try {
-      for (const Query& query : inbound) {
+      std::size_t active_sources = 0U;
+      for (const auto& budget : budgets) active_sources += active(budget) ? 1U : 0U;
+      const std::size_t query_count = core::checkedSizeMultiply(
+          active_sources, static_cast<std::size_t>(std::max(ranks - 1, 0)), "remote feedback halo query count");
+      if (m_memory_governor != nullptr && query_count != 0U) {
+        query_lease = m_memory_governor->reserve(
+            core::MemoryClass::kCommunication,
+            core::checkedSizeMultiply(query_count, sizeof(Query) + sizeof(int), "remote feedback halo query bytes"),
+            "sources.feedback.remote_halo_queries");
+        query_lease.commit();
+      }
+      queries.reserve(query_count);
+      destinations.reserve(query_count);
+      for (const auto& budget : budgets) {
+        if (!active(budget)) continue;
+        const double r2 = deposition.localStencilRadius2(state, budget.position_comoving);
+        for (int peer = 0; peer < ranks; ++peer) {
+          if (peer == rank) continue;
+          queries.push_back(Query{.position = budget.position_comoving, .radius2 = r2, .requester_rank = rank});
+          destinations.push_back(peer);
+        }
+      }
+    } catch (...) {
+      failure = std::current_exception();
+    }
+    m_mpi_context.rethrowCollectivePreparationFailure(failure, "remote feedback halo queries");
+    auto inbound = parallel::exchangeGovernedRecords<Query>(
+        m_mpi_context, queries, destinations, m_memory_governor, "sources.feedback.remote_halo_query_exchange");
+    core::MemoryReservation response_lease;  // outbound candidates + destinations
+    std::vector<physics::FeedbackRemoteCandidate> responses;
+    std::vector<int> response_destinations;
+    try {
+      // At most k (neighbor_count) local candidates answer one query.
+      const std::size_t response_bound = core::checkedSizeMultiply(
+          inbound.records.size(), static_cast<std::size_t>(std::max<std::uint32_t>(m_physics_config.fb_neighbor_count, 1U)),
+          "remote feedback halo response bound");
+      if (m_memory_governor != nullptr && response_bound != 0U) {
+        response_lease = m_memory_governor->reserve(
+            core::MemoryClass::kCommunication,
+            core::checkedSizeMultiply(response_bound, sizeof(physics::FeedbackRemoteCandidate) + sizeof(int),
+                                      "remote feedback halo response bytes"),
+            "sources.feedback.remote_halo_responses");
+        response_lease.commit();
+      }
+      for (const Query& query : inbound.records) {
+        if (query.requester_rank < 0 || query.requester_rank >= ranks || query.requester_rank == rank) {
+          throw std::runtime_error("remote feedback halo: query from an invalid requester rank");
+        }
         for (const std::uint32_t row : deposition.localCandidatesWithin(state, query.position, query.radius2)) {
           physics::FeedbackRemoteCandidate candidate;
           candidate.gas_cell_id = state.gas_cells.gas_cell_id[row];
@@ -2825,14 +2874,19 @@ class SourceRuntimeImpl final : public SourceRuntime {
       failure = std::current_exception();
     }
     m_mpi_context.rethrowCollectivePreparationFailure(failure, "remote feedback halo responses");
-    const auto response_bytes = parallel::executeBlockingDestinationRecordExchange(
-        m_mpi_context,
-        std::span<const std::byte>(reinterpret_cast<const std::byte*>(responses.data()),
-                                   responses.size() * sizeof(physics::FeedbackRemoteCandidate)),
-        sizeof(physics::FeedbackRemoteCandidate), response_destinations, sequence);
-    std::vector<physics::FeedbackRemoteCandidate> remote(response_bytes.size() / sizeof(physics::FeedbackRemoteCandidate));
-    if (!remote.empty()) std::memcpy(remote.data(), response_bytes.data(), response_bytes.size());
-    deposition.setRemoteCandidates(state, std::move(remote));
+    inbound.releaseStorage();
+    auto remote = parallel::exchangeGovernedRecords<physics::FeedbackRemoteCandidate>(
+        m_mpi_context, responses, response_destinations, m_memory_governor,
+        "sources.feedback.remote_halo_candidate_exchange");
+    try {
+      deposition.setRemoteCandidates(state, std::move(remote.records));
+    } catch (...) {
+      failure = std::current_exception();
+    }
+    m_mpi_context.rethrowCollectivePreparationFailure(failure, "remote feedback halo import");
+    // Ownership transfer: the candidate storage now lives in `deposition`;
+    // its admission travels with it to the caller.
+    return std::move(remote.lease);
   }
 
   // G0.3: decomposition-independent association discovery and merge.
@@ -2902,16 +2956,23 @@ class SourceRuntimeImpl final : public SourceRuntime {
       const auto bytes = m_mpi_context.allgatherBytesBounded(std::span<const std::uint8_t>(
           reinterpret_cast<const std::uint8_t*>(local.data()),
           local.size() * sizeof(physics::AssociationSourceDescriptor)));
-      if (bytes.size() != global_count * sizeof(physics::AssociationSourceDescriptor)) {
-        throw std::runtime_error("association discovery: gathered descriptor size mismatch");
+      // Patch 52: the decode is a guarded phase (the next collective is the
+      // discovery vote below, so a local failure here is reported there).
+      try {
+        if (bytes.size() != global_count * sizeof(physics::AssociationSourceDescriptor)) {
+          throw std::runtime_error("association discovery: gathered descriptor size mismatch");
+        }
+        global.resize(static_cast<std::size_t>(global_count));
+        if (!bytes.empty()) std::memcpy(global.data(), bytes.data(), bytes.size());
+      } catch (...) {
+        failure = std::current_exception();
       }
-      global.resize(static_cast<std::size_t>(global_count));
-      if (!bytes.empty()) std::memcpy(global.data(), bytes.data(), bytes.size());
     } else {
       global = local;
     }
     std::vector<std::uint64_t> leaders;
     try {
+      if (failure != nullptr) std::rethrow_exception(failure);
       leaders = physics::discoverAssociationLeaders(
           global, m_physics_config.ssp_association_radius_code,
           m_physics_config.ssp_association_time_window_years, units.periodic, units.box_extent_comoving);
@@ -2921,74 +2982,95 @@ class SourceRuntimeImpl final : public SourceRuntime {
     if (distributed) m_mpi_context.rethrowCollectivePreparationFailure(failure, "association discovery");
     else if (failure != nullptr) std::rethrow_exception(failure);
 
-    // Leader id -> owner rank (the descriptor whose id equals the leader).
-    std::vector<std::pair<std::uint64_t, int>> owner_of;
-    owner_of.reserve(global.size());
-    for (const auto& d : global) owner_of.emplace_back(d.source_id, d.owner_rank);
-    std::sort(owner_of.begin(), owner_of.end());
-    const auto owner_rank_of = [&owner_of](std::uint64_t id) {
-      const auto it = std::lower_bound(owner_of.begin(), owner_of.end(), std::make_pair(id, -1));
-      if (it == owner_of.end() || it->first != id) {
-        throw std::logic_error("association discovery: leader id has no descriptor");
-      }
-      return it->second;
-    };
-    std::vector<std::uint64_t> local_leader(local.size());
-    {
-      std::vector<std::pair<std::uint64_t, std::uint64_t>> id_to_leader(global.size());
-      for (std::size_t g = 0; g < global.size(); ++g) id_to_leader[g] = {global[g].source_id, leaders[g]};
-      std::sort(id_to_leader.begin(), id_to_leader.end());
-      for (std::size_t l = 0; l < local.size(); ++l) {
-        const auto it = std::lower_bound(id_to_leader.begin(), id_to_leader.end(),
-                                         std::make_pair(local[l].source_id, std::uint64_t{0}));
-        local_leader[l] = it->second;
-      }
-    }
     struct MemberRecord {
       std::uint64_t leader_id = 0U;
       physics::FeedbackSourceBudget budget{};
     };
     static_assert(std::is_trivially_copyable_v<MemberRecord>);
+    // Patch 52 (P1-51-01/02): routing preparation is a guarded phase with a
+    // collective vote before the member exchange; members are received into
+    // a governed typed buffer and appended to `kept` in a guarded phase
+    // (the final merge has no further collective in this function).
     std::vector<MemberRecord> outbound;
     std::vector<int> destinations;
     std::vector<MemberRecord> kept;
-    for (std::size_t l = 0; l < local.size(); ++l) {
-      MemberRecord rec{local_leader[l], budgets[local_budget_index[l]]};
-      const int dest = owner_rank_of(local_leader[l]);
-      if (dest == rank) {
-        kept.push_back(rec);
-      } else {
-        outbound.push_back(rec);
-        destinations.push_back(dest);
+    try {
+      // Leader id -> owner rank (the descriptor whose id equals the leader).
+      std::vector<std::pair<std::uint64_t, int>> owner_of;
+      owner_of.reserve(global.size());
+      for (const auto& d : global) owner_of.emplace_back(d.source_id, d.owner_rank);
+      std::sort(owner_of.begin(), owner_of.end());
+      const auto owner_rank_of = [&owner_of](std::uint64_t id) {
+        const auto it = std::lower_bound(owner_of.begin(), owner_of.end(), std::make_pair(id, -1));
+        if (it == owner_of.end() || it->first != id) {
+          throw std::logic_error("association discovery: leader id has no descriptor");
+        }
+        return it->second;
+      };
+      std::vector<std::uint64_t> local_leader(local.size());
+      {
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> id_to_leader(global.size());
+        for (std::size_t g = 0; g < global.size(); ++g) id_to_leader[g] = {global[g].source_id, leaders[g]};
+        std::sort(id_to_leader.begin(), id_to_leader.end());
+        for (std::size_t l = 0; l < local.size(); ++l) {
+          const auto it = std::lower_bound(id_to_leader.begin(), id_to_leader.end(),
+                                           std::make_pair(local[l].source_id, std::uint64_t{0}));
+          if (it == id_to_leader.end() || it->first != local[l].source_id) {
+            throw std::logic_error("association discovery: local source missing from the global descriptor set");
+          }
+          local_leader[l] = it->second;
+        }
+      }
+      for (std::size_t l = 0; l < local.size(); ++l) {
+        MemberRecord rec{local_leader[l], budgets[local_budget_index[l]]};
+        const int dest = owner_rank_of(local_leader[l]);
+        if (dest == rank) {
+          kept.push_back(rec);
+        } else {
+          outbound.push_back(rec);
+          destinations.push_back(dest);
+        }
+      }
+      if (!distributed && !outbound.empty()) {
+        throw std::logic_error("association merge: single-rank merge routed a member off-rank");
+      }
+    } catch (...) {
+      failure = std::current_exception();
+    }
+    if (distributed) m_mpi_context.rethrowCollectivePreparationFailure(failure, "association member routing");
+    else if (failure != nullptr) std::rethrow_exception(failure);
+    if (distributed) {
+      auto received = parallel::exchangeGovernedRecords<MemberRecord>(
+          m_mpi_context, outbound, destinations, m_memory_governor, "sources.associations.member_exchange");
+      try {
+        kept.insert(kept.end(), received.records.begin(), received.records.end());
+      } catch (...) {
+        failure = std::current_exception();
       }
     }
-    if (distributed) {
-      const auto bytes = parallel::executeBlockingDestinationRecordExchange(
-          m_mpi_context,
-          std::span<const std::byte>(reinterpret_cast<const std::byte*>(outbound.data()),
-                                     outbound.size() * sizeof(MemberRecord)),
-          sizeof(MemberRecord), destinations, sequence);
-      const std::size_t received = bytes.size() / sizeof(MemberRecord);
-      const std::size_t base = kept.size();
-      kept.resize(base + received);
-      if (received > 0U) std::memcpy(kept.data() + base, bytes.data(), received * sizeof(MemberRecord));
-    } else if (!outbound.empty()) {
-      throw std::logic_error("association merge: single-rank merge routed a member off-rank");
-    }
-    std::sort(kept.begin(), kept.end(), [](const MemberRecord& l, const MemberRecord& r) {
-      return l.leader_id != r.leader_id ? l.leader_id < r.leader_id : l.budget.source_id < r.budget.source_id;
-    });
     std::vector<physics::FeedbackSourceBudget> merged;
-    std::vector<physics::FeedbackSourceBudget> members;
-    std::size_t begin = 0U;
-    while (begin < kept.size()) {
-      std::size_t end = begin + 1U;
-      while (end < kept.size() && kept[end].leader_id == kept[begin].leader_id) ++end;
-      members.clear();
-      for (std::size_t k = begin; k < end; ++k) members.push_back(kept[k].budget);
-      merged.push_back(physics::mergeAssociationMembers(members, units.periodic, units.box_extent_comoving));
-      begin = end;
+    try {
+      if (failure != nullptr) std::rethrow_exception(failure);
+      std::sort(kept.begin(), kept.end(), [](const MemberRecord& l, const MemberRecord& r) {
+        return l.leader_id != r.leader_id ? l.leader_id < r.leader_id : l.budget.source_id < r.budget.source_id;
+      });
+      std::vector<physics::FeedbackSourceBudget> members;
+      std::size_t begin = 0U;
+      while (begin < kept.size()) {
+        std::size_t end = begin + 1U;
+        while (end < kept.size() && kept[end].leader_id == kept[begin].leader_id) ++end;
+        members.clear();
+        for (std::size_t k = begin; k < end; ++k) members.push_back(kept[k].budget);
+        merged.push_back(physics::mergeAssociationMembers(members, units.periodic, units.box_extent_comoving));
+        begin = end;
+      }
+    } catch (...) {
+      failure = std::current_exception();
     }
+    // The caller's next step is a collective (remote halo query vote), so a
+    // local merge failure is reported collectively here (patch 52).
+    if (distributed) m_mpi_context.rethrowCollectivePreparationFailure(failure, "association member merge");
+    else if (failure != nullptr) std::rethrow_exception(failure);
     return merged;
   }
 
@@ -3047,6 +3129,10 @@ class SourceRuntimeImpl final : public SourceRuntime {
     for (std::uint32_t row = 0; row < state.cells.size(); ++row) {
       if (row < m_owned_leaf_mask.size() && m_owned_leaf_mask[row] != 0U) owned_leaf.push_back(row);
     }
+    // Admission of the remote candidate storage handed to `deposition` by
+    // importRemoteFeedbackCandidates; declared before `deposition` so the
+    // storage is destroyed before the lease is released (patch 52).
+    core::MemoryReservation remote_candidate_lease;
     physics::MechanicalFeedbackDeposition deposition(fb_config, units);
     deposition.setCandidates(state, std::move(owned_leaf));
     physics::StellarPopulationStore store(state);
@@ -3249,7 +3335,8 @@ class SourceRuntimeImpl final : public SourceRuntime {
             context.integrator_state.step_index);
       }
       if (distributed_feedback) {
-        importRemoteFeedbackCandidates(state, deposition, staged_budgets, context.integrator_state.step_index);
+        remote_candidate_lease =
+            importRemoteFeedbackCandidates(state, deposition, staged_budgets, context.integrator_state.step_index);
       }
       std::exception_ptr stage_failure;
       try {
@@ -3259,21 +3346,32 @@ class SourceRuntimeImpl final : public SourceRuntime {
       }
       if (distributed_feedback) {
         m_mpi_context.rethrowCollectivePreparationFailure(stage_failure, "mechanical feedback staging");
-        std::vector<physics::FeedbackCellDelta> outbound = deposition.remoteDeltas(m_mpi_context.worldRank());
+        // Patch 52 (P1-51-01/02): outbound delta preparation and the inbound
+        // merge are guarded phases with collective votes; the inbound deltas
+        // are received directly into a governed typed buffer whose lease
+        // lives until they are merged.
+        std::vector<physics::FeedbackCellDelta> outbound;
         std::vector<int> destinations;
-        for (const auto& d : outbound) destinations.push_back(d.owner_rank);
-        const std::vector<std::byte> bytes = parallel::executeBlockingDestinationRecordExchange(
-            m_mpi_context,
-            std::span<const std::byte>(reinterpret_cast<const std::byte*>(outbound.data()),
-                                       outbound.size() * sizeof(physics::FeedbackCellDelta)),
-            sizeof(physics::FeedbackCellDelta), destinations, context.integrator_state.step_index);
-        std::vector<physics::FeedbackCellDelta> inbound(bytes.size() / sizeof(physics::FeedbackCellDelta));
-        if (!inbound.empty()) std::memcpy(inbound.data(), bytes.data(), bytes.size());
-        // Deterministic merge order (cell id, then source rank).
-        std::sort(inbound.begin(), inbound.end(), [](const auto& l, const auto& r) {
-          return l.gas_cell_id != r.gas_cell_id ? l.gas_cell_id < r.gas_cell_id : l.source_rank < r.source_rank;
-        });
-        for (const auto& d : inbound) deposition.addImportedDelta(state, d);
+        try {
+          outbound = deposition.remoteDeltas(m_mpi_context.worldRank());
+          destinations.reserve(outbound.size());
+          for (const auto& d : outbound) destinations.push_back(d.owner_rank);
+        } catch (...) {
+          stage_failure = std::current_exception();
+        }
+        m_mpi_context.rethrowCollectivePreparationFailure(stage_failure, "mechanical feedback remote delta export");
+        auto inbound = parallel::exchangeGovernedRecords<physics::FeedbackCellDelta>(
+            m_mpi_context, outbound, destinations, m_memory_governor, "sources.feedback.remote_delta_exchange");
+        try {
+          // Deterministic merge order (cell id, then source rank).
+          std::sort(inbound.records.begin(), inbound.records.end(), [](const auto& l, const auto& r) {
+            return l.gas_cell_id != r.gas_cell_id ? l.gas_cell_id < r.gas_cell_id : l.source_rank < r.source_rank;
+          });
+          for (const auto& d : inbound.records) deposition.addImportedDelta(state, d);
+        } catch (...) {
+          stage_failure = std::current_exception();
+        }
+        m_mpi_context.rethrowCollectivePreparationFailure(stage_failure, "mechanical feedback remote delta import");
       } else if (stage_failure != nullptr) {
         std::rethrow_exception(stage_failure);
       }

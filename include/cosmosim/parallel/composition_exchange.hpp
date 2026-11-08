@@ -35,9 +35,10 @@
 // k_max_destination_exchange_round_bytes_per_peer bytes per peer, so no MPI
 // int count/displacement overflows; the receive capacity of every round is
 // admitted through the optional MemoryGovernor before allocation, and a local
-// refusal (or any local narrowing failure) is turned into a collective error
-// BEFORE any rank enters the payload collective (no deadlock, no partial
-// application). All ranks always participate (empty streams allowed); receive
+// refusal, allocation failure or narrowing failure is turned into a
+// collective error BEFORE any rank enters the next collective (patch 52:
+// this now also covers the control-plane arrays allocated before the count
+// exchange; see exchangeDestinationRecordsInto). All ranks always participate (empty streams allowed); receive
 // order is deterministic (ascending source rank, then send order).
 // Without MPI (or one rank) records addressed to the local rank are returned
 // and any other destination is refused.
@@ -46,7 +47,10 @@
 #include <cstddef>
 #include <cstdint>
 #include <span>
+#include <stdexcept>
 #include <string_view>
+#include <type_traits>
+#include <utility>
 #include <vector>
 
 #include "cosmosim/core/memory_governor.hpp"
@@ -128,9 +132,16 @@ struct AssembledCompositionLanes {
 // layout bound. 0 lanes -> 0 chunks.
 [[nodiscard]] std::size_t compositionLaneChunkCount(std::size_t lane_count);
 
-// Bytes that coexist for `entries` lane vectors of `lane_count` lanes on one
-// side of a chunked exchange (send records + bucketed send copy + receive
-// records + reassembled flat lanes). Saturating.
+// Caller-owned bytes of one side of a chunked lane exchange for `entries`
+// lane vectors of `lane_count` lanes: the outbound chunk records and their
+// destination ranks, plus the reassembled flat lanes/ids/scalars and the
+// reassembly sort order. Saturating.
+//
+// Patch 52 (P1-51-02): the exchange primitive itself now admits and owns
+// every allocation it makes (control plane, bucket/cursor, round staging and
+// the final receive buffer, see exchangeDestinationRecordsInto), so this
+// caller-side figure deliberately EXCLUDES them; adding them here would
+// double-charge the same bytes against the node budget.
 [[nodiscard]] std::uint64_t compositionLaneExchangeAdmissionBytes(std::uint64_t entries, std::size_t lane_count);
 
 // Splits one cell's lane vector into chunk records addressed to
@@ -153,22 +164,133 @@ void appendCompositionLaneChunks(
     int receiver_rank);
 
 // Received payload whose memory admission lives exactly as long as the
-// payload (patch 51, M01/D01): `lease` (kCommunication) covers the owned
-// capacity of `records`/`bytes` and is released only when the buffer object
-// is destroyed or the caller releases it after decoding.
+// payload (patch 51, M01/D01; lifetime order fixed in patch 52, P1-51-02):
+// `lease` (kCommunication) covers the owned capacity of `records`/`bytes`.
+// `lease` is declared FIRST so that implicit destruction (reverse
+// declaration order) frees the storage BEFORE the admission is released;
+// move assignment likewise frees the old storage before releasing the old
+// lease. releaseStorage() frees early in the same order.
 struct GovernedRecordBuffer {
-  std::vector<std::byte> bytes;
   core::MemoryReservation lease;
+  std::vector<std::byte> bytes;
+
+  GovernedRecordBuffer() = default;
+  GovernedRecordBuffer(const GovernedRecordBuffer&) = delete;
+  GovernedRecordBuffer& operator=(const GovernedRecordBuffer&) = delete;
+  GovernedRecordBuffer(GovernedRecordBuffer&&) noexcept = default;
+  GovernedRecordBuffer& operator=(GovernedRecordBuffer&& other) noexcept {
+    if (this != &other) {
+      bytes = std::move(other.bytes);
+      lease = std::move(other.lease);
+    }
+    return *this;
+  }
+  ~GovernedRecordBuffer() = default;
+  void releaseStorage() noexcept {
+    std::vector<std::byte>().swap(bytes);
+    lease.release();
+  }
 };
 template <class Record>
 struct GovernedRecords {
-  std::vector<Record> records;
   core::MemoryReservation lease;
+  std::vector<Record> records;
+
+  GovernedRecords() = default;
+  GovernedRecords(const GovernedRecords&) = delete;
+  GovernedRecords& operator=(const GovernedRecords&) = delete;
+  GovernedRecords(GovernedRecords&&) noexcept = default;
+  GovernedRecords& operator=(GovernedRecords&& other) noexcept {
+    if (this != &other) {
+      records = std::move(other.records);
+      lease = std::move(other.lease);
+    }
+    return *this;
+  }
+  ~GovernedRecords() = default;
+  void releaseStorage() noexcept {
+    std::vector<Record>().swap(records);
+    lease.release();
+  }
 };
 
-// Ungoverned byte-level primitive: record i (record_bytes wide) goes to
-// destination[i]. Collective. The caller owns admission of the returned
-// bytes (used by small control-plane streams in SourceRuntime).
+// Receive-buffer allocator of the governed primitive: called at most once,
+// inside the guarded admission phase (step 4 below, i.e. BEFORE the
+// collective readiness vote), with the total received byte count; returns
+// the base of a caller-owned buffer of at least that many bytes. It may
+// throw: the failure is made collective before any payload round.
+using DestinationReceiveAllocator = std::byte* (*)(void* owner, std::size_t bytes);
+
+// Collective-safe destination record exchange (patch 52, P1-51-01). Every
+// rank calls it in the same order, possibly with an empty stream. Protocol:
+//   1. [local, guarded] argument/destination validation, control-plane
+//      admission (count/offset/displacement/cursor arrays, kCommunication)
+//      and allocation, per-destination tally;
+//   2. [collective] failure vote "destination record exchange preparation";
+//   3. [collective] MPI_Alltoall of per-peer record counts (no allocation
+//      or throwing operation between 2 and 3);
+//   4. [local, noexcept arithmetic] round plan; [collective] Allreduce(max)
+//      of the round count;
+//   5. [local, guarded] MPI int-range checks of every round count and
+//      displacement, admission of the final receive buffer (`lease`,
+//      returned to the caller) and of the scratch (bucket index + maximal
+//      round staging), allocation of the receive buffer (via `allocate`),
+//      bucket and staging capacity;
+//   6. [collective] failure vote "destination record exchange admission";
+//   7. [collective x rounds] MPI_Alltoallv payload rounds. Between 6 and the
+//      last round nothing allocates: staging is resized within reserved
+//      capacity, counts are already range-checked.
+// An MPI error return inside steps 3/4/7 throws on that rank and remains
+// communicator-fatal (default MPI error handler); ordinary local failures
+// (bad_alloc, admission refusal, narrowing) are always reported through the
+// votes in 2/6 so no peer is stranded inside a collective. On any throw the
+// scratch/control reservations are released by RAII and the caller-owned
+// receive buffer is destroyed by the caller's unwinding.
+// Without MPI (or one rank) records addressed to the local rank are copied
+// into the receive buffer (admitted when a governor is given) and any other
+// destination is refused.
+[[nodiscard]] core::MemoryReservation exchangeDestinationRecordsInto(
+    const MpiContext& mpi_context,
+    std::span<const std::byte> records,
+    std::size_t record_bytes,
+    std::span<const int> destination_rank,
+    core::MemoryGovernor* governor,
+    std::string_view owner_label,
+    DestinationReceiveAllocator allocate,
+    void* allocate_owner);
+
+// Typed governed front end: received records land directly in the returned
+// typed vector (no byte buffer, no second typed copy) and the lease covering
+// them is returned with them.
+template <class Record>
+[[nodiscard]] GovernedRecords<Record> exchangeGovernedRecords(
+    const MpiContext& mpi_context,
+    std::span<const Record> records,
+    std::span<const int> destinations,
+    core::MemoryGovernor* governor,
+    std::string_view owner_label) {
+  static_assert(std::is_trivially_copyable_v<Record>);
+  static_assert(std::is_default_constructible_v<Record>);
+  GovernedRecords<Record> out;
+  const std::span<const std::byte> bytes(
+      reinterpret_cast<const std::byte*>(records.data()), records.size() * sizeof(Record));
+  out.lease = exchangeDestinationRecordsInto(
+      mpi_context, bytes, sizeof(Record), destinations, governor, owner_label,
+      [](void* owner, std::size_t total) -> std::byte* {
+        auto& target = *static_cast<std::vector<Record>*>(owner);
+        if (total % sizeof(Record) != 0U) {
+          throw std::runtime_error("destination record exchange: received byte count is not a whole record stream");
+        }
+        target.resize(total / sizeof(Record));
+        return reinterpret_cast<std::byte*>(target.data());
+      },
+      &out.records);
+  return out;
+}
+
+// Ungoverned byte-level primitive (same collective-safe protocol, no
+// admission). Retained for API compatibility; production streams use the
+// governed front ends.
 [[nodiscard]] std::vector<std::byte> executeBlockingDestinationRecordExchange(
     const MpiContext& mpi_context,
     std::span<const std::byte> records,
@@ -176,20 +298,7 @@ struct GovernedRecords {
     std::span<const int> destination_rank,
     std::uint64_t exchange_sequence);
 
-// Governed primitive. Protocol (every rank, same order):
-//   1. local argument check -> collective failure vote;
-//   2. count Alltoall; round count Allreduce(max);
-//   3. admission + allocation of the FINAL receive buffer (lease returned
-//      with it) and of the bounded round staging at its maximum round size
-//      (separate scratch reservation, released on return) -> collective
-//      failure vote. After this vote no allocation happens before or between
-//      the payload rounds (staging is resized within reserved capacity,
-//      which cannot throw), so a local bad_alloc can no longer strand peers
-//      inside MPI_Alltoallv.
-//   4. bounded payload rounds; an MPI error return throws on that rank only
-//      and is fatal for the communicator (MPI default error handler aborts).
-// The received payload is written directly into the final buffer (no second
-// typed copy, see exchangeGovernedTyped).
+// Governed byte-level primitive (protocol of exchangeDestinationRecordsInto).
 [[nodiscard]] GovernedRecordBuffer executeGovernedDestinationRecordExchange(
     const MpiContext& mpi_context,
     std::span<const std::byte> records,
