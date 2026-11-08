@@ -152,20 +152,54 @@ void appendCompositionLaneChunks(
     const CompositionLaneStreamIdentity& expected,
     int receiver_rank);
 
-// Byte-level primitive: record i (record_bytes wide) goes to destination[i].
-// Collective. When governor != nullptr every round's receive capacity is
-// reserved (kCommunication, owner label) before allocation; refusal is
-// collective before the payload Alltoallv.
+// Received payload whose memory admission lives exactly as long as the
+// payload (patch 51, M01/D01): `lease` (kCommunication) covers the owned
+// capacity of `records`/`bytes` and is released only when the buffer object
+// is destroyed or the caller releases it after decoding.
+struct GovernedRecordBuffer {
+  std::vector<std::byte> bytes;
+  core::MemoryReservation lease;
+};
+template <class Record>
+struct GovernedRecords {
+  std::vector<Record> records;
+  core::MemoryReservation lease;
+};
+
+// Ungoverned byte-level primitive: record i (record_bytes wide) goes to
+// destination[i]. Collective. The caller owns admission of the returned
+// bytes (used by small control-plane streams in SourceRuntime).
 [[nodiscard]] std::vector<std::byte> executeBlockingDestinationRecordExchange(
     const MpiContext& mpi_context,
     std::span<const std::byte> records,
     std::size_t record_bytes,
     std::span<const int> destination_rank,
-    std::uint64_t exchange_sequence,
-    core::MemoryGovernor* governor = nullptr,
-    std::string_view owner_label = "parallel.destination_record_exchange");
+    std::uint64_t exchange_sequence);
 
-[[nodiscard]] std::vector<CompositionDonorRequestRecord> exchangeCompositionDonorRequests(
+// Governed primitive. Protocol (every rank, same order):
+//   1. local argument check -> collective failure vote;
+//   2. count Alltoall; round count Allreduce(max);
+//   3. admission + allocation of the FINAL receive buffer (lease returned
+//      with it) and of the bounded round staging at its maximum round size
+//      (separate scratch reservation, released on return) -> collective
+//      failure vote. After this vote no allocation happens before or between
+//      the payload rounds (staging is resized within reserved capacity,
+//      which cannot throw), so a local bad_alloc can no longer strand peers
+//      inside MPI_Alltoallv.
+//   4. bounded payload rounds; an MPI error return throws on that rank only
+//      and is fatal for the communicator (MPI default error handler aborts).
+// The received payload is written directly into the final buffer (no second
+// typed copy, see exchangeGovernedTyped).
+[[nodiscard]] GovernedRecordBuffer executeGovernedDestinationRecordExchange(
+    const MpiContext& mpi_context,
+    std::span<const std::byte> records,
+    std::size_t record_bytes,
+    std::span<const int> destination_rank,
+    std::uint64_t exchange_sequence,
+    core::MemoryGovernor* governor,
+    std::string_view owner_label);
+
+[[nodiscard]] GovernedRecords<CompositionDonorRequestRecord> exchangeCompositionDonorRequests(
     const MpiContext& mpi_context,
     std::span<const CompositionDonorRequestRecord> requests,
     std::uint64_t exchange_sequence,
@@ -173,7 +207,8 @@ void appendCompositionLaneChunks(
 
 // Chunked lane exchange (collective). Validates every outbound record
 // (schema, source == this rank, destination matches) before the collective.
-[[nodiscard]] std::vector<CompositionLaneChunkRecord> exchangeCompositionLaneChunks(
+// Records are received directly into the returned typed buffer.
+[[nodiscard]] GovernedRecords<CompositionLaneChunkRecord> exchangeCompositionLaneChunks(
     const MpiContext& mpi_context,
     std::span<const CompositionLaneChunkRecord> records,
     std::span<const int> destinations,

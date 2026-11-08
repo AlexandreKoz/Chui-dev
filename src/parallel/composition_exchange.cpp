@@ -33,27 +33,48 @@ static_assert(k_max_composition_lane_chunks <= std::numeric_limits<std::uint16_t
   return a > std::numeric_limits<std::uint64_t>::max() - b ? std::numeric_limits<std::uint64_t>::max() : a + b;
 }
 
+// Destination allocator: called once (inside the admission phase, before
+// the collective failure vote) with the total received byte count; returns
+// the base of a buffer of at least that many bytes that outlives the call.
+using ReceiveAllocator = std::byte* (*)(void* owner, std::size_t bytes);
+
+// Core collective implementation shared by the byte and typed front ends.
+// Returns the lease covering the final receive buffer (or an invalid
+// reservation without a governor).
+core::MemoryReservation exchangeIntoDestination(
+    const MpiContext& mpi_context,
+    std::span<const std::byte> records,
+    std::size_t record_bytes,
+    std::span<const int> destination_rank,
+    core::MemoryGovernor* governor,
+    std::string_view owner_label,
+    ReceiveAllocator allocate,
+    void* allocate_owner);
+
 template <class Record>
-[[nodiscard]] std::vector<Record> exchangeTyped(
+[[nodiscard]] GovernedRecords<Record> exchangeGovernedTyped(
     const MpiContext& mpi_context,
     std::span<const Record> records,
     std::span<const int> destinations,
-    std::uint64_t exchange_sequence,
     core::MemoryGovernor* governor,
     std::string_view owner_label) {
   static_assert(std::is_trivially_copyable_v<Record>);
+  static_assert(std::is_default_constructible_v<Record>);
+  GovernedRecords<Record> out;
   const std::span<const std::byte> bytes(
       reinterpret_cast<const std::byte*>(records.data()), records.size() * sizeof(Record));
-  const std::vector<std::byte> received = executeBlockingDestinationRecordExchange(
-      mpi_context, bytes, sizeof(Record), destinations, exchange_sequence, governor, owner_label);
-  if (received.size() % sizeof(Record) != 0U) {
-    throw std::runtime_error("composition exchange received a truncated record stream");
-  }
-  std::vector<Record> result(received.size() / sizeof(Record));
-  if (!result.empty()) {
-    std::memcpy(result.data(), received.data(), received.size());
-  }
-  return result;
+  out.lease = exchangeIntoDestination(
+      mpi_context, bytes, sizeof(Record), destinations, governor, owner_label,
+      [](void* owner, std::size_t total) -> std::byte* {
+        auto& target = *static_cast<std::vector<Record>*>(owner);
+        if (total % sizeof(Record) != 0U) {
+          throw std::runtime_error("composition exchange: received byte count is not a whole record stream");
+        }
+        target.resize(total / sizeof(Record));
+        return reinterpret_cast<std::byte*>(target.data());
+      },
+      &out.records);
+  return out;
 }
 
 }  // namespace
@@ -197,15 +218,17 @@ AssembledCompositionLanes assembleCompositionLaneChunks(
   return out;
 }
 
-std::vector<std::byte> executeBlockingDestinationRecordExchange(
+namespace {
+
+core::MemoryReservation exchangeIntoDestination(
     const MpiContext& mpi_context,
     std::span<const std::byte> records,
     std::size_t record_bytes,
     std::span<const int> destination_rank,
-    std::uint64_t exchange_sequence,
     core::MemoryGovernor* governor,
-    std::string_view owner_label) {
-  (void)exchange_sequence;
+    std::string_view owner_label,
+    ReceiveAllocator allocate,
+    void* allocate_owner) {
   const int world_rank = mpi_context.worldRank();
   const int world_size = std::max(1, mpi_context.worldSize());
   // Every local argument check is made collective before any payload
@@ -223,6 +246,7 @@ std::vector<std::byte> executeBlockingDestinationRecordExchange(
   } catch (...) {
     failure = std::current_exception();
   }
+  core::MemoryReservation lease;
   if (!mpi_context.isEnabled() || world_size <= 1) {
     if (failure != nullptr) std::rethrow_exception(failure);
     for (const int destination : destination_rank) {
@@ -230,12 +254,13 @@ std::vector<std::byte> executeBlockingDestinationRecordExchange(
         throw std::runtime_error("destination record exchange: remote destination without MPI");
       }
     }
-    core::MemoryReservation reservation;
     if (governor != nullptr && !records.empty()) {
-      reservation = governor->reserve(core::MemoryClass::kCommunication, records.size(), owner_label);
-      reservation.commit();
+      lease = governor->reserve(core::MemoryClass::kCommunication, records.size(), owner_label);
+      lease.commit();
     }
-    return std::vector<std::byte>(records.begin(), records.end());
+    std::byte* target = allocate(allocate_owner, records.size());
+    if (!records.empty()) std::memcpy(target, records.data(), records.size());
+    return lease;
   }
 #if defined(COSMOSIM_ENABLE_MPI) && COSMOSIM_ENABLE_MPI
   mpi_context.rethrowCollectivePreparationFailure(failure, "destination record exchange arguments");
@@ -258,32 +283,48 @@ std::vector<std::byte> executeBlockingDestinationRecordExchange(
   const std::uint64_t per_peer_records = std::max<std::uint64_t>(1U, per_peer_bytes_cap / record_bytes);
   std::uint64_t local_rounds = 0U;
   std::uint64_t recv_total_records = 0U;
+  std::uint64_t max_send_round_bytes = 0U;  // round 0 is the largest round
+  std::uint64_t max_recv_round_bytes = 0U;
   for (std::size_t r = 0; r < ranks; ++r) {
     local_rounds = std::max(local_rounds, (send_counts[r] + per_peer_records - 1U) / per_peer_records);
     local_rounds = std::max(local_rounds, (recv_counts[r] + per_peer_records - 1U) / per_peer_records);
     recv_total_records = saturatingAdd(recv_total_records, recv_counts[r]);
+    max_send_round_bytes = saturatingAdd(
+        max_send_round_bytes, saturatingMul(std::min(per_peer_records, send_counts[r]), record_bytes));
+    max_recv_round_bytes = saturatingAdd(
+        max_recv_round_bytes, saturatingMul(std::min(per_peer_records, recv_counts[r]), record_bytes));
   }
   const std::uint64_t rounds = mpi_context.allreduceMaxUint64(local_rounds);
 
-  // Admission + allocation of the result buffer and bounded round staging.
-  core::MemoryReservation reservation;
-  std::vector<std::byte> recv_buffer;
+  // Admission + EVERY allocation of the exchange happens here, before the
+  // collective vote: final receive buffer (lease, returned), bucket index and
+  // round staging at maximum round size (scratch reservation, local).
+  core::MemoryReservation scratch;
+  std::byte* recv_base = nullptr;
   std::vector<std::size_t> bucket;                 // send order bucketed by destination
   std::vector<std::size_t> send_offsets(ranks + 1U, 0U);
   std::vector<std::size_t> recv_offsets(ranks + 1U, 0U);
   std::vector<std::byte> send_stage;
   std::vector<std::byte> recv_stage;
+  std::vector<int> send_bytes(ranks);
+  std::vector<int> send_displ(ranks);
+  std::vector<int> recv_bytes(ranks);
+  std::vector<int> recv_displ(ranks);
   failure = nullptr;
   try {
     const std::uint64_t recv_bytes_total = saturatingMul(recv_total_records, record_bytes);
-    const std::uint64_t stage_bytes = saturatingMul(per_peer_records * record_bytes, ranks);
-    const std::uint64_t admitted = saturatingAdd(
-        saturatingAdd(recv_bytes_total, saturatingMul(destination_rank.size(), sizeof(std::size_t))),
-        saturatingMul(2U, std::min<std::uint64_t>(stage_bytes,
-                                                  saturatingAdd(recv_bytes_total, records.size()))));
-    if (governor != nullptr && admitted != 0U) {
-      reservation = governor->reserve(core::MemoryClass::kCommunication, admitted, owner_label);
-      reservation.commit();
+    const std::uint64_t scratch_bytes = saturatingAdd(
+        saturatingAdd(max_send_round_bytes, max_recv_round_bytes),
+        saturatingMul(destination_rank.size(), sizeof(std::size_t)));
+    if (governor != nullptr) {
+      if (recv_bytes_total != 0U) {
+        lease = governor->reserve(core::MemoryClass::kCommunication, recv_bytes_total, owner_label);
+        lease.commit();
+      }
+      if (scratch_bytes != 0U) {
+        scratch = governor->reserve(core::MemoryClass::kCommunication, scratch_bytes, owner_label);
+        scratch.commit();
+      }
     }
     for (std::size_t r = 0; r < ranks; ++r) {
       send_offsets[r + 1U] = core::checkedSizeAdd(send_offsets[r],
@@ -291,35 +332,36 @@ std::vector<std::byte> executeBlockingDestinationRecordExchange(
       recv_offsets[r + 1U] = core::checkedSizeAdd(recv_offsets[r],
           core::checkedIntegralNarrow<std::size_t>(recv_counts[r], "recv count"), "recv offsets");
     }
-    recv_buffer.resize(core::checkedSizeMultiply(recv_offsets[ranks], record_bytes, "recv buffer bytes"));
+    recv_base = allocate(allocate_owner,
+                         core::checkedSizeMultiply(recv_offsets[ranks], record_bytes, "recv buffer bytes"));
     bucket.resize(destination_rank.size());
     std::vector<std::size_t> cursor(send_offsets.begin(), send_offsets.end() - 1);
     for (std::size_t i = 0; i < destination_rank.size(); ++i) {
       bucket[cursor[static_cast<std::size_t>(destination_rank[i])]++] = i;
     }
+    send_stage.reserve(core::checkedIntegralNarrow<std::size_t>(max_send_round_bytes, "send stage"));
+    recv_stage.reserve(core::checkedIntegralNarrow<std::size_t>(max_recv_round_bytes, "recv stage"));
   } catch (...) {
     failure = std::current_exception();
   }
   mpi_context.rethrowCollectivePreparationFailure(failure, "destination record exchange admission");
 
-  std::vector<int> send_bytes(ranks);
-  std::vector<int> send_displ(ranks);
-  std::vector<int> recv_bytes(ranks);
-  std::vector<int> recv_displ(ranks);
   for (std::uint64_t round = 0; round < rounds; ++round) {
     const std::uint64_t first = round * per_peer_records;
     std::size_t send_round_total = 0U;
     std::size_t recv_round_total = 0U;
     for (std::size_t r = 0; r < ranks; ++r) {
-      const std::uint64_t s = send_counts[r] > first ? std::min(per_peer_records, send_counts[r] - first) : 0U;
-      const std::uint64_t q = recv_counts[r] > first ? std::min(per_peer_records, recv_counts[r] - first) : 0U;
-      send_bytes[r] = static_cast<int>(s * record_bytes);
+      const std::uint64_t sc = send_counts[r] > first ? std::min(per_peer_records, send_counts[r] - first) : 0U;
+      const std::uint64_t qc = recv_counts[r] > first ? std::min(per_peer_records, recv_counts[r] - first) : 0U;
+      send_bytes[r] = static_cast<int>(sc * record_bytes);
       send_displ[r] = static_cast<int>(send_round_total);
-      recv_bytes[r] = static_cast<int>(q * record_bytes);
+      recv_bytes[r] = static_cast<int>(qc * record_bytes);
       recv_displ[r] = static_cast<int>(recv_round_total);
-      send_round_total += static_cast<std::size_t>(s * record_bytes);
-      recv_round_total += static_cast<std::size_t>(q * record_bytes);
+      send_round_total += static_cast<std::size_t>(sc * record_bytes);
+      recv_round_total += static_cast<std::size_t>(qc * record_bytes);
     }
+    // Within reserved capacity (round 0 is maximal): no reallocation, no
+    // throw between collectives.
     send_stage.resize(send_round_total);
     recv_stage.resize(recv_round_total);
     for (std::size_t r = 0; r < ranks; ++r) {
@@ -337,22 +379,64 @@ std::vector<std::byte> executeBlockingDestinationRecordExchange(
     }
     for (std::size_t r = 0; r < ranks; ++r) {
       if (recv_bytes[r] == 0) continue;
-      std::memcpy(recv_buffer.data() + (recv_offsets[r] + static_cast<std::size_t>(first)) * record_bytes,
+      std::memcpy(recv_base + (recv_offsets[r] + static_cast<std::size_t>(first)) * record_bytes,
                   recv_stage.data() + static_cast<std::size_t>(recv_displ[r]),
                   static_cast<std::size_t>(recv_bytes[r]));
     }
   }
-  // Staging is released here; the reservation covers its peak and is
-  // released when this frame returns (the caller owns recv_buffer through
-  // its own decode admission).
   (void)world_rank;
-  return recv_buffer;
+  return lease;  // staging + scratch reservation released here
 #else
+  (void)allocate;
+  (void)allocate_owner;
+  (void)owner_label;
   throw std::runtime_error("destination record exchange requires MPI support when MPI context is enabled");
 #endif
 }
 
-std::vector<CompositionDonorRequestRecord> exchangeCompositionDonorRequests(
+}  // namespace
+
+std::vector<std::byte> executeBlockingDestinationRecordExchange(
+    const MpiContext& mpi_context,
+    std::span<const std::byte> records,
+    std::size_t record_bytes,
+    std::span<const int> destination_rank,
+    std::uint64_t exchange_sequence) {
+  (void)exchange_sequence;
+  std::vector<std::byte> out;
+  (void)exchangeIntoDestination(
+      mpi_context, records, record_bytes, destination_rank, nullptr, "parallel.destination_record_exchange",
+      [](void* owner, std::size_t total) -> std::byte* {
+        auto& target = *static_cast<std::vector<std::byte>*>(owner);
+        target.resize(total);
+        return target.data();
+      },
+      &out);
+  return out;
+}
+
+GovernedRecordBuffer executeGovernedDestinationRecordExchange(
+    const MpiContext& mpi_context,
+    std::span<const std::byte> records,
+    std::size_t record_bytes,
+    std::span<const int> destination_rank,
+    std::uint64_t exchange_sequence,
+    core::MemoryGovernor* governor,
+    std::string_view owner_label) {
+  (void)exchange_sequence;
+  GovernedRecordBuffer out;
+  out.lease = exchangeIntoDestination(
+      mpi_context, records, record_bytes, destination_rank, governor, owner_label,
+      [](void* owner, std::size_t total) -> std::byte* {
+        auto& target = *static_cast<std::vector<std::byte>*>(owner);
+        target.resize(total);
+        return target.data();
+      },
+      &out.bytes);
+  return out;
+}
+
+GovernedRecords<CompositionDonorRequestRecord> exchangeCompositionDonorRequests(
     const MpiContext& mpi_context,
     std::span<const CompositionDonorRequestRecord> requests,
     std::uint64_t exchange_sequence,
@@ -372,11 +456,12 @@ std::vector<CompositionDonorRequestRecord> exchangeCompositionDonorRequests(
     destinations.clear();
   }
   mpi_context.rethrowCollectivePreparationFailure(failure, "composition donor request validation");
-  return exchangeTyped(mpi_context, requests, destinations, exchange_sequence, governor,
-                       "parallel.composition_donor_requests");
+  (void)exchange_sequence;
+  return exchangeGovernedTyped(mpi_context, requests, std::span<const int>(destinations), governor,
+                               "parallel.composition_donor_requests");
 }
 
-std::vector<CompositionLaneChunkRecord> exchangeCompositionLaneChunks(
+GovernedRecords<CompositionLaneChunkRecord> exchangeCompositionLaneChunks(
     const MpiContext& mpi_context,
     std::span<const CompositionLaneChunkRecord> records,
     std::span<const int> destinations,
@@ -401,7 +486,7 @@ std::vector<CompositionLaneChunkRecord> exchangeCompositionLaneChunks(
     failure = std::current_exception();
   }
   mpi_context.rethrowCollectivePreparationFailure(failure, "composition lane chunk validation");
-  return exchangeTyped(mpi_context, records, destinations, exchange_sequence, governor, owner_label);
+  return exchangeGovernedTyped(mpi_context, records, destinations, governor, owner_label);
 }
 
 }  // namespace cosmosim::parallel

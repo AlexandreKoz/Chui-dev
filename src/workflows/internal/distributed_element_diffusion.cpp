@@ -419,7 +419,7 @@ void DistributedElementDiffusionCoupling::addRemoteFaceTransfers(
   std::vector<int> delta_destinations;
   try {
     const parallel::AssembledCompositionLanes remote_states = parallel::assembleCompositionLaneChunks(
-        state_chunks, identity(parallel::CompositionLaneStream::kDiffusionState), rank);
+        state_chunks.records, identity(parallel::CompositionLaneStream::kDiffusionState), rank);
     const auto find_state = [&remote_states](std::uint64_t id) -> std::size_t {
       const auto it = std::lower_bound(remote_states.gas_cell_id.begin(), remote_states.gas_cell_id.end(), id);
       if (it == remote_states.gas_cell_id.end() || *it != id) {
@@ -477,7 +477,7 @@ void DistributedElementDiffusionCoupling::addRemoteFaceTransfers(
       m_mpi, delta_chunks_out, delta_destinations, sequence, m_governor, "sources.element_diffusion.delta_exchange");
   try {
     const parallel::AssembledCompositionLanes imported = parallel::assembleCompositionLaneChunks(
-        imported_chunks, identity(parallel::CompositionLaneStream::kDiffusionDelta), rank);
+        imported_chunks.records, identity(parallel::CompositionLaneStream::kDiffusionDelta), rank);
     for (std::size_t i = 0; i < imported.size(); ++i) {
       const auto it = std::lower_bound(m_dependent_rows.begin(), m_dependent_rows.end(),
                                        std::make_pair(imported.gas_cell_id[i], std::uint32_t{0}));
