@@ -124,8 +124,13 @@ void BaryonicSourceStage::prepare(const core::SimulationState& state, const Sour
       temperature_k = r.staged.temperature_k;
       meta.last_temperature_k = std::max(r.staged.temperature_k, 0.0);
       meta.last_error_estimate = std::max(r.ledger.max_error_estimate, 0.0);
-      meta.last_element_fraction_residual =
-          std::abs(r.ledger.element_mass_residual_code);
+      // P1-49-04: the charge history is the pure charge-balance residual on
+      // the identical light + metal-ion inventory; ladder normalization and
+      // inventory round-off are element-fraction projections and feed the
+      // element residual history (C03 error triggers stay truthful).
+      meta.last_element_fraction_residual = std::max(
+          {std::abs(r.ledger.element_mass_residual_code), r.ledger.metal_ion_normalization_residual,
+           r.ledger.metal_ion_inventory_residual});
       meta.last_charge_residual = std::abs(r.ledger.charge_residual);
       meta.cumulative_radiative_loss_erg +=
           std::max(r.ledger.radiative_loss_erg, 0.0);
@@ -149,6 +154,14 @@ void BaryonicSourceStage::prepare(const core::SimulationState& state, const Sour
       const double n_h = x_h * rho_cgs / (chemicalElementInfo(ChemicalElement::kH).atomic_mass_amu * k_amu_g);
       advanceDustCell(scratch, layout, 0, n_h, temperature_k, interval.physical_seconds, *m_config.dust,
                       m_pending.dust);
+      // P1-49-03: dust moved C/O/Si/Fe nuclei between gas and solids; keep
+      // the ladder inventory equal to (gas element - CO) on the private row.
+      if (layout.ionStageCount() > 0U) {
+        // The returned correction is a physical dust transfer, not a
+        // numerical residual: it is deliberately not folded into the
+        // C03 error history.
+        (void)m_chemistry.reconcileMetalIonStageLanes(scratch, 0);
+      }
     }
     // 5) SGS dissipation (exact transfer SGS -> thermal).
     if (m_config.sgs.has_value() && layout.hasSgs()) {

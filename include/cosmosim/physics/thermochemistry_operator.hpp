@@ -95,6 +95,14 @@ struct ChemistryShadowReport {
   double max_relative_electron_difference = 0.0;
   double max_relative_energy_difference = 0.0;
   double mean_substep_cost_ratio = 0.0;  // reference / production substeps
+  // P1-49-07: independent reference integration of the C02 ladders (same
+  // sampled rows; reference ladder solver with 10x tighter tolerance and a
+  // 4x substep cap, its own light-network reference and CO transfer).
+  std::uint64_t ion_samples = 0U;
+  double max_ion_stage_fraction_difference = 0.0;     // max |x_ref - x_prod| over stages
+  double max_relative_ion_electron_difference = 0.0;  // metal-ion electrons
+  double max_relative_ion_temperature_difference = 0.0;  // post-refresh T
+  double max_relative_ion_potential_difference = 0.0;    // stored potential
 };
 
 struct ThermochemistryOperatorConfig {
@@ -188,6 +196,14 @@ class ThermochemistryOperator {
   // Build the solver input of one row (also used by the shadow sampler).
   [[nodiscard]] ThermochemistryCellInput cellInput(const core::SimulationState& state, std::uint32_t row,
                                                    const SourceInterval& interval) const;
+  // P1-49-03: re-establishes the C02 inventory invariant of one composition
+  // row after an operator that changed element lanes inside the source stage
+  // (live dust): for every selected element the stage lanes are rescaled
+  // proportionally so that sum_k stage_mass = element_mass - CO-bound mass
+  // (C, O; CO mass split by atomic mass). Rows without ladder history (all
+  // stages zero) stay zero (equilibrium initialization at the next interval).
+  // Returns the max relative correction applied (diagnostic).
+  double reconcileMetalIonStageLanes(core::GasCompositionSidecar& sidecar, std::size_t row) const;
   // Net thermal cooling time using this operator's exact rate set. +inf means
   // net heating/no cooling constraint. Exposed to AMR so cooling-length
   // refinement cannot drift from the chemistry model that actually evolves
@@ -204,6 +220,27 @@ class ThermochemistryOperator {
     std::array<double, k_metal_ion_element_count> nuclei_cm3{};
     bool initialized_from_equilibrium = false;
   };
+  // Result of one coupled ion(dt/2) -> light network(dt) -> CO transfer ->
+  // ion(dt/2) -> EOS refresh integration (production or shadow reference).
+  struct CoupledRowOutcome {
+    SourceAdvanceStatus status = SourceAdvanceStatus::kCompleted;
+    std::string diagnostic;
+    double suggested_retry_seconds = 0.0;
+    ThermochemistryCellOutput output{};
+    SourceLedger ledger{};  // per unit volume
+    MetalIonRowState ions{};
+    MetalIonAdvanceReport ion_report{};
+    double ion_electron_cm3 = 0.0;      // final metal-ion electron correction
+    double ion_potential_erg_cm3 = 0.0; // final stored ionization potential
+  };
+  // Pure coupled integration of one row from its step-start input and
+  // attached ion state (ions_enabled = false: light network only).
+  [[nodiscard]] CoupledRowOutcome integrateCoupled(const ThermochemistrySolver& light,
+                                                   const MetalIonLadderSolver* ion_solver, bool ions_enabled,
+                                                   const ThermochemistryCellInput& start_input,
+                                                   const MetalIonRowState& start_ions, double dt_seconds) const;
+  // Stored ionization potential [erg cm^-3] of the ladders.
+  [[nodiscard]] double ionPotentialDensity(const MetalIonRowState& ions) const;
   [[nodiscard]] bool rowCarriesMetalIons(std::uint8_t chemistry_tag) const noexcept;
   // Reads the ladder distribution of `row` (or initializes it from ionization
   // equilibrium at T when the row has no ladder state) and attaches the

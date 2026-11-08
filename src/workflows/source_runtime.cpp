@@ -2049,6 +2049,15 @@ class SourceRuntimeImpl final : public SourceRuntime {
         total.max_relative_electron_difference, shadow.max_relative_electron_difference);
     total.max_relative_energy_difference = std::max(
         total.max_relative_energy_difference, shadow.max_relative_energy_difference);
+    add(total.ion_samples, shadow.ion_samples);
+    total.max_ion_stage_fraction_difference = std::max(
+        total.max_ion_stage_fraction_difference, shadow.max_ion_stage_fraction_difference);
+    total.max_relative_ion_electron_difference = std::max(
+        total.max_relative_ion_electron_difference, shadow.max_relative_ion_electron_difference);
+    total.max_relative_ion_temperature_difference = std::max(
+        total.max_relative_ion_temperature_difference, shadow.max_relative_ion_temperature_difference);
+    total.max_relative_ion_potential_difference = std::max(
+        total.max_relative_ion_potential_difference, shadow.max_relative_ion_potential_difference);
     total.mean_substep_cost_ratio = total.samples == 0U
         ? 0.0
         : static_cast<double>(weighted_cost / static_cast<long double>(total.samples));
@@ -2389,7 +2398,14 @@ class SourceRuntimeImpl final : public SourceRuntime {
                       {"metal_table_clamps", std::to_string(l.metal_table_clamps)},
                       {"max_error_estimate", std::to_string(l.max_error_estimate)},
                       {"element_projection_residual", std::to_string(l.element_mass_residual_code)},
-                      {"charge_residual", std::to_string(l.charge_residual)}}});
+                      {"charge_residual", std::to_string(l.charge_residual)},
+                      {"metal_ion_potential_delta_erg", std::to_string(l.metal_ion_potential_delta_erg)},
+                      {"metal_ion_co_transfer_nuclei", std::to_string(l.metal_ion_co_transfer_nuclei)},
+                      {"metal_ion_normalization_residual", std::to_string(l.metal_ion_normalization_residual)},
+                      {"metal_ion_inventory_residual", std::to_string(l.metal_ion_inventory_residual)},
+                      {"shadow_ion_samples", std::to_string(m_last_shadow_report.ion_samples)},
+                      {"shadow_max_ion_stage_fraction_difference",
+                       std::to_string(m_last_shadow_report.max_ion_stage_fraction_difference)}}});
     }
   }
 
@@ -2459,8 +2475,17 @@ class SourceRuntimeImpl final : public SourceRuntime {
     }
     m_mpi_context.rethrowCollectivePreparationFailure(
         load_failure, "adaptive chemistry controller update load");
-    const double global_max = -m_mpi_context.allreduceMinDouble(-current_shadow.max_relative_species_difference);
+    // P1-49-07: the controlled disagreement covers the light network AND the
+    // C02 ladders (stage fractions, ion electrons). It remains a LOCAL
+    // sampled shadow disagreement, never a certified global error bar.
+    const double local_ion_disagreement = std::max(
+        current_shadow.max_ion_stage_fraction_difference, current_shadow.max_relative_ion_electron_difference);
+    const double global_species_max =
+        -m_mpi_context.allreduceMinDouble(-current_shadow.max_relative_species_difference);
+    const double global_ion_max = -m_mpi_context.allreduceMinDouble(-local_ion_disagreement);
+    const double global_max = std::max(global_species_max, global_ion_max);
     const std::uint64_t global_samples = m_mpi_context.allreduceSumUint64(current_shadow.samples);
+    const std::uint64_t global_ion_samples = m_mpi_context.allreduceSumUint64(current_shadow.ion_samples);
     const double bias = physics::nextChemistryPromotionBias(committed_bias, global_max, global_samples);
     m_thermochemistry->setGlobalPromotionBias(bias);
     if (joint) {
@@ -2469,8 +2494,10 @@ class SourceRuntimeImpl final : public SourceRuntime {
         local_detailed += tag == physics::k_chemistry_tag_detailed ? 1U : 0U;
       }
       joint_state.chemistry_promotion_bias = bias;
-      joint_state.last_shadow_species_error = std::max(global_max, 0.0);
+      joint_state.last_shadow_species_error = std::max(global_species_max, 0.0);
       joint_state.last_shadow_samples = global_samples;
+      joint_state.last_shadow_ion_error = std::max(global_ion_max, 0.0);
+      joint_state.last_shadow_ion_samples = global_ion_samples;
       joint_state.chemistry_detailed_rows =
           m_mpi_context.allreduceSumUint64(local_detailed);
       joint_state.chemistry_total_rows =
@@ -2497,8 +2524,10 @@ class SourceRuntimeImpl final : public SourceRuntime {
       std::ostringstream text;
       text.precision(17);
       text << "module=chui_adaptive_chemistry_control\npromotion_bias=" << bias
-           << "\nlast_global_shadow_max_relative_species_difference=" << global_max
-           << "\nlast_global_shadow_samples=" << global_samples << "\n";
+           << "\nlast_global_shadow_max_relative_species_difference=" << global_species_max
+           << "\nlast_global_shadow_samples=" << global_samples
+           << "\nlast_global_shadow_ion_disagreement=" << global_ion_max
+           << "\nlast_global_shadow_ion_samples=" << global_ion_samples << "\n";
       const std::string payload = text.str();
       core::ModuleSidecarBlock block;
       block.module_name = "chui_adaptive_chemistry_control_v1";

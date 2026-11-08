@@ -18,6 +18,9 @@ constexpr std::size_t k_process_photoionization = 3U;
 constexpr std::size_t k_process_photoheating = 4U;
 constexpr std::size_t k_process_count = 5U;
 constexpr std::size_t k_max_stages = 27U;  // Fe
+// CODATA 2018 exact unit conversion (definition of the electron volt), not a
+// fitted physical coefficient.
+constexpr double k_electron_volt_erg = 1.602176634e-12;
 
 constexpr std::array<std::string_view, k_metal_ion_element_count> k_symbols{"C", "O", "Si", "Fe"};
 
@@ -180,6 +183,8 @@ MetalIonRateTable MetalIonRateTable::parse(std::string_view text, std::string_vi
   MetalIonRateTable table;
   table.m_source_label = std::string(source_label);
   table.m_series.assign(k_metal_ion_element_count * k_max_stages * k_process_count, Series{});
+  table.m_ionization_potential_erg.assign(k_metal_ion_element_count * k_max_stages,
+                                          std::numeric_limits<double>::quiet_NaN());
   const std::string where = "metal-ion rate table '" + table.m_source_label + "'";
   bool schema_seen = false;
   bool verification_seen = false;
@@ -218,6 +223,37 @@ MetalIonRateTable MetalIonRateTable::parse(std::string_view text, std::string_vi
         throw std::runtime_error(context + ": verification must be verified_against_source or unverified");
       }
       verification_seen = true;
+    } else if (keyword == "energy_convention") {
+      std::string value;
+      tokens >> value;
+      if (value != "collisional_ionization_work_in_cooling") {
+        throw std::runtime_error(context + ": unsupported energy_convention '" + value +
+                                 "' (supported: collisional_ionization_work_in_cooling)");
+      }
+      if (!table.m_energy_convention.empty()) throw std::runtime_error(context + ": energy_convention declared twice");
+      table.m_energy_convention = value;
+    } else if (keyword == "ionization_potential") {
+      std::string symbol, token;
+      std::size_t stage = 0U;
+      if (!(tokens >> symbol >> stage >> token)) throw std::runtime_error(context + ": malformed ionization_potential");
+      const MetalIonElement element = elementFromSymbol(symbol);
+      if (stage + 1U >= metalIonStageCount(element)) {
+        throw std::runtime_error(context + ": ionization_potential stage must be < Z (bare nucleus cannot ionize)");
+      }
+      std::size_t consumed = 0U;
+      double ev = 0.0;
+      try {
+        ev = std::stod(token, &consumed);
+      } catch (const std::exception&) {
+        throw std::runtime_error(context + ": invalid ionization potential '" + token + "'");
+      }
+      if (consumed != token.size() || !std::isfinite(ev) || !(ev > 0.0)) {
+        throw std::runtime_error(context + ": ionization potential must be a positive finite eV value");
+      }
+      double& slot = table.m_ionization_potential_erg[static_cast<std::size_t>(element) * k_max_stages + stage];
+      if (!std::isnan(slot)) throw std::runtime_error(context + ": duplicate ionization_potential");
+      slot = ev * k_electron_volt_erg;
+      if (tokens >> token) throw std::runtime_error(context + ": trailing tokens after ionization_potential");
     } else if (keyword == "temperature_grid_log10_k" || keyword == "redshift_grid") {
       std::size_t count = 0U;
       if (!(tokens >> count) || count < 2U) throw std::runtime_error(context + ": grid needs a count >= 2");
@@ -329,6 +365,40 @@ MetalIonRateTable MetalIonRateTable::parse(std::string_view text, std::string_vi
                              "' are not all provided (dataset covers '" + table.m_elements.label() + "')");
   }
   return table;
+}
+
+bool MetalIonRateTable::hasIonizationEnergyContract(MetalIonElement element) const noexcept {
+  if (m_energy_convention.empty() || !m_elements.contains(element)) return false;
+  const std::size_t stages = metalIonStageCount(element);
+  for (std::size_t k = 0; k + 1U < stages; ++k) {
+    if (std::isnan(m_ionization_potential_erg[static_cast<std::size_t>(element) * k_max_stages + k])) return false;
+  }
+  return true;
+}
+
+double MetalIonRateTable::ionizationPotentialErg(MetalIonElement element, std::size_t stage) const {
+  if (stage + 1U >= metalIonStageCount(element)) {
+    throw std::out_of_range("ionization potential requested for a bare nucleus or out-of-range stage");
+  }
+  const double value = m_ionization_potential_erg[static_cast<std::size_t>(element) * k_max_stages + stage];
+  if (std::isnan(value)) {
+    throw std::out_of_range("metal-ion dataset '" + m_source_label + "' supplies no ionization potential for " +
+                            metalIonStageName(element, stage));
+  }
+  return value;
+}
+
+double MetalIonRateTable::storedIonizationEnergyPerNucleusErg(MetalIonElement element,
+                                                              std::span<const double> fractions) const {
+  const std::size_t stages = metalIonStageCount(element);
+  if (fractions.size() != stages) throw std::invalid_argument("metal-ion fraction span size mismatch");
+  double cumulative = 0.0;
+  double stored = 0.0;
+  for (std::size_t k = 1; k < stages; ++k) {
+    cumulative += ionizationPotentialErg(element, k - 1U);
+    stored += fractions[k] * cumulative;
+  }
+  return stored;
 }
 
 double MetalIonRateTable::minimumTemperatureK() const noexcept { return std::pow(10.0, m_log_t.front()); }
