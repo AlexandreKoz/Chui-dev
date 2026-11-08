@@ -169,6 +169,26 @@ Tests written but NOT RUN: `tests/unit/test_composition_lane_chunk_wire.cpp`
 (`testGovernedLeaseLifetime`), `tests/unit/test_stellar_population_feedback.cpp`
 (`testEventPhysicalTimeIsSubdivisionInvariant`).
 
+## Public interface changes and migration (`include/cosmosim/**`)
+
+* `parallel::GovernedRecords<T>` / `GovernedRecordBuffer`: member order is now
+  `lease, records|bytes`; types are move-only (copy deleted) and no longer
+  aggregates. Brace-initialization by position must be replaced by member
+  assignment; `.records`/`.bytes`/`.lease` access is unchanged. New
+  `releaseStorage()`.
+* New `parallel::exchangeDestinationRecordsInto`, `DestinationReceiveAllocator`
+  and template `parallel::exchangeGovernedRecords<T>`; prefer them over
+  `executeBlockingDestinationRecordExchange` (kept, ungoverned, same protocol).
+* `parallel::compositionLaneExchangeAdmissionBytes` now returns caller-owned
+  bytes only (smaller than before); callers that also counted the primitive's
+  receive buffer/bucket must not add them back.
+* `workflows::SourceRuntime::discreteEventStepEndLimitTimeCode` (virtual,
+  default +infinity: other implementations need no change).
+* `physics::{stellarEventCumulativeCount, stellarEventChannelHorizonYears,
+  stellarEventAgeYears, RealizedEventChronology, realizedEventChronology,
+  nextStellarEventAgeYears}` (additive).
+* `core::PhysicsConfig::ssp_max_event_publication_lag_years` (additive, default 0).
+
 ## Open source items
 
 1. `executeBlockingDirectedAmrPatchPayloadExchange`: guarded per-peer protocol
