@@ -44,6 +44,24 @@ namespace cosmosim::physics {
 // step-start donor fractions, so patch iteration order cannot change results.
 // Positivity: an outflow never exceeds the donor mass under the hydro CFL;
 // the apply step verifies non-negativity and refuses (throws) otherwise.
+// Operator split with level-clock sources (patch 51, T02): under recursive
+// AMR the composition sidecar is advanced by level-local chemistry and
+// element diffusion DURING the hierarchy sweep, while this accumulator is
+// prepared once after it. Donor fractions are read at prepare time (the
+// current, post-source sidecar, locally and for remote donors), so the
+// composition frame sees  [sources + diffusion]  then  [advection]  with
+// consistent fractions (a Lie split of the composition operator; hydro mass
+// itself is advanced by the solver). Admissibility of that order: element
+// diffusion conserves each cell's composition gas mass exactly (sum of
+// fractions = 1 on both sides of every face) and, under its stable
+// subcycle, keeps every fraction inside the range of its face neighbours
+// (discrete maximum principle). The outflow of lane s from donor d is
+// F_d X_s,d <= M_s,d whenever F_d <= M_d, a condition on the hydro mass
+// only, identical before and after diffusion; diffusion therefore cannot
+// create a negative lane here. The remaining condition (cumulative outflow
+// of the deferred interval <= donor composition mass) is the deferred
+// donor-cell CFL contract, checked exactly in validatePrepared and refused
+// collectively before any commit (no clamp, no partial publication).
 // ---------------------------------------------------------------------------
 struct CompositionTransportCommitReport {
   double max_relative_mismatch = 0.0;   // before reconciliation

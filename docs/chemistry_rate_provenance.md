@@ -369,6 +369,14 @@ claimed); frequency-resolved shielding of metal-ion photo rates (grey HI
 factor only). Shadow reference (C04, P1-49-07): sampled rows rerun the whole
 coupled chronology with a 10× tighter ladder tolerance and 4× substep cap and
 report stage-fraction, ion-electron, temperature and stored-potential
-disagreement; this is a local sampled diagnostic, not a global error bar. **External data still required:** a licensed, source-verified
+disagreement; this is a local sampled diagnostic, not a global error bar.
+Patch 51: sampled hybrid (demoted) rows are referenced by the same detailed
+chronology on a private ladder reconstruction (element lanes minus CO, frozen
+stored distribution or the step-start equilibrium projection), so demotion
+error is measured; reduced rows are costed by the hybrid solver (metal table
+and fine-structure terms include C/O/Si/Fe) and detailed rows by the ladder.
+Charge exchange decision: route v10 C02 names "selected metal ions/molecules"
+without a charge-exchange requirement; the channel is a recorded limitation of
+the chosen model, and no rate is compiled or invented. **External data still required:** a licensed, source-verified
 dataset in this schema (e.g. assembled from published ionization/recombination
 compilations and an ion-by-ion cooling calculation). None is supplied.

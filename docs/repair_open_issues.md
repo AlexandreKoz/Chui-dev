@@ -894,3 +894,25 @@ Static-only campaign; nothing below has been compiled or run. See
    (new source, not run); multi-rank ion-rich (≥ 37 lanes) composition/diffusion
    exchange; ion ladder conservation through CO transfer; level-clock diffusion
    conservation and recursive-vs-synchronized comparison.
+
+## Patch 51 (2026-11-08) — open items after static source work
+
+Static-only; nothing compiled or run.
+
+1. **T02 events — owner decision:** discrete events follow the
+   specification-permitted synchronized-epoch exception (enforced in
+   `SourceRuntimeImpl::executeDiscreteSourceEvents`). If per-level-substep
+   event dispatch is required, it is new source work (level-timestamped
+   births, cross-level/cross-rank deposit queues, deferred particle
+   materialization).
+2. **Composition deferred-donor CFL:** cumulative outflow over a recursive
+   coarse interval must not exceed the donor composition mass; violations are
+   refused collectively (no limiter). Per-level composition commit would
+   remove this condition.
+3. **MPI error returns** inside a payload round are rank-local and fatal for
+   the communicator; not recoverable by design.
+4. **Data:** C01/C02/S02/F02 production datasets; metal–H/He charge exchange
+   recorded as a C02 model limitation.
+5. **Validation (owner-reserved):** recursive-vs-synchronized diffusion/SGS,
+   coarse/fine pre/sync pairing under MPI, hybrid shadow thresholds,
+   governed-lease peak under multi-rank exchanges.
