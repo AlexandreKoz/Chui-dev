@@ -728,6 +728,16 @@ struct PhysicsConfig {
   // and the table-driven wind/pre-SN mechanical channel.
   double ssp_association_radius_code = 0.0;
   double ssp_association_time_window_years = 3.0e6;
+  // Patch 52 (T02/S02/F01): bound on the publication lag of stochastic SN
+  // events. Each event's physical time is the model-defined crossing of its
+  // cumulative-hazard threshold; deposition happens at the synchronized
+  // source-interval end. Zero (default) leaves the lag bounded only by the
+  // accepted coarse interval (recorded per interval). A positive value makes
+  // the time authority clip every global step to end no later than
+  // (next pending event time + this lag), so every realized event is
+  // published at most this many years after its physical time; the source
+  // stage refuses (fail closed) an interval that violates it.
+  double ssp_max_event_publication_lag_years = 0.0;
   SspWindModelConfig ssp_wind_model = SspWindModelConfig::kNone;
   std::string ssp_wind_table_path;
   std::string ssp_wind_table_sha256;

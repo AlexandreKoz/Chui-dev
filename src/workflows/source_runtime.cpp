@@ -937,6 +937,58 @@ struct SourceStagePlan {
   bool closes_interval = false;
 };
 
+// T02 (patch 52) physical-time ledger of the discrete stochastic events of
+// one source interval. Physical event time (model-defined threshold
+// crossing, see physics::realizedEventChronology) is distinct from the
+// publication epoch (interval end, the only legal synchronized deposition
+// point). The lag = age_end - a_k >= 0 of every timed event is recorded;
+// when physics.ssp_max_event_publication_lag_years > 0 it is enforced
+// (fail closed) -- the time authority clips steps so it cannot be exceeded.
+// Catch-up events of a legacy record (threshold already crossed at age_begin)
+// are counted and exempt: their physical time precedes the interval.
+struct DiscreteEventChronologyLedger {
+  double interval_begin_code = 0.0;
+  double interval_end_code = 0.0;  // publication epoch
+  double lag_bound_years = 0.0;    // 0: bounded by the interval only
+  std::uint64_t timed_events = 0U;
+  std::uint64_t catch_up_events = 0U;
+  double earliest_event_fraction = 1.0;  // (a_k - age_b) / (age_e - age_b)
+  double max_publication_lag_years = 0.0;
+  double sum_publication_lag_years = 0.0;
+
+  [[nodiscard]] double earliestEventTimeCode() const noexcept {
+    return timed_events == 0U ? interval_end_code
+                              : interval_begin_code +
+            earliest_event_fraction * (interval_end_code - interval_begin_code);
+  }
+
+  void accumulate(const physics::RealizedEventChronology& chronology, std::uint64_t particle_id, double age_begin_years,
+                  double age_end_years, bool enforce_lag_bound) {
+    catch_up_events += chronology.catch_up_count;
+    const std::uint32_t timed = chronology.count - chronology.catch_up_count;
+    if (timed == 0U) return;
+    const double span = age_end_years - age_begin_years;
+    if (!(span > 0.0) || chronology.earliest_age_years < age_begin_years ||
+        chronology.latest_age_years > age_end_years) {
+      throw std::logic_error("discrete stellar event physical age lies outside its own source interval");
+    }
+    timed_events += timed;
+    const double lag = age_end_years - chronology.earliest_age_years;
+    max_publication_lag_years = std::max(max_publication_lag_years, lag);
+    sum_publication_lag_years += static_cast<double>(timed) * age_end_years - chronology.sum_age_years;
+    earliest_event_fraction =
+        std::min(earliest_event_fraction, (chronology.earliest_age_years - age_begin_years) / span);
+    // Relative 1e-6 covers the code-time <-> stellar-years conversion
+    // round-off between the forecast and the accepted interval.
+    if (enforce_lag_bound && lag_bound_years > 0.0 && lag > lag_bound_years * (1.0 + 1.0e-6)) {
+      throw std::runtime_error(
+          "discrete SN event of star " + std::to_string(particle_id) + " would be published " +
+          std::to_string(lag) + " yr after its physical time, above physics.ssp_max_event_publication_lag_years = " +
+          std::to_string(lag_bound_years) + " (time-authority event clip not honoured)");
+    }
+  }
+};
+
 // Accumulates the observations of one Strang source interval (both global
 // halves and every recursive level half) for the single controller
 // publication at interval close. Plain values: rollback restores it.
@@ -1092,6 +1144,42 @@ class SourceRuntimeImpl final : public SourceRuntime {
     return true;
   }
 
+  // T02 (patch 52): event-aware time-authority input (see SourceRuntime).
+  [[nodiscard]] double discreteEventStepEndLimitTimeCode(const core::SimulationState& state,
+                                                         double current_time_code) const override {
+    const double lag_years = m_physics_config.ssp_max_event_publication_lag_years;
+    double limit = std::numeric_limits<double>::infinity();
+    if (!(lag_years > 0.0) || m_ssp_model == nullptr || !m_ssp_model->config().stochastic_events ||
+        state.star_particles.size() == 0U) {
+      return limit;
+    }
+    constexpr double k_seconds_per_year = 31557600.0;
+    const double years_per_code = m_units.timeSiPerCode() / k_seconds_per_year;
+    const double msun_code = m_units.massSiToCode(physics::k_solar_mass_g * 1.0e-3);
+    if (!(std::isfinite(years_per_code) && years_per_code > 0.0 && std::isfinite(msun_code) && msun_code > 0.0)) {
+      throw std::runtime_error("discrete event step limit requires finite positive time and mass units");
+    }
+    const physics::StellarPopulationStore store(state);
+    for (std::uint32_t s = 0; s < state.star_particles.size(); ++s) {
+      const std::uint32_t p = state.star_particles.particle_index[s];
+      const std::uint64_t pid = state.particle_sidecar.particle_id[p];
+      // A star without a record, or a legacy record without an absolute
+      // cursor, is initialized by its next interval; its past chronology is
+      // catch-up (counted, exempt), so it does not constrain this step.
+      if (!store.has(pid)) continue;
+      const physics::StellarPopulationRecord record = store.get(pid);
+      if (record.initialized == 0U || record.chronology_initialized == 0U) continue;
+      const double age_now = std::max(state.star_particles.stellar_age_years_last[s], 0.0) +
+          std::max(current_time_code - record.chronology_time_code, 0.0) * years_per_code;
+      const double next_age = physics::nextStellarEventAgeYears(
+          *m_ssp_model, record, age_now, state.star_particles.birth_mass_code[s] / msun_code);
+      if (!std::isfinite(next_age)) continue;
+      const double event_time_code = current_time_code + (next_age - age_now) / years_per_code;
+      limit = std::min(limit, event_time_code + lag_years / years_per_code);
+    }
+    return limit;
+  }
+
   void captureRollbackCheckpoint() override {
     ControllerCheckpoint checkpoint;
     if (m_ssp_model != nullptr) {
@@ -1105,6 +1193,7 @@ class SourceRuntimeImpl final : public SourceRuntime {
     checkpoint.sf_gradient_coarse_fine_cells = m_sf_gradient_coarse_fine_cells;
     checkpoint.last_thermochemistry_ledger = m_last_thermochemistry_ledger;
     checkpoint.last_feedback_ledger = m_last_feedback_ledger;
+    checkpoint.last_event_chronology = m_last_event_chronology;
     checkpoint.last_ism_regime_report = m_last_ism_regime_report;
     checkpoint.last_chemistry_adaptive_report = m_last_chemistry_adaptive_report;
     checkpoint.last_dust_ledger = m_last_dust_ledger;
@@ -1132,6 +1221,7 @@ class SourceRuntimeImpl final : public SourceRuntime {
     m_sf_gradient_coarse_fine_cells = c.sf_gradient_coarse_fine_cells;
     m_last_thermochemistry_ledger = c.last_thermochemistry_ledger;
     m_last_feedback_ledger = c.last_feedback_ledger;
+    m_last_event_chronology = c.last_event_chronology;
     m_last_ism_regime_report = c.last_ism_regime_report;
     m_last_chemistry_adaptive_report = c.last_chemistry_adaptive_report;
     m_last_dust_ledger = c.last_dust_ledger;
@@ -3174,6 +3264,10 @@ class SourceRuntimeImpl final : public SourceRuntime {
     const std::uint64_t nonmonotone_before = m_ssp_model->nonmonotone_return_clamps;
     std::vector<physics::FeedbackSourceBudget> staged_budgets;
     std::vector<double> association_birth_years;
+    DiscreteEventChronologyLedger event_chronology;
+    event_chronology.interval_begin_code = event_interval_begin_code;
+    event_chronology.interval_end_code = event_interval_end_code;
+    event_chronology.lag_bound_years = m_physics_config.ssp_max_event_publication_lag_years;
     (void)transaction.prepare([&] {
       std::exception_ptr loop_failure;
       try {
@@ -3201,11 +3295,18 @@ class SourceRuntimeImpl final : public SourceRuntime {
           record.chronology_initialized = 0U;
           ++legacy_initialized;
         }
+        // Only a record with an absolute cursor at step start was seen by the
+        // time authority's event forecast, so only its events are held to
+        // the publication-lag bound (legacy/v1 records adopt a cursor now).
+        const bool event_forecast_covered = record.chronology_initialized != 0U;
         physics::advanceStellarPopulationChronology(
             record,
             event_interval_begin_code,
             event_interval_end_code,
-            level_selection.has_value() ? level_selection->phase_tag : context.integrator_state.step_index);
+            // Patch 52: discrete events run once per accepted coarse interval
+            // (never on a level clock); patch 51 referenced an identifier
+            // that is not in scope here.
+            context.integrator_state.step_index);
         const double birth_mass = state.star_particles.birth_mass_code[s];
         const double birth_msun = birth_mass / msun_code;
         const double age_b = std::max(state.star_particles.stellar_age_years_last[s], 0.0);
@@ -3219,8 +3320,21 @@ class SourceRuntimeImpl final : public SourceRuntime {
         const double lam_cc_end = m_ssp_model->ccCumulativeNumber(age_e, z) * birth_msun;
         const double lam_ia_end = m_ssp_model->iaCumulativeNumber(age_e) * birth_msun;
         if (m_ssp_model->config().stochastic_events) {
-          n_cc = physics::realizeEvents(record, 0U, lam_cc_end).count;
-          n_ia = physics::realizeEvents(record, 1U, lam_ia_end).count;
+          // T02 (patch 52): each realized event keeps its model-defined
+          // physical age (threshold crossing of Lambda_c); it is published at
+          // the synchronized interval end with a recorded, bounded lag.
+          const physics::StellarPopulationRecord record_before = record;
+          const auto cc_events = physics::realizeEvents(record, 0U, lam_cc_end);
+          const auto ia_events = physics::realizeEvents(record, 1U, lam_ia_end);
+          n_cc = static_cast<double>(cc_events.count);
+          n_ia = static_cast<double>(ia_events.count);
+          for (std::uint32_t channel = 0; channel < 2U; ++channel) {
+            event_chronology.accumulate(
+                physics::realizedEventChronology(*m_ssp_model, record_before, channel,
+                                                 channel == 0U ? cc_events.count : ia_events.count, z, birth_msun,
+                                                 age_b, age_e),
+                pid, age_b, age_e, event_forecast_covered);
+          }
         } else {
           n_cc = lam_cc_end - m_ssp_model->ccCumulativeNumber(age_b, z) * birth_msun;
           n_ia = lam_ia_end - m_ssp_model->iaCumulativeNumber(age_b) * birth_msun;
@@ -3403,6 +3517,7 @@ class SourceRuntimeImpl final : public SourceRuntime {
       if (!updates.empty()) state.notifyParticleMassMutation();
     });
     m_last_feedback_ledger = deposition.ledger();
+    m_last_event_chronology = event_chronology;  // published only with the commit
     internal::synchronizeParentParticleCompatibilityMirrors(state, m_world_rank, "SourceRuntime Part 2 stellar population");
     if (!touched.empty()) {
       state.notifyGasThermodynamicMutation();
@@ -3451,7 +3566,18 @@ class SourceRuntimeImpl final : public SourceRuntime {
                       {"dust_injected_code", std::to_string(l.dust_injected_code)},
                       {"dust_destroyed_code", std::to_string(l.dust_destroyed_code)},
                       {"yield_table_clamps", std::to_string(m_ssp_model->table_clamps)},
-                      {"ssp_nonmonotone_return_clamps", std::to_string(m_ssp_model->nonmonotone_return_clamps)}}});
+                      {"ssp_nonmonotone_return_clamps", std::to_string(m_ssp_model->nonmonotone_return_clamps)},
+                      {"event_publication_time_code", std::to_string(m_last_event_chronology.interval_end_code)},
+                      {"timed_discrete_events", std::to_string(m_last_event_chronology.timed_events)},
+                      {"catch_up_discrete_events", std::to_string(m_last_event_chronology.catch_up_events)},
+                      {"earliest_event_time_code",
+                       std::to_string(m_last_event_chronology.earliestEventTimeCode())},
+                      {"max_event_publication_lag_years",
+                       std::to_string(m_last_event_chronology.max_publication_lag_years)},
+                      {"sum_event_publication_lag_years",
+                       std::to_string(m_last_event_chronology.sum_publication_lag_years)},
+                      {"event_publication_lag_bound_years",
+                       std::to_string(m_last_event_chronology.lag_bound_years)}}});
     }
   }
 
@@ -4569,6 +4695,7 @@ class SourceRuntimeImpl final : public SourceRuntime {
   std::shared_ptr<const physics::SspYieldTable> m_ssp_yield_table;
   std::unique_ptr<physics::SspModel> m_ssp_model;
   physics::FeedbackLedger m_last_feedback_ledger{};
+  DiscreteEventChronologyLedger m_last_event_chronology{};
   std::unique_ptr<internal::StarFormationNeighborIndex> m_sf_neighbor_index;
   std::array<double, 3> m_box_extent_comoving{};
   std::uint64_t m_sf_gradient_unavailable_cells = 0U;
@@ -4597,6 +4724,7 @@ class SourceRuntimeImpl final : public SourceRuntime {
     std::uint64_t sf_gradient_coarse_fine_cells = 0U;
     physics::SourceLedger last_thermochemistry_ledger{};
     physics::FeedbackLedger last_feedback_ledger{};
+    DiscreteEventChronologyLedger last_event_chronology{};
     physics::IsmRegimeReport last_ism_regime_report{};
     physics::ChemistryAdaptiveReport last_chemistry_adaptive_report{};
     physics::DustUpdateLedger last_dust_ledger{};

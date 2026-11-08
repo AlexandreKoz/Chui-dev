@@ -1277,11 +1277,43 @@ void TimeCoordinator::runRungZeroSegment(
     }
     double ordered_step_limit_time_code = config.numerics.t_code_end;
     bool limited_by_output_event = false;
+    bool limited_by_source_event = false;
     if (pending_output.snapshot_interval_time_code > 0.0 &&
         pending_output.next_snapshot_time_code < ordered_step_limit_time_code &&
         pending_output.next_snapshot_time_code > integrator_state.current_time_code) {
       ordered_step_limit_time_code = pending_output.next_snapshot_time_code;
       limited_by_output_event = true;
+    }
+    // T02 (patch 52): discrete-event publication-lag boundary. Every rank
+    // contributes its forecast (guarded, voted), the MIN is the one global
+    // limit. It is ordered with output events: whichever is earlier ends the
+    // step; an output-event clip keeps its restart-resume dt bookkeeping.
+    {
+      double local_event_limit = std::numeric_limits<double>::infinity();
+      std::exception_ptr event_limit_failure;
+      try {
+        local_event_limit = m_source.discreteEventStepEndLimitTimeCode(state, integrator_state.current_time_code);
+        if (std::isnan(local_event_limit)) {
+          throw std::runtime_error("source event step-end limit is NaN");
+        }
+      } catch (...) {
+        event_limit_failure = std::current_exception();
+      }
+      m_services.mpi_context.rethrowCollectivePreparationFailure(
+          event_limit_failure, "discrete source event step limit");
+      const double event_limit = m_services.mpi_context.allreduceMinDouble(local_event_limit);
+      if (std::isfinite(event_limit)) {
+        if (!(event_limit > integrator_state.current_time_code)) {
+          throw std::runtime_error(
+              "discrete source event step limit does not lie after the current time (publication-lag "
+              "contract cannot be honoured by a positive step)");
+        }
+        if (event_limit < ordered_step_limit_time_code) {
+          ordered_step_limit_time_code = event_limit;
+          limited_by_output_event = false;
+          limited_by_source_event = true;
+        }
+      }
     }
     const double ordered_remaining_time_code =
         ordered_step_limit_time_code - integrator_state.current_time_code;
@@ -1295,7 +1327,9 @@ void TimeCoordinator::runRungZeroSegment(
         pending_output.restart_resume_dt_time_code = unclipped_dt_time_code;
       }
       profiler.recordEvent(core::RuntimeEvent{
-          .event_kind = limited_by_output_event ? "time.output_event_clip" : "time.endpoint_clip",
+          .event_kind = limited_by_output_event ? "time.output_event_clip"
+              : limited_by_source_event         ? "time.source_event_publication_clip"
+                                                : "time.endpoint_clip",
           .severity = core::RuntimeEventSeverity::kInfo,
           .subsystem = "core.time",
           .step_index = integrator_state.step_index,
@@ -1303,10 +1337,14 @@ void TimeCoordinator::runRungZeroSegment(
           .scale_factor = integrator_state.current_scale_factor,
           .message = limited_by_output_event
               ? "integration interval clipped to an ordered output event"
-              : "integration interval clipped to the configured endpoint",
+              : limited_by_source_event
+                  ? "integration interval clipped to bound discrete source event publication lag"
+                  : "integration interval clipped to the configured endpoint",
           .payload = {{"unclipped_dt_time_code", formatRuntimeDouble(unclipped_dt_time_code)},
                       {"clipped_dt_time_code", formatRuntimeDouble(accepted_dt)},
-                      {limited_by_output_event ? "output_event_time_code" : "endpoint_time_code",
+                      {limited_by_output_event ? "output_event_time_code"
+                           : limited_by_source_event ? "source_event_publication_limit_time_code"
+                                                     : "endpoint_time_code",
                        formatRuntimeDouble(ordered_step_limit_time_code)}},
       });
     }

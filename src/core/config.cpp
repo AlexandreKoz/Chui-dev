@@ -1709,6 +1709,7 @@ struct ConfigKeySpec {
       {"physics.ssp_clustered_associations", "false"},
       {"physics.ssp_association_radius_code", "0.0"},
       {"physics.ssp_association_time_window_years", "3.0e6"},
+      {"physics.ssp_max_event_publication_lag_years", "0.0"},
       {"physics.ssp_wind_model", "none"},
       {"physics.ssp_wind_table_path", ""},
       {"physics.ssp_wind_table_sha256", ""},
@@ -2005,6 +2006,16 @@ void validatePart2BaryonicPhysics(const SimulationConfig& config) {
   if (!std::isfinite(p.ssp_association_radius_code) || p.ssp_association_radius_code < 0.0 ||
       !std::isfinite(p.ssp_association_time_window_years) || !(p.ssp_association_time_window_years > 0.0)) {
     throw ConfigError("physics.ssp_association_radius_code must be >= 0 and ssp_association_time_window_years > 0");
+  }
+  if (!std::isfinite(p.ssp_max_event_publication_lag_years) || p.ssp_max_event_publication_lag_years < 0.0) {
+    throw ConfigError("physics.ssp_max_event_publication_lag_years must be finite and >= 0");
+  }
+  if (p.ssp_max_event_publication_lag_years > 0.0 &&
+      (p.stellar_population_model == StellarPopulationModelConfig::kLegacyTable || !p.ssp_stochastic_sn_events)) {
+    throw ConfigError(
+        "physics.ssp_max_event_publication_lag_years > 0 bounds the publication lag of discrete stochastic SN "
+        "events; it requires a Part 2 stellar_population_model with ssp_stochastic_sn_events=true (expectation "
+        "mode has no discrete event times)");
   }
   if (p.ssp_clustered_associations &&
       (p.ssp_association_radius_code == 0.0 || p.stellar_population_model == StellarPopulationModelConfig::kLegacyTable)) {
@@ -3485,6 +3496,7 @@ class NormalizedConfigStream {
   stream << "ssp_clustered_associations = " << (frozen.config.physics.ssp_clustered_associations ? "true" : "false") << '\n';
   stream << "ssp_association_radius_code = " << frozen.config.physics.ssp_association_radius_code << '\n';
   stream << "ssp_association_time_window_years = " << frozen.config.physics.ssp_association_time_window_years << '\n';
+  stream << "ssp_max_event_publication_lag_years = " << frozen.config.physics.ssp_max_event_publication_lag_years << '\n';
   stream << "ssp_wind_model = " << sspWindModelConfigToString(frozen.config.physics.ssp_wind_model) << '\n';
   stream << "ssp_wind_table_path = " << frozen.config.physics.ssp_wind_table_path << '\n';
   stream << "ssp_wind_table_sha256 = " << frozen.config.physics.ssp_wind_table_sha256 << '\n';
@@ -4616,6 +4628,9 @@ class NormalizedConfigStream {
   frozen.config.physics.ssp_association_time_window_years = parseFloating(
       requireString(entries, consumed, "physics.ssp_association_time_window_years", "3.0e6"),
       "physics.ssp_association_time_window_years");
+  frozen.config.physics.ssp_max_event_publication_lag_years = parseFloating(
+      requireString(entries, consumed, "physics.ssp_max_event_publication_lag_years", "0.0"),
+      "physics.ssp_max_event_publication_lag_years");
   frozen.config.physics.ssp_wind_model = parseSspWindModelConfig(
       requireString(entries, consumed, "physics.ssp_wind_model", "none"));
   frozen.config.physics.ssp_wind_table_path =

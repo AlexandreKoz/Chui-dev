@@ -203,6 +203,58 @@ void advanceStellarPopulationChronology(
                                         double age_years, double lookahead_years, double birth_mass_msun,
                                         bool stochastic, double expected_threshold = 0.5);
 
+// ---------------------------------------------------------------------------
+// Physical event time vs publication epoch (patch 52, T02/S02/F01/F02).
+//
+// A stochastic SN of channel c is the k-th jump of the Poisson process in
+// the birth-mass-scaled cumulative expected count Lambda_c(age). The model
+// therefore DEFINES its physical event age exactly:
+//     a_k = inf { a : Lambda_c(a) >= Lambda_k },
+// Lambda_k the pre-drawn threshold of ordinal k (same counter-based draws as
+// realizeEvents). Lambda_c is non-decreasing and constant beyond the channel
+// horizon (CC: lifetime of cc_mass_min_msun; Ia: snia_delay_max_years), so
+// a_k is unique and is found by bisection to round-off. a_k depends only on
+// (birth key, channel, ordinal, birth mass, birth metallicity, SSP model):
+// it is invariant under step subdivision, refinement, rank, retry and
+// restart. Deposition still happens at the synchronized source-interval end
+// (legal publication epoch); the difference age_end - a_k >= 0 is the
+// event's publication lag, recorded by SourceRuntime and bounded by the
+// time authority when physics.ssp_max_event_publication_lag_years > 0.
+// Expectation mode (stochastic_events = false) has no discrete event times:
+// its fractional counts are interval-integrated like continuous returns.
+// ---------------------------------------------------------------------------
+// Birth-mass-scaled cumulative expected count of channel c (0 = CC, 1 = Ia).
+[[nodiscard]] double stellarEventCumulativeCount(const SspModel& model, std::uint32_t channel, double age_years,
+                                                 double metallicity, double birth_mass_msun);
+// Age beyond which Lambda_c no longer grows.
+[[nodiscard]] double stellarEventChannelHorizonYears(const SspModel& model, std::uint32_t channel,
+                                                     double metallicity);
+// a = inf{a in [age_lo, age_hi] : Lambda_c(a) >= threshold}; returns age_lo
+// when the threshold is already reached at age_lo, +infinity when it is not
+// reached by age_hi.
+[[nodiscard]] double stellarEventAgeYears(const SspModel& model, std::uint32_t channel, double threshold,
+                                          double metallicity, double birth_mass_msun, double age_lo_years,
+                                          double age_hi_years);
+// Physical ages of the `count` events realizeEvents just produced from
+// `record_before` over the age interval [age_begin, age_end].
+struct RealizedEventChronology {
+  std::uint32_t count = 0U;
+  // Events whose threshold was already reached at age_begin (a legacy record
+  // catching up its past chronology): their true age precedes this interval
+  // and is not reconstructible from the interval; they are counted, not timed.
+  std::uint32_t catch_up_count = 0U;
+  double earliest_age_years = 0.0;  // over timed events (count - catch_up_count)
+  double latest_age_years = 0.0;
+  double sum_age_years = 0.0;
+};
+[[nodiscard]] RealizedEventChronology realizedEventChronology(
+    const SspModel& model, const StellarPopulationRecord& record_before, std::uint32_t channel,
+    std::uint32_t count, double metallicity, double birth_mass_msun, double age_begin_years, double age_end_years);
+// Absolute stellar age of the next not-yet-realized event of either channel
+// (stochastic chronology), +infinity if the population has no further event.
+[[nodiscard]] double nextStellarEventAgeYears(const SspModel& model, const StellarPopulationRecord& record,
+                                              double age_now_years, double birth_mass_msun);
+
 class StellarPopulationStore {
  public:
   explicit StellarPopulationStore(const core::SimulationState& state);

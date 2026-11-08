@@ -3608,6 +3608,16 @@ std::string restartConfigurationCompatibilityRecord(
         "hydro_riemann_solver", "hydro_dual_energy", "hydro_dual_energy_eta",
         "node_memory_admission", "node_memory_budget_bytes", "node_memory_reserve_bytes"});
   }
+  // Patch 52 key (T02 event publication-lag bound). A checkpoint written
+  // before it carries no value; only the default (0 = no extra clip, lag
+  // bounded by the accepted interval as before) is accepted on resume.
+  if (projected.find("\nssp_max_event_publication_lag_years = ") != std::string::npos &&
+      restart.normalized_config_text.find("\nssp_max_event_publication_lag_years = ") == std::string::npos) {
+    if (current.config.physics.ssp_max_event_publication_lag_years != 0.0) {
+      fail("checkpoint predates physics.ssp_max_event_publication_lag_years; only its default 0 is accepted");
+    }
+    removeKeyLines({"ssp_max_event_publication_lag_years"});
+  }
   const std::string after_part1_projection = projected;
   // Support exact predecessor groups, not arbitrary missing keys.
   if (projected != restart.normalized_config_text) {
