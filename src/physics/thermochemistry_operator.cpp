@@ -63,6 +63,14 @@ ThermochemistryCellInput ThermochemistryOperator::cellInput(const core::Simulati
   return input;
 }
 
+const ThermochemistrySolver& ThermochemistryOperator::fidelityModelForRow(const core::SimulationState& state,
+                                                                         std::uint32_t row) const noexcept {
+  const std::uint8_t tag = state.gas_composition.chemistry_model_tag.size() > row
+      ? state.gas_composition.chemistry_model_tag[row]
+      : k_chemistry_tag_detailed;
+  return (m_hybrid_solver != nullptr && tag == k_chemistry_tag_hybrid) ? *m_hybrid_solver : m_solver;
+}
+
 bool ThermochemistryOperator::rowCarriesMetalIons(std::uint8_t chemistry_tag) const noexcept {
   return m_solver.metalIonSolver() != nullptr &&
       (m_hybrid_solver == nullptr || chemistry_tag == k_chemistry_tag_detailed);
@@ -436,14 +444,37 @@ ThermochemistryRowResult ThermochemistryOperator::advanceRow(const core::Simulat
                                             std::to_string(interval.accepted_step_index));
     const double u01 = static_cast<double>(key >> 11U) * (1.0 / 9007199254740992.0);
     if (u01 < m_config.shadow.sample_fraction) {
-      // P1-49-07: the reference runs the SAME coupled chronology with its
-      // own higher-accuracy light network AND its own higher-accuracy ladder
-      // (m_reference_solver->metalIonSolver(): 10x tighter tolerance, 4x
-      // substep cap), from the identical step-start state, on local copies
-      // only (no production state is touched; no allocation).
-      const CoupledRowOutcome reference = integrateCoupled(
-          *m_reference_solver, ions ? m_reference_solver->metalIonSolver() : nullptr, ions, input, start_ions,
-          interval.physical_seconds);
+      // P1-49-07 / patch 51: the reference ALWAYS runs the full detailed
+      // coupled chronology (its own higher-accuracy light network AND, when
+      // ladders are configured, its own higher-accuracy ladder:
+      // m_reference_solver->metalIonSolver(), 10x tighter tolerance, 4x
+      // substep cap), from the identical step-start state, on private stack
+      // copies only (no production state is touched; no heap allocation, so
+      // no governor admission is required; cost bounded by shadow.max_cells).
+      // For a demoted (hybrid) row the production branch stays genuinely
+      // reduced; the reference reconstructs the row's detailed ladder
+      // privately from the authoritative element lanes minus CO and the
+      // frozen stored stage distribution (or, for a row that never carried
+      // ladder state, the documented ionization-equilibrium projection at
+      // the step-start (T, n_e, radiation) - the same initializer a promoted
+      // row would use). This measures exactly the error of demotion.
+      const bool reference_ions = m_reference_solver->metalIonSolver() != nullptr;
+      ThermochemistryCellInput reference_input = input;
+      MetalIonRowState reference_start = start_ions;
+      bool reference_ready = true;
+      if (reference_ions && !ions) {
+        MetalIonAdvanceReport reference_attach;
+        try {
+          attachMetalIonState(state, row, rowTemperatureK(state, row, reference_input), reference_input,
+                              reference_start, reference_attach);
+        } catch (const std::range_error&) {
+          reference_ready = false;  // reference outside its dataset: no sample (production unaffected)
+        }
+      }
+      const CoupledRowOutcome reference = reference_ready
+          ? integrateCoupled(*m_reference_solver, reference_ions ? m_reference_solver->metalIonSolver() : nullptr,
+                             reference_ions, reference_input, reference_start, interval.physical_seconds)
+          : CoupledRowOutcome{.status = SourceAdvanceStatus::kRejectedInvalid};
       if (reference.status == SourceAdvanceStatus::kCompleted) {
         ++shadow.samples;
         NetworkState prod_species = output.species_cm3;
@@ -467,27 +498,50 @@ ThermochemistryRowResult ThermochemistryOperator::advanceRow(const core::Simulat
             shadow.max_relative_energy_difference,
             std::abs(reference.output.specific_internal_energy_erg_g - output.specific_internal_energy_erg_g) /
                 reference.output.specific_internal_energy_erg_g);
-        if (ions) {
+        if (reference_ions) {
           ++shadow.ion_samples;
+          // Production ladder: evolved (detailed row) or the frozen /
+          // projected distribution a reduced row carries (hybrid row).
+          const MetalIonRowState& production_ladder = ions ? ion_state : reference_start;
+          const auto metal_free_electrons = [&](const MetalIonRowState& ladder) {
+            double electrons = 0.0;
+            for (std::size_t e = 0; e < k_metal_ion_element_count; ++e) {
+              const auto element = static_cast<MetalIonElement>(e);
+              if (!ion_set.contains(element)) continue;
+              electrons += ladder.nuclei_cm3[e] *
+                  metalIonElectronsPerNucleus(std::span<const double>(
+                      ladder.fractions.data() + ion_set.stageOffset(element), metalIonStageCount(element)));
+            }
+            return electrons;
+          };
           double stage = 0.0;
           for (std::size_t k = 0; k < ion_set.stageCount(); ++k) {
-            stage = std::max(stage, std::abs(reference.ions.fractions[k] - ion_state.fractions[k]));
+            stage = std::max(stage, std::abs(reference.ions.fractions[k] - production_ladder.fractions[k]));
           }
           shadow.max_ion_stage_fraction_difference = std::max(shadow.max_ion_stage_fraction_difference, stage);
-          const double ne_scale = std::max({std::abs(reference.ion_electron_cm3), std::abs(production.ion_electron_cm3),
-                                            1.0e-12 * std::max(output.electron_per_hydrogen, 1.0e-300)});
+          // Metal free electrons the production model actually counts: the
+          // full ladder for a detailed row; none for a reduced row (the
+          // hybrid network carries no metal-ion electrons). Normalized by the
+          // reference TOTAL electron density, i.e. the n_e error of the model.
+          const double n_h = input.gas_element_mass_fraction[0] * input.mass_density_cgs /
+              (chemicalElementInfo(ChemicalElement::kH).atomic_mass_amu * k_amu_g);
+          const double production_metal_e = ions ? metal_free_electrons(ion_state) : 0.0;
+          const double reference_metal_e = metal_free_electrons(reference.ions);
+          const double ne_reference_total = std::max(reference.output.electron_per_hydrogen * n_h, 1.0e-300);
           shadow.max_relative_ion_electron_difference = std::max(
               shadow.max_relative_ion_electron_difference,
-              std::abs(reference.ion_electron_cm3 - production.ion_electron_cm3) / ne_scale);
+              std::abs(reference_metal_e - production_metal_e) / ne_reference_total);
           shadow.max_relative_ion_temperature_difference = std::max(
               shadow.max_relative_ion_temperature_difference,
               std::abs(reference.output.temperature_k - output.temperature_k) /
                   std::max(reference.output.temperature_k, 1.0e-300));
+          const double production_potential = ions ? production.ion_potential_erg_cm3
+                                                   : ionPotentialDensity(reference_start);
           const double e_scale = std::max({std::abs(reference.ion_potential_erg_cm3),
-                                           std::abs(production.ion_potential_erg_cm3), 1.0e-300});
+                                           std::abs(production_potential), 1.0e-300});
           shadow.max_relative_ion_potential_difference = std::max(
               shadow.max_relative_ion_potential_difference,
-              std::abs(reference.ion_potential_erg_cm3 - production.ion_potential_erg_cm3) / e_scale);
+              std::abs(reference.ion_potential_erg_cm3 - production_potential) / e_scale);
         }
         const double ratio =
             static_cast<double>(reference.ledger.accepted_substeps + reference.ledger.rejected_substeps) /
@@ -614,7 +668,14 @@ double nextChemistryPromotionBias(double bias, double global_max_shadow_differen
 double ThermochemistryOperator::coolingTimeSeconds(
     const core::SimulationState& state, std::uint32_t row,
     const SourceInterval& interval) const {
+  // Patch 51 (A03/C02): the cooling estimate uses the SAME model that
+  // advances this row (fidelityModelForRow): a reduced row is costed by the
+  // hybrid solver, whose element table / fine-structure terms still include
+  // C/O/Si/Fe (the hybrid solver owns no ladder, so nothing is excluded); a
+  // detailed row by the detailed solver with its attached ladder (ladder
+  // losses replace the excluded table elements). Never both, never neither.
   const ThermochemistryCellInput input = cellInput(state, row, interval);
+  const ThermochemistrySolver& row_solver = fidelityModelForRow(state, row);
   double mu = state.gas_composition.mean_molecular_weight[row];
   if (!(mu > 0.0) || !std::isfinite(mu)) mu = 1.22;
   const double temperature_k = (m_config.solver.adiabatic_index - 1.0) * mu * k_amu_g *
@@ -624,7 +685,7 @@ double ThermochemistryOperator::coolingTimeSeconds(
     return std::numeric_limits<double>::infinity();
   }
   const CoolingHeatingTerms terms =
-      m_solver.coolingHeating(input, input.species_cm3, temperature_k);
+      row_solver.coolingHeating(input, input.species_cm3, temperature_k);
   const double loss =
       terms.radiative_cooling + terms.chemical_cooling - terms.heating;
   const double energy_density =
@@ -654,7 +715,7 @@ ChemistryFidelityDecision ThermochemistryOperator::decideChemistryFidelity(
   // path in both fixed-reference and adaptive modes.
   double t_cool = std::numeric_limits<double>::infinity();
   if (interval.physical_seconds > 0.0 && t > 0.0) {
-    const CoolingHeatingTerms terms = m_solver.coolingHeating(input, input.species_cm3, t);
+    const CoolingHeatingTerms terms = fidelityModelForRow(state, row).coolingHeating(input, input.species_cm3, t);
     const double loss = terms.radiative_cooling + terms.chemical_cooling - terms.heating;  // erg cm^-3 s^-1
     const double u = input.mass_density_cgs * input.specific_internal_energy_erg_g;     // erg cm^-3
     if (loss > 0.0 && u > 0.0) t_cool = u / loss;

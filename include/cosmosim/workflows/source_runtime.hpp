@@ -58,9 +58,12 @@ class SourceRuntime {
   // of that level's own Strang split. The AMR clock owner calls both phases on
   // every rank for every level clock, including empty local spans (the stage
   // vote is collective). Observations accumulate into the open coarse source
-  // interval; nothing is published here. Discrete events, element diffusion
-  // and SGS shear transfer keep their globally synchronized coarse chronology
-  // in execute() and are never executed implicitly by this method. Throws
+  // interval; nothing is published here. Under recursive AMR the level
+  // halves also integrate element diffusion and SGS shear on the faces owned
+  // by this level clock (same-level faces in both halves, coarse/fine faces
+  // whose coarser side is this level in the pre half only; their closing half
+  // is executeAmrLevelInterfaceSynchronization). Discrete events keep their
+  // synchronized coarse chronology in execute(). Throws
   // std::logic_error when composition did not enable the coupling or when no
   // coarse source interval is open.
   virtual void executeAmrLevelSmoothSources(
@@ -75,6 +78,16 @@ class SourceRuntime {
   // thermochemistry halves (the AMR levels own them) and verifies at interval
   // close that every level pre half had a matching post half.
   virtual void setAmrLevelSourceCouplingEnabled(bool enabled) noexcept = 0;
+  // T02 (patch 51): closing half of the coarse/fine interface split of level
+  // `level`, called by the recursive AMR driver after all children of the
+  // level interval, its reflux and history retirement (every rank, same
+  // order). Integrates the diffusion/SGS faces whose coarser side is on
+  // `level` and whose finer side is deeper, for dt_level/2, with both sides
+  // at the level end time. Must follow the matching level pre half.
+  virtual void executeAmrLevelInterfaceSynchronization(
+      core::StepContext& parent_context,
+      const hydro::HydroUpdateContext& level_update,
+      int level) = 0;
   [[nodiscard]] virtual RuntimeTaskMemoryEstimate estimateMemory(
       const core::SimulationState&) const {
     return {0U, false, "source owner does not publish a complete memory model"};

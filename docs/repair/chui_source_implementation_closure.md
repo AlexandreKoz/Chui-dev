@@ -1,3 +1,71 @@
+# CHUÍ — patch 51 source-completion record (supersedes the patch-50 matrix)
+
+Date: 2026-11-08. Branch `claude/intelligent-cray-m8rxdv`. Input audit:
+`CHUI_patch50_auditoria_independente_fonte_2026-11-08.md`. Static edits and
+static cross-file tracing only. **Nothing was compiled, configured, linked,
+tested, benchmarked, simulated or validated.** No statement below is a runtime,
+convergence, MPI-deadlock-freedom, performance or memory-fit claim.
+
+**Status: source work packages A–D implemented; NOT SOURCE-COMPLETE only in the
+sense that T02 discrete events follow the specification-permitted
+synchronized-epoch exception (owner confirmation requested, see below).**
+External datasets (C01/C02/S02/F02) and G01 qualification remain separate.
+
+## Audit findings → source changes
+
+| Finding | Resolution (path::symbol) | Guaranteed by source / left to qualification |
+|---|---|---|
+| P0/P1-50-A coarse/fine time | `amr::RecursiveAmrSourcePhase::kPostChildrenSynchronization` (called by `advanceProductionAmrHydroRecursiveImpl` after children, reflux and history retirement, every rank); `RecursiveAmrLevelSourceAdapter::apply`; `SourceRuntime::executeAmrLevelInterfaceSynchronization`; `SourceRuntimeImpl::{restrictDiffusionFacesToLevelSelection, levelPhaseTag, executeAmrLevelSmoothSources}`; phase-tagged `gatherRemoteDiffusionCells` and `DistributedElementDiffusionCoupling(…, phase_tag)` | Source: every face owned by its COARSER side L; same-level faces dt/2 in L pre + dt/2 in L post; coarse/fine faces dt/2 in L pre (all finer levels at t_b, before L history start) + dt/2 at the post-children synchronization (all levels ≥ L at t_e, after reflux/history retirement). Both sides read at the same instant, same interval, equal/opposite transfers applied once; pre/sync pairing verified by global coarse/fine face counts; open splits refused at interval close and before events; remote records of another phase refused (phase-tagged sequences). Qualification: temporal order of the S(dt/2)[subtree]S(dt/2) split, positivity margin, recursive vs synchronized equivalence. |
+| A — composition ordering risk | `composition_transport.hpp` contract | Source/argument: donor fractions are read at prepare time (post-source); diffusion is mass-neutral per cell and maximum-principle bounded, so outflow F·X ≤ M_s iff F ≤ M (hydro-only condition) — diffusion adds no negativity risk. Deferred-donor CFL remains checked exactly and refused collectively. |
+| P1-50-B hybrid shadow / cooling authority | `ThermochemistryOperator::advanceRow` shadow (private detailed ladder reconstruction for demoted rows, reference never ladder-less), `fidelityModelForRow` used by `decideChemistryFidelity` and `coolingTimeSeconds` | Source: reduced rows stay reduced; reference measures demotion error (stage fractions, metal electrons / reference total n_e, T, stored potential); published once per interval through the existing C03/V02 path (rollback-restored). Cooling estimate uses the row's own model: no metal cooling vanishes, no double counting. Qualification: thresholds. |
+| P1-50-C MPI lease / allocation | `parallel::{GovernedRecords, GovernedRecordBuffer, executeGovernedDestinationRecordExchange}`, internal `exchangeIntoDestination`; callers in `completeDistributedCompositionTransport`, `DistributedElementDiffusionCoupling::addRemoteFaceTransfers` | Source: receive directly into the final typed buffer (no decode copy); its lease is returned with it; staging + bucket admitted separately and pre-reserved at the maximal round; no allocation between the admission vote and the payload rounds. An MPI error return is still rank-local and fatal for the communicator (default MPI error handler) — not claimed recoverable. |
+| P1-50-D discrete events | `SourceRuntimeImpl::executeDiscreteSourceEvents` epoch guard + `SourceIntervalAccumulator::discrete_event_dispatches` | Specification-permitted exception (route v10 §4.6 / T02 “stochastic-event separation”, “do not force stochastic events into smooth integrators”, F5 absolute birth time): events run once per interval at the absolute interval end, the only legal publication epoch (hierarchy synchronized, verified collectively). Budgets are age-integrated (cumulative cursors, gap/replay refusal), invariant under level cadence/refinement/rank/retry; unresolved deposits carried. **Owner decision requested** if per-substep event dispatch is required instead. |
+| P2-50-E data / charge exchange | unchanged loaders and refusals | Metal–H/He charge exchange is not named by C02 in route v10 (“selected metal ions/molecules”, qualification “exact network inventory, reaction data”); it is recorded as a model limitation, not implemented, and no rate is invented. |
+
+## H01–V02 source matrix (patch 51)
+
+| ID | Status | Production evidence / exact remaining gap |
+|---|---|---|
+| H01 | implemented in source | `hydro_core_solver.cpp` (unchanged) |
+| H02 | implemented in source | dual energy / EOS refresh (unchanged) |
+| C01 | external-data dependency | loaders + refusals; production tables absent |
+| C02 | implemented in source + external-data dependency | ladder physics (patch 50); charge exchange a declared limitation; verified dataset with energy contract absent |
+| C03 | implemented in source (research) | hybrid-row ion error now measured; `fidelityModelForRow` |
+| C04 | implemented in source (research) | detailed reference for every sampled row, stack-only |
+| I01 | implemented in source | unchanged |
+| I02 | implemented in source (research) | SGS shear on causal level phases |
+| S01 | implemented in source | synchronized-epoch events (exception above) |
+| S02 | external-data dependency | age-integrated returns; yields absent |
+| F01 | implemented in source | synchronized-epoch deposition |
+| F02 | external-data dependency | wind dataset absent |
+| D01 | implemented in source | schema-2 wire, governed leases, causal multilevel diffusion |
+| A01 | implemented in source | unchanged |
+| A02 | implemented in source | new post-children phase in recursive driver |
+| A03 | implemented in source | cooling time from the row's fidelity model |
+| A04 | implemented in source (research) | unchanged |
+| G01 | conditional | qualification pending by specification |
+| T01 | implemented in source | Strang plan, exactly-once events |
+| T02 | implemented in source with specification-permitted event exception | smooth sources/diffusion/SGS causal per level; events at synchronized epochs |
+| M01 | implemented in source for traced owners | MPI receive leases; FFTW/HDF5/MPI-library internals estimate-only |
+| M02 | implemented in source | unchanged |
+| V01 | implemented in source | ledgers/restart (no schema change this patch) |
+| V02 | implemented in source (research) | hybrid ion disagreement reaches the joint controller |
+
+X01 out of scope (no MHD, GRMHD, moving mesh, SPH, CHIMES, Grackle, new AGN).
+
+Restart/schema impact: none (all new state is runtime controller state inside
+`SourceIntervalAccumulator`, captured by the existing rollback checkpoint and
+always closed at legal restart boundaries). Reproducibility impact: recursive
+AMR runs with diffusion/SGS change (coarse/fine faces now integrated on the
+coarser clock); adaptive runs with shadow sampling change their promotion
+bias (hybrid ion disagreement).
+
+Tests written/updated but NOT RUN: `tests/unit/test_amr_recursive_subcycling.cpp`
+(post-children phase counts), `tests/unit/test_composition_lane_chunk_wire.cpp`
+(governed return type).
+
+---
+
 # CHUÍ — patch 50 source-completion record (supersedes the patch-49 matrix)
 
 Date: 2026-11-08. Branch `claude/intelligent-cray-m8rxdv`. Scope: static source

@@ -209,13 +209,17 @@ DistributedElementDiffusionCoupling::DistributedElementDiffusionCoupling(
     const core::SimulationState& state,
     std::span<const RemoteDiffusionFace> remote_faces,
     std::span<const double> rho_kappa_code,
-    std::size_t lane_upper_bound)
+    std::size_t lane_upper_bound,
+    std::uint64_t phase_tag)
     : m_mpi(mpi_context),
       m_governor(governor),
       m_state(state),
       m_faces(remote_faces),
       m_rho_kappa(rho_kappa_code),
-      m_lane_upper_bound(lane_upper_bound) {}
+      m_lane_upper_bound(lane_upper_bound),
+      // T02 phase identity (step, level, interval, phase) seeds the subcycle
+      // sequence so a record of another level phase is refused on assembly.
+      m_exchange_sequence(phase_tag) {}
 
 void DistributedElementDiffusionCoupling::reduceFailure(std::exception_ptr local_failure, const char* stage) {
   m_mpi.rethrowCollectivePreparationFailure(local_failure, stage);
@@ -419,7 +423,7 @@ void DistributedElementDiffusionCoupling::addRemoteFaceTransfers(
   std::vector<int> delta_destinations;
   try {
     const parallel::AssembledCompositionLanes remote_states = parallel::assembleCompositionLaneChunks(
-        state_chunks, identity(parallel::CompositionLaneStream::kDiffusionState), rank);
+        state_chunks.records, identity(parallel::CompositionLaneStream::kDiffusionState), rank);
     const auto find_state = [&remote_states](std::uint64_t id) -> std::size_t {
       const auto it = std::lower_bound(remote_states.gas_cell_id.begin(), remote_states.gas_cell_id.end(), id);
       if (it == remote_states.gas_cell_id.end() || *it != id) {
@@ -477,7 +481,7 @@ void DistributedElementDiffusionCoupling::addRemoteFaceTransfers(
       m_mpi, delta_chunks_out, delta_destinations, sequence, m_governor, "sources.element_diffusion.delta_exchange");
   try {
     const parallel::AssembledCompositionLanes imported = parallel::assembleCompositionLaneChunks(
-        imported_chunks, identity(parallel::CompositionLaneStream::kDiffusionDelta), rank);
+        imported_chunks.records, identity(parallel::CompositionLaneStream::kDiffusionDelta), rank);
     for (std::size_t i = 0; i < imported.size(); ++i) {
       const auto it = std::lower_bound(m_dependent_rows.begin(), m_dependent_rows.end(),
                                        std::make_pair(imported.gas_cell_id[i], std::uint32_t{0}));

@@ -66,7 +66,7 @@ void testRoundTripAndRefusals() {
     }
     std::reverse(records.begin(), records.end());  // arrival order must not matter
     std::reverse(destinations.begin(), destinations.end());
-    const auto received = par::exchangeCompositionLaneChunks(serial, records, destinations, 7U);
+    const auto received = par::exchangeCompositionLaneChunks(serial, records, destinations, 7U).records;
     const auto assembled = par::assembleCompositionLaneChunks(received, identity, 0);
     CHUI_REQUIRE(assembled.size() == 2U);
     CHUI_REQUIRE(assembled.gas_cell_id[0] == 3U && assembled.gas_cell_id[1] == 5U);

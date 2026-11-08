@@ -77,7 +77,8 @@ class DistributedElementDiffusionCoupling final : public physics::ElementDiffusi
                                       const core::SimulationState& state,
                                       std::span<const RemoteDiffusionFace> remote_faces,
                                       std::span<const double> rho_kappa_code,
-                                      std::size_t lane_upper_bound);
+                                      std::size_t lane_upper_bound,
+                                      std::uint64_t phase_tag = 0U);
 
   // Collective topology validation and conductance agreement (step 3).
   void setup();

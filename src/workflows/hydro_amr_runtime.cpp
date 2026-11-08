@@ -729,11 +729,20 @@ class RecursiveAmrLevelSourceAdapter final : public amr::RecursiveAmrLevelSource
       throw std::logic_error(
           "recursive AMR level source adapter received a foreign SimulationState");
     }
-    const core::SourceSplitPhase split_phase =
-        phase == amr::RecursiveAmrSourcePhase::kPreHydroHalf
-        ? core::SourceSplitPhase::kStrangPreHalf
-        : core::SourceSplitPhase::kStrangPostHalf;
-    m_source.executeAmrLevelSmoothSources(m_step, level_rows, level_update, level, split_phase);
+    switch (phase) {
+      case amr::RecursiveAmrSourcePhase::kPreHydroHalf:
+        m_source.executeAmrLevelSmoothSources(m_step, level_rows, level_update, level,
+                                              core::SourceSplitPhase::kStrangPreHalf);
+        return;
+      case amr::RecursiveAmrSourcePhase::kPostHydroHalf:
+        m_source.executeAmrLevelSmoothSources(m_step, level_rows, level_update, level,
+                                              core::SourceSplitPhase::kStrangPostHalf);
+        return;
+      case amr::RecursiveAmrSourcePhase::kPostChildrenSynchronization:
+        m_source.executeAmrLevelInterfaceSynchronization(m_step, level_update, level);
+        return;
+    }
+    throw std::logic_error("recursive AMR level source adapter received an unknown phase");
   }
 
  private:
@@ -3337,8 +3346,11 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
       }
     } catch (...) { failure = std::current_exception(); }
     m_mpi_context.rethrowCollectivePreparationFailure(failure, "distributed composition donor requests");
-    const auto inbound_requests =
+    // Governed result: the lease of the received records lives as long as
+    // the records themselves (M01/D01, patch 51).
+    const auto inbound_request_buffer =
         parallel::exchangeCompositionDonorRequests(m_mpi_context, requests, sequence, m_memory_governor);
+    const auto& inbound_requests = inbound_request_buffer.records;
     // P0-49-01: lane vectors travel as chunked schema-2 records bound to the
     // authoritative layout signature; any layout CompositionLayout::make can
     // build (up to k_max_composition_layout_lanes) is representable.
@@ -3399,7 +3411,7 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
       if (composition_flux != nullptr) {
         const std::size_t lanes = context.state.gas_composition.laneCount();
         const auto fractions = parallel::assembleCompositionLaneChunks(
-            fraction_chunks, lane_identity(parallel::CompositionLaneStream::kDonorFraction), rank);
+            fraction_chunks.records, lane_identity(parallel::CompositionLaneStream::kDonorFraction), rank);
         // A donor is owned by exactly one rank: one lane vector per cell.
         for (std::size_t i = 1; i < fractions.size(); ++i) {
           if (fractions.gas_cell_id[i] == fractions.gas_cell_id[i - 1U]) {
@@ -3424,11 +3436,11 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
       // Deterministic application order independent of arrival order:
       // reassembly sorts by (gas_cell_id, source_rank) and refuses a
       // duplicated, truncated or foreign-layout lane vector (exactly once).
-      if (!inbound_correction_chunks.empty() && composition_flux == nullptr) {
+      if (!inbound_correction_chunks.records.empty() && composition_flux == nullptr) {
         throw std::runtime_error("distributed composition: correction delivered to a rank without composition");
       }
       const auto inbound_corrections = parallel::assembleCompositionLaneChunks(
-          inbound_correction_chunks, lane_identity(parallel::CompositionLaneStream::kCorrection), rank);
+          inbound_correction_chunks.records, lane_identity(parallel::CompositionLaneStream::kCorrection), rank);
       for (std::size_t i = 0; i < inbound_corrections.size(); ++i) {
         composition_flux->addInboundCorrection(
             context.state, inbound_corrections.gas_cell_id[i], inbound_corrections.lanesOf(i));

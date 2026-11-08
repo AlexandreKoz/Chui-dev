@@ -63,9 +63,22 @@ struct AmrLevelRefluxInterval {
 // after each level transport interval. The implementation may perform MPI
 // collectives; empty local row spans are therefore meaningful participation,
 // not a reason to skip the call.
+// Phase identity of one level interval [t_b, t_e] of level L (patch 51, T02):
+//  * kPreHydroHalf: level L and every finer level are synchronized at t_b
+//    (children have not started); called BEFORE the level-L temporal history
+//    start is captured.
+//  * kPostHydroHalf: level L at t_e, finer levels still at t_b; called before
+//    the level-L history end is captured.
+//  * kPostChildrenSynchronization: called only for a level that HAS finer
+//    levels, after all children substeps, the complete reflux and the
+//    retirement of the level-L temporal history; level L and every finer
+//    level are synchronized at t_e. Operators that couple level L to finer
+//    cells (coarse/fine interface diffusion and SGS faces) must use only
+//    kPreHydroHalf and this phase, where both sides are contemporaneous.
 enum class RecursiveAmrSourcePhase : std::uint8_t {
   kPreHydroHalf = 0,
   kPostHydroHalf = 1,
+  kPostChildrenSynchronization = 2,
 };
 
 class RecursiveAmrLevelSourceOperator {
