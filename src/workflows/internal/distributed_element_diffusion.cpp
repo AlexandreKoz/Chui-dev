@@ -150,6 +150,7 @@ RemoteDiffusionCellGather gatherRemoteDiffusionCells(
       }
       out.velocity_peculiar = {cell.velocity_x_peculiar, cell.velocity_y_peculiar, cell.velocity_z_peculiar};
       const double volume_factor = scale_factor * scale_factor * scale_factor;
+      out.level = static_cast<std::int32_t>(patch.level);
       out.density_physical_code = cell.density_code > 0.0
           ? cell.density_code / volume_factor
           : 0.0;

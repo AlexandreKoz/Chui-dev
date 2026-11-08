@@ -436,7 +436,8 @@ MetalDiffusionTopologyResult buildMetalDiffusionTopology(
           .area_code = overlap_u * overlap_v,
           .center_distance_code = 0.5 * (upper.normal_width + lower.normal_width),
           .remote_density_physical_code = remote.density_physical_code,
-          .remote_velocity_peculiar = remote.velocity_peculiar});
+          .remote_velocity_peculiar = remote.velocity_peculiar,
+          .remote_level = remote.level});
       ++result.remote_face_count;
       return;
     }

@@ -177,6 +177,8 @@ struct SgsRemoteShearFace {
   double center_distance_code = 0.0;
   double remote_density_physical_code = 0.0;
   std::array<double, 3> remote_velocity_peculiar{};
+  // T02: AMR level of the remote leaf (multirate face clock selection).
+  std::int32_t remote_level = 0;
 };
 
 // Five full-row staging lanes. prepareSgsShearTransfer never mutates state;
