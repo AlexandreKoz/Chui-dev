@@ -209,13 +209,17 @@ DistributedElementDiffusionCoupling::DistributedElementDiffusionCoupling(
     const core::SimulationState& state,
     std::span<const RemoteDiffusionFace> remote_faces,
     std::span<const double> rho_kappa_code,
-    std::size_t lane_upper_bound)
+    std::size_t lane_upper_bound,
+    std::uint64_t phase_tag)
     : m_mpi(mpi_context),
       m_governor(governor),
       m_state(state),
       m_faces(remote_faces),
       m_rho_kappa(rho_kappa_code),
-      m_lane_upper_bound(lane_upper_bound) {}
+      m_lane_upper_bound(lane_upper_bound),
+      // T02 phase identity (step, level, interval, phase) seeds the subcycle
+      // sequence so a record of another level phase is refused on assembly.
+      m_exchange_sequence(phase_tag) {}
 
 void DistributedElementDiffusionCoupling::reduceFailure(std::exception_ptr local_failure, const char* stage) {
   m_mpi.rethrowCollectivePreparationFailure(local_failure, stage);

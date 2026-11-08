@@ -729,11 +729,20 @@ class RecursiveAmrLevelSourceAdapter final : public amr::RecursiveAmrLevelSource
       throw std::logic_error(
           "recursive AMR level source adapter received a foreign SimulationState");
     }
-    const core::SourceSplitPhase split_phase =
-        phase == amr::RecursiveAmrSourcePhase::kPreHydroHalf
-        ? core::SourceSplitPhase::kStrangPreHalf
-        : core::SourceSplitPhase::kStrangPostHalf;
-    m_source.executeAmrLevelSmoothSources(m_step, level_rows, level_update, level, split_phase);
+    switch (phase) {
+      case amr::RecursiveAmrSourcePhase::kPreHydroHalf:
+        m_source.executeAmrLevelSmoothSources(m_step, level_rows, level_update, level,
+                                              core::SourceSplitPhase::kStrangPreHalf);
+        return;
+      case amr::RecursiveAmrSourcePhase::kPostHydroHalf:
+        m_source.executeAmrLevelSmoothSources(m_step, level_rows, level_update, level,
+                                              core::SourceSplitPhase::kStrangPostHalf);
+        return;
+      case amr::RecursiveAmrSourcePhase::kPostChildrenSynchronization:
+        m_source.executeAmrLevelInterfaceSynchronization(m_step, level_update, level);
+        return;
+    }
+    throw std::logic_error("recursive AMR level source adapter received an unknown phase");
   }
 
  private:

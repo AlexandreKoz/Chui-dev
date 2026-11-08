@@ -950,6 +950,11 @@ struct SourceIntervalAccumulator {
   std::uint64_t level_post_halves = 0U;
   // T02: level halves that integrated level-clock diffusion/SGS faces.
   std::uint64_t level_transport_halves = 0U;
+  // T02 (patch 51): per level, 0 = no pre half yet; 1 = coarse/fine split
+  // closed (or none opened); n + 1 = n global coarse/fine faces opened by the
+  // level pre half and awaiting the post-children synchronization.
+  std::vector<std::uint64_t> pending_interface_sync;
+  std::uint64_t level_interface_syncs = 0U;
   physics::ChemistryShadowReport shadow{};
   physics::ChemistryAdaptiveReport adaptive{};
 };
@@ -1481,26 +1486,106 @@ class SourceRuntimeImpl final : public SourceRuntime {
         level_context, sourceEvaluationScaleFactor(level_context));
     // Palindromic level split, identical to the global halves: pre = smooth
     // transport then thermochemistry, post = thermochemistry then transport.
-    // Transport advances this level's half interval on the faces owned by
-    // this level clock; every rank enters (collective participation).
+    // Transport faces follow the causal owner rule documented at
+    // restrictDiffusionFacesToLevelSelection: the pre half (t_begin, every
+    // finer level synchronized) integrates same-level AND coarse/fine faces
+    // owned by this level; the post half (finer levels still at t_begin)
+    // integrates same-level faces only. Every rank enters.
     const double half_dt_code = 0.5 * level_update.dt_code;
     const double transport_scale_factor = phase == core::SourceSplitPhase::kStrangPreHalf
         ? 0.5 * (level_update.scale_factor_begin + level_update.scale_factor)
         : 0.5 * (level_update.scale_factor + level_update.scale_factor_end);
+    const auto level_index = static_cast<std::size_t>(std::max(level, 0));
     if (phase == core::SourceSplitPhase::kStrangPreHalf) {
-      executeDiffusionAndSgsShear(level_context, transport_scale_factor, half_dt_code,
-                                  static_cast<std::int32_t>(level));
+      if (m_source_interval.pending_interface_sync.size() <= level_index) {
+        m_source_interval.pending_interface_sync.resize(level_index + 1U, 0U);
+      }
+      if (m_source_interval.pending_interface_sync[level_index] > 1U) {
+        throw std::logic_error(
+            "recursive AMR level pre half opened while the previous coarse/fine interface split of the level "
+            "was never closed (missing post-children synchronization)");
+      }
+      executeDiffusionAndSgsShear(
+          level_context, transport_scale_factor, half_dt_code,
+          LevelFaceSelection{.level = static_cast<std::int32_t>(level), .same_level = true, .coarse_fine = true,
+                             .phase_tag = levelPhaseTag(parent_context.integrator_state.step_index, level,
+                                                        level_update.time_begin_code, 0U)});
+      // Global count of coarse/fine faces opened by this pre half; stored +1
+      // so that "pre half seen, no coarse/fine faces" is distinguishable.
+      const std::uint64_t opened = m_mpi_context.allreduceSumUint64(m_last_level_face_selection.coarse_fine);
+      m_source_interval.pending_interface_sync[level_index] = opened + 1U;
     }
     executeThermochemistryInterval(
         level_context, interval, level_rows, false, level);
     if (phase == core::SourceSplitPhase::kStrangPostHalf) {
-      executeDiffusionAndSgsShear(level_context, transport_scale_factor, half_dt_code,
-                                  static_cast<std::int32_t>(level));
+      executeDiffusionAndSgsShear(
+          level_context, transport_scale_factor, half_dt_code,
+          LevelFaceSelection{.level = static_cast<std::int32_t>(level), .same_level = true, .coarse_fine = false,
+                             .phase_tag = levelPhaseTag(parent_context.integrator_state.step_index, level,
+                                                        level_update.time_begin_code, 1U)});
     }
     if (m_source_interval.level_transport_halves == std::numeric_limits<std::uint64_t>::max()) {
       throw std::overflow_error("recursive AMR level transport counter overflow");
     }
     ++m_source_interval.level_transport_halves;
+  }
+
+  void executeAmrLevelInterfaceSynchronization(
+      core::StepContext& parent_context,
+      const hydro::HydroUpdateContext& level_update,
+      int level) override {
+    if (!m_amr_level_source_coupling_enabled || !m_source_interval.open || !m_source_interval.recursive_levels) {
+      throw std::logic_error(
+          "recursive AMR interface synchronization invoked outside an open level-owned source interval");
+    }
+    if (!(std::isfinite(level_update.dt_code) && level_update.dt_code > 0.0 &&
+          level_update.scale_factor_end > 0.0 && level_update.scale_factor > 0.0)) {
+      throw std::invalid_argument("recursive AMR interface synchronization received an invalid level interval");
+    }
+    const auto level_index = static_cast<std::size_t>(std::max(level, 0));
+    if (level_index >= m_source_interval.pending_interface_sync.size() ||
+        m_source_interval.pending_interface_sync[level_index] == 0U) {
+      throw std::logic_error("recursive AMR interface synchronization without a matching level pre half");
+    }
+    // Level clock of the closing half [t_mid, t_end] (all levels >= L at t_end).
+    core::IntegratorState level_integrator = parent_context.integrator_state;
+    level_integrator.current_time_code = level_update.time_end_code;
+    level_integrator.current_scale_factor = level_update.scale_factor_end;
+    level_integrator.current_redshift = m_is_cosmological
+        ? std::max(0.0, 1.0 / level_update.scale_factor_end - 1.0)
+        : 0.0;
+    level_integrator.dt_time_code = level_update.dt_code;
+    core::StepContext level_context{parent_context.state, level_integrator};
+    level_context.active_set = parent_context.active_set;
+    level_context.workspace = parent_context.workspace;
+    level_context.cosmology_background = parent_context.cosmology_background;
+    level_context.mode_policy = parent_context.mode_policy;
+    level_context.profiler_session = parent_context.profiler_session;
+    level_context.timeline_step = parent_context.timeline_step;
+    level_context.boundary = parent_context.boundary;
+    level_context.stage = core::IntegrationStage::kSourceTerms;
+    level_context.source_split_phase = core::SourceSplitPhase::kStrangPostHalf;
+    executeDiffusionAndSgsShear(
+        level_context, 0.5 * (level_update.scale_factor + level_update.scale_factor_end), 0.5 * level_update.dt_code,
+        LevelFaceSelection{.level = static_cast<std::int32_t>(level), .same_level = false, .coarse_fine = true,
+                           .phase_tag = levelPhaseTag(parent_context.integrator_state.step_index, level,
+                                                      level_update.time_begin_code, 2U)});
+    const std::uint64_t closed = m_mpi_context.allreduceSumUint64(m_last_level_face_selection.coarse_fine);
+    if (closed + 1U != m_source_interval.pending_interface_sync[level_index]) {
+      // The hierarchy is frozen inside one coarse interval (regrid only at
+      // synchronized coarse boundaries), so the closing half must integrate
+      // exactly the coarse/fine faces its pre half opened.
+      throw std::logic_error(
+          "recursive AMR coarse/fine interface synchronization integrated " + std::to_string(closed) +
+          " faces but its pre half opened " +
+          std::to_string(m_source_interval.pending_interface_sync[level_index] - 1U) +
+          " (face missed or double integrated)");
+    }
+    m_source_interval.pending_interface_sync[level_index] = 1U;  // closed; pre half seen
+    if (m_source_interval.level_interface_syncs == std::numeric_limits<std::uint64_t>::max()) {
+      throw std::overflow_error("recursive AMR interface synchronization counter overflow");
+    }
+    ++m_source_interval.level_interface_syncs;
   }
 
   void execute(SourceMutationStageView& view) override {
@@ -2116,6 +2201,12 @@ class SourceRuntimeImpl final : public SourceRuntime {
       // faces exactly once (no face clock skipped or doubled).
       throw std::logic_error(
           "recursive AMR level transport halves do not match the level source halves");
+    }
+    for (const std::uint64_t pending : m_source_interval.pending_interface_sync) {
+      if (pending > 1U) {
+        throw std::logic_error(
+            "recursive AMR coarse/fine interface split left open at interval close (faces integrated for dt/2 only)");
+      }
     }
     m_last_shadow_report = m_source_interval.shadow;
     updateGlobalChemistryControl(
@@ -2986,7 +3077,7 @@ class SourceRuntimeImpl final : public SourceRuntime {
             record,
             event_interval_begin_code,
             event_interval_end_code,
-            context.integrator_state.step_index);
+            level_selection.has_value() ? level_selection->phase_tag : context.integrator_state.step_index);
         const double birth_mass = state.star_particles.birth_mass_code[s];
         const double birth_msun = birth_mass / msun_code;
         const double age_b = std::max(state.star_particles.stellar_age_years_last[s], 0.0);
@@ -3660,50 +3751,105 @@ class SourceRuntimeImpl final : public SourceRuntime {
     }
   }
 
-  // T02 multirate face clock. Every diffusion/SGS face (local or rank
-  // crossing) is integrated on exactly ONE AMR level clock: the finer of its
-  // two leaf cells, clock(f) = max(level(a), level(b)). A same-level face
-  // advances with its level; a coarse/fine face advances with the fine
-  // level's substeps, so over one coarse interval it is integrated for
-  // sum_k dt_fine,k = dt_coarse exactly, applying each equal-and-opposite
-  // transfer to both owners immediately. No coarse/fine flux mismatch can
-  // arise (one clock owns the face), so no reflux register is required for
-  // these parabolic operators; conservation is exact to round-off. Both
-  // owners of a remote face evaluate the same symmetric max(), so the
-  // distributed claim/authority handshake stays one-to-one.
+  // T02 causal multilevel face ownership (patch 51; replaces the patch-50
+  // finest-leaf clock, which read a coarse neighbour that had already
+  // completed its interval while the fine side was at a substep start).
+  //
+  // Owner of a two-sided face f between leaves a and b:
+  //   owner level L(f) = min(level(a), level(b))  (the COARSER side).
+  // Integration of f over one level-L interval [t_b, t_e] (dt = t_e - t_b):
+  //   * same-level face (level(a) == level(b) == L): dt/2 in the level-L
+  //     pre half at t_b and dt/2 in the level-L post half at t_e (both
+  //     sides advance in the same level sweep, so they are contemporaneous);
+  //   * coarse/fine face (max level > L): dt/2 in the level-L pre half at
+  //     t_b (every finer level is still synchronized with L at t_b; the
+  //     transfer precedes the level-L history-start capture, so finer
+  //     children interpolate from an already-updated coarse boundary) and
+  //     dt/2 in executeAmrLevelInterfaceSynchronization at t_e (after every
+  //     child substep, the complete hydro reflux and the retirement of the
+  //     level-L history, when all levels >= L are synchronized at t_e).
+  // Hence each face is integrated on both of its sides for exactly the same
+  // physical interval [t_b, t_e], with states read at the same physical
+  // instant on both sides (equal/opposite transfers applied immediately: no
+  // flux register or coarse/fine mismatch exists), in a palindromic
+  // S(dt/2) [subtree advance] S(dt/2) split around the level-L subtree.
+  // Never applied in the post half or in any finer-level half, so no face is
+  // integrated twice. Remote faces use the same symmetric min/max on both
+  // owners, so the distributed claim/authority handshake stays one-to-one.
+  // One-sided (open/reflective) faces belong to their single cell's level.
+  struct LevelFaceSelection {
+    std::int32_t level = 0;
+    bool same_level = true;   // faces with min == max == level
+    bool coarse_fine = false; // faces with min == level < max
+    std::uint64_t phase_tag = 0U;  // exchange identity of this phase
+  };
+  struct LevelFaceSelectionCount {
+    std::uint64_t same_level = 0U;
+    std::uint64_t coarse_fine = 0U;
+  };
+
   [[nodiscard]] static std::int32_t leafLevelOfRow(const core::SimulationState& state, std::uint32_t row) {
     if (row >= state.cells.patch_index.size()) return 0;
     const std::uint32_t patch = state.cells.patch_index[row];
     return patch < state.patches.level.size() ? state.patches.level[patch] : 0;
   }
 
-  void restrictDiffusionFacesToClockLevel(
+  [[nodiscard]] static std::uint64_t levelPhaseTag(std::uint64_t step_index, int level, double time_begin_code,
+                                                   std::uint32_t phase) noexcept {
+    std::uint64_t bits = 0U;
+    static_assert(sizeof(bits) == sizeof(time_begin_code));
+    std::memcpy(&bits, &time_begin_code, sizeof(bits));
+    std::uint64_t h = 1469598103934665603ULL;
+    const auto mix = [&h](std::uint64_t v) { h ^= v; h *= 1099511628211ULL; };
+    mix(step_index);
+    mix(static_cast<std::uint64_t>(static_cast<std::uint32_t>(level)));
+    mix(bits);
+    mix(phase);
+    return h == 0U ? 1U : h;
+  }
+
+  LevelFaceSelectionCount restrictDiffusionFacesToLevelSelection(
       const core::SimulationState& state,
       std::vector<physics::MetalDiffusionFace>& faces,
       std::vector<internal::RemoteDiffusionFace>& remote_faces,
-      std::int32_t clock_level) const {
-    const auto local_clock = [&](const physics::MetalDiffusionFace& face) {
-      const std::int32_t left = leafLevelOfRow(state, face.left_cell);
-      const bool two_sided = face.boundary_kind == physics::MetalDiffusionBoundaryKind::kInternal ||
-          face.boundary_kind == physics::MetalDiffusionBoundaryKind::kPeriodic;
-      return two_sided ? std::max(left, leafLevelOfRow(state, face.right_cell)) : left;
+      const LevelFaceSelection& selection) {
+    LevelFaceSelectionCount count;
+    const auto keep = [&](std::int32_t lo, std::int32_t hi) {
+      if (lo != selection.level) return false;
+      if (hi == lo) {
+        if (selection.same_level) ++count.same_level;
+        return selection.same_level;
+      }
+      if (selection.coarse_fine) ++count.coarse_fine;
+      return selection.coarse_fine;
     };
     faces.erase(std::remove_if(faces.begin(), faces.end(),
-                               [&](const physics::MetalDiffusionFace& f) { return local_clock(f) != clock_level; }),
+                               [&](const physics::MetalDiffusionFace& face) {
+                                 const std::int32_t left = leafLevelOfRow(state, face.left_cell);
+                                 const bool two_sided =
+                                     face.boundary_kind == physics::MetalDiffusionBoundaryKind::kInternal ||
+                                     face.boundary_kind == physics::MetalDiffusionBoundaryKind::kPeriodic;
+                                 const std::int32_t right = two_sided ? leafLevelOfRow(state, face.right_cell) : left;
+                                 return !keep(std::min(left, right), std::max(left, right));
+                               }),
                 faces.end());
     remote_faces.erase(
         std::remove_if(remote_faces.begin(), remote_faces.end(),
                        [&](const internal::RemoteDiffusionFace& f) {
-                         return std::max(leafLevelOfRow(state, f.local_row), f.remote_level) != clock_level;
+                         const std::int32_t local = leafLevelOfRow(state, f.local_row);
+                         return !keep(std::min(local, f.remote_level), std::max(local, f.remote_level));
                        }),
         remote_faces.end());
+    m_last_level_face_selection = count;
+    return count;
   }
 
   void executeDiffusionAndSgsShear(
       core::StepContext& context,
       double source_evaluation_scale_factor,
       double source_dt_code,
-      std::optional<std::int32_t> face_clock_level = std::nullopt) {
+      std::optional<LevelFaceSelection> level_selection = std::nullopt) {
+    m_last_level_face_selection = {};
     const bool diffusion_enabled = m_metal_diffusion.config().enabled;
     // Configuration is rank-uniform. Do not derive collective participation
     // from local row count/sidecar population (empty ranks must still enter).
@@ -3886,11 +4032,11 @@ class SourceRuntimeImpl final : public SourceRuntime {
 
     m_diffusion_faces = std::move(topology.faces);
     m_diffusion_rho_kappa_code = std::move(topology.strain_magnitude_code);
-    if (face_clock_level.has_value()) {
-      // T02: this dispatch is one AMR level half; only faces owned by this
-      // level clock are integrated (see restrictDiffusionFacesToClockLevel).
-      restrictDiffusionFacesToClockLevel(context.state, m_diffusion_faces, topology.remote_faces,
-                                         *face_clock_level);
+    if (level_selection.has_value()) {
+      // T02: this dispatch is one AMR level phase; only the faces owned by
+      // this level and phase are integrated (restrictDiffusionFacesToLevelSelection).
+      (void)restrictDiffusionFacesToLevelSelection(context.state, m_diffusion_faces, topology.remote_faces,
+                                                   *level_selection);
     }
     if (m_memory_governor != nullptr) {
       m_diffusion_faces_reservation.release();
@@ -3915,7 +4061,8 @@ class SourceRuntimeImpl final : public SourceRuntime {
       if (distributed) {
         internal::DistributedElementDiffusionCoupling topology_agreement(
             m_mpi_context, m_memory_governor, context.state,
-            topology.remote_faces, m_diffusion_rho_kappa_code, 0U);
+            topology.remote_faces, m_diffusion_rho_kappa_code, 0U,
+            level_selection.has_value() ? level_selection->phase_tag : 0U);
         topology_agreement.setup();
       }
       const internal::MpiStageCollectiveDecision decision(m_mpi_context);
@@ -4089,7 +4236,8 @@ class SourceRuntimeImpl final : public SourceRuntime {
           std::optional<internal::DistributedElementDiffusionCoupling> coupling;
           if (distributed) {
             coupling.emplace(m_mpi_context, m_memory_governor, context.state, topology.remote_faces,
-                             m_diffusion_rho_kappa_code, sidecar.laneCount());
+                             m_diffusion_rho_kappa_code, sidecar.laneCount(),
+                             level_selection.has_value() ? level_selection->phase_tag : 0U);
             coupling->setup();
           }
           element_report = physics::advanceElementResolvedDiffusion(
@@ -4331,6 +4479,9 @@ class SourceRuntimeImpl final : public SourceRuntime {
   core::MemoryReservation m_contiguous_cell_batch_reservation;
   core::MemoryReservation m_diffusion_phase_reservation;
   core::MemoryReservation m_diffusion_faces_reservation;
+  // Face counts selected by the last level-phase transport dispatch (local;
+  // used for the coarse/fine pre/sync pairing check).
+  LevelFaceSelectionCount m_last_level_face_selection{};
   std::uint32_t m_world_rank = 0;
   core::CoordinateFrame m_coordinate_frame = core::CoordinateFrame::kComoving;
   core::BoundaryCondition m_hydro_boundary = core::BoundaryCondition::kOpen;

@@ -3671,6 +3671,22 @@ ProductionAmrHydroDiagnostics advanceProductionAmrHydroRecursiveImpl(
     if (distributed) hooks->retireLevel(level);
     reduce(level_failure, "recursive AMR level reflux");
     intervals[static_cast<std::size_t>(level)].valid = false;
+    // T02 (patch 51): level L and all finer levels are synchronized at t_end
+    // only here (after every child substep, the complete reflux and the
+    // retirement of the level-L history). Coarse/fine interface source
+    // operators owned by level L close their palindromic split now; every
+    // rank enters (has_finer is rank-uniform: `levels` is global).
+    if (options.recursive_level_source_operator != nullptr) {
+      level_failure = nullptr;
+      try {
+        options.recursive_level_source_operator->apply(
+            state, rows_by_level[i], update, level,
+            RecursiveAmrSourcePhase::kPostChildrenSynchronization);
+      } catch (...) {
+        level_failure = std::current_exception();
+      }
+      reduce(level_failure, "recursive AMR level post-children interface synchronization");
+    }
   };
   hydro::HydroUpdateContext root = coarse_update;
   if (!(root.time_end_code > root.time_begin_code)) {

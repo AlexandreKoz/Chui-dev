@@ -169,6 +169,10 @@ class RecursiveSourceOperatorProbe final : public amr::RecursiveAmrLevelSourceOp
   std::array<std::uint32_t, 4> post_by_level{};
   std::array<std::uint64_t, 4> rows_by_level{};
   std::array<double, 4> open_begin_by_level{-1.0, -1.0, -1.0, -1.0};
+  // Patch 51: post-children synchronization of levels that have children,
+  // after their post half (closed interval) and at the same level interval.
+  std::array<std::uint32_t, 4> sync_by_level{};
+  std::array<double, 4> last_closed_begin_by_level{-1.0, -1.0, -1.0, -1.0};
 
   void apply(core::SimulationState&, std::span<const std::uint32_t> rows,
              const hy::HydroUpdateContext& update, int level,
@@ -181,10 +185,16 @@ class RecursiveSourceOperatorProbe final : public amr::RecursiveAmrLevelSourceOp
       open_begin_by_level[l] = update.time_begin_code;
       ++pre_by_level[l];
       rows_by_level[l] += rows.size();
-    } else {
+    } else if (phase == amr::RecursiveAmrSourcePhase::kPostHydroHalf) {
       CHUI_REQUIRE(open_begin_by_level[l] == update.time_begin_code);
       open_begin_by_level[l] = -1.0;
+      last_closed_begin_by_level[l] = update.time_begin_code;
       ++post_by_level[l];
+    } else {
+      CHUI_REQUIRE(phase == amr::RecursiveAmrSourcePhase::kPostChildrenSynchronization);
+      CHUI_REQUIRE(open_begin_by_level[l] < 0.0);
+      CHUI_REQUIRE(last_closed_begin_by_level[l] == update.time_begin_code);
+      ++sync_by_level[l];
     }
   }
 };
@@ -208,6 +218,9 @@ void testRecursiveLevelSourceOperatorFollowsLevelClocks() {
   CHUI_REQUIRE(probe.pre_by_level[0] == 1U && probe.post_by_level[0] == 1U);
   CHUI_REQUIRE(probe.pre_by_level[1] == 2U && probe.post_by_level[1] == 2U);
   CHUI_REQUIRE(probe.pre_by_level[2] == 4U && probe.post_by_level[2] == 4U);
+  // Levels with children synchronize once per level interval; the finest
+  // level never does.
+  CHUI_REQUIRE(probe.sync_by_level[0] == 1U && probe.sync_by_level[1] == 2U && probe.sync_by_level[2] == 0U);
   CHUI_REQUIRE(probe.rows_by_level[0] > 0U);
   CHUI_REQUIRE(probe.rows_by_level[1] > 0U);
   CHUI_REQUIRE(probe.rows_by_level[2] > 0U);
