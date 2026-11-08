@@ -687,3 +687,25 @@ bitwise.
   interval (post half) instead of being reachable in both halves; runs from
   patch 48 are not bit-comparable (patch 48 could not have produced a valid
   run in any case — see `docs/repair/chui_source_implementation_closure.md`).
+
+## Patch 50 (2026-11-08) — compatibility notes (static source only, NOT RUN)
+
+* V02 controller sidecar `chui_v02_joint_error_resource_control_v1` (schema 1)
+  gains the additive keys `last_shadow_ion_error` and
+  `last_shadow_ion_samples` (C02 ladder shadow disagreement). Absent keys load
+  as 0, so patch-49 checkpoints restart unchanged; patch-50 files carry two
+  extra lines that older readers ignore (key search, no positional parse). The
+  promotion bias now responds to max(light-species, ladder) disagreement:
+  reproducibility impact only for runs with metal-ion ladders and shadow
+  sampling.
+* Distributed composition wire schema 2 (P0-49-01) is a transient MPI
+  protocol, not restart state; no checkpoint field changes. Migration and
+  restart already carry variable-width composition rows bound to the layout
+  signature.
+* `SourceLedger` gained diagnostic fields (`metal_ion_potential_delta_erg`,
+  `metal_ion_co_transfer_nuclei`, `metal_ion_normalization_residual`,
+  `metal_ion_inventory_residual`); ledgers are diagnostics/profiling payloads,
+  not restart truth. The step rollback checkpoint copies them by value.
+* Reproducibility impact (T02): under `amr_time_stepping = recursive_subcycling`
+  element diffusion and SGS shear now integrate on AMR level clocks instead of
+  the coarse halves, so recursive runs are not bit-comparable with patch 49.

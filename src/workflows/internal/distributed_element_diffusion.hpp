@@ -32,6 +32,10 @@
 // decompositions); bitwise identity across decompositions is NOT claimed.
 // Units: faces and conductances are physical (scaled by a) exactly as in the
 // single-rank operator; dt is the accepted code interval.
+// Wire (P0-49-01): interface lane state and deltas are exchanged as chunked
+// schema-2 parallel::CompositionLaneChunkRecord streams bound to the layout
+// signature, so every constructible layout (ion-rich C/O/Si/Fe, dust, SGS;
+// <= parallel::k_max_composition_layout_lanes) is supported.
 // Memory: exchange records and lookup tables are admitted through the
 // MemoryGovernor (owner "sources.element_diffusion.remote") before
 // allocation; refusal is a collective failure before any mutation.
@@ -138,6 +142,9 @@ class DistributedElementDiffusionCoupling final : public physics::ElementDiffusi
   std::vector<std::pair<std::uint64_t, std::uint32_t>> m_dependent_rows;
   core::MemoryReservation m_reservation;
   std::uint64_t m_admitted_bytes = 0U;
+  // Per-coupling collective subcycle counter bound into every chunked lane
+  // record (stale/foreign records are refused on reassembly).
+  std::uint64_t m_exchange_sequence = 0U;
   bool m_setup_done = false;
 };
 

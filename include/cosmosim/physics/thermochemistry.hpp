@@ -157,6 +157,18 @@ class ThermochemistrySolver {
     return m_metal_ion_solver.get();
   }
   [[nodiscard]] double totalElectronDensity(const ThermochemistryCellInput& input, const NetworkState& n) const;
+  // P1-49-02: the ONE authoritative local radiation context of the C02
+  // ladder at state (input, n, T): temperature, coupled total electron
+  // density (light network + metal ions), redshift and the photo-rate
+  // attenuation (MetalIonPhotoAttenuationModel; same local factor as the
+  // light-network photo rates in environment()). Used by the ion
+  // equilibrium initializer, both ion half-steps and coolingHeating().
+  [[nodiscard]] MetalIonEnvironment metalIonEnvironment(const ThermochemistryCellInput& input,
+                                                        const NetworkState& n, double temperature_k) const;
+  // True when the carbon ladder owns C ionization (stored potential and
+  // electrons); the NL97 kCII lane is then the atomic-carbon (non-CO)
+  // reservoir of the light network only (P1-49-03/-06).
+  [[nodiscard]] bool carbonIonizationOwnedByLadder() const noexcept;
 
  private:
   ThermochemistryConfig m_config;

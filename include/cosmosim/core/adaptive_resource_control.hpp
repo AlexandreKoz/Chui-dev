@@ -25,6 +25,10 @@ struct V02ControlState {
   double chemistry_promotion_bias = 0.0;
   double last_shadow_species_error = 0.0;
   std::uint64_t last_shadow_samples = 0U;
+  // P1-49-07 (additive keys, schema 1 compatible: absent -> 0): global max
+  // sampled C02 ladder disagreement (stage fraction / ion electrons).
+  double last_shadow_ion_error = 0.0;
+  std::uint64_t last_shadow_ion_samples = 0U;
   std::uint64_t chemistry_detailed_rows = 0U;
   std::uint64_t chemistry_total_rows = 0U;
   std::uint64_t chemistry_promoted_last_interval = 0U;
@@ -108,6 +112,8 @@ namespace adaptive_resource_control_detail {
   result.chemistry_promotion_bias = real(text, "chemistry_promotion_bias", 0.0);
   result.last_shadow_species_error = real(text, "last_shadow_species_error", 0.0);
   result.last_shadow_samples = u64(text, "last_shadow_samples", 0U);
+  result.last_shadow_ion_error = real(text, "last_shadow_ion_error", 0.0);
+  result.last_shadow_ion_samples = u64(text, "last_shadow_ion_samples", 0U);
   result.chemistry_detailed_rows = u64(text, "chemistry_detailed_rows", 0U);
   result.chemistry_total_rows = u64(text, "chemistry_total_rows", 0U);
   result.chemistry_promoted_last_interval =
@@ -121,6 +127,7 @@ namespace adaptive_resource_control_detail {
   result.optional_benefit_floor = real(text, "optional_benefit_floor", 1.0);
   if (result.chemistry_promotion_bias < 0.0 ||
       result.last_shadow_species_error < 0.0 ||
+      result.last_shadow_ion_error < 0.0 ||
       result.optional_benefit_floor < 1.0 ||
       result.chemistry_detailed_rows > result.chemistry_total_rows ||
       result.optional_amr_admitted > result.optional_amr_requests) {
@@ -135,6 +142,8 @@ inline void storeV02ControlState(
       control.chemistry_promotion_bias < 0.0 ||
       !std::isfinite(control.last_shadow_species_error) ||
       control.last_shadow_species_error < 0.0 ||
+      !std::isfinite(control.last_shadow_ion_error) ||
+      control.last_shadow_ion_error < 0.0 ||
       !std::isfinite(control.optional_benefit_floor) ||
       control.optional_benefit_floor < 1.0 ||
       control.chemistry_detailed_rows > control.chemistry_total_rows ||
@@ -148,6 +157,8 @@ inline void storeV02ControlState(
        << "chemistry_promotion_bias=" << control.chemistry_promotion_bias << '\n'
        << "last_shadow_species_error=" << control.last_shadow_species_error << '\n'
        << "last_shadow_samples=" << control.last_shadow_samples << '\n'
+       << "last_shadow_ion_error=" << control.last_shadow_ion_error << '\n'
+       << "last_shadow_ion_samples=" << control.last_shadow_ion_samples << '\n'
        << "chemistry_detailed_rows=" << control.chemistry_detailed_rows << '\n'
        << "chemistry_total_rows=" << control.chemistry_total_rows << '\n'
        << "chemistry_promoted_last_interval="

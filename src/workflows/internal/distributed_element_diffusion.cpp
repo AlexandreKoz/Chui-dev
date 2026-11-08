@@ -17,8 +17,6 @@
 namespace cosmosim::workflows::internal {
 namespace {
 
-constexpr std::size_t k_lanes = parallel::k_max_composition_lanes;
-
 struct ClaimRecord {
   DistributedElementDiffusionCoupling::FaceKey key{};
   std::int32_t other_rank = 0;
@@ -33,25 +31,8 @@ struct ConductanceRecord {
   double conductance = 0.0;
 };
 
-struct StateRecord {
-  std::uint64_t gas_cell_id = 0U;
-  std::int32_t source_rank = 0;
-  std::uint32_t lane_count = 0U;
-  double gas_mass = 0.0;
-  std::array<double, k_lanes> values{};
-};
-
-struct DeltaRecord {
-  std::uint64_t gas_cell_id = 0U;
-  std::int32_t source_rank = 0;
-  std::uint32_t lane_count = 0U;
-  std::array<double, k_lanes> delta{};
-};
-
 static_assert(std::is_trivially_copyable_v<ClaimRecord>);
 static_assert(std::is_trivially_copyable_v<ConductanceRecord>);
-static_assert(std::is_trivially_copyable_v<StateRecord>);
-static_assert(std::is_trivially_copyable_v<DeltaRecord>);
 
 // Identical expression to physics::conductance (harmonic mean of rho*kappa
 // times area / centre distance).
@@ -169,6 +150,7 @@ RemoteDiffusionCellGather gatherRemoteDiffusionCells(
       }
       out.velocity_peculiar = {cell.velocity_x_peculiar, cell.velocity_y_peculiar, cell.velocity_z_peculiar};
       const double volume_factor = scale_factor * scale_factor * scale_factor;
+      out.level = static_cast<std::int32_t>(patch.level);
       out.density_physical_code = cell.density_code > 0.0
           ? cell.density_code / volume_factor
           : 0.0;
@@ -253,18 +235,22 @@ void DistributedElementDiffusionCoupling::setup() {
   std::vector<int> claim_destinations;
   std::exception_ptr failure;
   try {
-    if (m_lane_upper_bound > k_lanes) {
-      throw std::runtime_error("distributed element diffusion supports at most " + std::to_string(k_lanes) +
-                               " composition lanes per exchange record");
-    }
+    // P0-49-01: lane vectors travel as chunked schema-2 records, so every
+    // constructible layout (ion-rich C/O/Si/Fe + dust + SGS) is admitted;
+    // only a layout above the static bound is refused (impossible by
+    // CompositionLayout::make).
+    const std::size_t chunks_per_row = parallel::compositionLaneChunkCount(m_lane_upper_bound);
     // Admission: tables + one subcycle's state/delta send+receive buffers.
     const std::uint64_t n = m_faces.size();
     std::uint64_t bytes = saturatingMul(n, sizeof(AuthorityFace) + sizeof(DependentFace) +
                                                2U * sizeof(ClaimRecord) + 2U * sizeof(ConductanceRecord) +
                                                sizeof(std::pair<std::uint32_t, int>) +
                                                sizeof(std::pair<std::uint64_t, std::uint32_t>));
-    bytes = saturatingAdd(bytes, saturatingMul(n, 2U * sizeof(StateRecord) + 2U * sizeof(DeltaRecord) +
-                                                       sizeof(int)));
+    // Per subcycle at most one state and one delta lane vector per face on
+    // each side (chunked), plus the reassembled flat lanes.
+    bytes = saturatingAdd(bytes, saturatingMul(2U, parallel::compositionLaneExchangeAdmissionBytes(
+                                                       n, m_lane_upper_bound)));
+    (void)chunks_per_row;
     if (m_governor != nullptr && bytes != 0U) {
       m_reservation = m_governor->reserve(core::MemoryClass::kPhaseResident, bytes,
                                           "sources.element_diffusion.remote");
@@ -396,50 +382,63 @@ void DistributedElementDiffusionCoupling::addRemoteFaceTransfers(
   const int rank = m_mpi.worldRank();
   const std::size_t rows = gas_mass.size();
   std::exception_ptr failure;
-  std::vector<StateRecord> states;
+  // Collective sequence: every rank calls this once per subcycle.
+  const std::uint64_t sequence = ++m_exchange_sequence;
+  const auto identity = [&](parallel::CompositionLaneStream stream) {
+    return parallel::CompositionLaneStreamIdentity{
+        .stream = stream,
+        .layout_signature = m_state.gas_composition.enabled() ? m_state.gas_composition.descriptor().layout_signature
+                                                              : 0U,
+        .lane_count = static_cast<std::uint32_t>(lane_count),
+        .exchange_sequence = sequence};
+  };
+  std::vector<parallel::CompositionLaneChunkRecord> states;
   std::vector<int> state_destinations;
   try {
-    if (lane_count > k_lanes || values.size() != lane_count * rows || delta.size() != lane_count * rows) {
+    if (lane_count > m_lane_upper_bound || values.size() != lane_count * rows || delta.size() != lane_count * rows) {
       throw std::invalid_argument("distributed diffusion transfer: inconsistent lane/row extents");
     }
-    states.reserve(m_exports.size());
+    const auto state_identity = identity(parallel::CompositionLaneStream::kDiffusionState);
+    std::array<double, parallel::k_max_composition_layout_lanes> lane_values{};
+    states.reserve(m_exports.size() * parallel::compositionLaneChunkCount(lane_count));
     for (const auto& [row, dest] : m_exports) {
-      StateRecord s;
-      s.gas_cell_id = m_state.gas_cells.gas_cell_id[row];
-      s.source_rank = rank;
-      s.lane_count = static_cast<std::uint32_t>(lane_count);
-      s.gas_mass = gas_mass[row];
-      for (std::size_t k = 0; k < lane_count; ++k) s.values[k] = values[k * rows + row];
-      states.push_back(s);
-      state_destinations.push_back(dest);
+      for (std::size_t k = 0; k < lane_count; ++k) lane_values[k] = values[k * rows + row];
+      parallel::appendCompositionLaneChunks(state_identity, m_state.gas_cells.gas_cell_id[row], rank, dest,
+                                            gas_mass[row], std::span<const double>(lane_values.data(), lane_count),
+                                            states, state_destinations);
     }
   } catch (...) {
     failure = std::current_exception();
   }
   reduceFailure(failure, "distributed diffusion state export");
-  std::vector<StateRecord> remote_states = exchangeRecords(m_mpi, states, state_destinations);
+  const auto state_chunks = parallel::exchangeCompositionLaneChunks(
+      m_mpi, states, state_destinations, sequence, m_governor, "sources.element_diffusion.state_exchange");
+  states.clear();
 
-  std::vector<DeltaRecord> deltas;
+  std::vector<parallel::CompositionLaneChunkRecord> delta_chunks_out;
   std::vector<int> delta_destinations;
   try {
-    std::sort(remote_states.begin(), remote_states.end(), [](const StateRecord& l, const StateRecord& r) {
-      return l.gas_cell_id != r.gas_cell_id ? l.gas_cell_id < r.gas_cell_id : l.source_rank < r.source_rank;
-    });
-    const auto find_state = [&remote_states](std::uint64_t id) -> const StateRecord& {
-      const auto it = std::lower_bound(remote_states.begin(), remote_states.end(), id,
-                                       [](const StateRecord& s, std::uint64_t v) { return s.gas_cell_id < v; });
-      if (it == remote_states.end() || it->gas_cell_id != id) {
+    const parallel::AssembledCompositionLanes remote_states = parallel::assembleCompositionLaneChunks(
+        state_chunks, identity(parallel::CompositionLaneStream::kDiffusionState), rank);
+    const auto find_state = [&remote_states](std::uint64_t id) -> std::size_t {
+      const auto it = std::lower_bound(remote_states.gas_cell_id.begin(), remote_states.gas_cell_id.end(), id);
+      if (it == remote_states.gas_cell_id.end() || *it != id) {
         throw std::runtime_error("distributed diffusion: authority face has no fresh remote state (fail closed)");
       }
-      return *it;
+      return static_cast<std::size_t>(it - remote_states.gas_cell_id.begin());
     };
-    // One outbound transfer record per (other cell, other rank), summed in
+    // One outbound transfer vector per (other cell, other rank), summed in
     // authority-face key order (deterministic for a given decomposition).
-    std::vector<std::pair<std::uint64_t, std::size_t>> slot;  // other id -> deltas index
+    std::vector<std::pair<std::uint64_t, std::size_t>> slot;  // other id -> outbound index
+    std::vector<std::uint64_t> out_id;
+    std::vector<int> out_rank;
+    std::vector<double> out_delta;  // flat, lane_count per outbound entry
     for (const AuthorityFace& a : m_authority) {
       if (!(a.conductance > 0.0)) continue;
-      const StateRecord& other = find_state(a.key.other_id);
-      if (other.lane_count != lane_count || !(other.gas_mass > 0.0) || !(gas_mass[a.local_row] > 0.0)) {
+      const std::size_t other = find_state(a.key.other_id);
+      const double other_gas_mass = remote_states.scalar[other];
+      const auto other_values = remote_states.lanesOf(other);
+      if (!(other_gas_mass > 0.0) || !(gas_mass[a.local_row] > 0.0)) {
         throw std::runtime_error("distributed diffusion: interface cell without composition gas mass");
       }
       auto it = std::lower_bound(slot.begin(), slot.end(), std::make_pair(a.key.other_id, std::size_t{0}));
@@ -447,42 +446,47 @@ void DistributedElementDiffusionCoupling::addRemoteFaceTransfers(
       if (it != slot.end() && it->first == a.key.other_id) {
         index = it->second;
       } else {
-        index = deltas.size();
-        DeltaRecord rec;
-        rec.gas_cell_id = a.key.other_id;
-        rec.source_rank = rank;
-        rec.lane_count = static_cast<std::uint32_t>(lane_count);
-        deltas.push_back(rec);
-        delta_destinations.push_back(a.other_rank);
+        index = out_id.size();
+        out_id.push_back(a.key.other_id);
+        out_rank.push_back(a.other_rank);
+        out_delta.resize(out_delta.size() + lane_count, 0.0);
         slot.insert(it, std::make_pair(a.key.other_id, index));
       }
       const std::size_t row = a.local_row;
       for (std::size_t k = 0; k < lane_count; ++k) {
         // Same expression as the local face loop (a = authority, b = other).
         const double x_a = values[k * rows + row] / gas_mass[row];
-        const double x_b = other.values[k] / other.gas_mass;
+        const double x_b = other_values[k] / other_gas_mass;
         const double transfer = dt_sub * a.conductance * (x_a - x_b);
         delta[k * rows + row] -= transfer;
-        deltas[index].delta[k] += transfer;
+        out_delta[index * lane_count + k] += transfer;
       }
+    }
+    const auto delta_identity = identity(parallel::CompositionLaneStream::kDiffusionDelta);
+    for (std::size_t i = 0; i < out_id.size(); ++i) {
+      parallel::appendCompositionLaneChunks(
+          delta_identity, out_id[i], rank, out_rank[i], 0.0,
+          std::span<const double>(out_delta.data() + i * lane_count, lane_count), delta_chunks_out,
+          delta_destinations);
     }
   } catch (...) {
     failure = std::current_exception();
   }
   reduceFailure(failure, "distributed diffusion authority transfers");
-  std::vector<DeltaRecord> imported = exchangeRecords(m_mpi, deltas, delta_destinations);
+  const auto imported_chunks = parallel::exchangeCompositionLaneChunks(
+      m_mpi, delta_chunks_out, delta_destinations, sequence, m_governor, "sources.element_diffusion.delta_exchange");
   try {
-    std::sort(imported.begin(), imported.end(), [](const DeltaRecord& l, const DeltaRecord& r) {
-      return l.gas_cell_id != r.gas_cell_id ? l.gas_cell_id < r.gas_cell_id : l.source_rank < r.source_rank;
-    });
-    for (const DeltaRecord& d : imported) {
+    const parallel::AssembledCompositionLanes imported = parallel::assembleCompositionLaneChunks(
+        imported_chunks, identity(parallel::CompositionLaneStream::kDiffusionDelta), rank);
+    for (std::size_t i = 0; i < imported.size(); ++i) {
       const auto it = std::lower_bound(m_dependent_rows.begin(), m_dependent_rows.end(),
-                                       std::make_pair(d.gas_cell_id, std::uint32_t{0}));
-      if (it == m_dependent_rows.end() || it->first != d.gas_cell_id || d.lane_count != lane_count) {
+                                       std::make_pair(imported.gas_cell_id[i], std::uint32_t{0}));
+      if (it == m_dependent_rows.end() || it->first != imported.gas_cell_id[i]) {
         throw std::runtime_error("distributed diffusion: imported transfer for an unknown interface row");
       }
       const std::size_t row = it->second;
-      for (std::size_t k = 0; k < lane_count; ++k) delta[k * rows + row] += d.delta[k];
+      const auto d = imported.lanesOf(i);
+      for (std::size_t k = 0; k < lane_count; ++k) delta[k * rows + row] += d[k];
     }
   } catch (...) {
     failure = std::current_exception();

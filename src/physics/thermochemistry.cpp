@@ -59,7 +59,12 @@ bool luSolve(Mat a, Vec& b, std::size_t m) {
 }
 
 // Chemical potential energy of a state relative to neutral atoms [erg cm^-3].
-[[nodiscard]] double bindingEnergyDensity(const NetworkState& n, std::size_t species_count) {
+// With the C02 carbon ladder active the C ionization potential belongs to
+// the ladder ledger (metal_ion_potential_delta_erg): the kCII lane is then
+// the atomic (non-CO) carbon reservoir, not the C+ population, and its
+// 11.26 eV term is excluded here so carbon ionization is counted once.
+[[nodiscard]] double bindingEnergyDensity(const NetworkState& n, std::size_t species_count,
+                                          bool carbon_ionization_owned_by_ladder) {
   double e = 0.0;
   e += 13.598 * k_ev * n[idx(S::kHII)];
   if (species_count > idx(S::kHm)) e -= 0.754 * k_ev * n[idx(S::kHm)];
@@ -67,7 +72,7 @@ bool luSolve(Mat a, Vec& b, std::size_t m) {
   if (species_count > idx(S::kH2p)) e += (13.598 - 2.651) * k_ev * n[idx(S::kH2p)];
   e += 24.587 * k_ev * n[idx(S::kHeII)];
   e += (24.587 + 54.418) * k_ev * n[idx(S::kHeIII)];
-  if (species_count > idx(S::kCII)) e += 11.260 * k_ev * n[idx(S::kCII)];
+  if (species_count > idx(S::kCII) && !carbon_ionization_owned_by_ladder) e += 11.260 * k_ev * n[idx(S::kCII)];
   if (species_count > idx(S::kCO)) e -= 11.09 * k_ev * n[idx(S::kCO)];
   return e;
 }
@@ -146,6 +151,29 @@ ThermochemistrySolver::ThermochemistrySolver(ThermochemistryConfig config) : m_c
           "' declares verification = unverified; set physics.thermochemistry_allow_unqualified_rates = true to "
           "run it as an explicitly unqualified research model");
     }
+    for (std::size_t e = 0; e < k_metal_ion_element_count; ++e) {
+      const auto element = static_cast<MetalIonElement>(e);
+      if (!m_config.metal_ion_elements.contains(element)) continue;
+      // P1-49-06: the ion energy ledger needs the dataset's energy
+      // convention and every ionization potential; never zero-filled.
+      if (!m_config.metal_ion_table->hasIonizationEnergyContract(element)) {
+        throw SourceModelUnavailableError(
+            "metal-ion rate dataset '" + m_config.metal_ion_table->sourceLabel() + "' lacks the energy contract for " +
+            std::string(metalIonElementSymbol(element)) +
+            " (energy_convention collisional_ionization_work_in_cooling and ionization_potential lines for every "
+            "ionizable stage); the C02 ionization-energy ledger cannot be closed, refusing the configuration");
+      }
+      // P1-49-02: the ladder's photo rates must see the same radiation field
+      // as the light network. Dataset photo rates without a configured UVB
+      // would photoionize metals while H/He see no radiation.
+      if (m_config.metal_ion_table->hasPhotoRates(element) && m_config.uv_background == nullptr) {
+        throw SourceModelUnavailableError(
+            "metal-ion dataset '" + m_config.metal_ion_table->sourceLabel() + "' carries photo rates for " +
+            std::string(metalIonElementSymbol(element)) +
+            " but no UV background is configured for the light network; the local radiation context would be "
+            "incoherent (configure the UVB table or supply a collisional-only dataset)");
+      }
+    }
     m_metal_ion_solver = std::make_shared<const MetalIonLadderSolver>(
         *m_config.metal_ion_table,
         m_config.metal_table_range == MetalTableRangePolicy::kReject ? MetalIonRangePolicy::kReject
@@ -159,6 +187,29 @@ double ThermochemistrySolver::totalElectronDensity(const ThermochemistryCellInpu
   return std::max(electronDensity(n, std::max<std::size_t>(m_species_count, k_hybrid_species_count)) +
                       input.metal_ion_electron_cm3,
                   0.0);
+}
+
+bool ThermochemistrySolver::carbonIonizationOwnedByLadder() const noexcept {
+  return m_metal_ion_solver != nullptr && m_config.metal_ion_elements.contains(MetalIonElement::kC);
+}
+
+MetalIonEnvironment ThermochemistrySolver::metalIonEnvironment(const ThermochemistryCellInput& input,
+                                                               const NetworkState& n, double temperature_k) const {
+  MetalIonEnvironment ion_env;
+  const RateEnvironment env = environment(input, n, temperature_k);
+  ion_env.temperature_k = env.temperature_k;
+  ion_env.electron_cm3 = totalElectronDensity(input, n);
+  ion_env.redshift = env.redshift;
+  ion_env.photo_attenuation = 1.0;
+  ion_env.attenuation_model = MetalIonPhotoAttenuationModel::kNone;
+  if (m_config.self_shielding && m_config.uv_background != nullptr) {
+    // environment() applied the Rahmati factor to Gamma_HI; recover it as
+    // the ratio so both networks see the identical local factor.
+    const UvBackgroundRates uvb = m_config.uv_background->ratesAtRedshift(input.redshift);
+    ion_env.photo_attenuation = uvb.gamma_hi_s > 0.0 ? std::clamp(env.gamma_hi_s / uvb.gamma_hi_s, 0.0, 1.0) : 1.0;
+    ion_env.attenuation_model = MetalIonPhotoAttenuationModel::kHiSelfShieldingGrey;
+  }
+  return ion_env;
 }
 
 double ThermochemistrySolver::meanMolecularWeight(double mass_density_cgs, double n_particles) noexcept {
@@ -332,15 +383,7 @@ CoolingHeatingTerms ThermochemistrySolver::coolingHeating(const ThermochemistryC
     // Ion-resolved losses L_k(T) at the CURRENT Newton temperature with the
     // operator-split frozen ion distribution; photoheating from the dataset
     // UVB with the same local attenuation as the HI photo-rate.
-    MetalIonEnvironment ion_env;
-    ion_env.temperature_k = env.temperature_k;
-    ion_env.electron_cm3 = n_e;
-    ion_env.redshift = env.redshift;
-    ion_env.photo_attenuation = 1.0;
-    if (m_config.uv_background != nullptr) {
-      const UvBackgroundRates uvb = m_config.uv_background->ratesAtRedshift(input.redshift);
-      ion_env.photo_attenuation = uvb.gamma_hi_s > 0.0 ? std::clamp(env.gamma_hi_s / uvb.gamma_hi_s, 0.0, 1.0) : 1.0;
-    }
+    const MetalIonEnvironment ion_env = metalIonEnvironment(input, n, temperature_k);
     MetalIonAdvanceReport ion_report;
     double ion_heating = 0.0;
     for (std::size_t e = 0; e < k_metal_ion_element_count; ++e) {
@@ -531,7 +574,8 @@ void ThermochemistrySolver::advanceCell(const ThermochemistryCellInput& input, d
     t_begin = gm1 * k_reference_mu_ionized * k_amu_g * u_scale / k_boltzmann_erg_per_k;
   }
   const double binding_begin = network || m_config.backend == ThermochemistryBackend::kEquilibriumPrimordial
-      ? bindingEnergyDensity(n_begin, std::max<std::size_t>(m_species_count, k_hybrid_species_count))
+      ? bindingEnergyDensity(n_begin, std::max<std::size_t>(m_species_count, k_hybrid_species_count),
+                             carbonIonizationOwnedByLadder())
       : 0.0;
 
   // Initial step from the explicit rate scale.
@@ -699,14 +743,19 @@ void ThermochemistrySolver::advanceCell(const ThermochemistryCellInput& input, d
   ledger.heating_gain_erg += heating;
   ledger.chemical_binding_delta_erg +=
       (network || m_config.backend == ThermochemistryBackend::kEquilibriumPrimordial)
-          ? bindingEnergyDensity(n_end, stored) - binding_begin
+          ? bindingEnergyDensity(n_end, stored, carbonIonizationOwnedByLadder()) - binding_begin
           : 0.0;
   ledger.floor_injection_erg += floor_injection;
   ledger.thermal_energy_delta_erg += rho * (u_end - u_scale);
   ledger.element_mass_residual_code = std::max(ledger.element_mass_residual_code, projection);
-  double charge = 0.0;
+  // P1-49-04: positive charge from the IDENTICAL inventory that defines
+  // ne_end: light-network species charges plus the metal-ion charge beyond
+  // the NL97 C+ already carried by kCII (input.metal_ion_electron_cm3, held
+  // fixed over this solve by the operator split). A physically correct
+  // metal-ion electron contribution is therefore not a residual.
+  double charge = input.metal_ion_electron_cm3;
   for (std::size_t s = 0; s < stored; ++s) charge += chemicalSpeciesInfo(static_cast<S>(s)).charge * n_end[s];
-  ledger.charge_residual = std::max(ledger.charge_residual, std::abs(charge - ne_end) / n_h);
+  ledger.charge_residual = std::max(ledger.charge_residual, std::abs(std::max(charge, 0.0) - ne_end) / n_h);
   ledger.cells += 1U;
   ledger.accepted_substeps += accepted;
   ledger.rejected_substeps += rejected;

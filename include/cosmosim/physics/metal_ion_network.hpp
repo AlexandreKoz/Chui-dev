@@ -132,6 +132,16 @@ class MetalIonRateTable {
   [[nodiscard]] bool hasPhotoRates(MetalIonElement element) const noexcept {
     return m_has_photo[static_cast<std::size_t>(element)];
   }
+  // True when the dataset declares a supported energy convention and every
+  // ionization potential (stages 0..Z-1) of `element`.
+  [[nodiscard]] bool hasIonizationEnergyContract(MetalIonElement element) const noexcept;
+  [[nodiscard]] const std::string& energyConvention() const noexcept { return m_energy_convention; }
+  // chi_k (k -> k+1) in erg; throws std::out_of_range when absent.
+  [[nodiscard]] double ionizationPotentialErg(MetalIonElement element, std::size_t stage) const;
+  // Stored ionization potential per nucleus for a stage distribution,
+  // sum_k x_k sum_{j<k} chi_j [erg]. Requires hasIonizationEnergyContract.
+  [[nodiscard]] double storedIonizationEnergyPerNucleusErg(MetalIonElement element,
+                                                           std::span<const double> fractions) const;
   [[nodiscard]] double minimumTemperatureK() const noexcept;
   [[nodiscard]] double maximumTemperatureK() const noexcept;
   // Rates of one stage at (T, z). `clamped` is set when T (or z) was outside
@@ -156,17 +166,37 @@ class MetalIonRateTable {
   std::vector<double> m_log_t;
   std::vector<double> m_redshift;
   std::array<bool, k_metal_ion_element_count> m_has_photo{};
+  std::string m_energy_convention;
+  // [element][stage] chi_k in erg; NaN = not supplied.
+  std::vector<double> m_ionization_potential_erg;
   // [element][stage][process]; process 0..2 temperature, 3..4 photo.
   std::vector<Series> m_series;
+};
+
+// Local radiation context of the metal-ion ladder (P1-49-02). The single
+// authority is ThermochemistrySolver::metalIonEnvironment(), used by the
+// equilibrium initializer, both operator-split ion half-steps, and the
+// ion cooling/photoheating terms inside the Newton energy solve.
+enum class MetalIonPhotoAttenuationModel : std::uint8_t {
+  // No attenuation (self_shielding off): dataset UVB rates as tabulated.
+  kNone = 0,
+  // Grey approximation: the local Rahmati (2013) HI self-shielding factor
+  // Gamma_HI,shielded / Gamma_HI,UVB is applied to every metal-ion photo
+  // rate and photoheating rate. This is a stated frequency-independent
+  // approximation (NOT frequency-resolved transfer): ions with thresholds
+  // above 13.6 eV are in reality shielded differently. It is the same factor
+  // the light network applies to its He photo rates.
+  kHiSelfShieldingGrey = 1,
 };
 
 struct MetalIonEnvironment {
   double temperature_k = 1.0e4;
   double electron_cm3 = 0.0;
   double redshift = 0.0;
-  // Multiplicative attenuation of the dataset photo rates (same local
-  // self-shielding factor that the light network applies to HI; 1 = none).
+  // Multiplicative attenuation of the dataset photo rates (1 = none). Set
+  // only through ThermochemistrySolver::metalIonEnvironment().
   double photo_attenuation = 1.0;
+  MetalIonPhotoAttenuationModel attenuation_model = MetalIonPhotoAttenuationModel::kNone;
 };
 
 struct MetalIonAdvanceReport {

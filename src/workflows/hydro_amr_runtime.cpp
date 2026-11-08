@@ -57,6 +57,10 @@
 #include <mpi.h>
 #endif
 
+static_assert(cosmosim::parallel::k_max_composition_layout_lanes >=
+                  cosmosim::physics::k_max_constructible_composition_lane_count,
+              "composition wire chunking must cover every constructible composition layout (P0-49-01)");
+
 namespace cosmosim::workflows {
 namespace {
 
@@ -3333,17 +3337,39 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
       }
     } catch (...) { failure = std::current_exception(); }
     m_mpi_context.rethrowCollectivePreparationFailure(failure, "distributed composition donor requests");
-    const auto inbound_requests = parallel::exchangeCompositionDonorRequests(m_mpi_context, requests, sequence);
-    std::vector<parallel::CompositionDonorFractionRecord> responses;
+    const auto inbound_requests =
+        parallel::exchangeCompositionDonorRequests(m_mpi_context, requests, sequence, m_memory_governor);
+    // P0-49-01: lane vectors travel as chunked schema-2 records bound to the
+    // authoritative layout signature; any layout CompositionLayout::make can
+    // build (up to k_max_composition_layout_lanes) is representable.
+    const auto& comp_descriptor = context.state.gas_composition.descriptor();
+    const auto lane_identity = [&](parallel::CompositionLaneStream stream) {
+      return parallel::CompositionLaneStreamIdentity{
+          .stream = stream,
+          .layout_signature = context.state.gas_composition.enabled() ? comp_descriptor.layout_signature : 0U,
+          .lane_count = static_cast<std::uint32_t>(
+              context.state.gas_composition.enabled() ? context.state.gas_composition.laneCount() : 0U),
+          .exchange_sequence = sequence};
+    };
+    std::vector<parallel::CompositionLaneChunkRecord> responses;
+    std::vector<int> response_destinations;
+    core::MemoryReservation response_reservation;
     try {
       const auto& sidecar = context.state.gas_composition;
       if (!inbound_requests.empty() && !sidecar.enabled()) {
         throw std::runtime_error("distributed composition: donor requested from a rank without composition");
       }
       const std::size_t lanes = sidecar.enabled() ? sidecar.laneCount() : 0U;
-      if (lanes > parallel::k_max_composition_lanes) {
-        throw std::runtime_error("distributed composition: lane count exceeds the wire record capacity");
+      (void)parallel::compositionLaneChunkCount(lanes);  // refuses only an impossible layout
+      if (m_memory_governor != nullptr && !inbound_requests.empty()) {
+        response_reservation = m_memory_governor->reserve(
+            core::MemoryClass::kCommunication,
+            parallel::compositionLaneExchangeAdmissionBytes(inbound_requests.size(), lanes),
+            "hydro.distributed_amr.composition_donor_fractions");
+        response_reservation.commit();
       }
+      const auto identity = lane_identity(parallel::CompositionLaneStream::kDonorFraction);
+      std::vector<double> fraction(lanes, 0.0);
       const auto& d = sidecar.descriptor();
       for (const auto& request : inbound_requests) {
         const auto row = context.state.rowForGasCellId(request.gas_cell_id);
@@ -3356,53 +3382,56 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
         if (!(gas_mass > 0.0)) {
           throw std::runtime_error("distributed composition: requested donor has no composition mass");
         }
-        parallel::CompositionDonorFractionRecord response{
-            .gas_cell_id = request.gas_cell_id, .owner_rank = rank, .requester_rank = request.requester_rank,
-            .lane_count = static_cast<std::uint32_t>(lanes)};
-        for (std::size_t l = 0; l < lanes; ++l) response.fraction[l] = sidecar.value(l, *row) / gas_mass;
-        responses.push_back(response);
+        for (std::size_t l = 0; l < lanes; ++l) fraction[l] = sidecar.value(l, *row) / gas_mass;
+        parallel::appendCompositionLaneChunks(identity, request.gas_cell_id, rank, request.requester_rank,
+                                              gas_mass, fraction, responses, response_destinations);
       }
     } catch (...) { failure = std::current_exception(); }
     m_mpi_context.rethrowCollectivePreparationFailure(failure, "distributed composition donor responses");
-    auto fractions = parallel::exchangeCompositionDonorFractions(m_mpi_context, responses, sequence);
-    std::vector<parallel::CompositionCorrectionRecord> corrections;
+    const auto fraction_chunks = parallel::exchangeCompositionLaneChunks(
+        m_mpi_context, responses, response_destinations, sequence, m_memory_governor,
+        "hydro.distributed_amr.composition_donor_fraction_exchange");
+    responses.clear();
+    responses.shrink_to_fit();
+    std::vector<parallel::CompositionLaneChunkRecord> corrections;
+    std::vector<int> correction_destinations;
     try {
       if (composition_flux != nullptr) {
-        std::sort(fractions.begin(), fractions.end(),
-                  [](const auto& l, const auto& r) { return l.gas_cell_id < r.gas_cell_id; });
         const std::size_t lanes = context.state.gas_composition.laneCount();
-        std::vector<std::uint64_t> ids;
-        std::vector<double> values;
-        for (const auto& record : fractions) {
-          if (record.lane_count != lanes) throw std::runtime_error("distributed composition: donor lane mismatch");
-          ids.push_back(record.gas_cell_id);
-          values.insert(values.end(), record.fraction.begin(), record.fraction.begin() + lanes);
+        const auto fractions = parallel::assembleCompositionLaneChunks(
+            fraction_chunks, lane_identity(parallel::CompositionLaneStream::kDonorFraction), rank);
+        // A donor is owned by exactly one rank: one lane vector per cell.
+        for (std::size_t i = 1; i < fractions.size(); ++i) {
+          if (fractions.gas_cell_id[i] == fractions.gas_cell_id[i - 1U]) {
+            throw std::runtime_error("distributed composition: donor fractions from two owners for one cell");
+          }
         }
-        composition_flux->setRemoteDonorFractions(ids, values, lanes);
+        composition_flux->setRemoteDonorFractions(fractions.gas_cell_id, fractions.lanes, lanes);
         composition_flux->prepareDeferred(context.state);
+        const auto identity = lane_identity(parallel::CompositionLaneStream::kCorrection);
         for (const auto& outbound : composition_flux->outboundRemoteCorrections()) {
-          parallel::CompositionCorrectionRecord record{
-              .gas_cell_id = outbound.gas_cell_id, .source_rank = rank, .owner_rank = ownerOf(outbound.gas_cell_id),
-              .lane_count = static_cast<std::uint32_t>(outbound.lane_delta_code.size())};
-          std::copy(outbound.lane_delta_code.begin(), outbound.lane_delta_code.end(), record.lane_delta_code.begin());
-          corrections.push_back(record);
+          parallel::appendCompositionLaneChunks(identity, outbound.gas_cell_id, rank, ownerOf(outbound.gas_cell_id),
+                                                0.0, outbound.lane_delta_code, corrections,
+                                                correction_destinations);
         }
       }
     } catch (...) { failure = std::current_exception(); }
     m_mpi_context.rethrowCollectivePreparationFailure(failure, "distributed composition deferred prepare");
-    auto inbound_corrections = parallel::exchangeCompositionCorrections(m_mpi_context, corrections, sequence);
+    const auto inbound_correction_chunks = parallel::exchangeCompositionLaneChunks(
+        m_mpi_context, corrections, correction_destinations, sequence, m_memory_governor,
+        "hydro.distributed_amr.composition_correction_exchange");
     try {
-      // Deterministic application order independent of arrival order.
-      std::stable_sort(inbound_corrections.begin(), inbound_corrections.end(), [](const auto& l, const auto& r) {
-        return l.gas_cell_id != r.gas_cell_id ? l.gas_cell_id < r.gas_cell_id : l.source_rank < r.source_rank;
-      });
-      if (!inbound_corrections.empty() && composition_flux == nullptr) {
+      // Deterministic application order independent of arrival order:
+      // reassembly sorts by (gas_cell_id, source_rank) and refuses a
+      // duplicated, truncated or foreign-layout lane vector (exactly once).
+      if (!inbound_correction_chunks.empty() && composition_flux == nullptr) {
         throw std::runtime_error("distributed composition: correction delivered to a rank without composition");
       }
-      for (const auto& record : inbound_corrections) {
+      const auto inbound_corrections = parallel::assembleCompositionLaneChunks(
+          inbound_correction_chunks, lane_identity(parallel::CompositionLaneStream::kCorrection), rank);
+      for (std::size_t i = 0; i < inbound_corrections.size(); ++i) {
         composition_flux->addInboundCorrection(
-            context.state, record.gas_cell_id,
-            std::span<const double>(record.lane_delta_code.data(), record.lane_count));
+            context.state, inbound_corrections.gas_cell_id[i], inbound_corrections.lanesOf(i));
       }
       if (composition_flux != nullptr) {
         composition_flux->validatePrepared(context.state);

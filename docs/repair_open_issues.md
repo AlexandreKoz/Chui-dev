@@ -869,3 +869,28 @@ Static-only campaign; nothing below has been compiled or run.
 4. **Validation (owner-reserved):** build, unit/integration tests, Strang
    convergence, exactly-once event counts under retry, recursive-vs-synchronized
    source equivalence, restart round-trip with ion lanes.
+
+## Patch 50 (2026-11-08) — open items after static source completion
+
+Static-only campaign; nothing below has been compiled or run. See
+`docs/repair/chui_source_implementation_closure.md` (patch 50 matrix).
+
+1. **T02 (partial — discrete events):** element diffusion and SGS shear now run
+   on AMR level clocks (finer-leaf face clock). Star formation, SSP returns,
+   winds/pre-SN, SN and BH remain a coarse-barrier synchronization operator at
+   the post half (exactly-once, age-integrated, birth-key deterministic) and are
+   not yet dispatched per level substep. Entry point:
+   `SourceRuntimeImpl::executeDiscreteSourceEvents` /
+   `executeAmrLevelSmoothSources`.
+2. **C02 (external data):** a licensed, source-verified
+   `chui_metal_ion_rates_v1` dataset with the patch-50 energy contract
+   (`energy_convention`, `ionization_potential`) does not exist in the
+   repository; metal-ion runs are refused until supplied. Metal-ion charge
+   exchange with H/He remains unrepresented.
+3. **M01 (remaining unmeasured):** composition sidecar and rollback scheduler
+   copies are now admitted; FFTW/HDF5/MPI-library internals remain declared
+   estimate-only reserves; no RSS/PSS fit is claimed.
+4. **Validation (owner-reserved):** build; `test_unit_composition_lane_chunk_wire`
+   (new source, not run); multi-rank ion-rich (≥ 37 lanes) composition/diffusion
+   exchange; ion ladder conservation through CO transfer; level-clock diffusion
+   conservation and recursive-vs-synchronized comparison.

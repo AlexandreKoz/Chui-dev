@@ -1193,9 +1193,17 @@ void TimeCoordinator::runRungZeroSegment(
       std::exception_ptr capture_failure;
       try {
         if (m_services.memory_governor != nullptr) {
+          // M01: the retry point copies the canonical state (now including
+          // the composition sidecar) AND both schedulers; admit their owned
+          // capacities together before any copy is allocated.
+          const std::uint64_t state_copy_bytes =
+              core::memoryReportBaselineOwnedBytes(core::collectSimulationMemoryReport(state));
+          const std::uint64_t scheduler_copy_bytes = core::memoryReportBaselineOwnedBytes(
+              core::collectSchedulerMemoryReport(particle_scheduler, gas_cell_scheduler));
           retry_point.reservation = m_services.memory_governor->reserve(
               core::MemoryClass::kPhaseResident,
-              core::memoryReportBaselineOwnedBytes(core::collectSimulationMemoryReport(state)),
+              core::checkedMemoryBytesAdd(state_copy_bytes, scheduler_copy_bytes,
+                                          "global-step rollback state plus scheduler copy"),
               "time.global_step_rollback.state_copy");
           retry_point.reservation.commit();
         }

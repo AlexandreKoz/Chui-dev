@@ -72,6 +72,24 @@ struct SourceLedger {
   // element-nuclei projection residual, not a code-mass quantity.
   double element_mass_residual_code = 0.0;
   double charge_residual = 0.0;             // max |sum charge| per H nucleus
+  // C02 metal-ion ledger (P1-49-03/-04/-06). Stored ionization potential
+  // change sum_e sum_k n_{e,k} chi_cum(k) over the interval, including the
+  // C/O atomic<->CO reservoir transfer. Under the dataset convention
+  // collisional_ionization_work_in_cooling this energy is already contained
+  // in radiative_loss_erg (collisional work) or came from absorbed UVB
+  // photons (photoionization threshold energy); it is NOT subtracted from
+  // thermal energy again (no double counting) - this field is the explicit
+  // partition of the stored potential.
+  double metal_ion_potential_delta_erg = 0.0;
+  // Ion nuclei moved between the atomic ladders and CO (C + O), [cm^-3 * V]
+  // volume-integrated nuclei count (>= 0, both directions summed).
+  double metal_ion_co_transfer_nuclei = 0.0;
+  // max |sum_k x_k - 1| removed by ladder round-off projection (dimensionless;
+  // never folded into charge_residual).
+  double metal_ion_normalization_residual = 0.0;
+  // max relative mismatch of sum_k (ion-stage nuclei) vs (element - CO)
+  // nuclei after staging (dimensionless; round-off only when consistent).
+  double metal_ion_inventory_residual = 0.0;
   double dust_to_gas_transfer_code = 0.0;   // + = solids returned to gas
   double gas_to_dust_transfer_code = 0.0;   // + = gas locked into solids
   std::uint64_t cells = 0U;

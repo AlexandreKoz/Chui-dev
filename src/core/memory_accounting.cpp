@@ -488,6 +488,29 @@ MemoryReport collectSimulationMemoryReport(const SimulationState& state, const T
   accountPatchSoa(builder, state.patches);
   accountAmrIdentityAndSynchronization(builder, state);
   accountModulePayloads(builder, state.sidecars);
+  // M01 (patch 50): the element/species/ion/dust/SGS composition sidecar is
+  // canonical persistent state (82 lanes per cell for the largest C02
+  // layout, plus dense or sparse detailed rows and chemistry history). It
+  // was previously absent from this report, so the governor baseline, the
+  // global-step rollback state-copy admission and the retained-capacity
+  // baseline reconciliation all undercounted it.
+  if (state.gas_composition.enabled() || state.gas_composition.ownedCapacityBytes() != 0U) {
+    const std::uint64_t composition_capacity = state.gas_composition.ownedCapacityBytes();
+    builder.addEntry(MemoryEntry{
+        .subsystem = MemorySubsystem::kSidecars,
+        .lifetime = MemoryLifetime::kPersistent,
+        .memory_class = MemoryClass::kCanonicalPersistent,
+        .label = "gas_composition.lanes_sparse_rows_and_history",
+        .current_size_bytes = state.gas_composition.currentSizeBytes(),
+        .owned_capacity_bytes = composition_capacity,
+        .referenced_bytes = 0U,
+        .high_water_bytes = composition_capacity,
+        .estimated_next_step_bytes = composition_capacity,
+        .estimate_only = false,
+        .governed_commitment = false,
+        .uncertainty_note = "capacity of every composition lane, sparse detailed-row store and per-row "
+                            "chemistry history vector (GasCompositionSidecar::ownedCapacityBytes)"});
+  }
   // Representation policy is scalar authority. Population-scale compact DMO
   // metadata is accounted only when its backing vectors actually exist above.
   constexpr std::uint64_t particle_metadata_policy_scalar_bytes =

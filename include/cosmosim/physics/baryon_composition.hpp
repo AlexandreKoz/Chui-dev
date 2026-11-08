@@ -175,6 +175,14 @@ class CompositionLayout {
 // composition approximated by MgFeSiO4); carbonaceous: pure C (graphite/
 // amorphous carbon). These are compositional definitions, not fitted rates.
 inline constexpr std::size_t k_dust_reservoir_count = 2U;
+// Largest lane count CompositionLayout::make can construct: 11 elements +
+// 10 detailed light species + 58 C/O/Si/Fe ion stages (k_metal_ion_stage_capacity,
+// metal_ion_network.hpp) + 2 dust reservoirs + 1 SGS energy lane = 82.
+// Distributed wire protocols size their chunking against this bound
+// (parallel::k_max_composition_layout_lanes must be >= it; asserted in
+// workflows/hydro_amr_runtime.cpp and checked at layout construction).
+inline constexpr std::size_t k_max_constructible_composition_lane_count =
+    k_chemical_element_count + k_detailed_species_count + (7U + 9U + 15U + 27U) + k_dust_reservoir_count + 1U;
 enum class DustReservoir : std::uint8_t { kSilicate = 0, kCarbonaceous = 1 };
 [[nodiscard]] const std::array<double, k_chemical_element_count>& dustElementMassFractions(
     DustReservoir reservoir);

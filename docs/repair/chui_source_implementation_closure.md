@@ -1,3 +1,132 @@
+# CHUÍ — patch 50 source-completion record (supersedes the patch-49 matrix)
+
+Date: 2026-11-08. Branch `claude/intelligent-cray-m8rxdv`. Scope: static source
+edits and static cross-file tracing only.
+**No compilation, configuration, tests, benchmarks, simulations, sanitizers or
+scientific validation were performed.** Nothing below is COMPILED, TESTED,
+SCIENTIFICALLY VALIDATED or PERFORMANCE VERIFIED.
+
+**Status: NOT SOURCE-COMPLETE.** Remaining mandatory source gap: T02 discrete
+events (SF/SSP/winds/SN/BH) are still a coarse-barrier synchronization
+operator, not dispatched per AMR level substep (exact entry point below).
+External datasets (C01/C02/S02/F02) and G01 qualification remain separate.
+
+## Audit findings closed in source
+
+| ID | Fix (path::symbol) | Contract chosen |
+|---|---|---|
+| P0-49-01 | `parallel/composition_exchange.{hpp,cpp}`: `CompositionLaneChunkRecord`, `appendCompositionLaneChunks`, `assembleCompositionLaneChunks`, `exchangeCompositionLaneChunks`, bounded-round `executeBlockingDestinationRecordExchange`; callers `HydroAmrRuntimeImpl::completeDistributedCompositionTransport`, `DistributedElementDiffusionCoupling::{setup,addRemoteFaceTransfers}`; bound `physics::k_max_constructible_composition_lane_count` checked in `CompositionLayout::make` and `static_assert` in `hydro_amr_runtime.cpp` | Wire schema 2: fixed 32-double chunks, ceil(L/32) per cell; header = schema, stream kind, layout signature, lane count, chunk index/count/range, exchange sequence, stable `gas_cell_id`, source/destination rank. Reassembly sorts by (id, source) and refuses truncation, duplicates, foreign layout, stale sequence, misaddressing. Receive + staging capacity reserved (`kCommunication`) before allocation; argument/admission failures are collective before the payload `Alltoallv`; per-peer round cap keeps MPI int counts below `INT_MAX/2`. The 32-lane constant was removed, not raised. Capability gate unchanged (`core_elements` allowed, scalar-Z refused on >1 rank). |
+| P1-49-02 | `ThermochemistrySolver::metalIonEnvironment`; used by `ThermochemistryOperator::attachMetalIonState`, `integrateCoupled::advance_ions`, `ThermochemistrySolver::coolingHeating`; refusal in `ThermochemistrySolver` ctor | One radiation context. Grey approximation: HI Rahmati factor applied to every ion photo/photoheating rate (`MetalIonPhotoAttenuationModel::kHiSelfShieldingGrey`, documented as not frequency resolved). Photo-rate datasets without a configured UVB are refused. Equilibrium initialization iterates the coupled n_e (≤ 8 bounded iterations). |
+| P1-49-03 | `transferLadderNuclei`, `ThermochemistryOperator::integrateCoupled`, staging in `advanceRow`, `ThermochemistryOperator::reconcileMetalIonStageLanes` (called after dust in `BaryonicSourceStage::prepare`) | Invariant: Σ_k stage nuclei = element − CO-bound nuclei after every chemistry commit. CO formation/destruction moves nuclei through the NL97 channel stages (C II, O I); remainder proportional only if the channel is exhausted; no hidden creation. `kCII` = atomic-carbon (non-CO) reservoir of the light network; ionization distribution owned by the ladder. Transport, diffusion, prolong/restrict are linear in all lanes, so the invariant is carried; dust changes are reconciled on the private row. |
+| P1-49-04 | `ThermochemistrySolver::advanceCell` charge residual; closing check in `integrateCoupled`; `BaryonicSourceStage::prepare` history | Charge = light-species charges + metal-ion electrons beyond NL97 C+ (identical inventory to n_e). Ladder normalization goes to `metal_ion_normalization_residual` → element-fraction history, never charge history. |
+| P1-49-05 | EOS refresh in `integrateCoupled` (μ, T, n_e/n_H from final ions at `u_end`); stage commit returns the rows to the caller's thermodynamic/CFL refresh | Conserved: u (thermal), element nuclei, CO/atomic partition. Derived: n_e, μ, T, P, c_s. No energy is manufactured to hold T. |
+| P1-49-06 | `MetalIonRateTable::{hasIonizationEnergyContract, ionizationPotentialErg, storedIonizationEnergyPerNucleusErg}`, `energy_convention`/`ionization_potential` parsing; `SourceLedger::metal_ion_potential_delta_erg`; CII term moved out of `bindingEnergyDensity` when C ladder runs | Convention `collisional_ionization_work_in_cooling`: L_k contains collisional work, photoheating is excess energy; the stored-potential change is ledgered separately and not subtracted again from u. Missing contract ⇒ refusal, never zero-fill. No potentials compiled in. |
+| P1-49-07 | `ThermochemistryOperator::integrateCoupled` (shared by production and reference), shadow block in `advanceRow`; `ChemistryShadowReport::{ion_samples, max_ion_stage_fraction_difference, …}`; `SourceRuntimeImpl::{accumulateSourceIntervalObservation, updateGlobalChemistryControl}`; `V02ControlState::{last_shadow_ion_error, last_shadow_ion_samples}` | Reference = same chronology with the reference solver's own ladder (10× tighter rtol, 4× substeps), on stack copies only. Global MPI-max ion disagreement enters the promotion-bias law and V02 restart state. Local sampled diagnostic, never a certified global error; no memory-pressure downgrade path added. |
+| T02 (diffusion/SGS) | `SourceRuntimeImpl::{restrictDiffusionFacesToClockLevel, leafLevelOfRow, executeAmrLevelSmoothSources, executeDiffusionAndSgsShear(face_clock_level)}`; `makeSourceStagePlan` (`smooth_transport = !recursive_levels_active`); `RemoteDiffusionCell::level`, `SgsRemoteShearFace::remote_level`; check in `closeSourceInterval` | Face clock = max(level of both leaves). Each face integrated on one clock in palindromic level halves (pre: transport→chemistry; post: chemistry→transport), total integrated time = coarse dt; transfers equal/opposite and applied immediately ⇒ no coarse/fine mismatch, no reflux register needed. Rank-crossing faces use the symmetric clock so the claim/authority handshake stays one-to-one. |
+| M01 (gap found) | `core::collectSimulationMemoryReport` (new `gas_composition.lanes_sparse_rows_and_history` entry); `TimeCoordinator` retry point reservation | The composition sidecar was absent from the report ⇒ governor baseline, `RetainedCapacityTransaction` baseline reconciliation and rollback state-copy admission undercounted it. Rollback now also admits both scheduler copies. |
+
+## Production call flow — coarse level with a finer level and a rank-spanning feedback event
+
+1. Clocks: `TimeCoordinator` agrees `accepted_dt` (MPI min) → optional retry
+   point (state + composition + schedulers admitted, `m_source.captureRollbackCheckpoint`).
+2. Pre-source: `StepOrchestrator` → `SourceRuntimeImpl::execute(kStrangPreHalf)`
+   → `makeSourceStagePlan` (recursive levels: no global smooth chemistry or
+   transport) → `openSourceInterval`.
+3. Hydro: `runProductionAmrHydroPath` → `advanceDistributedProductionAmrHydroRecursive`
+   → level L: `apply(kPreHydroHalf)` → `executeAmrLevelSmoothSources` →
+   level-clock diffusion/SGS (faces with clock L, collective gather/handshake,
+   chunked lane exchange) → thermochemistry (coupled ion chronology) →
+   history start → sweep → register exchange → `apply(kPostHydroHalf)`
+   (chemistry → level-clock transport) → history end.
+4. Fine substeps: same per child level k = 0..r-1 with `subintervalUpdate`.
+5. Reflux: `applyCompletePendingFluxRegistersToSimulationState`; temporal
+   history retired; synchronization check.
+6. Composition transport: `completeDistributedCompositionTransport` (schema-2
+   chunks, collective validation, single commit).
+7. Post-source: `execute(kStrangPostHalf)` → `executeDiscreteSourceEvents`
+   (SF → SSP/winds/pre-SN/SN → BH, once, at the coarse end epoch; remote
+   deposits through the existing owner-addressed exchanges) → `closeSourceInterval`
+   (level-half and level-transport counters verified; one controller publication).
+8. Regrid at the synchronized boundary; rollback restores state, schedulers,
+   force endpoint and source checkpoint on collective numerical rejection;
+   restart only at closed intervals.
+
+## H01–V02 source matrix (patch 50)
+
+| ID | Normative requirement | Production evidence (`path::symbol`) | Status | Exact remaining code gap | Deferred obligations |
+|---|---|---|---|---|---|
+| H01 | MUSCL–Hancock/CTU/PPM, HLLC+HLLE | `hydro_core_solver.cpp`, CTU ghost slabs (patch 48/49, unchanged) | implemented in source | none known | order/convergence, multi-axis positivity |
+| H02 | Dual energy, EOS/comoving CFL | `hydro_core_solver.cpp`, `gas_thermodynamic_refresh.cpp` | implemented in source | none known | Mach sweep |
+| C01 | Hybrid light network + element cooling | `thermochemistry.cpp`, `metal_cooling_table.cpp` | external-data dependency | none in source | production UVB/metal tables |
+| C02 | Detailed reference incl. selected metal ions | `metal_ion_network.cpp`, `ThermochemistryOperator::integrateCoupled`, P1-49-02..06 above | implemented in source + external-data dependency | none known; metal–H/He charge exchange unrepresented (named omission) | verified dataset with energy contract; conservation/equilibrium tests |
+| C03 | Adaptive fidelity, hysteresis | `decideChemistryFidelity`, `BaryonicSourceStage`, ion history fixes | implemented in source (research) | none known | matched-error qualification |
+| C04 | Sampled shadow | `advanceRow` shadow + coupled ion reference | implemented in source (research) | none known | bounded-cost measurement |
+| I01 | Effective vs resolved ISM | `effective_multiphase_ism.cpp`, `BaryonicSourceStage` | implemented in source | none known | consistency tests |
+| I02 | SGS reservoir | `ism_dust_sgs.cpp`, level-clock shear (T02) | implemented in source (research) | none known | energy-transfer calibration |
+| S01 | SF eligibility, conservative births | `star_formation.cpp`, `executeDiscreteSourceEvents` | implemented in source | per-level birth cadence (T02) | patch/rank independence |
+| S02 | SSP returns, event timeline | `stellar_population.cpp`, cumulative age bookkeeping | external-data dependency | per-level deposition cadence (T02) | licensed yields |
+| F01 | Mechanical SN deposition | `supernova_feedback.cpp` | implemented in source | per-level deposition cadence (T02) | MPI/resolution tests |
+| F02 | Winds/pre-SN | `stellar_wind.cpp` | external-data dependency | per-level cadence (T02) | wind dataset |
+| D01 | Elements, advection/diffusion, dust, molecules | `CompositionFluxAccumulator`, schema-2 wire, `DistributedElementDiffusionCoupling` | implemented in source | none known (P0-49-01 closed) | ≥ 37-lane multi-rank tests |
+| A01 | Production regrid | `runAutomaticAmrRegrid`, `planProductionAmrRegrid` | implemented in source | none known | evolving-workflow tests |
+| A02 | Distributed recursive subcycling | `advanceProductionAmrHydroRecursiveImpl`, pending registers | implemented in source | none known | nested-history MPI tests |
+| A03 | Physics-aware indicators | `patchDecision`, cooling-time path | implemented in source | none known | resolved-error studies |
+| A04 | Predictive/cost-aware AMR | predictive block, joint ordering | implemented in source (research) | none known | fixed-budget comparisons |
+| G01 | TreePM/KDK, fine-gas force check | TreePM, AMR softening policy | conditional | correction only if qualification demands | force-accuracy qualification |
+| T01 | One time authority, Strang, chronology | `SourceStagePlan`, once-only events, retry | implemented in source | none known | temporal convergence |
+| T02 | Recursive multirate particle/AMR/source | level chemistry + level-clock diffusion/SGS (this patch); KDK unchanged | **partial** | `SourceRuntimeImpl::executeDiscreteSourceEvents` still runs at the coarse post half: missing per-level-substep SF/SSP/wind/SN/BH dispatch with level-timestamped births, cross-level/cross-rank deposit aggregation and deferred particle materialization at a legal barrier | mixed-source convergence, exactly-once under retry |
+| M01 | Canonical state, governed peaks | ownership table below; composition now in baseline | implemented in source for traced owners; FFTW/HDF5/MPI internals estimate-only | none known in traced owners | RSS/PSS measurement, 48 GiB fit not claimed |
+| M02 | CPU serial/OpenMP/MPI, optional GPU | unchanged runtimes | implemented in source | none known | rank/NUMA measurements |
+| V01 | Ledgers, four modes, restart/provenance | ledgers extended (ion potential/CO/inventory); restart notes | implemented in source | none known | end-to-end four-mode tests |
+| V02 | Error/resource coordination | joint controller + ion shadow keys | implemented in source (research) | none known | policy comparisons |
+
+X01 remains outside scope (no MHD/RT/new AGN/CHIMES/Grackle added).
+
+## M01 ownership / admission table (statically traced)
+
+| Phase / buffer | Owner | Capacity formula | Allocation site | Admission site | Lifetime / release |
+|---|---|---|---|---|---|
+| Composition sidecar (dense lanes, sparse rows, history) | `GasCompositionSidecar` | `ownedCapacityBytes()` (Σ lane capacities, sparse ids/values, 10 history vectors) | configure/growth | baseline via `collectSimulationMemoryReport` (new); growth via `RetainedCapacityTransaction` | persistent |
+| Global-step rollback copy | `TimeCoordinator` retry point | baseline(state) + baseline(schedulers) | `retry_point.state.emplace` | `time.global_step_rollback.state_copy` (kPhaseResident) | until accept/restore |
+| Multirate PM rollback | `TimeCoordinator` | rows × per-row + metadata | rollback store | `time.multirate_cycle_rollback_snapshot` | cycle |
+| Composition donor/correction exchange | `completeDistributedCompositionTransport` | `compositionLaneExchangeAdmissionBytes(n, L)` + primitive recv/staging | response vectors / primitive | `hydro.distributed_amr.composition_*` + `parallel.*` (kCommunication) | call frame |
+| Diffusion interface exchange | `DistributedElementDiffusionCoupling` | tables + 2× lane-exchange bytes per face | setup / per subcycle | `sources.element_diffusion.remote` + primitive | coupling lifetime |
+| Diffusion workspace | `advanceElementResolvedDiffusion` | `elementDiffusionWorkspaceBytes(L, rows)` | operator | `sources.element_diffusion.workspace` | phase |
+| Diffusion topology / faces | `executeDiffusionAndSgsShear` | construction bound + retained faces | builder | `sources.metal_diffusion.*` | phase / retained graph |
+| SGS shear staging | `SgsShearTransferWorkspace` | `requiredBytes(cells)` | prepare | `sources.metal_diffusion.cell_phase` | phase |
+| Detailed chemistry Jacobian / ion ladder / shadow | `ThermochemistrySolver`, `MetalIonLadderSolver`, `integrateCoupled` | fixed stack arrays (≤ 11² doubles, ≤ 27 stages, two `CoupledRowOutcome`) | stack | none required (no heap) | row |
+| Source-stage staging | `BaryonicSourceStage` | rows × lanes | `m_lanes.reserve` | source-stage transaction (existing) | stage |
+| AMR regrid old+new hierarchy | `runAutomaticAmrRegrid` | candidate state copy | candidate | `amr.production_*.transaction` | until publish |
+| AMR temporal history / registers | AMR | per-interface | ghost fill | `amr.temporal_history.*`, `amr.pending_flux_registers.*` | level interval |
+| TreePM / FFTW | gravity runtime | worker scratch + declared reserve | solver | `treepm.worker_leaf_scratch`, `parallel.process_fftw_unknown_reserve_bytes` (estimate-only) | step |
+| HDF5 staging | output runtime | declared reserve + overlap | library | `parallel.process_hdf5_unknown_reserve_bytes`, `process_output_restart_overlap_bytes` (estimate-only) | output |
+
+Node aggregation: every reservation above goes through the rank governor,
+which charges the attached `NodeMemoryPool` when shared-pool admission is
+configured (`MemoryGovernor::attachNodePool`). FFTW/HDF5/MPI-library internals
+remain opaque estimate-only reserves; no RSS/PSS or 48 GiB fit is claimed.
+
+## Regression review (static)
+
+H01/H02, A01–A04, G01, M02: untouched. I01/I02: SGS shear unchanged in uniform
+runs; recursive runs integrate shear per level clock. S01/S02/F01/F02: event
+code unchanged. D01: wire protocol replaced (all three streams + diffusion);
+other users of `executeBlockingDestinationRecordExchange` keep their arguments
+(two new defaulted parameters) and gain one collective argument check and one
+round-count reduction per call (rank-uniform). T01: plan ordering unchanged in
+uniform runs. V01/V02: additive ledger/state fields. C01: binding ledger
+unchanged unless the C ladder is selected. New refusals (deliberate): ion
+datasets without the energy contract; photo-rate ion datasets without a UVB.
+
+## Tests written but not run
+
+`tests/unit/test_composition_lane_chunk_wire.cpp` (registered as
+`unit_composition_lane_chunk_wire`, NOT RUN — USER-RESERVED).
+
+---
+
+# Patch-49 record (history, superseded by the patch-50 matrix above)
+
 # CHUÍ — patch 49 source-completion record (supersedes the patch-48 self-assessment)
 
 Date: 2026-11-05. Scope: static source edits only.

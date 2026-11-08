@@ -948,6 +948,8 @@ struct SourceIntervalAccumulator {
   std::uint64_t global_smooth_halves = 0U;
   std::uint64_t level_pre_halves = 0U;
   std::uint64_t level_post_halves = 0U;
+  // T02: level halves that integrated level-clock diffusion/SGS faces.
+  std::uint64_t level_transport_halves = 0U;
   physics::ChemistryShadowReport shadow{};
   physics::ChemistryAdaptiveReport adaptive{};
 };
@@ -1477,8 +1479,28 @@ class SourceRuntimeImpl final : public SourceRuntime {
     (void)physics::ensureGasCompositionInitialized(level_context.state, m_physics_config);
     const physics::SourceInterval interval = makeSourceInterval(
         level_context, sourceEvaluationScaleFactor(level_context));
+    // Palindromic level split, identical to the global halves: pre = smooth
+    // transport then thermochemistry, post = thermochemistry then transport.
+    // Transport advances this level's half interval on the faces owned by
+    // this level clock; every rank enters (collective participation).
+    const double half_dt_code = 0.5 * level_update.dt_code;
+    const double transport_scale_factor = phase == core::SourceSplitPhase::kStrangPreHalf
+        ? 0.5 * (level_update.scale_factor_begin + level_update.scale_factor)
+        : 0.5 * (level_update.scale_factor + level_update.scale_factor_end);
+    if (phase == core::SourceSplitPhase::kStrangPreHalf) {
+      executeDiffusionAndSgsShear(level_context, transport_scale_factor, half_dt_code,
+                                  static_cast<std::int32_t>(level));
+    }
     executeThermochemistryInterval(
         level_context, interval, level_rows, false, level);
+    if (phase == core::SourceSplitPhase::kStrangPostHalf) {
+      executeDiffusionAndSgsShear(level_context, transport_scale_factor, half_dt_code,
+                                  static_cast<std::int32_t>(level));
+    }
+    if (m_source_interval.level_transport_halves == std::numeric_limits<std::uint64_t>::max()) {
+      throw std::overflow_error("recursive AMR level transport counter overflow");
+    }
+    ++m_source_interval.level_transport_halves;
   }
 
   void execute(SourceMutationStageView& view) override {
@@ -1985,7 +2007,10 @@ class SourceRuntimeImpl final : public SourceRuntime {
       plan.event_dt_code = plan.coarse_dt_code;
     }
     plan.global_smooth_thermochemistry = !recursive_levels_active;
-    plan.smooth_transport = true;
+    // T02: with recursive AMR levels the element diffusion and SGS shear are
+    // integrated on the level clocks (executeAmrLevelSmoothSources), never
+    // additionally on the coarse interval.
+    plan.smooth_transport = !recursive_levels_active;
     if (!(std::isfinite(plan.smooth_dt_code) && plan.smooth_dt_code > 0.0 &&
           std::isfinite(plan.smooth_evaluation_scale_factor) &&
           plan.smooth_evaluation_scale_factor > 0.0)) {
@@ -2049,6 +2074,15 @@ class SourceRuntimeImpl final : public SourceRuntime {
         total.max_relative_electron_difference, shadow.max_relative_electron_difference);
     total.max_relative_energy_difference = std::max(
         total.max_relative_energy_difference, shadow.max_relative_energy_difference);
+    add(total.ion_samples, shadow.ion_samples);
+    total.max_ion_stage_fraction_difference = std::max(
+        total.max_ion_stage_fraction_difference, shadow.max_ion_stage_fraction_difference);
+    total.max_relative_ion_electron_difference = std::max(
+        total.max_relative_ion_electron_difference, shadow.max_relative_ion_electron_difference);
+    total.max_relative_ion_temperature_difference = std::max(
+        total.max_relative_ion_temperature_difference, shadow.max_relative_ion_temperature_difference);
+    total.max_relative_ion_potential_difference = std::max(
+        total.max_relative_ion_potential_difference, shadow.max_relative_ion_potential_difference);
     total.mean_substep_cost_ratio = total.samples == 0U
         ? 0.0
         : static_cast<double>(weighted_cost / static_cast<long double>(total.samples));
@@ -2074,6 +2108,14 @@ class SourceRuntimeImpl final : public SourceRuntime {
         m_source_interval.level_pre_halves != m_source_interval.level_post_halves) {
       throw std::logic_error(
           "recursive AMR level sources left an unmatched pre half at interval close");
+    }
+    if (m_source_interval.recursive_levels &&
+        m_source_interval.level_transport_halves !=
+            m_source_interval.level_pre_halves + m_source_interval.level_post_halves) {
+      // T02: every level half must have integrated its level-clock transport
+      // faces exactly once (no face clock skipped or doubled).
+      throw std::logic_error(
+          "recursive AMR level transport halves do not match the level source halves");
     }
     m_last_shadow_report = m_source_interval.shadow;
     updateGlobalChemistryControl(
@@ -2389,7 +2431,14 @@ class SourceRuntimeImpl final : public SourceRuntime {
                       {"metal_table_clamps", std::to_string(l.metal_table_clamps)},
                       {"max_error_estimate", std::to_string(l.max_error_estimate)},
                       {"element_projection_residual", std::to_string(l.element_mass_residual_code)},
-                      {"charge_residual", std::to_string(l.charge_residual)}}});
+                      {"charge_residual", std::to_string(l.charge_residual)},
+                      {"metal_ion_potential_delta_erg", std::to_string(l.metal_ion_potential_delta_erg)},
+                      {"metal_ion_co_transfer_nuclei", std::to_string(l.metal_ion_co_transfer_nuclei)},
+                      {"metal_ion_normalization_residual", std::to_string(l.metal_ion_normalization_residual)},
+                      {"metal_ion_inventory_residual", std::to_string(l.metal_ion_inventory_residual)},
+                      {"shadow_ion_samples", std::to_string(m_last_shadow_report.ion_samples)},
+                      {"shadow_max_ion_stage_fraction_difference",
+                       std::to_string(m_last_shadow_report.max_ion_stage_fraction_difference)}}});
     }
   }
 
@@ -2459,8 +2508,17 @@ class SourceRuntimeImpl final : public SourceRuntime {
     }
     m_mpi_context.rethrowCollectivePreparationFailure(
         load_failure, "adaptive chemistry controller update load");
-    const double global_max = -m_mpi_context.allreduceMinDouble(-current_shadow.max_relative_species_difference);
+    // P1-49-07: the controlled disagreement covers the light network AND the
+    // C02 ladders (stage fractions, ion electrons). It remains a LOCAL
+    // sampled shadow disagreement, never a certified global error bar.
+    const double local_ion_disagreement = std::max(
+        current_shadow.max_ion_stage_fraction_difference, current_shadow.max_relative_ion_electron_difference);
+    const double global_species_max =
+        -m_mpi_context.allreduceMinDouble(-current_shadow.max_relative_species_difference);
+    const double global_ion_max = -m_mpi_context.allreduceMinDouble(-local_ion_disagreement);
+    const double global_max = std::max(global_species_max, global_ion_max);
     const std::uint64_t global_samples = m_mpi_context.allreduceSumUint64(current_shadow.samples);
+    const std::uint64_t global_ion_samples = m_mpi_context.allreduceSumUint64(current_shadow.ion_samples);
     const double bias = physics::nextChemistryPromotionBias(committed_bias, global_max, global_samples);
     m_thermochemistry->setGlobalPromotionBias(bias);
     if (joint) {
@@ -2469,8 +2527,10 @@ class SourceRuntimeImpl final : public SourceRuntime {
         local_detailed += tag == physics::k_chemistry_tag_detailed ? 1U : 0U;
       }
       joint_state.chemistry_promotion_bias = bias;
-      joint_state.last_shadow_species_error = std::max(global_max, 0.0);
+      joint_state.last_shadow_species_error = std::max(global_species_max, 0.0);
       joint_state.last_shadow_samples = global_samples;
+      joint_state.last_shadow_ion_error = std::max(global_ion_max, 0.0);
+      joint_state.last_shadow_ion_samples = global_ion_samples;
       joint_state.chemistry_detailed_rows =
           m_mpi_context.allreduceSumUint64(local_detailed);
       joint_state.chemistry_total_rows =
@@ -2497,8 +2557,10 @@ class SourceRuntimeImpl final : public SourceRuntime {
       std::ostringstream text;
       text.precision(17);
       text << "module=chui_adaptive_chemistry_control\npromotion_bias=" << bias
-           << "\nlast_global_shadow_max_relative_species_difference=" << global_max
-           << "\nlast_global_shadow_samples=" << global_samples << "\n";
+           << "\nlast_global_shadow_max_relative_species_difference=" << global_species_max
+           << "\nlast_global_shadow_samples=" << global_samples
+           << "\nlast_global_shadow_ion_disagreement=" << global_ion_max
+           << "\nlast_global_shadow_ion_samples=" << global_ion_samples << "\n";
       const std::string payload = text.str();
       core::ModuleSidecarBlock block;
       block.module_name = "chui_adaptive_chemistry_control_v1";
@@ -3598,10 +3660,50 @@ class SourceRuntimeImpl final : public SourceRuntime {
     }
   }
 
+  // T02 multirate face clock. Every diffusion/SGS face (local or rank
+  // crossing) is integrated on exactly ONE AMR level clock: the finer of its
+  // two leaf cells, clock(f) = max(level(a), level(b)). A same-level face
+  // advances with its level; a coarse/fine face advances with the fine
+  // level's substeps, so over one coarse interval it is integrated for
+  // sum_k dt_fine,k = dt_coarse exactly, applying each equal-and-opposite
+  // transfer to both owners immediately. No coarse/fine flux mismatch can
+  // arise (one clock owns the face), so no reflux register is required for
+  // these parabolic operators; conservation is exact to round-off. Both
+  // owners of a remote face evaluate the same symmetric max(), so the
+  // distributed claim/authority handshake stays one-to-one.
+  [[nodiscard]] static std::int32_t leafLevelOfRow(const core::SimulationState& state, std::uint32_t row) {
+    if (row >= state.cells.patch_index.size()) return 0;
+    const std::uint32_t patch = state.cells.patch_index[row];
+    return patch < state.patches.level.size() ? state.patches.level[patch] : 0;
+  }
+
+  void restrictDiffusionFacesToClockLevel(
+      const core::SimulationState& state,
+      std::vector<physics::MetalDiffusionFace>& faces,
+      std::vector<internal::RemoteDiffusionFace>& remote_faces,
+      std::int32_t clock_level) const {
+    const auto local_clock = [&](const physics::MetalDiffusionFace& face) {
+      const std::int32_t left = leafLevelOfRow(state, face.left_cell);
+      const bool two_sided = face.boundary_kind == physics::MetalDiffusionBoundaryKind::kInternal ||
+          face.boundary_kind == physics::MetalDiffusionBoundaryKind::kPeriodic;
+      return two_sided ? std::max(left, leafLevelOfRow(state, face.right_cell)) : left;
+    };
+    faces.erase(std::remove_if(faces.begin(), faces.end(),
+                               [&](const physics::MetalDiffusionFace& f) { return local_clock(f) != clock_level; }),
+                faces.end());
+    remote_faces.erase(
+        std::remove_if(remote_faces.begin(), remote_faces.end(),
+                       [&](const internal::RemoteDiffusionFace& f) {
+                         return std::max(leafLevelOfRow(state, f.local_row), f.remote_level) != clock_level;
+                       }),
+        remote_faces.end());
+  }
+
   void executeDiffusionAndSgsShear(
       core::StepContext& context,
       double source_evaluation_scale_factor,
-      double source_dt_code) {
+      double source_dt_code,
+      std::optional<std::int32_t> face_clock_level = std::nullopt) {
     const bool diffusion_enabled = m_metal_diffusion.config().enabled;
     // Configuration is rank-uniform. Do not derive collective participation
     // from local row count/sidecar population (empty ranks must still enter).
@@ -3784,6 +3886,12 @@ class SourceRuntimeImpl final : public SourceRuntime {
 
     m_diffusion_faces = std::move(topology.faces);
     m_diffusion_rho_kappa_code = std::move(topology.strain_magnitude_code);
+    if (face_clock_level.has_value()) {
+      // T02: this dispatch is one AMR level half; only faces owned by this
+      // level clock are integrated (see restrictDiffusionFacesToClockLevel).
+      restrictDiffusionFacesToClockLevel(context.state, m_diffusion_faces, topology.remote_faces,
+                                         *face_clock_level);
+    }
     if (m_memory_governor != nullptr) {
       m_diffusion_faces_reservation.release();
       if (replacement_faces_reservation.committed()) {

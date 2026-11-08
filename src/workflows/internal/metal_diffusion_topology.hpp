@@ -26,6 +26,8 @@ struct RemoteDiffusionCell {
   std::array<std::uint32_t, 3> patch_dims{};
   std::array<double, 3> velocity_peculiar{};
   double density_physical_code = 0.0;
+  // T02: owner's AMR level of this leaf (face clock = max of both sides).
+  std::int32_t level = 0;
 };
 
 // Interface between a local owned leaf row and a remote owned leaf cell.
