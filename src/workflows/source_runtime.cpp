@@ -989,6 +989,34 @@ struct DiscreteEventChronologyLedger {
   }
 };
 
+// T02 (patch 52) canonical identity of one coarse/fine interface face as
+// seen by one rank: the two stable gas_cell_ids (lo < hi), the face axis,
+// the side of the face relative to the lo cell and the periodic-image flag.
+// The hierarchy, the leaf identities and the rank ownership are frozen
+// inside one coarse interval, so the exact sorted set a rank selects in the
+// level pre half must equal the set it selects in the post-children closure.
+struct CanonicalInterfaceFace {
+  std::uint64_t lo_id = 0U;
+  std::uint64_t hi_id = 0U;
+  std::uint8_t axis = 0U;
+  std::int8_t side = 0;
+  std::uint8_t periodic = 0U;
+  std::uint8_t remote = 0U;  // 1: MPI-mirrored face (the peer owner holds the other cell)
+
+  [[nodiscard]] friend bool operator<(const CanonicalInterfaceFace& l, const CanonicalInterfaceFace& r) noexcept {
+    if (l.lo_id != r.lo_id) return l.lo_id < r.lo_id;
+    if (l.hi_id != r.hi_id) return l.hi_id < r.hi_id;
+    if (l.axis != r.axis) return l.axis < r.axis;
+    if (l.side != r.side) return l.side < r.side;
+    if (l.periodic != r.periodic) return l.periodic < r.periodic;
+    return l.remote < r.remote;
+  }
+  [[nodiscard]] friend bool operator==(const CanonicalInterfaceFace& l, const CanonicalInterfaceFace& r) noexcept {
+    return l.lo_id == r.lo_id && l.hi_id == r.hi_id && l.axis == r.axis && l.side == r.side &&
+        l.periodic == r.periodic && l.remote == r.remote;
+  }
+};
+
 // Accumulates the observations of one Strang source interval (both global
 // halves and every recursive level half) for the single controller
 // publication at interval close. Plain values: rollback restores it.
@@ -1006,6 +1034,12 @@ struct SourceIntervalAccumulator {
   // closed (or none opened); n + 1 = n global coarse/fine faces opened by the
   // level pre half and awaiting the post-children synchronization.
   std::vector<std::uint64_t> pending_interface_sync;
+  // T02 (patch 52): exact per-rank ledger of the coarse/fine faces each level
+  // pre half opened (sorted canonical identities), consumed and compared by
+  // the post-children closure. Bounded by the rank's coarse/fine face count
+  // and admitted (m_interface_face_ledger_leases); empty outside an open
+  // split, so the rollback copy taken at the step start is empty.
+  std::vector<std::vector<CanonicalInterfaceFace>> pending_interface_faces;
   std::uint64_t level_interface_syncs = 0U;
   // T02 exactly-once discrete-event dispatch per interval.
   std::uint64_t discrete_event_dispatches = 0U;
@@ -1180,6 +1214,17 @@ class SourceRuntimeImpl final : public SourceRuntime {
     return limit;
   }
 
+  // Drops every face-identity ledger and its admission (storage first).
+  void resetInterfaceFaceLedger() noexcept {
+    for (auto& ledger : m_source_interval.pending_interface_faces) {
+      std::vector<CanonicalInterfaceFace>().swap(ledger);
+    }
+    for (auto& lease : m_interface_face_ledger_leases) lease.release();
+    std::vector<CanonicalInterfaceFace>().swap(m_last_coarse_fine_faces);
+    m_last_coarse_fine_faces_lease.release();
+    m_face_ledger_failure = nullptr;
+  }
+
   void captureRollbackCheckpoint() override {
     ControllerCheckpoint checkpoint;
     if (m_ssp_model != nullptr) {
@@ -1231,6 +1276,7 @@ class SourceRuntimeImpl final : public SourceRuntime {
     // open interval; the checkpoint was taken at the step rollback point, so
     // restoring it also discards every partial shadow/adaptive observation.
     m_source_interval = c.source_interval;
+    resetInterfaceFaceLedger();  // the restored interval holds no open split
     m_last_skipped_effective_rows = c.last_skipped_effective_rows;
     m_last_element_diffusion = c.last_element_diffusion;
     m_particle_id_registry.invalidateForRollback();
@@ -1602,6 +1648,31 @@ class SourceRuntimeImpl final : public SourceRuntime {
           LevelFaceSelection{.level = static_cast<std::int32_t>(level), .same_level = true, .coarse_fine = true,
                              .phase_tag = levelPhaseTag(parent_context.integrator_state.step_index, level,
                                                         level_update.time_begin_code, 0U)});
+      // T02 (patch 52): park the exact per-rank identity ledger of the opened
+      // coarse/fine faces (and its lease) until the post-children closure.
+      // Any local ledger failure is made collective before the count reduce.
+      {
+        std::exception_ptr ledger_failure = std::exchange(m_face_ledger_failure, nullptr);
+        try {
+          if (ledger_failure != nullptr) std::rethrow_exception(ledger_failure);
+          if (m_source_interval.pending_interface_faces.size() <= level_index) {
+            m_source_interval.pending_interface_faces.resize(level_index + 1U);
+          }
+          if (m_interface_face_ledger_leases.size() <= level_index) {
+            m_interface_face_ledger_leases.resize(level_index + 1U);
+          }
+          if (!m_source_interval.pending_interface_faces[level_index].empty()) {
+            throw std::logic_error("recursive AMR interface face ledger of the level was never consumed");
+          }
+        } catch (...) {
+          ledger_failure = std::current_exception();
+        }
+        m_mpi_context.rethrowCollectivePreparationFailure(ledger_failure, "recursive AMR interface face ledger open");
+        // noexcept hand-over (vector move + reservation move).
+        m_source_interval.pending_interface_faces[level_index] = std::move(m_last_coarse_fine_faces);
+        m_interface_face_ledger_leases[level_index] = std::move(m_last_coarse_fine_faces_lease);
+        m_last_coarse_fine_faces = {};
+      }
       // Global count of coarse/fine faces opened by this pre half; stored +1
       // so that "pre half seen, no coarse/fine faces" is distinguishable.
       const std::uint64_t opened = m_mpi_context.allreduceSumUint64(m_last_level_face_selection.coarse_fine);
@@ -1662,6 +1733,45 @@ class SourceRuntimeImpl final : public SourceRuntime {
         LevelFaceSelection{.level = static_cast<std::int32_t>(level), .same_level = false, .coarse_fine = true,
                            .phase_tag = levelPhaseTag(parent_context.integrator_state.step_index, level,
                                                       level_update.time_begin_code, 2U)});
+    // T02 (patch 52): exact coverage. Every rank compares the sorted
+    // canonical identities it integrated now with those its pre half opened
+    // (identical set <=> no face missed, none duplicated, none foreign; a
+    // missing face balanced by a duplicate elsewhere is detected, which the
+    // global count alone cannot do). Mirrored remote faces are additionally
+    // matched key-for-key across the two owners by the per-phase claim
+    // handshake (DistributedElementDiffusionCoupling::setup, phase-tagged).
+    {
+      std::exception_ptr ledger_failure = std::exchange(m_face_ledger_failure, nullptr);
+      try {
+        if (ledger_failure != nullptr) std::rethrow_exception(ledger_failure);
+        if (level_index >= m_source_interval.pending_interface_faces.size()) {
+          throw std::logic_error("recursive AMR interface closure without an opened face ledger");
+        }
+        const auto& opened_faces = m_source_interval.pending_interface_faces[level_index];
+        if (opened_faces.size() != m_last_coarse_fine_faces.size() ||
+            !std::equal(opened_faces.begin(), opened_faces.end(), m_last_coarse_fine_faces.begin())) {
+          const auto mismatch = std::mismatch(opened_faces.begin(), opened_faces.end(),
+                                              m_last_coarse_fine_faces.begin(), m_last_coarse_fine_faces.end());
+          const CanonicalInterfaceFace& face = mismatch.first != opened_faces.end()
+              ? *mismatch.first
+              : *mismatch.second;
+          throw std::logic_error(
+              "recursive AMR coarse/fine interface closure on level " + std::to_string(level) +
+              " does not integrate exactly the faces its pre half opened (opened " +
+              std::to_string(opened_faces.size()) + ", closing " + std::to_string(m_last_coarse_fine_faces.size()) +
+              "; first differing face cells " + std::to_string(face.lo_id) + "/" + std::to_string(face.hi_id) +
+              " axis " + std::to_string(face.axis) + ")");
+        }
+      } catch (...) {
+        ledger_failure = std::current_exception();
+      }
+      m_mpi_context.rethrowCollectivePreparationFailure(ledger_failure, "recursive AMR interface face ledger close");
+      // Consume: storage first, then its admission.
+      std::vector<CanonicalInterfaceFace>().swap(m_source_interval.pending_interface_faces[level_index]);
+      m_interface_face_ledger_leases[level_index].release();
+      std::vector<CanonicalInterfaceFace>().swap(m_last_coarse_fine_faces);
+      m_last_coarse_fine_faces_lease.release();
+    }
     const std::uint64_t closed = m_mpi_context.allreduceSumUint64(m_last_level_face_selection.coarse_fine);
     if (closed + 1U != m_source_interval.pending_interface_sync[level_index]) {
       // The hierarchy is frozen inside one coarse interval (regrid only at
@@ -2250,6 +2360,7 @@ class SourceRuntimeImpl final : public SourceRuntime {
     }
     const std::uint64_t sequence = m_source_interval.sequence + 1U;
     m_source_interval = SourceIntervalAccumulator{};
+    resetInterfaceFaceLedger();
     m_source_interval.open = true;
     m_source_interval.sequence = sequence;
     m_source_interval.step_index = context.integrator_state.step_index;
@@ -2340,6 +2451,12 @@ class SourceRuntimeImpl final : public SourceRuntime {
             "recursive AMR coarse/fine interface split left open at interval close (faces integrated for dt/2 only)");
       }
     }
+    for (const auto& ledger : m_source_interval.pending_interface_faces) {
+      if (!ledger.empty()) {
+        throw std::logic_error("recursive AMR interface face ledger left open at interval close");
+      }
+    }
+    resetInterfaceFaceLedger();
     m_last_shadow_report = m_source_interval.shadow;
     updateGlobalChemistryControl(
         context, m_source_interval.shadow, m_source_interval.adaptive);
@@ -4107,6 +4224,69 @@ class SourceRuntimeImpl final : public SourceRuntime {
                        }),
         remote_faces.end());
     m_last_level_face_selection = count;
+    // T02 (patch 52): exact identity ledger of the kept coarse/fine faces.
+    // Built here (the remote face list is phase-local), admitted before it
+    // is allocated; any local failure is parked in m_face_ledger_failure and
+    // reported by the collective vote of the calling level phase (never
+    // thrown between the diffusion/SGS collectives of this dispatch).
+    std::vector<CanonicalInterfaceFace>().swap(m_last_coarse_fine_faces);
+    m_last_coarse_fine_faces_lease.release();
+    if (selection.coarse_fine && m_face_ledger_failure == nullptr) {
+      try {
+        const std::size_t bound = core::checkedSizeAdd(faces.size(), remote_faces.size(), "interface face ledger");
+        if (m_memory_governor != nullptr && bound != 0U) {
+          m_last_coarse_fine_faces_lease = m_memory_governor->reserve(
+              core::MemoryClass::kPhaseResident,
+              core::checkedSizeMultiply(bound, sizeof(CanonicalInterfaceFace), "interface face ledger bytes"),
+              "sources.amr_interface_face_ledger");
+          m_last_coarse_fine_faces_lease.commit();
+        }
+        m_last_coarse_fine_faces.reserve(bound);
+        const auto gid = [&state](std::uint32_t row) {
+          if (row >= state.gas_cells.gas_cell_id.size()) {
+            throw std::runtime_error("interface face ledger: face row outside the gas-cell identity lane");
+          }
+          return state.gas_cells.gas_cell_id[row];
+        };
+        for (const physics::MetalDiffusionFace& face : faces) {
+          const bool two_sided = face.boundary_kind == physics::MetalDiffusionBoundaryKind::kInternal ||
+              face.boundary_kind == physics::MetalDiffusionBoundaryKind::kPeriodic;
+          if (!two_sided) continue;  // one-sided faces belong to their cell's level (same-level)
+          const std::int32_t left = leafLevelOfRow(state, face.left_cell);
+          const std::int32_t right = leafLevelOfRow(state, face.right_cell);
+          if (left == right) continue;  // same-level face
+          const std::uint64_t l = gid(face.left_cell);
+          const std::uint64_t r = gid(face.right_cell);
+          m_last_coarse_fine_faces.push_back(CanonicalInterfaceFace{
+              .lo_id = std::min(l, r), .hi_id = std::max(l, r), .axis = face.axis,
+              .side = static_cast<std::int8_t>(l < r ? 1 : -1),
+              .periodic = static_cast<std::uint8_t>(
+                  face.boundary_kind == physics::MetalDiffusionBoundaryKind::kPeriodic ? 1U : 0U),
+              .remote = 0U});
+        }
+        for (const internal::RemoteDiffusionFace& f : remote_faces) {
+          if (leafLevelOfRow(state, f.local_row) == f.remote_level) continue;
+          const bool local_is_lo = f.local_gas_cell_id < f.remote_gas_cell_id;
+          m_last_coarse_fine_faces.push_back(CanonicalInterfaceFace{
+              .lo_id = std::min(f.local_gas_cell_id, f.remote_gas_cell_id),
+              .hi_id = std::max(f.local_gas_cell_id, f.remote_gas_cell_id), .axis = f.axis,
+              .side = static_cast<std::int8_t>(local_is_lo ? f.local_side : -f.local_side),
+              .periodic = static_cast<std::uint8_t>(f.periodic ? 1U : 0U), .remote = 1U});
+        }
+        std::sort(m_last_coarse_fine_faces.begin(), m_last_coarse_fine_faces.end());
+        if (std::adjacent_find(m_last_coarse_fine_faces.begin(), m_last_coarse_fine_faces.end()) !=
+            m_last_coarse_fine_faces.end()) {
+          throw std::logic_error(
+              "recursive AMR coarse/fine phase selected the same canonical interface face twice (double "
+              "integration)");
+        }
+        if (m_last_coarse_fine_faces.size() != count.coarse_fine) {
+          throw std::logic_error("interface face ledger size differs from the coarse/fine selection count");
+        }
+      } catch (...) {
+        m_face_ledger_failure = std::current_exception();
+      }
+    }
     return count;
   }
 
@@ -4116,6 +4296,8 @@ class SourceRuntimeImpl final : public SourceRuntime {
       double source_dt_code,
       std::optional<LevelFaceSelection> level_selection = std::nullopt) {
     m_last_level_face_selection = {};
+    std::vector<CanonicalInterfaceFace>().swap(m_last_coarse_fine_faces);
+    m_last_coarse_fine_faces_lease.release();
     const bool diffusion_enabled = m_metal_diffusion.config().enabled;
     // Configuration is rank-uniform. Do not derive collective participation
     // from local row count/sidecar population (empty ranks must still enter).
@@ -4750,6 +4932,12 @@ class SourceRuntimeImpl final : public SourceRuntime {
   // Face counts selected by the last level-phase transport dispatch (local;
   // used for the coarse/fine pre/sync pairing check).
   LevelFaceSelectionCount m_last_level_face_selection{};
+  // T02 (patch 52) face-identity ledger plumbing (see CanonicalInterfaceFace).
+  // Each lease is declared before the storage it covers.
+  core::MemoryReservation m_last_coarse_fine_faces_lease;
+  std::vector<CanonicalInterfaceFace> m_last_coarse_fine_faces;
+  std::exception_ptr m_face_ledger_failure;
+  std::vector<core::MemoryReservation> m_interface_face_ledger_leases;  // per level, covers pending_interface_faces
   std::uint32_t m_world_rank = 0;
   core::CoordinateFrame m_coordinate_frame = core::CoordinateFrame::kComoving;
   core::BoundaryCondition m_hydro_boundary = core::BoundaryCondition::kOpen;

@@ -135,14 +135,20 @@ class DistributedElementDiffusionCoupling final : public physics::ElementDiffusi
   std::span<const RemoteDiffusionFace> m_faces;
   std::span<const double> m_rho_kappa;
   std::size_t m_lane_upper_bound = 0U;
+  // Declared before the tables it covers (patch 52, P1-51-02): implicit
+  // destruction frees the storage before the admission is released.
+  core::MemoryReservation m_reservation;
   std::vector<AuthorityFace> m_authority;  // sorted by key
   std::vector<DependentFace> m_dependent;  // sorted by key
   // Distinct (local_row, authority_rank) exports, sorted.
   std::vector<std::pair<std::uint32_t, int>> m_exports;
   // gas_cell_id -> local row for rows receiving imported transfers (sorted).
   std::vector<std::pair<std::uint64_t, std::uint32_t>> m_dependent_rows;
-  core::MemoryReservation m_reservation;
   std::uint64_t m_admitted_bytes = 0U;
+  // T02 phase identity of this coupling (patch 52): carried in every claim
+  // record and checked by the authority owner, so both owners of a mirrored
+  // face provably act in the same level phase.
+  std::uint64_t m_phase_tag = 0U;
   // Per-coupling collective subcycle counter bound into every chunked lane
   // record (stale/foreign records are refused on reassembly).
   std::uint64_t m_exchange_sequence = 0U;

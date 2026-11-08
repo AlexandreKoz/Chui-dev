@@ -21,7 +21,8 @@ namespace {
 struct ClaimRecord {
   DistributedElementDiffusionCoupling::FaceKey key{};
   std::int32_t other_rank = 0;
-  std::int32_t reserved = 0;
+  // Low 31 bits of the sender's T02 phase tag (patch 52; formerly unused).
+  std::int32_t phase_check = 0;
   double rho_kappa_other = 0.0;
   double area_code = 0.0;
   double distance_code = 0.0;
@@ -217,6 +218,7 @@ DistributedElementDiffusionCoupling::DistributedElementDiffusionCoupling(
       m_faces(remote_faces),
       m_rho_kappa(rho_kappa_code),
       m_lane_upper_bound(lane_upper_bound),
+      m_phase_tag(phase_tag),
       // T02 phase identity (step, level, interval, phase) seeds the subcycle
       // sequence so a record of another level phase is refused on assembly.
       m_exchange_sequence(phase_tag) {}
@@ -299,6 +301,7 @@ void DistributedElementDiffusionCoupling::setup() {
         ClaimRecord claim;
         claim.key = d.key;
         claim.other_rank = rank;
+        claim.phase_check = static_cast<std::int32_t>(m_phase_tag & 0x7fffffffULL);
         claim.rho_kappa_other = m_rho_kappa[face.local_row];
         claim.area_code = face.area_code;
         claim.distance_code = face.center_distance_code;
@@ -338,6 +341,11 @@ void DistributedElementDiffusionCoupling::setup() {
       const ClaimRecord& c = inbound[i];
       if (!(c.key == a.key) || c.other_rank != a.other_rank) {
         throw std::runtime_error("distributed diffusion: interface claim does not match the authority face");
+      }
+      if (c.phase_check != static_cast<std::int32_t>(m_phase_tag & 0x7fffffffULL)) {
+        throw std::runtime_error(
+            "distributed diffusion: interface claim belongs to a different T02 level phase than the authority "
+            "owner (phase identity mismatch)");
       }
       const double area_scale = std::max(std::abs(a.area_code), 1.0e-300);
       const double dist_scale = std::max(std::abs(a.distance_code), 1.0e-300);
