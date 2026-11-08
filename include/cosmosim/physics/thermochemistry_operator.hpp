@@ -242,6 +242,11 @@ class ThermochemistryOperator {
   // Stored ionization potential [erg cm^-3] of the ladders.
   [[nodiscard]] double ionPotentialDensity(const MetalIonRowState& ions) const;
   [[nodiscard]] bool rowCarriesMetalIons(std::uint8_t chemistry_tag) const noexcept;
+  // Solver that owns the row's current fidelity (hybrid for a demoted row of
+  // an adaptive run, detailed otherwise); single authority for both the
+  // advance and the cooling-time estimate of the row.
+  [[nodiscard]] const ThermochemistrySolver& fidelityModelForRow(const core::SimulationState& state,
+                                                                 std::uint32_t row) const noexcept;
   // Reads the ladder distribution of `row` (or initializes it from ionization
   // equilibrium at T when the row has no ladder state) and attaches the
   // frozen stage densities and electron correction to `input`.
