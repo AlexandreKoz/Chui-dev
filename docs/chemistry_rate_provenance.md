@@ -310,7 +310,32 @@ rate <El> <stage> recombination          <N log10 cm^3 s^-1>
 rate <El> <stage> cooling                <N log10 erg cm^3 s^-1, per n_e n_ion>
 photo <El> <stage> ionization <M log10 s^-1>
 photo <El> <stage> heating    <M log10 erg s^-1 per ion>
+energy_convention collisional_ionization_work_in_cooling   # patch 50, required to run
+ionization_potential <El> <stage> <eV>                     # patch 50, stages 0..Z-1, required to run
 ```
+
+Patch 50 energy contract (P1-49-06). The two lines are optional for parsing
+(every existing v1 file still parses, same schema token and hash policy) but
+**required to run**: `ThermochemistrySolver` refuses (`SourceModelUnavailableError`)
+a selected element whose dataset lacks the convention or any ionization
+potential. No ionization potential is compiled into CHUI; the only constant in
+the parser is the exact eV→erg unit conversion. The supported convention states
+that the per-ion `cooling` L_k already contains the thermal energy spent on
+collisional ionization, recombination releases the stored potential as
+escaping radiation, and `photo heating` is the photoelectron excess energy.
+Under that convention the thermal energy equation is unchanged (no extra
+ionization-work sink — no double counting) and the stored potential
+`sum_e sum_k n_{e,k} chi_cum(k)` is ledgered separately in
+`SourceLedger::metal_ion_potential_delta_erg`.
+
+Patch 50 radiation contract (P1-49-02). `ThermochemistrySolver::metalIonEnvironment`
+is the single local radiation context of the ladders (equilibrium initializer,
+both half-steps, per-ion cooling and photoheating). With
+`self_shielding = true` the dataset photo rates and photoheating are multiplied
+by the local Rahmati (2013) HI self-shielding factor (stated grey,
+frequency-independent approximation, `MetalIonPhotoAttenuationModel::kHiSelfShieldingGrey`).
+A dataset that carries photo rates while no UV background is configured for the
+light network is refused (incoherent radiation field).
 
 `-inf` is an exact zero. Validation refuses: missing processes for any stage of
 a present element, ionization of the bare nucleus, recombination of the neutral
@@ -318,9 +343,18 @@ stage, non-monotone grids, value-count mismatches, duplicates, unknown keywords
 or processes, and a dataset that does not cover the selected elements.
 
 Coupling contract (per detailed row, inside one source interval): ions(dt/2) at
-the step-start (T, n_e) → light network + energy over dt with frozen ion
+the step-start (T, n_e, radiation) → light network + energy over dt with frozen ion
 distribution (per-ion losses evaluated at the Newton temperature; the frozen
-metal free electrons enter every n_e use) → ions(dt/2) at the end state. The
+metal free electrons enter every n_e use) → conservative C/O atomic↔CO
+reservoir transfer to the END CO abundance (NL97 channel stages: C II for
+carbon, O I for oxygen; remainder proportional only if the channel stage is
+exhausted) → ions(dt/2) at the end state → EOS refresh (n_e, μ, T at the
+authoritative end thermal energy; no energy manufactured). The charge residual
+is computed on the identical light + ion inventory (P1-49-04); ladder
+normalization round-off is reported as `metal_ion_normalization_residual`
+(element history), never as charge error. With the C ladder active the NL97
+`kCII` lane is the atomic (non-CO) carbon reservoir of the light network; C
+ionization electrons and potential are owned by the ladder (counted once). The
 ladder is backward Euler with step doubling + Richardson, exact element
 conservation (zero column sums) and non-negativity; exhaustion is a retry, never
 a partial advance. Ion lanes are a distribution carrier; nuclei totals are owned
@@ -329,9 +363,12 @@ initialized from ionization equilibrium (counted). Covered elements are removed
 from the element cooling-table query and their C+ 158 µm / O I 63 µm
 fine-structure terms are disabled (the dataset losses must include them).
 
-Named omitted channels (schema v1): charge exchange with H/He; metal ionization
-potential energy in the chemical-binding ledger (losses are radiative only);
-coupling of the NL97 C+ species to the C ladder beyond the frozen charge
-correction. **External data still required:** a licensed, source-verified
+Named omitted channels (schema v1): charge exchange of metal ions with H/He
+(no dataset process exists; the transfer is not represented and is not
+claimed); frequency-resolved shielding of metal-ion photo rates (grey HI
+factor only). Shadow reference (C04, P1-49-07): sampled rows rerun the whole
+coupled chronology with a 10× tighter ladder tolerance and 4× substep cap and
+report stage-fraction, ion-electron, temperature and stored-potential
+disagreement; this is a local sampled diagnostic, not a global error bar. **External data still required:** a licensed, source-verified
 dataset in this schema (e.g. assembled from published ionization/recombination
 compilations and an ion-by-ion cooling calculation). None is supplied.
