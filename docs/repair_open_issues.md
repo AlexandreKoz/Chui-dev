@@ -916,3 +916,33 @@ Static-only; nothing compiled or run.
 5. **Validation (owner-reserved):** recursive-vs-synchronized diffusion/SGS,
    coarse/fine pre/sync pairing under MPI, hybrid shadow thresholds,
    governed-lease peak under multi-rank exchanges.
+
+## Patch 52 (2026-11-08) — open items after static source work
+
+Static-only; nothing compiled or run. Record:
+[`repair/chui_source_implementation_closure.md`](repair/chui_source_implementation_closure.md).
+
+Closed in source (unvalidated): P1-51-01 (phased collective-safe destination
+exchange and its production callers), P1-51-02 (lease-before-storage ownership,
+governed typed receives for every production stream, no double charge),
+T02-51-03 (explicit physical SN event time, publication-lag ledger and
+event-aware time-authority clip, `physics.ssp_max_event_publication_lag_years`),
+T02-51-04 (exact per-rank canonical coarse/fine face ledger, phase-tagged claim
+handshake). Patch-51 item 1 (owner decision on T02 events) is superseded by the
+accepted synchronized-publication design with explicit physical event time.
+
+Still open in source (NOT SOURCE-COMPLETE):
+
+1. **M01 / §7.2:** `parallel::executeBlockingDirectedAmrPatchPayloadExchange`
+   may throw rank-locally between point-to-point peer messages; needs a guarded
+   per-peer (or two-phase collective) protocol.
+2. Association-routing scratch and remote-candidate index growth are guarded
+   but not separately admitted (bounded by admitted parents).
+
+Unchanged: MPI error returns inside a payload collective are communicator-fatal;
+C01/C02/S02/F02 production datasets; G01 conditional qualification;
+composition deferred-donor CFL refusal (patch-51 item 2).
+
+Validation (owner-reserved): low-memory fault injection on every new vote;
+event-lag bound and subdivision invariance; face-ledger mismatch injection;
+restart equivalence with a positive lag bound; RSS/PSS reconciliation.

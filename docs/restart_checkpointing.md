@@ -706,6 +706,13 @@ bitwise.
   `metal_ion_co_transfer_nuclei`, `metal_ion_normalization_residual`,
   `metal_ion_inventory_residual`); ledgers are diagnostics/profiling payloads,
   not restart truth. The step rollback checkpoint copies them by value.
+* Patch 52: `physics.ssp_max_event_publication_lag_years` joins the normalized
+  configuration. A checkpoint written before it resumes only with the default
+  `0` (the key line is projected away). No checkpoint field changed: the
+  discrete-event forecast is a pure function of the persisted population
+  records and star ages, and the per-interval event chronology ledger and the
+  coarse/fine face-identity ledger are runtime state that is always empty at a
+  legal restart boundary (step rollback restores/drops them).
 * Reproducibility impact (T02): under `amr_time_stepping = recursive_subcycling`
   element diffusion and SGS shear now integrate on AMR level clocks instead of
   the coarse halves, so recursive runs are not bit-comparable with patch 49.

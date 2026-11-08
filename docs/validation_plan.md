@@ -871,3 +871,22 @@ Additional campaign checks to run on top of the unit tests:
     `memory.node_admission` event (`node_pool_established`,
     `node_pool_mpi_shared_window`, `node_pool_fallback_reason`) and a forced
     contention test where one rank reserves most of the node budget.
+
+## Patch 52 source-closure validation targets (authored, NOT RUN) — 20261108
+
+* **Collective failure safety:** inject a local allocation/admission failure at
+  each vote of `exchangeDestinationRecordsInto` (preparation, admission) and of
+  its callers (feedback halo, association routing/merge, delta export/import,
+  stage prologue, star-formation neighbour import) on one rank of 2/4/8; expect
+  a collective exception on every rank, no hang, no committed partial state.
+* **Lease lifetime:** `testGovernedLeaseLifetime`; multi-rank governor high-water
+  without the patch-51 receive/bucket double charge.
+* **Event time:** `testEventPhysicalTimeIsSubdivisionInvariant`; an isolated
+  galaxy with `physics.ssp_max_event_publication_lag_years > 0` must show
+  `max_event_publication_lag_years <= L` every interval, identical event ages at
+  1/2/4 ranks and across restart, and `time.source_event_publication_clip`
+  events ordered correctly with snapshot clips.
+* **Face coverage:** inject a dropped/duplicated coarse/fine face between the
+  pre half and the post-children closure; expect the collective
+  "interface face ledger close" refusal. Recursive-vs-synchronized diffusion/SGS
+  conservation and accuracy remain the patch-51 targets.
