@@ -3363,9 +3363,14 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
               context.state.gas_composition.enabled() ? context.state.gas_composition.laneCount() : 0U),
           .exchange_sequence = sequence};
     };
+    // Patch 52 (P1-51-02): each caller-owned buffer's reservation is
+    // declared BEFORE the buffer so the storage is freed first; the exchange
+    // primitive admits its own control/staging/receive memory, so these
+    // reservations cover only outbound records/destinations and reassembled
+    // lanes (compositionLaneExchangeAdmissionBytes, no double charge).
+    core::MemoryReservation response_reservation;
     std::vector<parallel::CompositionLaneChunkRecord> responses;
     std::vector<int> response_destinations;
-    core::MemoryReservation response_reservation;
     try {
       const auto& sidecar = context.state.gas_composition;
       if (!inbound_requests.empty() && !sidecar.enabled()) {
@@ -3403,13 +3408,25 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
     const auto fraction_chunks = parallel::exchangeCompositionLaneChunks(
         m_mpi_context, responses, response_destinations, sequence, m_memory_governor,
         "hydro.distributed_amr.composition_donor_fraction_exchange");
-    responses.clear();
-    responses.shrink_to_fit();
+    std::vector<parallel::CompositionLaneChunkRecord>().swap(responses);
+    std::vector<int>().swap(response_destinations);
+    response_reservation.release();
+    core::MemoryReservation correction_reservation;
     std::vector<parallel::CompositionLaneChunkRecord> corrections;
     std::vector<int> correction_destinations;
     try {
       if (composition_flux != nullptr) {
         const std::size_t lanes = context.state.gas_composition.laneCount();
+        // Reassembled donor fractions (one lane vector per request); the
+        // lease is scoped to this block and declared before `fractions`.
+        core::MemoryReservation fraction_assembly_reservation;
+        if (m_memory_governor != nullptr && !requests.empty()) {
+          fraction_assembly_reservation = m_memory_governor->reserve(
+              core::MemoryClass::kCommunication,
+              parallel::compositionLaneExchangeAdmissionBytes(requests.size(), lanes),
+              "hydro.distributed_amr.composition_donor_fraction_assembly");
+          fraction_assembly_reservation.commit();
+        }
         const auto fractions = parallel::assembleCompositionLaneChunks(
             fraction_chunks.records, lane_identity(parallel::CompositionLaneStream::kDonorFraction), rank);
         // A donor is owned by exactly one rank: one lane vector per cell.
@@ -3421,6 +3438,16 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
         composition_flux->setRemoteDonorFractions(fractions.gas_cell_id, fractions.lanes, lanes);
         composition_flux->prepareDeferred(context.state);
         const auto identity = lane_identity(parallel::CompositionLaneStream::kCorrection);
+        const std::size_t outbound_count = composition_flux->outboundRemoteCorrections().size();
+        if (m_memory_governor != nullptr && outbound_count != 0U) {
+          // Outbound correction chunks + destinations (outer scope: they
+          // live until the correction exchange returns).
+          correction_reservation = m_memory_governor->reserve(
+              core::MemoryClass::kCommunication,
+              parallel::compositionLaneExchangeAdmissionBytes(outbound_count, lanes),
+              "hydro.distributed_amr.composition_correction_outbound");
+          correction_reservation.commit();
+        }
         for (const auto& outbound : composition_flux->outboundRemoteCorrections()) {
           parallel::appendCompositionLaneChunks(identity, outbound.gas_cell_id, rank, ownerOf(outbound.gas_cell_id),
                                                 0.0, outbound.lane_delta_code, corrections,

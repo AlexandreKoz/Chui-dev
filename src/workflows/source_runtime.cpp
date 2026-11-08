@@ -937,6 +937,86 @@ struct SourceStagePlan {
   bool closes_interval = false;
 };
 
+// T02 (patch 52) physical-time ledger of the discrete stochastic events of
+// one source interval. Physical event time (model-defined threshold
+// crossing, see physics::realizedEventChronology) is distinct from the
+// publication epoch (interval end, the only legal synchronized deposition
+// point). The lag = age_end - a_k >= 0 of every timed event is recorded;
+// when physics.ssp_max_event_publication_lag_years > 0 it is enforced
+// (fail closed) -- the time authority clips steps so it cannot be exceeded.
+// Catch-up events of a legacy record (threshold already crossed at age_begin)
+// are counted and exempt: their physical time precedes the interval.
+struct DiscreteEventChronologyLedger {
+  double interval_begin_code = 0.0;
+  double interval_end_code = 0.0;  // publication epoch
+  double lag_bound_years = 0.0;    // 0: bounded by the interval only
+  std::uint64_t timed_events = 0U;
+  std::uint64_t catch_up_events = 0U;
+  double earliest_event_fraction = 1.0;  // (a_k - age_b) / (age_e - age_b)
+  double max_publication_lag_years = 0.0;
+  double sum_publication_lag_years = 0.0;
+
+  [[nodiscard]] double earliestEventTimeCode() const noexcept {
+    return timed_events == 0U ? interval_end_code
+                              : interval_begin_code +
+            earliest_event_fraction * (interval_end_code - interval_begin_code);
+  }
+
+  void accumulate(const physics::RealizedEventChronology& chronology, std::uint64_t particle_id, double age_begin_years,
+                  double age_end_years, bool enforce_lag_bound) {
+    catch_up_events += chronology.catch_up_count;
+    const std::uint32_t timed = chronology.count - chronology.catch_up_count;
+    if (timed == 0U) return;
+    const double span = age_end_years - age_begin_years;
+    if (!(span > 0.0) || chronology.earliest_age_years < age_begin_years ||
+        chronology.latest_age_years > age_end_years) {
+      throw std::logic_error("discrete stellar event physical age lies outside its own source interval");
+    }
+    timed_events += timed;
+    const double lag = age_end_years - chronology.earliest_age_years;
+    max_publication_lag_years = std::max(max_publication_lag_years, lag);
+    sum_publication_lag_years += static_cast<double>(timed) * age_end_years - chronology.sum_age_years;
+    earliest_event_fraction =
+        std::min(earliest_event_fraction, (chronology.earliest_age_years - age_begin_years) / span);
+    // Relative 1e-6 covers the code-time <-> stellar-years conversion
+    // round-off between the forecast and the accepted interval.
+    if (enforce_lag_bound && lag_bound_years > 0.0 && lag > lag_bound_years * (1.0 + 1.0e-6)) {
+      throw std::runtime_error(
+          "discrete SN event of star " + std::to_string(particle_id) + " would be published " +
+          std::to_string(lag) + " yr after its physical time, above physics.ssp_max_event_publication_lag_years = " +
+          std::to_string(lag_bound_years) + " (time-authority event clip not honoured)");
+    }
+  }
+};
+
+// T02 (patch 52) canonical identity of one coarse/fine interface face as
+// seen by one rank: the two stable gas_cell_ids (lo < hi), the face axis,
+// the side of the face relative to the lo cell and the periodic-image flag.
+// The hierarchy, the leaf identities and the rank ownership are frozen
+// inside one coarse interval, so the exact sorted set a rank selects in the
+// level pre half must equal the set it selects in the post-children closure.
+struct CanonicalInterfaceFace {
+  std::uint64_t lo_id = 0U;
+  std::uint64_t hi_id = 0U;
+  std::uint8_t axis = 0U;
+  std::int8_t side = 0;
+  std::uint8_t periodic = 0U;
+  std::uint8_t remote = 0U;  // 1: MPI-mirrored face (the peer owner holds the other cell)
+
+  [[nodiscard]] friend bool operator<(const CanonicalInterfaceFace& l, const CanonicalInterfaceFace& r) noexcept {
+    if (l.lo_id != r.lo_id) return l.lo_id < r.lo_id;
+    if (l.hi_id != r.hi_id) return l.hi_id < r.hi_id;
+    if (l.axis != r.axis) return l.axis < r.axis;
+    if (l.side != r.side) return l.side < r.side;
+    if (l.periodic != r.periodic) return l.periodic < r.periodic;
+    return l.remote < r.remote;
+  }
+  [[nodiscard]] friend bool operator==(const CanonicalInterfaceFace& l, const CanonicalInterfaceFace& r) noexcept {
+    return l.lo_id == r.lo_id && l.hi_id == r.hi_id && l.axis == r.axis && l.side == r.side &&
+        l.periodic == r.periodic && l.remote == r.remote;
+  }
+};
+
 // Accumulates the observations of one Strang source interval (both global
 // halves and every recursive level half) for the single controller
 // publication at interval close. Plain values: rollback restores it.
@@ -954,6 +1034,12 @@ struct SourceIntervalAccumulator {
   // closed (or none opened); n + 1 = n global coarse/fine faces opened by the
   // level pre half and awaiting the post-children synchronization.
   std::vector<std::uint64_t> pending_interface_sync;
+  // T02 (patch 52): exact per-rank ledger of the coarse/fine faces each level
+  // pre half opened (sorted canonical identities), consumed and compared by
+  // the post-children closure. Bounded by the rank's coarse/fine face count
+  // and admitted (m_interface_face_ledger_leases); empty outside an open
+  // split, so the rollback copy taken at the step start is empty.
+  std::vector<std::vector<CanonicalInterfaceFace>> pending_interface_faces;
   std::uint64_t level_interface_syncs = 0U;
   // T02 exactly-once discrete-event dispatch per interval.
   std::uint64_t discrete_event_dispatches = 0U;
@@ -1092,6 +1178,53 @@ class SourceRuntimeImpl final : public SourceRuntime {
     return true;
   }
 
+  // T02 (patch 52): event-aware time-authority input (see SourceRuntime).
+  [[nodiscard]] double discreteEventStepEndLimitTimeCode(const core::SimulationState& state,
+                                                         double current_time_code) const override {
+    const double lag_years = m_physics_config.ssp_max_event_publication_lag_years;
+    double limit = std::numeric_limits<double>::infinity();
+    if (!(lag_years > 0.0) || m_ssp_model == nullptr || !m_ssp_model->config().stochastic_events ||
+        state.star_particles.size() == 0U) {
+      return limit;
+    }
+    constexpr double k_seconds_per_year = 31557600.0;
+    const double years_per_code = m_units.timeSiPerCode() / k_seconds_per_year;
+    const double msun_code = m_units.massSiToCode(physics::k_solar_mass_g * 1.0e-3);
+    if (!(std::isfinite(years_per_code) && years_per_code > 0.0 && std::isfinite(msun_code) && msun_code > 0.0)) {
+      throw std::runtime_error("discrete event step limit requires finite positive time and mass units");
+    }
+    const physics::StellarPopulationStore store(state);
+    for (std::uint32_t s = 0; s < state.star_particles.size(); ++s) {
+      const std::uint32_t p = state.star_particles.particle_index[s];
+      const std::uint64_t pid = state.particle_sidecar.particle_id[p];
+      // A star without a record, or a legacy record without an absolute
+      // cursor, is initialized by its next interval; its past chronology is
+      // catch-up (counted, exempt), so it does not constrain this step.
+      if (!store.has(pid)) continue;
+      const physics::StellarPopulationRecord record = store.get(pid);
+      if (record.initialized == 0U || record.chronology_initialized == 0U) continue;
+      const double age_now = std::max(state.star_particles.stellar_age_years_last[s], 0.0) +
+          std::max(current_time_code - record.chronology_time_code, 0.0) * years_per_code;
+      const double next_age = physics::nextStellarEventAgeYears(
+          *m_ssp_model, record, age_now, state.star_particles.birth_mass_code[s] / msun_code);
+      if (!std::isfinite(next_age)) continue;
+      const double event_time_code = current_time_code + (next_age - age_now) / years_per_code;
+      limit = std::min(limit, event_time_code + lag_years / years_per_code);
+    }
+    return limit;
+  }
+
+  // Drops every face-identity ledger and its admission (storage first).
+  void resetInterfaceFaceLedger() noexcept {
+    for (auto& ledger : m_source_interval.pending_interface_faces) {
+      std::vector<CanonicalInterfaceFace>().swap(ledger);
+    }
+    for (auto& lease : m_interface_face_ledger_leases) lease.release();
+    std::vector<CanonicalInterfaceFace>().swap(m_last_coarse_fine_faces);
+    m_last_coarse_fine_faces_lease.release();
+    m_face_ledger_failure = nullptr;
+  }
+
   void captureRollbackCheckpoint() override {
     ControllerCheckpoint checkpoint;
     if (m_ssp_model != nullptr) {
@@ -1105,6 +1238,7 @@ class SourceRuntimeImpl final : public SourceRuntime {
     checkpoint.sf_gradient_coarse_fine_cells = m_sf_gradient_coarse_fine_cells;
     checkpoint.last_thermochemistry_ledger = m_last_thermochemistry_ledger;
     checkpoint.last_feedback_ledger = m_last_feedback_ledger;
+    checkpoint.last_event_chronology = m_last_event_chronology;
     checkpoint.last_ism_regime_report = m_last_ism_regime_report;
     checkpoint.last_chemistry_adaptive_report = m_last_chemistry_adaptive_report;
     checkpoint.last_dust_ledger = m_last_dust_ledger;
@@ -1132,6 +1266,7 @@ class SourceRuntimeImpl final : public SourceRuntime {
     m_sf_gradient_coarse_fine_cells = c.sf_gradient_coarse_fine_cells;
     m_last_thermochemistry_ledger = c.last_thermochemistry_ledger;
     m_last_feedback_ledger = c.last_feedback_ledger;
+    m_last_event_chronology = c.last_event_chronology;
     m_last_ism_regime_report = c.last_ism_regime_report;
     m_last_chemistry_adaptive_report = c.last_chemistry_adaptive_report;
     m_last_dust_ledger = c.last_dust_ledger;
@@ -1141,6 +1276,7 @@ class SourceRuntimeImpl final : public SourceRuntime {
     // open interval; the checkpoint was taken at the step rollback point, so
     // restoring it also discards every partial shadow/adaptive observation.
     m_source_interval = c.source_interval;
+    resetInterfaceFaceLedger();  // the restored interval holds no open split
     m_last_skipped_effective_rows = c.last_skipped_effective_rows;
     m_last_element_diffusion = c.last_element_diffusion;
     m_particle_id_registry.invalidateForRollback();
@@ -1512,6 +1648,31 @@ class SourceRuntimeImpl final : public SourceRuntime {
           LevelFaceSelection{.level = static_cast<std::int32_t>(level), .same_level = true, .coarse_fine = true,
                              .phase_tag = levelPhaseTag(parent_context.integrator_state.step_index, level,
                                                         level_update.time_begin_code, 0U)});
+      // T02 (patch 52): park the exact per-rank identity ledger of the opened
+      // coarse/fine faces (and its lease) until the post-children closure.
+      // Any local ledger failure is made collective before the count reduce.
+      {
+        std::exception_ptr ledger_failure = std::exchange(m_face_ledger_failure, nullptr);
+        try {
+          if (ledger_failure != nullptr) std::rethrow_exception(ledger_failure);
+          if (m_source_interval.pending_interface_faces.size() <= level_index) {
+            m_source_interval.pending_interface_faces.resize(level_index + 1U);
+          }
+          if (m_interface_face_ledger_leases.size() <= level_index) {
+            m_interface_face_ledger_leases.resize(level_index + 1U);
+          }
+          if (!m_source_interval.pending_interface_faces[level_index].empty()) {
+            throw std::logic_error("recursive AMR interface face ledger of the level was never consumed");
+          }
+        } catch (...) {
+          ledger_failure = std::current_exception();
+        }
+        m_mpi_context.rethrowCollectivePreparationFailure(ledger_failure, "recursive AMR interface face ledger open");
+        // noexcept hand-over (vector move + reservation move).
+        m_source_interval.pending_interface_faces[level_index] = std::move(m_last_coarse_fine_faces);
+        m_interface_face_ledger_leases[level_index] = std::move(m_last_coarse_fine_faces_lease);
+        m_last_coarse_fine_faces = {};
+      }
       // Global count of coarse/fine faces opened by this pre half; stored +1
       // so that "pre half seen, no coarse/fine faces" is distinguishable.
       const std::uint64_t opened = m_mpi_context.allreduceSumUint64(m_last_level_face_selection.coarse_fine);
@@ -1572,6 +1733,45 @@ class SourceRuntimeImpl final : public SourceRuntime {
         LevelFaceSelection{.level = static_cast<std::int32_t>(level), .same_level = false, .coarse_fine = true,
                            .phase_tag = levelPhaseTag(parent_context.integrator_state.step_index, level,
                                                       level_update.time_begin_code, 2U)});
+    // T02 (patch 52): exact coverage. Every rank compares the sorted
+    // canonical identities it integrated now with those its pre half opened
+    // (identical set <=> no face missed, none duplicated, none foreign; a
+    // missing face balanced by a duplicate elsewhere is detected, which the
+    // global count alone cannot do). Mirrored remote faces are additionally
+    // matched key-for-key across the two owners by the per-phase claim
+    // handshake (DistributedElementDiffusionCoupling::setup, phase-tagged).
+    {
+      std::exception_ptr ledger_failure = std::exchange(m_face_ledger_failure, nullptr);
+      try {
+        if (ledger_failure != nullptr) std::rethrow_exception(ledger_failure);
+        if (level_index >= m_source_interval.pending_interface_faces.size()) {
+          throw std::logic_error("recursive AMR interface closure without an opened face ledger");
+        }
+        const auto& opened_faces = m_source_interval.pending_interface_faces[level_index];
+        if (opened_faces.size() != m_last_coarse_fine_faces.size() ||
+            !std::equal(opened_faces.begin(), opened_faces.end(), m_last_coarse_fine_faces.begin())) {
+          const auto mismatch = std::mismatch(opened_faces.begin(), opened_faces.end(),
+                                              m_last_coarse_fine_faces.begin(), m_last_coarse_fine_faces.end());
+          const CanonicalInterfaceFace& face = mismatch.first != opened_faces.end()
+              ? *mismatch.first
+              : *mismatch.second;
+          throw std::logic_error(
+              "recursive AMR coarse/fine interface closure on level " + std::to_string(level) +
+              " does not integrate exactly the faces its pre half opened (opened " +
+              std::to_string(opened_faces.size()) + ", closing " + std::to_string(m_last_coarse_fine_faces.size()) +
+              "; first differing face cells " + std::to_string(face.lo_id) + "/" + std::to_string(face.hi_id) +
+              " axis " + std::to_string(face.axis) + ")");
+        }
+      } catch (...) {
+        ledger_failure = std::current_exception();
+      }
+      m_mpi_context.rethrowCollectivePreparationFailure(ledger_failure, "recursive AMR interface face ledger close");
+      // Consume: storage first, then its admission.
+      std::vector<CanonicalInterfaceFace>().swap(m_source_interval.pending_interface_faces[level_index]);
+      m_interface_face_ledger_leases[level_index].release();
+      std::vector<CanonicalInterfaceFace>().swap(m_last_coarse_fine_faces);
+      m_last_coarse_fine_faces_lease.release();
+    }
     const std::uint64_t closed = m_mpi_context.allreduceSumUint64(m_last_level_face_selection.coarse_fine);
     if (closed + 1U != m_source_interval.pending_interface_sync[level_index]) {
       // The hierarchy is frozen inside one coarse interval (regrid only at
@@ -2160,6 +2360,7 @@ class SourceRuntimeImpl final : public SourceRuntime {
     }
     const std::uint64_t sequence = m_source_interval.sequence + 1U;
     m_source_interval = SourceIntervalAccumulator{};
+    resetInterfaceFaceLedger();
     m_source_interval.open = true;
     m_source_interval.sequence = sequence;
     m_source_interval.step_index = context.integrator_state.step_index;
@@ -2250,6 +2451,12 @@ class SourceRuntimeImpl final : public SourceRuntime {
             "recursive AMR coarse/fine interface split left open at interval close (faces integrated for dt/2 only)");
       }
     }
+    for (const auto& ledger : m_source_interval.pending_interface_faces) {
+      if (!ledger.empty()) {
+        throw std::logic_error("recursive AMR interface face ledger left open at interval close");
+      }
+    }
+    resetInterfaceFaceLedger();
     m_last_shadow_report = m_source_interval.shadow;
     updateGlobalChemistryControl(
         context, m_source_interval.shadow, m_source_interval.adaptive);
@@ -2734,24 +2941,33 @@ class SourceRuntimeImpl final : public SourceRuntime {
             .periodic_box_extent_comoving = m_hydro_boundary == core::BoundaryCondition::kPeriodic
                 ? m_box_extent_comoving : std::array<double, 3>{0.0, 0.0, 0.0},
             .ghost_layers = 1U});
-    std::unordered_map<std::uint64_t, parallel::AmrPatchPayloadRecord> patch_by_id;
-    for (const auto& record : exchange.patch_payloads_received) patch_by_id.emplace(record.patch_id, record);
-    std::vector<internal::StarFormationNeighborIndex::RemoteCell> remote;
-    remote.reserve(received.size());
-    for (const auto& cell : received) {
-      const auto it = patch_by_id.find(cell.patch_id);
-      if (it == patch_by_id.end()) {
-        throw std::runtime_error("star-formation remote neighbour has no patch metadata (fail closed)");
+    // Patch 52 (P1-51-01): the decode and index import are a guarded phase
+    // with a collective vote, because the star-formation batch rounds that
+    // follow enter collectives; a local failure must not strand peers there.
+    std::exception_ptr failure;
+    try {
+      std::unordered_map<std::uint64_t, parallel::AmrPatchPayloadRecord> patch_by_id;
+      for (const auto& record : exchange.patch_payloads_received) patch_by_id.emplace(record.patch_id, record);
+      std::vector<internal::StarFormationNeighborIndex::RemoteCell> remote;
+      remote.reserve(received.size());
+      for (const auto& cell : received) {
+        const auto it = patch_by_id.find(cell.patch_id);
+        if (it == patch_by_id.end()) {
+          throw std::runtime_error("star-formation remote neighbour has no patch metadata (fail closed)");
+        }
+        const auto& patch = it->second;
+        remote.push_back(internal::StarFormationNeighborIndex::RemoteCell{
+            .center = {cell.center_x_comoving, cell.center_y_comoving, cell.center_z_comoving},
+            .width = {patch.extent_x_comoving / patch.cell_dim_x, patch.extent_y_comoving / patch.cell_dim_y,
+                      patch.extent_z_comoving / patch.cell_dim_z},
+            .level = patch.level,
+            .velocity = {cell.velocity_x_peculiar, cell.velocity_y_peculiar, cell.velocity_z_peculiar}});
       }
-      const auto& patch = it->second;
-      remote.push_back(internal::StarFormationNeighborIndex::RemoteCell{
-          .center = {cell.center_x_comoving, cell.center_y_comoving, cell.center_z_comoving},
-          .width = {patch.extent_x_comoving / patch.cell_dim_x, patch.extent_y_comoving / patch.cell_dim_y,
-                    patch.extent_z_comoving / patch.cell_dim_z},
-          .level = patch.level,
-          .velocity = {cell.velocity_x_peculiar, cell.velocity_y_peculiar, cell.velocity_z_peculiar}});
+      if (m_sf_neighbor_index != nullptr) m_sf_neighbor_index->addRemoteCells(std::move(remote));
+    } catch (...) {
+      failure = std::current_exception();
     }
-    if (m_sf_neighbor_index != nullptr) m_sf_neighbor_index->addRemoteCells(std::move(remote));
+    m_mpi_context.rethrowCollectivePreparationFailure(failure, "star-formation remote neighbour import");
   }
 
   // CHUI Part 3 Checkpoint C: remote feedback halo. For every staged source
@@ -2760,7 +2976,14 @@ class SourceRuntimeImpl final : public SourceRuntime {
   // properties), so the source owner sees the exact global k-NN stencil and
   // normalizes its weights over local AND remote cells (never a rank-local
   // renormalization). Query volume: O(active sources x ranks) small records.
-  void importRemoteFeedbackCandidates(
+  //
+  // Patch 52 (P1-51-01/02): every rank-local preparation (query build,
+  // response build, candidate import) runs in a guarded phase followed by a
+  // collective vote, and both streams are received directly into governed
+  // typed buffers (no ungoverned byte buffer + second typed copy). The
+  // returned lease covers the remote candidate storage now owned by
+  // `deposition`; the caller keeps it alive at least as long as that object.
+  [[nodiscard]] core::MemoryReservation importRemoteFeedbackCandidates(
       const core::SimulationState& state,
       physics::MechanicalFeedbackDeposition& deposition,
       std::span<const physics::FeedbackSourceBudget> budgets,
@@ -2771,37 +2994,70 @@ class SourceRuntimeImpl final : public SourceRuntime {
       int requester_rank = 0;
       int pad = 0;
     };
+    static_assert(std::is_trivially_copyable_v<Query>);
     const int rank = m_mpi_context.worldRank();
     const int ranks = m_mpi_context.worldSize();
-    std::vector<Query> queries;
-    std::vector<int> destinations;
-    for (const auto& budget : budgets) {
+    const auto active = [](const physics::FeedbackSourceBudget& budget) {
       // Same activity predicate as MechanicalFeedbackDeposition::stage: a
       // wind-only or dispersion-only source still deposits, so it must see the
       // global stencil (previously skipped => rank-local stencil).
-      if (budget.ejecta_mass_code == 0.0 && budget.supernova_energy_erg == 0.0 && budget.presn_momentum_code == 0.0 &&
-          budget.wind_energy_erg == 0.0 && budget.wind_momentum_code == 0.0 &&
-          budget.association_dispersion_energy_code == 0.0) {
-        continue;
-      }
-      const double r2 = deposition.localStencilRadius2(state, budget.position_comoving);
-      for (int peer = 0; peer < ranks; ++peer) {
-        if (peer == rank) continue;
-        queries.push_back(Query{.position = budget.position_comoving, .radius2 = r2, .requester_rank = rank});
-        destinations.push_back(peer);
-      }
-    }
-    const auto query_bytes = parallel::executeBlockingDestinationRecordExchange(
-        m_mpi_context,
-        std::span<const std::byte>(reinterpret_cast<const std::byte*>(queries.data()), queries.size() * sizeof(Query)),
-        sizeof(Query), destinations, sequence);
-    std::vector<Query> inbound(query_bytes.size() / sizeof(Query));
-    if (!inbound.empty()) std::memcpy(inbound.data(), query_bytes.data(), query_bytes.size());
-    std::vector<physics::FeedbackRemoteCandidate> responses;
-    std::vector<int> response_destinations;
+      return !(budget.ejecta_mass_code == 0.0 && budget.supernova_energy_erg == 0.0 &&
+               budget.presn_momentum_code == 0.0 && budget.wind_energy_erg == 0.0 &&
+               budget.wind_momentum_code == 0.0 && budget.association_dispersion_energy_code == 0.0);
+    };
+    core::MemoryReservation query_lease;  // outbound queries + destinations
+    std::vector<Query> queries;
+    std::vector<int> destinations;
     std::exception_ptr failure;
     try {
-      for (const Query& query : inbound) {
+      std::size_t active_sources = 0U;
+      for (const auto& budget : budgets) active_sources += active(budget) ? 1U : 0U;
+      const std::size_t query_count = core::checkedSizeMultiply(
+          active_sources, static_cast<std::size_t>(std::max(ranks - 1, 0)), "remote feedback halo query count");
+      if (m_memory_governor != nullptr && query_count != 0U) {
+        query_lease = m_memory_governor->reserve(
+            core::MemoryClass::kCommunication,
+            core::checkedSizeMultiply(query_count, sizeof(Query) + sizeof(int), "remote feedback halo query bytes"),
+            "sources.feedback.remote_halo_queries");
+        query_lease.commit();
+      }
+      queries.reserve(query_count);
+      destinations.reserve(query_count);
+      for (const auto& budget : budgets) {
+        if (!active(budget)) continue;
+        const double r2 = deposition.localStencilRadius2(state, budget.position_comoving);
+        for (int peer = 0; peer < ranks; ++peer) {
+          if (peer == rank) continue;
+          queries.push_back(Query{.position = budget.position_comoving, .radius2 = r2, .requester_rank = rank});
+          destinations.push_back(peer);
+        }
+      }
+    } catch (...) {
+      failure = std::current_exception();
+    }
+    m_mpi_context.rethrowCollectivePreparationFailure(failure, "remote feedback halo queries");
+    auto inbound = parallel::exchangeGovernedRecords<Query>(
+        m_mpi_context, queries, destinations, m_memory_governor, "sources.feedback.remote_halo_query_exchange");
+    core::MemoryReservation response_lease;  // outbound candidates + destinations
+    std::vector<physics::FeedbackRemoteCandidate> responses;
+    std::vector<int> response_destinations;
+    try {
+      // At most k (neighbor_count) local candidates answer one query.
+      const std::size_t response_bound = core::checkedSizeMultiply(
+          inbound.records.size(), static_cast<std::size_t>(std::max<std::uint32_t>(m_physics_config.fb_neighbor_count, 1U)),
+          "remote feedback halo response bound");
+      if (m_memory_governor != nullptr && response_bound != 0U) {
+        response_lease = m_memory_governor->reserve(
+            core::MemoryClass::kCommunication,
+            core::checkedSizeMultiply(response_bound, sizeof(physics::FeedbackRemoteCandidate) + sizeof(int),
+                                      "remote feedback halo response bytes"),
+            "sources.feedback.remote_halo_responses");
+        response_lease.commit();
+      }
+      for (const Query& query : inbound.records) {
+        if (query.requester_rank < 0 || query.requester_rank >= ranks || query.requester_rank == rank) {
+          throw std::runtime_error("remote feedback halo: query from an invalid requester rank");
+        }
         for (const std::uint32_t row : deposition.localCandidatesWithin(state, query.position, query.radius2)) {
           physics::FeedbackRemoteCandidate candidate;
           candidate.gas_cell_id = state.gas_cells.gas_cell_id[row];
@@ -2825,14 +3081,19 @@ class SourceRuntimeImpl final : public SourceRuntime {
       failure = std::current_exception();
     }
     m_mpi_context.rethrowCollectivePreparationFailure(failure, "remote feedback halo responses");
-    const auto response_bytes = parallel::executeBlockingDestinationRecordExchange(
-        m_mpi_context,
-        std::span<const std::byte>(reinterpret_cast<const std::byte*>(responses.data()),
-                                   responses.size() * sizeof(physics::FeedbackRemoteCandidate)),
-        sizeof(physics::FeedbackRemoteCandidate), response_destinations, sequence);
-    std::vector<physics::FeedbackRemoteCandidate> remote(response_bytes.size() / sizeof(physics::FeedbackRemoteCandidate));
-    if (!remote.empty()) std::memcpy(remote.data(), response_bytes.data(), response_bytes.size());
-    deposition.setRemoteCandidates(state, std::move(remote));
+    inbound.releaseStorage();
+    auto remote = parallel::exchangeGovernedRecords<physics::FeedbackRemoteCandidate>(
+        m_mpi_context, responses, response_destinations, m_memory_governor,
+        "sources.feedback.remote_halo_candidate_exchange");
+    try {
+      deposition.setRemoteCandidates(state, std::move(remote.records));
+    } catch (...) {
+      failure = std::current_exception();
+    }
+    m_mpi_context.rethrowCollectivePreparationFailure(failure, "remote feedback halo import");
+    // Ownership transfer: the candidate storage now lives in `deposition`;
+    // its admission travels with it to the caller.
+    return std::move(remote.lease);
   }
 
   // G0.3: decomposition-independent association discovery and merge.
@@ -2902,16 +3163,23 @@ class SourceRuntimeImpl final : public SourceRuntime {
       const auto bytes = m_mpi_context.allgatherBytesBounded(std::span<const std::uint8_t>(
           reinterpret_cast<const std::uint8_t*>(local.data()),
           local.size() * sizeof(physics::AssociationSourceDescriptor)));
-      if (bytes.size() != global_count * sizeof(physics::AssociationSourceDescriptor)) {
-        throw std::runtime_error("association discovery: gathered descriptor size mismatch");
+      // Patch 52: the decode is a guarded phase (the next collective is the
+      // discovery vote below, so a local failure here is reported there).
+      try {
+        if (bytes.size() != global_count * sizeof(physics::AssociationSourceDescriptor)) {
+          throw std::runtime_error("association discovery: gathered descriptor size mismatch");
+        }
+        global.resize(static_cast<std::size_t>(global_count));
+        if (!bytes.empty()) std::memcpy(global.data(), bytes.data(), bytes.size());
+      } catch (...) {
+        failure = std::current_exception();
       }
-      global.resize(static_cast<std::size_t>(global_count));
-      if (!bytes.empty()) std::memcpy(global.data(), bytes.data(), bytes.size());
     } else {
       global = local;
     }
     std::vector<std::uint64_t> leaders;
     try {
+      if (failure != nullptr) std::rethrow_exception(failure);
       leaders = physics::discoverAssociationLeaders(
           global, m_physics_config.ssp_association_radius_code,
           m_physics_config.ssp_association_time_window_years, units.periodic, units.box_extent_comoving);
@@ -2921,74 +3189,95 @@ class SourceRuntimeImpl final : public SourceRuntime {
     if (distributed) m_mpi_context.rethrowCollectivePreparationFailure(failure, "association discovery");
     else if (failure != nullptr) std::rethrow_exception(failure);
 
-    // Leader id -> owner rank (the descriptor whose id equals the leader).
-    std::vector<std::pair<std::uint64_t, int>> owner_of;
-    owner_of.reserve(global.size());
-    for (const auto& d : global) owner_of.emplace_back(d.source_id, d.owner_rank);
-    std::sort(owner_of.begin(), owner_of.end());
-    const auto owner_rank_of = [&owner_of](std::uint64_t id) {
-      const auto it = std::lower_bound(owner_of.begin(), owner_of.end(), std::make_pair(id, -1));
-      if (it == owner_of.end() || it->first != id) {
-        throw std::logic_error("association discovery: leader id has no descriptor");
-      }
-      return it->second;
-    };
-    std::vector<std::uint64_t> local_leader(local.size());
-    {
-      std::vector<std::pair<std::uint64_t, std::uint64_t>> id_to_leader(global.size());
-      for (std::size_t g = 0; g < global.size(); ++g) id_to_leader[g] = {global[g].source_id, leaders[g]};
-      std::sort(id_to_leader.begin(), id_to_leader.end());
-      for (std::size_t l = 0; l < local.size(); ++l) {
-        const auto it = std::lower_bound(id_to_leader.begin(), id_to_leader.end(),
-                                         std::make_pair(local[l].source_id, std::uint64_t{0}));
-        local_leader[l] = it->second;
-      }
-    }
     struct MemberRecord {
       std::uint64_t leader_id = 0U;
       physics::FeedbackSourceBudget budget{};
     };
     static_assert(std::is_trivially_copyable_v<MemberRecord>);
+    // Patch 52 (P1-51-01/02): routing preparation is a guarded phase with a
+    // collective vote before the member exchange; members are received into
+    // a governed typed buffer and appended to `kept` in a guarded phase
+    // (the final merge has no further collective in this function).
     std::vector<MemberRecord> outbound;
     std::vector<int> destinations;
     std::vector<MemberRecord> kept;
-    for (std::size_t l = 0; l < local.size(); ++l) {
-      MemberRecord rec{local_leader[l], budgets[local_budget_index[l]]};
-      const int dest = owner_rank_of(local_leader[l]);
-      if (dest == rank) {
-        kept.push_back(rec);
-      } else {
-        outbound.push_back(rec);
-        destinations.push_back(dest);
+    try {
+      // Leader id -> owner rank (the descriptor whose id equals the leader).
+      std::vector<std::pair<std::uint64_t, int>> owner_of;
+      owner_of.reserve(global.size());
+      for (const auto& d : global) owner_of.emplace_back(d.source_id, d.owner_rank);
+      std::sort(owner_of.begin(), owner_of.end());
+      const auto owner_rank_of = [&owner_of](std::uint64_t id) {
+        const auto it = std::lower_bound(owner_of.begin(), owner_of.end(), std::make_pair(id, -1));
+        if (it == owner_of.end() || it->first != id) {
+          throw std::logic_error("association discovery: leader id has no descriptor");
+        }
+        return it->second;
+      };
+      std::vector<std::uint64_t> local_leader(local.size());
+      {
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> id_to_leader(global.size());
+        for (std::size_t g = 0; g < global.size(); ++g) id_to_leader[g] = {global[g].source_id, leaders[g]};
+        std::sort(id_to_leader.begin(), id_to_leader.end());
+        for (std::size_t l = 0; l < local.size(); ++l) {
+          const auto it = std::lower_bound(id_to_leader.begin(), id_to_leader.end(),
+                                           std::make_pair(local[l].source_id, std::uint64_t{0}));
+          if (it == id_to_leader.end() || it->first != local[l].source_id) {
+            throw std::logic_error("association discovery: local source missing from the global descriptor set");
+          }
+          local_leader[l] = it->second;
+        }
+      }
+      for (std::size_t l = 0; l < local.size(); ++l) {
+        MemberRecord rec{local_leader[l], budgets[local_budget_index[l]]};
+        const int dest = owner_rank_of(local_leader[l]);
+        if (dest == rank) {
+          kept.push_back(rec);
+        } else {
+          outbound.push_back(rec);
+          destinations.push_back(dest);
+        }
+      }
+      if (!distributed && !outbound.empty()) {
+        throw std::logic_error("association merge: single-rank merge routed a member off-rank");
+      }
+    } catch (...) {
+      failure = std::current_exception();
+    }
+    if (distributed) m_mpi_context.rethrowCollectivePreparationFailure(failure, "association member routing");
+    else if (failure != nullptr) std::rethrow_exception(failure);
+    if (distributed) {
+      auto received = parallel::exchangeGovernedRecords<MemberRecord>(
+          m_mpi_context, outbound, destinations, m_memory_governor, "sources.associations.member_exchange");
+      try {
+        kept.insert(kept.end(), received.records.begin(), received.records.end());
+      } catch (...) {
+        failure = std::current_exception();
       }
     }
-    if (distributed) {
-      const auto bytes = parallel::executeBlockingDestinationRecordExchange(
-          m_mpi_context,
-          std::span<const std::byte>(reinterpret_cast<const std::byte*>(outbound.data()),
-                                     outbound.size() * sizeof(MemberRecord)),
-          sizeof(MemberRecord), destinations, sequence);
-      const std::size_t received = bytes.size() / sizeof(MemberRecord);
-      const std::size_t base = kept.size();
-      kept.resize(base + received);
-      if (received > 0U) std::memcpy(kept.data() + base, bytes.data(), received * sizeof(MemberRecord));
-    } else if (!outbound.empty()) {
-      throw std::logic_error("association merge: single-rank merge routed a member off-rank");
-    }
-    std::sort(kept.begin(), kept.end(), [](const MemberRecord& l, const MemberRecord& r) {
-      return l.leader_id != r.leader_id ? l.leader_id < r.leader_id : l.budget.source_id < r.budget.source_id;
-    });
     std::vector<physics::FeedbackSourceBudget> merged;
-    std::vector<physics::FeedbackSourceBudget> members;
-    std::size_t begin = 0U;
-    while (begin < kept.size()) {
-      std::size_t end = begin + 1U;
-      while (end < kept.size() && kept[end].leader_id == kept[begin].leader_id) ++end;
-      members.clear();
-      for (std::size_t k = begin; k < end; ++k) members.push_back(kept[k].budget);
-      merged.push_back(physics::mergeAssociationMembers(members, units.periodic, units.box_extent_comoving));
-      begin = end;
+    try {
+      if (failure != nullptr) std::rethrow_exception(failure);
+      std::sort(kept.begin(), kept.end(), [](const MemberRecord& l, const MemberRecord& r) {
+        return l.leader_id != r.leader_id ? l.leader_id < r.leader_id : l.budget.source_id < r.budget.source_id;
+      });
+      std::vector<physics::FeedbackSourceBudget> members;
+      std::size_t begin = 0U;
+      while (begin < kept.size()) {
+        std::size_t end = begin + 1U;
+        while (end < kept.size() && kept[end].leader_id == kept[begin].leader_id) ++end;
+        members.clear();
+        for (std::size_t k = begin; k < end; ++k) members.push_back(kept[k].budget);
+        merged.push_back(physics::mergeAssociationMembers(members, units.periodic, units.box_extent_comoving));
+        begin = end;
+      }
+    } catch (...) {
+      failure = std::current_exception();
     }
+    // The caller's next step is a collective (remote halo query vote), so a
+    // local merge failure is reported collectively here (patch 52).
+    if (distributed) m_mpi_context.rethrowCollectivePreparationFailure(failure, "association member merge");
+    else if (failure != nullptr) std::rethrow_exception(failure);
     return merged;
   }
 
@@ -3041,15 +3330,51 @@ class SourceRuntimeImpl final : public SourceRuntime {
     // kinetic closure); identical on 1 and N ranks.
     fb_config.step_start_reference = true;
 
-    buildOwnedLeafCellMetadata(context);
-    std::vector<std::uint32_t> owned_leaf;
-    owned_leaf.reserve(state.cells.size());
-    for (std::uint32_t row = 0; row < state.cells.size(); ++row) {
-      if (row < m_owned_leaf_mask.size() && m_owned_leaf_mask[row] != 0U) owned_leaf.push_back(row);
+    // Admission of the remote candidate storage handed to `deposition` by
+    // importRemoteFeedbackCandidates; declared before `deposition` so the
+    // storage is destroyed before the lease is released (patch 52).
+    core::MemoryReservation remote_candidate_lease;
+    physics::MechanicalFeedbackDeposition deposition(fb_config, units);  // rank-uniform config check only
+    // Patch 52 (P1-51-01): every rank-local allocation of the stage prologue
+    // (owned-leaf metadata, candidate index, population store, sorted star
+    // rows) precedes one collective vote, so a local failure cannot strand
+    // peers in the first collective of the distributed feedback path.
+    std::optional<physics::StellarPopulationStore> store_storage;
+    std::vector<std::uint32_t> star_rows;
+    {
+      std::exception_ptr prologue_failure;
+      try {
+        buildOwnedLeafCellMetadata(context);
+        std::vector<std::uint32_t> owned_leaf;
+        owned_leaf.reserve(state.cells.size());
+        for (std::uint32_t row = 0; row < state.cells.size(); ++row) {
+          if (row < m_owned_leaf_mask.size() && m_owned_leaf_mask[row] != 0U) owned_leaf.push_back(row);
+        }
+        deposition.setCandidates(state, std::move(owned_leaf));
+        store_storage.emplace(state);
+        if (!context.active_set.particles_are_subset || context.active_set.particle_indices.empty()) {
+          star_rows.reserve(state.star_particles.size());
+          for (std::uint32_t s = 0; s < state.star_particles.size(); ++s) star_rows.push_back(s);
+        } else {
+          std::pmr::vector<std::uint32_t> rows(std::pmr::get_default_resource());
+          buildActiveStarRows(context, rows, std::pmr::get_default_resource());
+          star_rows.assign(rows.begin(), rows.end());
+        }
+        // Deterministic source order: stable particle id (not row / rank order).
+        std::sort(star_rows.begin(), star_rows.end(), [&](std::uint32_t a, std::uint32_t b) {
+          return state.particle_sidecar.particle_id[state.star_particles.particle_index[a]] <
+              state.particle_sidecar.particle_id[state.star_particles.particle_index[b]];
+        });
+      } catch (...) {
+        prologue_failure = std::current_exception();
+      }
+      if (distributed_feedback) {
+        m_mpi_context.rethrowCollectivePreparationFailure(prologue_failure, "stellar population stage prologue");
+      } else if (prologue_failure != nullptr) {
+        std::rethrow_exception(prologue_failure);
+      }
     }
-    physics::MechanicalFeedbackDeposition deposition(fb_config, units);
-    deposition.setCandidates(state, std::move(owned_leaf));
-    physics::StellarPopulationStore store(state);
+    physics::StellarPopulationStore& store = *store_storage;
 
     struct StarUpdate {
       std::uint32_t star_index = 0;
@@ -3063,19 +3388,6 @@ class SourceRuntimeImpl final : public SourceRuntime {
       physics::StellarPopulationRecord record{};
     };
     std::vector<StarUpdate> updates;
-    std::vector<std::uint32_t> star_rows;
-    if (!context.active_set.particles_are_subset || context.active_set.particle_indices.empty()) {
-      for (std::uint32_t s = 0; s < state.star_particles.size(); ++s) star_rows.push_back(s);
-    } else {
-      std::pmr::vector<std::uint32_t> rows(std::pmr::get_default_resource());
-      buildActiveStarRows(context, rows, std::pmr::get_default_resource());
-      star_rows.assign(rows.begin(), rows.end());
-    }
-    // Deterministic source order: stable particle id (not row / rank order).
-    std::sort(star_rows.begin(), star_rows.end(), [&](std::uint32_t a, std::uint32_t b) {
-      return state.particle_sidecar.particle_id[state.star_particles.particle_index[a]] <
-          state.particle_sidecar.particle_id[state.star_particles.particle_index[b]];
-    });
     const double msun_code = physics::k_solar_mass_g / bridge.mass_code_to_g;
     const bool energy_coupled = m_physics_config.enable_feedback;
     std::uint64_t newborn_skipped = 0U, legacy_initialized = 0U;
@@ -3088,6 +3400,10 @@ class SourceRuntimeImpl final : public SourceRuntime {
     const std::uint64_t nonmonotone_before = m_ssp_model->nonmonotone_return_clamps;
     std::vector<physics::FeedbackSourceBudget> staged_budgets;
     std::vector<double> association_birth_years;
+    DiscreteEventChronologyLedger event_chronology;
+    event_chronology.interval_begin_code = event_interval_begin_code;
+    event_chronology.interval_end_code = event_interval_end_code;
+    event_chronology.lag_bound_years = m_physics_config.ssp_max_event_publication_lag_years;
     (void)transaction.prepare([&] {
       std::exception_ptr loop_failure;
       try {
@@ -3115,11 +3431,18 @@ class SourceRuntimeImpl final : public SourceRuntime {
           record.chronology_initialized = 0U;
           ++legacy_initialized;
         }
+        // Only a record with an absolute cursor at step start was seen by the
+        // time authority's event forecast, so only its events are held to
+        // the publication-lag bound (legacy/v1 records adopt a cursor now).
+        const bool event_forecast_covered = record.chronology_initialized != 0U;
         physics::advanceStellarPopulationChronology(
             record,
             event_interval_begin_code,
             event_interval_end_code,
-            level_selection.has_value() ? level_selection->phase_tag : context.integrator_state.step_index);
+            // Patch 52: discrete events run once per accepted coarse interval
+            // (never on a level clock); patch 51 referenced an identifier
+            // that is not in scope here.
+            context.integrator_state.step_index);
         const double birth_mass = state.star_particles.birth_mass_code[s];
         const double birth_msun = birth_mass / msun_code;
         const double age_b = std::max(state.star_particles.stellar_age_years_last[s], 0.0);
@@ -3133,8 +3456,21 @@ class SourceRuntimeImpl final : public SourceRuntime {
         const double lam_cc_end = m_ssp_model->ccCumulativeNumber(age_e, z) * birth_msun;
         const double lam_ia_end = m_ssp_model->iaCumulativeNumber(age_e) * birth_msun;
         if (m_ssp_model->config().stochastic_events) {
-          n_cc = physics::realizeEvents(record, 0U, lam_cc_end).count;
-          n_ia = physics::realizeEvents(record, 1U, lam_ia_end).count;
+          // T02 (patch 52): each realized event keeps its model-defined
+          // physical age (threshold crossing of Lambda_c); it is published at
+          // the synchronized interval end with a recorded, bounded lag.
+          const physics::StellarPopulationRecord record_before = record;
+          const auto cc_events = physics::realizeEvents(record, 0U, lam_cc_end);
+          const auto ia_events = physics::realizeEvents(record, 1U, lam_ia_end);
+          n_cc = static_cast<double>(cc_events.count);
+          n_ia = static_cast<double>(ia_events.count);
+          for (std::uint32_t channel = 0; channel < 2U; ++channel) {
+            event_chronology.accumulate(
+                physics::realizedEventChronology(*m_ssp_model, record_before, channel,
+                                                 channel == 0U ? cc_events.count : ia_events.count, z, birth_msun,
+                                                 age_b, age_e),
+                pid, age_b, age_e, event_forecast_covered);
+          }
         } else {
           n_cc = lam_cc_end - m_ssp_model->ccCumulativeNumber(age_b, z) * birth_msun;
           n_ia = lam_ia_end - m_ssp_model->iaCumulativeNumber(age_b) * birth_msun;
@@ -3249,7 +3585,8 @@ class SourceRuntimeImpl final : public SourceRuntime {
             context.integrator_state.step_index);
       }
       if (distributed_feedback) {
-        importRemoteFeedbackCandidates(state, deposition, staged_budgets, context.integrator_state.step_index);
+        remote_candidate_lease =
+            importRemoteFeedbackCandidates(state, deposition, staged_budgets, context.integrator_state.step_index);
       }
       std::exception_ptr stage_failure;
       try {
@@ -3259,21 +3596,32 @@ class SourceRuntimeImpl final : public SourceRuntime {
       }
       if (distributed_feedback) {
         m_mpi_context.rethrowCollectivePreparationFailure(stage_failure, "mechanical feedback staging");
-        std::vector<physics::FeedbackCellDelta> outbound = deposition.remoteDeltas(m_mpi_context.worldRank());
+        // Patch 52 (P1-51-01/02): outbound delta preparation and the inbound
+        // merge are guarded phases with collective votes; the inbound deltas
+        // are received directly into a governed typed buffer whose lease
+        // lives until they are merged.
+        std::vector<physics::FeedbackCellDelta> outbound;
         std::vector<int> destinations;
-        for (const auto& d : outbound) destinations.push_back(d.owner_rank);
-        const std::vector<std::byte> bytes = parallel::executeBlockingDestinationRecordExchange(
-            m_mpi_context,
-            std::span<const std::byte>(reinterpret_cast<const std::byte*>(outbound.data()),
-                                       outbound.size() * sizeof(physics::FeedbackCellDelta)),
-            sizeof(physics::FeedbackCellDelta), destinations, context.integrator_state.step_index);
-        std::vector<physics::FeedbackCellDelta> inbound(bytes.size() / sizeof(physics::FeedbackCellDelta));
-        if (!inbound.empty()) std::memcpy(inbound.data(), bytes.data(), bytes.size());
-        // Deterministic merge order (cell id, then source rank).
-        std::sort(inbound.begin(), inbound.end(), [](const auto& l, const auto& r) {
-          return l.gas_cell_id != r.gas_cell_id ? l.gas_cell_id < r.gas_cell_id : l.source_rank < r.source_rank;
-        });
-        for (const auto& d : inbound) deposition.addImportedDelta(state, d);
+        try {
+          outbound = deposition.remoteDeltas(m_mpi_context.worldRank());
+          destinations.reserve(outbound.size());
+          for (const auto& d : outbound) destinations.push_back(d.owner_rank);
+        } catch (...) {
+          stage_failure = std::current_exception();
+        }
+        m_mpi_context.rethrowCollectivePreparationFailure(stage_failure, "mechanical feedback remote delta export");
+        auto inbound = parallel::exchangeGovernedRecords<physics::FeedbackCellDelta>(
+            m_mpi_context, outbound, destinations, m_memory_governor, "sources.feedback.remote_delta_exchange");
+        try {
+          // Deterministic merge order (cell id, then source rank).
+          std::sort(inbound.records.begin(), inbound.records.end(), [](const auto& l, const auto& r) {
+            return l.gas_cell_id != r.gas_cell_id ? l.gas_cell_id < r.gas_cell_id : l.source_rank < r.source_rank;
+          });
+          for (const auto& d : inbound.records) deposition.addImportedDelta(state, d);
+        } catch (...) {
+          stage_failure = std::current_exception();
+        }
+        m_mpi_context.rethrowCollectivePreparationFailure(stage_failure, "mechanical feedback remote delta import");
       } else if (stage_failure != nullptr) {
         std::rethrow_exception(stage_failure);
       }
@@ -3305,6 +3653,7 @@ class SourceRuntimeImpl final : public SourceRuntime {
       if (!updates.empty()) state.notifyParticleMassMutation();
     });
     m_last_feedback_ledger = deposition.ledger();
+    m_last_event_chronology = event_chronology;  // published only with the commit
     internal::synchronizeParentParticleCompatibilityMirrors(state, m_world_rank, "SourceRuntime Part 2 stellar population");
     if (!touched.empty()) {
       state.notifyGasThermodynamicMutation();
@@ -3353,7 +3702,18 @@ class SourceRuntimeImpl final : public SourceRuntime {
                       {"dust_injected_code", std::to_string(l.dust_injected_code)},
                       {"dust_destroyed_code", std::to_string(l.dust_destroyed_code)},
                       {"yield_table_clamps", std::to_string(m_ssp_model->table_clamps)},
-                      {"ssp_nonmonotone_return_clamps", std::to_string(m_ssp_model->nonmonotone_return_clamps)}}});
+                      {"ssp_nonmonotone_return_clamps", std::to_string(m_ssp_model->nonmonotone_return_clamps)},
+                      {"event_publication_time_code", std::to_string(m_last_event_chronology.interval_end_code)},
+                      {"timed_discrete_events", std::to_string(m_last_event_chronology.timed_events)},
+                      {"catch_up_discrete_events", std::to_string(m_last_event_chronology.catch_up_events)},
+                      {"earliest_event_time_code",
+                       std::to_string(m_last_event_chronology.earliestEventTimeCode())},
+                      {"max_event_publication_lag_years",
+                       std::to_string(m_last_event_chronology.max_publication_lag_years)},
+                      {"sum_event_publication_lag_years",
+                       std::to_string(m_last_event_chronology.sum_publication_lag_years)},
+                      {"event_publication_lag_bound_years",
+                       std::to_string(m_last_event_chronology.lag_bound_years)}}});
     }
   }
 
@@ -3883,6 +4243,69 @@ class SourceRuntimeImpl final : public SourceRuntime {
                        }),
         remote_faces.end());
     m_last_level_face_selection = count;
+    // T02 (patch 52): exact identity ledger of the kept coarse/fine faces.
+    // Built here (the remote face list is phase-local), admitted before it
+    // is allocated; any local failure is parked in m_face_ledger_failure and
+    // reported by the collective vote of the calling level phase (never
+    // thrown between the diffusion/SGS collectives of this dispatch).
+    std::vector<CanonicalInterfaceFace>().swap(m_last_coarse_fine_faces);
+    m_last_coarse_fine_faces_lease.release();
+    if (selection.coarse_fine && m_face_ledger_failure == nullptr) {
+      try {
+        const std::size_t bound = core::checkedSizeAdd(faces.size(), remote_faces.size(), "interface face ledger");
+        if (m_memory_governor != nullptr && bound != 0U) {
+          m_last_coarse_fine_faces_lease = m_memory_governor->reserve(
+              core::MemoryClass::kPhaseResident,
+              core::checkedSizeMultiply(bound, sizeof(CanonicalInterfaceFace), "interface face ledger bytes"),
+              "sources.amr_interface_face_ledger");
+          m_last_coarse_fine_faces_lease.commit();
+        }
+        m_last_coarse_fine_faces.reserve(bound);
+        const auto gid = [&state](std::uint32_t row) {
+          if (row >= state.gas_cells.gas_cell_id.size()) {
+            throw std::runtime_error("interface face ledger: face row outside the gas-cell identity lane");
+          }
+          return state.gas_cells.gas_cell_id[row];
+        };
+        for (const physics::MetalDiffusionFace& face : faces) {
+          const bool two_sided = face.boundary_kind == physics::MetalDiffusionBoundaryKind::kInternal ||
+              face.boundary_kind == physics::MetalDiffusionBoundaryKind::kPeriodic;
+          if (!two_sided) continue;  // one-sided faces belong to their cell's level (same-level)
+          const std::int32_t left = leafLevelOfRow(state, face.left_cell);
+          const std::int32_t right = leafLevelOfRow(state, face.right_cell);
+          if (left == right) continue;  // same-level face
+          const std::uint64_t l = gid(face.left_cell);
+          const std::uint64_t r = gid(face.right_cell);
+          m_last_coarse_fine_faces.push_back(CanonicalInterfaceFace{
+              .lo_id = std::min(l, r), .hi_id = std::max(l, r), .axis = face.axis,
+              .side = static_cast<std::int8_t>(l < r ? 1 : -1),
+              .periodic = static_cast<std::uint8_t>(
+                  face.boundary_kind == physics::MetalDiffusionBoundaryKind::kPeriodic ? 1U : 0U),
+              .remote = 0U});
+        }
+        for (const internal::RemoteDiffusionFace& f : remote_faces) {
+          if (leafLevelOfRow(state, f.local_row) == f.remote_level) continue;
+          const bool local_is_lo = f.local_gas_cell_id < f.remote_gas_cell_id;
+          m_last_coarse_fine_faces.push_back(CanonicalInterfaceFace{
+              .lo_id = std::min(f.local_gas_cell_id, f.remote_gas_cell_id),
+              .hi_id = std::max(f.local_gas_cell_id, f.remote_gas_cell_id), .axis = f.axis,
+              .side = static_cast<std::int8_t>(local_is_lo ? f.local_side : -f.local_side),
+              .periodic = static_cast<std::uint8_t>(f.periodic ? 1U : 0U), .remote = 1U});
+        }
+        std::sort(m_last_coarse_fine_faces.begin(), m_last_coarse_fine_faces.end());
+        if (std::adjacent_find(m_last_coarse_fine_faces.begin(), m_last_coarse_fine_faces.end()) !=
+            m_last_coarse_fine_faces.end()) {
+          throw std::logic_error(
+              "recursive AMR coarse/fine phase selected the same canonical interface face twice (double "
+              "integration)");
+        }
+        if (m_last_coarse_fine_faces.size() != count.coarse_fine) {
+          throw std::logic_error("interface face ledger size differs from the coarse/fine selection count");
+        }
+      } catch (...) {
+        m_face_ledger_failure = std::current_exception();
+      }
+    }
     return count;
   }
 
@@ -3892,6 +4315,8 @@ class SourceRuntimeImpl final : public SourceRuntime {
       double source_dt_code,
       std::optional<LevelFaceSelection> level_selection = std::nullopt) {
     m_last_level_face_selection = {};
+    std::vector<CanonicalInterfaceFace>().swap(m_last_coarse_fine_faces);
+    m_last_coarse_fine_faces_lease.release();
     const bool diffusion_enabled = m_metal_diffusion.config().enabled;
     // Configuration is rank-uniform. Do not derive collective participation
     // from local row count/sidecar population (empty ranks must still enter).
@@ -4471,6 +4896,7 @@ class SourceRuntimeImpl final : public SourceRuntime {
   std::shared_ptr<const physics::SspYieldTable> m_ssp_yield_table;
   std::unique_ptr<physics::SspModel> m_ssp_model;
   physics::FeedbackLedger m_last_feedback_ledger{};
+  DiscreteEventChronologyLedger m_last_event_chronology{};
   std::unique_ptr<internal::StarFormationNeighborIndex> m_sf_neighbor_index;
   std::array<double, 3> m_box_extent_comoving{};
   std::uint64_t m_sf_gradient_unavailable_cells = 0U;
@@ -4499,6 +4925,7 @@ class SourceRuntimeImpl final : public SourceRuntime {
     std::uint64_t sf_gradient_coarse_fine_cells = 0U;
     physics::SourceLedger last_thermochemistry_ledger{};
     physics::FeedbackLedger last_feedback_ledger{};
+    DiscreteEventChronologyLedger last_event_chronology{};
     physics::IsmRegimeReport last_ism_regime_report{};
     physics::ChemistryAdaptiveReport last_chemistry_adaptive_report{};
     physics::DustUpdateLedger last_dust_ledger{};
@@ -4524,6 +4951,12 @@ class SourceRuntimeImpl final : public SourceRuntime {
   // Face counts selected by the last level-phase transport dispatch (local;
   // used for the coarse/fine pre/sync pairing check).
   LevelFaceSelectionCount m_last_level_face_selection{};
+  // T02 (patch 52) face-identity ledger plumbing (see CanonicalInterfaceFace).
+  // Each lease is declared before the storage it covers.
+  core::MemoryReservation m_last_coarse_fine_faces_lease;
+  std::vector<CanonicalInterfaceFace> m_last_coarse_fine_faces;
+  std::exception_ptr m_face_ledger_failure;
+  std::vector<core::MemoryReservation> m_interface_face_ledger_leases;  // per level, covers pending_interface_faces
   std::uint32_t m_world_rank = 0;
   core::CoordinateFrame m_coordinate_frame = core::CoordinateFrame::kComoving;
   core::BoundaryCondition m_hydro_boundary = core::BoundaryCondition::kOpen;

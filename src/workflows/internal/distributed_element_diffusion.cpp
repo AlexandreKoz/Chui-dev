@@ -6,6 +6,7 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <type_traits>
 #include <unordered_map>
 #include <utility>
@@ -20,7 +21,8 @@ namespace {
 struct ClaimRecord {
   DistributedElementDiffusionCoupling::FaceKey key{};
   std::int32_t other_rank = 0;
-  std::int32_t reserved = 0;
+  // Low 31 bits of the sender's T02 phase tag (patch 52; formerly unused).
+  std::int32_t phase_check = 0;
   double rho_kappa_other = 0.0;
   double area_code = 0.0;
   double distance_code = 0.0;
@@ -42,21 +44,20 @@ static_assert(std::is_trivially_copyable_v<ConductanceRecord>);
   return h * area / distance;
 }
 
+// Patch 52 (P1-51-01/02): control records are received directly into a
+// governed typed buffer (no ungoverned byte buffer + second typed copy, and
+// no unguarded allocation between this collective and the caller's next
+// failure vote). Every allocation of the exchange happens inside its own
+// guarded phases; the returned lease covers the received records until the
+// caller drops them.
 template <class Record>
-[[nodiscard]] std::vector<Record> exchangeRecords(const parallel::MpiContext& mpi,
-                                                  const std::vector<Record>& outbound,
-                                                  const std::vector<int>& destinations) {
-  const std::vector<std::byte> bytes = parallel::executeBlockingDestinationRecordExchange(
-      mpi,
-      std::span<const std::byte>(reinterpret_cast<const std::byte*>(outbound.data()),
-                                 outbound.size() * sizeof(Record)),
-      sizeof(Record), destinations, 0U);
-  if (bytes.size() % sizeof(Record) != 0U) {
-    throw std::runtime_error("distributed element diffusion: received a truncated record stream");
-  }
-  std::vector<Record> inbound(bytes.size() / sizeof(Record));
-  if (!inbound.empty()) std::memcpy(inbound.data(), bytes.data(), bytes.size());
-  return inbound;
+[[nodiscard]] parallel::GovernedRecords<Record> exchangeRecords(const parallel::MpiContext& mpi,
+                                                                core::MemoryGovernor* governor,
+                                                                const std::vector<Record>& outbound,
+                                                                const std::vector<int>& destinations,
+                                                                std::string_view owner_label) {
+  return parallel::exchangeGovernedRecords<Record>(mpi, std::span<const Record>(outbound),
+                                                   std::span<const int>(destinations), governor, owner_label);
 }
 
 [[nodiscard]] std::uint64_t saturatingMul(std::uint64_t a, std::uint64_t b) noexcept {
@@ -217,6 +218,7 @@ DistributedElementDiffusionCoupling::DistributedElementDiffusionCoupling(
       m_faces(remote_faces),
       m_rho_kappa(rho_kappa_code),
       m_lane_upper_bound(lane_upper_bound),
+      m_phase_tag(phase_tag),
       // T02 phase identity (step, level, interval, phase) seeds the subcycle
       // sequence so a record of another level phase is refused on assembly.
       m_exchange_sequence(phase_tag) {}
@@ -244,16 +246,28 @@ void DistributedElementDiffusionCoupling::setup() {
     // only a layout above the static bound is refused (impossible by
     // CompositionLayout::make).
     const std::size_t chunks_per_row = parallel::compositionLaneChunkCount(m_lane_upper_bound);
-    // Admission: tables + one subcycle's state/delta send+receive buffers.
+    // Admission (patch 52 ownership split, P1-51-02): this lease covers the
+    // CALLER-owned buffers of the coupling for its whole lifetime -- the
+    // authority/dependent tables, the outbound claim/reply records and
+    // their destination ranks, the export/dependent-row indices, and per
+    // subcycle the outbound state/delta chunk records, their reassembled
+    // lanes and the authority-side outbound accumulation (slot/id/rank/
+    // flat delta). The exchange primitive admits its own control plane,
+    // staging and the received records (returned lease), so received
+    // claim/conductance/chunk records are NOT charged here again.
     const std::uint64_t n = m_faces.size();
     std::uint64_t bytes = saturatingMul(n, sizeof(AuthorityFace) + sizeof(DependentFace) +
-                                               2U * sizeof(ClaimRecord) + 2U * sizeof(ConductanceRecord) +
+                                               sizeof(ClaimRecord) + sizeof(ConductanceRecord) +
+                                               2U * sizeof(int) +
                                                sizeof(std::pair<std::uint32_t, int>) +
                                                sizeof(std::pair<std::uint64_t, std::uint32_t>));
     // Per subcycle at most one state and one delta lane vector per face on
-    // each side (chunked), plus the reassembled flat lanes.
+    // each side (chunked, caller-owned part), plus the accumulation scratch.
     bytes = saturatingAdd(bytes, saturatingMul(2U, parallel::compositionLaneExchangeAdmissionBytes(
                                                        n, m_lane_upper_bound)));
+    bytes = saturatingAdd(bytes, saturatingMul(n, sizeof(std::pair<std::uint64_t, std::size_t>) +
+                                                      sizeof(std::uint64_t) + sizeof(int) +
+                                                      saturatingMul(m_lane_upper_bound, sizeof(double))));
     (void)chunks_per_row;
     if (m_governor != nullptr && bytes != 0U) {
       m_reservation = m_governor->reserve(core::MemoryClass::kPhaseResident, bytes,
@@ -287,6 +301,7 @@ void DistributedElementDiffusionCoupling::setup() {
         ClaimRecord claim;
         claim.key = d.key;
         claim.other_rank = rank;
+        claim.phase_check = static_cast<std::int32_t>(m_phase_tag & 0x7fffffffULL);
         claim.rho_kappa_other = m_rho_kappa[face.local_row];
         claim.area_code = face.area_code;
         claim.distance_code = face.center_distance_code;
@@ -307,7 +322,9 @@ void DistributedElementDiffusionCoupling::setup() {
     failure = std::current_exception();
   }
   reduceFailure(failure, "distributed diffusion topology admission");
-  std::vector<ClaimRecord> inbound = exchangeRecords(m_mpi, claims, claim_destinations);
+  auto inbound_buffer =
+      exchangeRecords(m_mpi, m_governor, claims, claim_destinations, "sources.element_diffusion.claim_exchange");
+  std::vector<ClaimRecord>& inbound = inbound_buffer.records;
 
   std::vector<ConductanceRecord> replies;
   std::vector<int> reply_destinations;
@@ -325,6 +342,11 @@ void DistributedElementDiffusionCoupling::setup() {
       if (!(c.key == a.key) || c.other_rank != a.other_rank) {
         throw std::runtime_error("distributed diffusion: interface claim does not match the authority face");
       }
+      if (c.phase_check != static_cast<std::int32_t>(m_phase_tag & 0x7fffffffULL)) {
+        throw std::runtime_error(
+            "distributed diffusion: interface claim belongs to a different T02 level phase than the authority "
+            "owner (phase identity mismatch)");
+      }
       const double area_scale = std::max(std::abs(a.area_code), 1.0e-300);
       const double dist_scale = std::max(std::abs(a.distance_code), 1.0e-300);
       if (std::abs(c.area_code - a.area_code) > 1.0e-10 * area_scale ||
@@ -339,7 +361,9 @@ void DistributedElementDiffusionCoupling::setup() {
     failure = std::current_exception();
   }
   reduceFailure(failure, "distributed diffusion interface validation");
-  std::vector<ConductanceRecord> conductances = exchangeRecords(m_mpi, replies, reply_destinations);
+  auto conductance_buffer = exchangeRecords(m_mpi, m_governor, replies, reply_destinations,
+                                            "sources.element_diffusion.conductance_exchange");
+  std::vector<ConductanceRecord>& conductances = conductance_buffer.records;
   try {
     std::sort(conductances.begin(), conductances.end(),
               [](const ConductanceRecord& l, const ConductanceRecord& r) { return l.key < r.key; });

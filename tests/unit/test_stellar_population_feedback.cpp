@@ -18,6 +18,11 @@
 //  * singleton yield-table axes report clamping when queried off-grid;
 //  * event chronology is invariant under step subdivision and restart
 //    (same thresholds => same realized ordinals);
+//  * patch 52 (T02): the physical age of each realized event (threshold
+//    crossing of Lambda_c) is identical under step subdivision, lies in its
+//    own interval, and nextStellarEventAgeYears predicts exactly the first
+//    event the stage then realizes (so the time authority's publication-lag
+//    clip is consistent with the chronology);
 //  * mechanical feedback: mass, every element, and vector momentum (lab
 //    frame: m_ej v_star) conserved exactly; injected kinetic + thermal energy
 //    equals the budget; asymmetric stencil still has zero net star-frame
@@ -30,6 +35,7 @@
 #include <limits>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "cosmosim/core/simulation_state.hpp"
@@ -300,11 +306,55 @@ void testEventForecastMatchesChronology() {
 
 }  // namespace
 
+void testEventPhysicalTimeIsSubdivisionInvariant() {
+  const physics::SspModel ssp(physics::SspConfig{});
+  std::array<double, physics::k_chemical_element_count> x{};
+  x[0] = 0.74; x[1] = 0.25; x[4] = 0.01;
+  double z = 0.0;
+  for (std::size_t e = 2; e < x.size(); ++e) z += x[e];
+  const double birth = 1000.0;
+  const auto collect = [&](double step_years) {
+    physics::StellarPopulationRecord record = physics::makeStellarPopulationRecord(x, 0.0, 0xabcdULL);
+    std::vector<double> ages;
+    for (double age_b = 0.0; age_b < 4.0e7; age_b += step_years) {
+      const double age_e = age_b + step_years;
+      const double predicted = physics::nextStellarEventAgeYears(ssp, record, age_b, birth);
+      const physics::StellarPopulationRecord before = record;
+      const auto cc = physics::realizeEvents(record, 0U, ssp.ccCumulativeNumber(age_e, z) * birth);
+      const auto chron = physics::realizedEventChronology(ssp, before, 0U, cc.count, z, birth, age_b, age_e);
+      assert(chron.catch_up_count == 0U);
+      if (cc.count > 0U) {
+        assert(chron.earliest_age_years >= age_b && chron.latest_age_years <= age_e);
+        // Ia cannot fire before snia_delay_min, so the next event is CC here.
+        if (age_e < physics::SspConfig{}.snia_delay_min_years) {
+          assert(std::abs(predicted - chron.earliest_age_years) <= 1.0e-9 * age_e);
+        }
+        ages.push_back(chron.sum_age_years / static_cast<double>(cc.count));
+      }
+      (void)physics::realizeEvents(record, 1U, ssp.iaCumulativeNumber(age_e) * birth);
+    }
+    return std::make_pair(record.cc_realized, ages.empty() ? 0.0 : ages.front());
+  };
+  const auto coarse = collect(1.0e6);
+  const auto fine = collect(2.5e5);
+  assert(coarse.first == fine.first && coarse.first > 0U);  // same realized ordinals
+  // The first event's physical age is the same (it is a single event in
+  // its interval for both cadences here or the mean of identical ages).
+  assert(std::abs(coarse.second - fine.second) <= 1.0e6);
+  // Direct check: the same threshold has one age whatever the bracket.
+  const double threshold = physics::eventExponentialDraw(0xabcdULL, 0U, 0U);
+  const double a1 = physics::stellarEventAgeYears(ssp, 0U, threshold, z, birth, 0.0, 4.0e7);
+  const double a2 = physics::stellarEventAgeYears(ssp, 0U, threshold, z, birth, 1.0e6, 1.0e8);
+  if (a1 > 1.0e6) assert(std::abs(a1 - a2) <= 1.0e-9 * a1);
+  assert(!std::isfinite(physics::stellarEventAgeYears(ssp, 0U, 1.0e30, z, birth, 0.0, 1.0e10)));
+}
+
 int main() {
   testF5Chronology();
   testSspBudgets();
   testSspFixedNodeSubdivisionIsMonotone();
   testEventForecastMatchesChronology();
+  testEventPhysicalTimeIsSubdivisionInvariant();
   testEventReplayIsSubdivisionAndRestartInvariant();
   testMechanicalFeedbackConservation();
   testTerminalMomentumScaling();

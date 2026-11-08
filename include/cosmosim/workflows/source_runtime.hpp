@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <span>
 
@@ -88,6 +89,21 @@ class SourceRuntime {
       core::StepContext& parent_context,
       const hydro::HydroUpdateContext& level_update,
       int level) = 0;
+  // T02 event-aware time authority input (patch 52). Rank-local, no
+  // collective: the latest code time at which the NEXT global step may end so
+  // that every discrete stochastic SN event realized in it is published (at
+  // the synchronized interval end) at most
+  // physics.ssp_max_event_publication_lag_years after its model-defined
+  // physical time. +infinity when the bound is disabled or no local
+  // population has a pending event. A pure function of the persistent
+  // population records and star ages in `state` (restored by rollback,
+  // checkpointed by restart), so no extra clock state exists. The time
+  // coordinator reduces it with MIN over ranks and clips the step like an
+  // ordered output event.
+  [[nodiscard]] virtual double discreteEventStepEndLimitTimeCode(
+      const core::SimulationState&, double /*current_time_code*/) const {
+    return std::numeric_limits<double>::infinity();
+  }
   [[nodiscard]] virtual RuntimeTaskMemoryEstimate estimateMemory(
       const core::SimulationState&) const {
     return {0U, false, "source owner does not publish a complete memory model"};

@@ -690,6 +690,88 @@ void StellarPopulationStore::store(core::SimulationState& state) const {
   state.sidecars.upsert(std::move(block));
 }
 
+double stellarEventCumulativeCount(const SspModel& model, std::uint32_t channel, double age_years,
+                                   double metallicity, double birth_mass_msun) {
+  return (channel == 0U ? model.ccCumulativeNumber(age_years, metallicity) : model.iaCumulativeNumber(age_years)) *
+      birth_mass_msun;
+}
+
+double stellarEventChannelHorizonYears(const SspModel& model, std::uint32_t channel, double metallicity) {
+  return channel == 0U ? model.lifetimeYears(model.config().cc_mass_min_msun, metallicity)
+                       : model.config().snia_delay_max_years;
+}
+
+double stellarEventAgeYears(const SspModel& model, std::uint32_t channel, double threshold, double metallicity,
+                            double birth_mass_msun, double age_lo_years, double age_hi_years) {
+  if (!(std::isfinite(age_lo_years) && std::isfinite(age_hi_years)) || age_hi_years < age_lo_years) {
+    throw std::invalid_argument("stellar event age search requires a finite ordered age interval");
+  }
+  const auto lambda = [&](double age) {
+    return stellarEventCumulativeCount(model, channel, age, metallicity, birth_mass_msun);
+  };
+  if (lambda(age_lo_years) >= threshold) return age_lo_years;
+  if (!(lambda(age_hi_years) >= threshold)) return std::numeric_limits<double>::infinity();
+  double lo = age_lo_years;  // lambda(lo) < threshold
+  double hi = age_hi_years;  // lambda(hi) >= threshold
+  // Monotone bisection; 200 halvings exceed double resolution of any age.
+  for (int iteration = 0; iteration < 200; ++iteration) {
+    const double mid = lo + 0.5 * (hi - lo);
+    if (!(mid > lo && mid < hi)) break;
+    if (lambda(mid) >= threshold) {
+      hi = mid;
+    } else {
+      lo = mid;
+    }
+  }
+  return hi;  // smallest representable age at which the threshold is reached
+}
+
+RealizedEventChronology realizedEventChronology(const SspModel& model, const StellarPopulationRecord& record_before,
+                                                std::uint32_t channel, std::uint32_t count, double metallicity,
+                                                double birth_mass_msun, double age_begin_years, double age_end_years) {
+  RealizedEventChronology out;
+  out.count = count;
+  if (count == 0U) return out;
+  double threshold = channel == 0U ? record_before.cc_next_threshold : record_before.ia_next_threshold;
+  const std::uint32_t ordinal_before = channel == 0U ? record_before.cc_realized : record_before.ia_realized;
+  const double lambda_begin =
+      stellarEventCumulativeCount(model, channel, age_begin_years, metallicity, birth_mass_msun);
+  bool first_timed = true;
+  for (std::uint32_t k = 0; k < count; ++k) {
+    if (lambda_begin >= threshold) {
+      ++out.catch_up_count;
+    } else {
+      const double age = stellarEventAgeYears(model, channel, threshold, metallicity, birth_mass_msun,
+                                              age_begin_years, age_end_years);
+      if (!std::isfinite(age)) {
+        throw std::logic_error("realized stellar event threshold is not reached inside its own interval");
+      }
+      out.earliest_age_years = first_timed ? age : std::min(out.earliest_age_years, age);
+      out.latest_age_years = first_timed ? age : std::max(out.latest_age_years, age);
+      out.sum_age_years += age;
+      first_timed = false;
+    }
+    // Same threshold sequence as realizeEvents (ordinal after increment).
+    threshold += eventExponentialDraw(record_before.event_stream_key, channel, ordinal_before + k + 1U);
+  }
+  return out;
+}
+
+double nextStellarEventAgeYears(const SspModel& model, const StellarPopulationRecord& record, double age_now_years,
+                                double birth_mass_msun) {
+  double next = std::numeric_limits<double>::infinity();
+  if (record.initialized == 0U || !(birth_mass_msun > 0.0)) return next;
+  double z = 0.0;
+  for (std::size_t e = 2; e < k_chemical_element_count; ++e) z += record.birth_element_mass_fraction[e];
+  const double age_now = std::max(age_now_years, 0.0);
+  for (std::uint32_t channel = 0; channel < 2U; ++channel) {
+    const double threshold = channel == 0U ? record.cc_next_threshold : record.ia_next_threshold;
+    const double horizon = std::max(stellarEventChannelHorizonYears(model, channel, z), age_now);
+    next = std::min(next, stellarEventAgeYears(model, channel, threshold, z, birth_mass_msun, age_now, horizon));
+  }
+  return next;
+}
+
 bool forecastStellarEvent(const SspModel& model, const StellarPopulationRecord& record, double age_years,
                           double lookahead_years, double birth_mass_msun, bool stochastic, double expected_threshold) {
   if (record.initialized == 0U || !(lookahead_years > 0.0) || !(birth_mass_msun > 0.0)) return false;

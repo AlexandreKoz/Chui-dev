@@ -1,3 +1,212 @@
+# CHUÍ — patch 52 source-completion record (supersedes the patch-51 matrix)
+
+Date: 2026-11-08. Branch `claude/nifty-ritchie-x69law` (base: `180b5bb`, the
+merge of PR #131 carrying the patch-51 commits the audit describes; the
+`main(51)` zip itself was not supplied, so byte identity was not verified). Input:
+`CHUI_patch51_auditoria_independente_fonte_2026-11-08.md`. Static edits and
+static cross-file tracing only. **Nothing was compiled, configured, linked,
+tested, benchmarked, simulated or validated; only `git diff --check` ran.** No
+statement below is a runtime, deadlock-freedom, convergence, positivity,
+RSS/PSS or machine-fit claim.
+
+**Status: NOT SOURCE-COMPLETE.** Work packages A–D are implemented in source
+(unvalidated). One codebase-wide M01 §7.2 property is still open in source:
+`parallel::executeBlockingDirectedAmrPatchPayloadExchange`
+(`src/parallel/distributed_memory_amr.cpp`) can throw rank-locally between its
+point-to-point peer messages (record validation, owner checks, request
+planning, consumer callbacks), so a local failure there can still leave a peer
+blocked. It is a different primitive from the destination exchange repaired
+here; closing it needs a guarded per-peer protocol (see §Open source items).
+
+## WP-A (P1-51-01) — collective-safe destination exchange
+
+`parallel::exchangeDestinationRecordsInto` (`src/parallel/composition_exchange.cpp`)
+replaces the anonymous `exchangeIntoDestination`; all front ends route through it.
+
+| Step | Rank-local fallible operations (guarded) | Failure agreement | Next collective |
+|---|---|---|---|
+| 1 | argument/allocator/destination validation; control-plane admission (`kCommunication`, counts/offsets/displacements/cursor, `(ranks+1)·(2·8+3·sizeof(size_t)+4·4)` B) and allocation; per-destination tally | `rethrowCollectivePreparationFailure("destination record exchange preparation")` | `MPI_Alltoall` counts (no throwing statement in between) |
+| 4 | none: saturating round plan (`noexcept` arithmetic) | — | `allreduceMaxUint64(local_rounds)` |
+| 5 | MPI-int range of the maximal round (`overflow_error`), receive lease + scratch (bucket + both maximal stagings) admission, checked offsets, receive-buffer allocation (caller allocator), bucket fill, staging `reserve` | `rethrowCollectivePreparationFailure("destination record exchange admission")` | `MPI_Alltoallv` rounds |
+| 7 | none: `resize` within reserved capacity, `memcpy`, pre-checked `int` narrowing | — | next round |
+
+Front-end phases: `exchangeCompositionDonorRequests` (destination list admitted
+and allocated inside its validation `try`, vote "composition donor request
+validation"), `exchangeCompositionLaneChunks` (vote "composition lane chunk
+validation"), then the table above. Serial/one-rank path: no collective, local
+throws propagate. MPI error returns inside steps 3/4/7 remain communicator-fatal
+(default handler), as before. Zero-work ranks traverse every collective with
+empty streams.
+
+Production callers made collective-safe (decode/merge after a collective is a
+guarded phase voted before the next collective):
+
+| Caller | Votes added |
+|---|---|
+| `DistributedElementDiffusionCoupling::setup` (claim/conductance) | typed governed receive replaces byte receive + unguarded typed copy that preceded "interface validation" |
+| `SourceRuntimeImpl::importRemoteFeedbackCandidates` | "remote feedback halo queries", "… responses", "… import" |
+| `SourceRuntimeImpl::mergeAssociationsDistributed` | decode now guarded (reported at "association discovery"), "association member routing", "association member merge" |
+| `executePart2StellarPopulation` feedback deltas | "mechanical feedback remote delta export", "… import" |
+| `executePart2StellarPopulation` prologue | "stellar population stage prologue" |
+| `importRemoteStarFormationNeighbors` | "star-formation remote neighbour import" |
+
+## WP-B (P1-51-02) — ownership and coexistence (source-derived, not measured)
+
+`GovernedRecords`/`GovernedRecordBuffer` now declare `lease` before the storage
+(implicit destruction frees storage first), move assignment frees the old
+storage before releasing the old lease, `releaseStorage()` does both in that
+order; copies are deleted. The primitive charges its own memory;
+`compositionLaneExchangeAdmissionBytes` now covers caller-owned buffers only
+(outbound records + destinations + reassembled lanes + sort order), removing the
+patch-51 double charge of received records and bucket.
+
+| Stream | Caller-owned (reservation, owner) | Primitive-owned transient | Returned | Coexistence / release |
+|---|---|---|---|---|
+| donor requests | requests (small, ungoverned control), destination list (`parallel.composition_donor_requests.destinations`) | control, bucket, staging | records + lease | destinations die at return; received requests live through response build |
+| donor fractions | `response_reservation` before `responses`/destinations | same | chunk records + lease | outbound freed and lease released right after the exchange; assembly lease scoped before `fractions` |
+| corrections | `correction_reservation` before `corrections`/destinations | same | chunk records + lease | inbound records + assembled corrections until commit |
+| diffusion claims / conductances | `m_reservation` (now declared before the tables): tables, outbound claim/reply + destinations, export/dependent rows | same | typed records + lease (`…claim_exchange`, `…conductance_exchange`) | inbound vectors live to the end of `setup` |
+| diffusion state / delta chunks | `m_reservation`: outbound + reassembled + accumulation scratch (slot/id/rank/flat delta) per subcycle | same | chunk records + lease | per subcycle |
+| feedback queries | `query_lease` (bounded active sources × (ranks−1)) | same | queries + lease | released after the responses are built |
+| feedback candidates | `response_lease` (≤ k per query) | same | candidates + lease | storage moved into `deposition`; lease returned to `remote_candidate_lease`, declared before `deposition` |
+| association members | outbound/kept (covered by `global_reservation` scale only — see open items) | same | records + lease | appended to `kept`, lease dies at scope end |
+| feedback deltas | `deposition.remoteDeltas` (owned by deposition scratch) | same | records + lease | merged before the vote, then freed |
+| interface face ledger | `sources.amr_interface_face_ledger` per level (`m_interface_face_ledger_leases`) | — | — | pre half → post-children closure; dropped at interval open/close and rollback |
+
+External MPI/FFTW/HDF5 internals remain M01 estimates. The step-rollback state
+copy, HDF5 chunk buffers and PM meshes are separate phases admitted by their
+own owners (unchanged); no new overlap with them was introduced.
+
+## WP-C (T02/S01/S02/F01/F02/T01) — physical event time vs publication epoch
+
+| Event family | Physical-time meaning | Time authority | Publication epoch | Conserved transfer | Rollback / restart owner |
+|---|---|---|---|---|---|
+| Star birth (S01) | model: birth at the interval end (probability integrated over the interval) | plan `event_time_code` = coarse end | same instant (age 0, F5; `stellarElapsedYearsInInterval`) | gas → star mass/momentum/elements | population record created at birth (`chronology_time_code` = birth); sidecar restart |
+| Continuous SSP return (AGB/CC mass, elements, dust), table winds/pre-SN | interval-integrated over absolute age `[age_b, age_e]`; no intra-step instant exists in the model | accepted interval | interval end | ejecta from star, exact element/dust sums | `stellar_age_years_last`, record cursor (`advanceStellarPopulationChronology`, gap/replay refusal) |
+| Stochastic CC/Ia SN | **exact** model age `a_k = inf{a: Λ_c(a) ≥ Λ_k}` (`physics::stellarEventAgeYears`, `realizedEventChronology`) | event forecast `SourceRuntime::discreteEventStepEndLimitTimeCode` → MIN over ranks → step clip when `physics.ssp_max_event_publication_lag_years > 0` | interval end; lag `age_e − a_k` recorded (`DiscreteEventChronologyLedger`), enforced fail-closed when bounded | SN energy/momentum/ejecta via mechanical deposition | thresholds/ordinals in the record (restart); ledger in the rollback checkpoint; forecast is a pure function of checkpointed state |
+| Expectation-mode SN | fractional expected count, interval-integrated (no discrete time) | interval | interval end | same | same |
+| BH seeding/accretion/feedback | seeding evaluated on the synchronized end state; accretion/feedback rate × full interval | interval | interval end | BH mass/energy budgets | BH sidecar (unchanged) |
+
+Trace of an SN whose threshold lies inside a coarse interval: the record holds
+`Λ_k` (pre-drawn); at step start every rank evaluates
+`nextStellarEventAgeYears` for its stars, `time_coordinator.cpp` (global step
+loop) reduces MIN and clips `ordered_step_limit_time_code` to
+`t_k + L` (event `time.source_event_publication_clip`, ordered with output
+events); the source post half of that interval realizes the event
+(`realizeEvents`), computes `a_k`, records the lag and refuses lag > L·(1+10⁻⁶)
+for records covered by the forecast; deposition is at the synchronized end, with
+no pending reflux/history/split (patch-51 epoch guard). With `L = 0` (default)
+behaviour is unchanged and the lag (≤ coarse dt) is reported. The criterion never
+shortens a step below `L`. Legacy records catching up past chronology are counted
+(`catch_up_discrete_events`), not timed. The event's identity, ordinal, age and
+budget do not depend on refinement, rank, retry or restart.
+
+Limitation (explicit): deposition remains first-order in time with respect to the
+physical event time unless `L` is chosen small; no claim of exact-time impulsive
+deposition is made. Not numerically qualified.
+
+Also fixed: `executePart2StellarPopulation` referenced `level_selection`, an
+identifier not in scope (introduced by `863f56a`); discrete events use the
+accepted coarse step index.
+
+## WP-D (T02/I02/D01) — exact coarse/fine face coverage
+
+Each rank builds, in `restrictDiffusionFacesToLevelSelection`, the sorted
+`CanonicalInterfaceFace` set (lo/hi stable `gas_cell_id`, axis, side relative to
+lo, periodic flag, remote flag) of the coarse/fine faces it integrates. The
+level pre half parks the set in `SourceIntervalAccumulator::pending_interface_faces`
+(governed lease, vote "recursive AMR interface face ledger open"); the
+post-children closure compares its own set element-for-element (vote "… close")
+before the existing global count check. Because hierarchy, leaf identity and
+rank ownership are frozen inside the coarse interval, per-rank set equality on
+all ranks is equality of the global face multiset: a missing face balanced by a
+duplicate is detected, and duplicates inside one phase are refused. Mirrored MPI
+faces are matched key-for-key across owners by the claim handshake, which now
+also carries the T02 phase tag (`ClaimRecord::phase_check`). Ledgers are dropped
+at interval open/close and step rollback (`resetInterfaceFaceLedger`); none
+survives a legal restart boundary. Chronology (unchanged from patch 51): pre
+half at `t_b` with finer levels synchronized; closure after all children,
+complete reflux and level-history retirement; each coarse/fine face integrates
+`dt_L/2 + dt_L/2`, same-level faces `dt/2 + dt/2`.
+
+## H01–V02/X01 matrix (patch 52)
+
+| ID | Classification | Production evidence |
+|---|---|---|
+| H01 | source implemented (unvalidated) | `src/hydro/hydro_core_solver.cpp` (unchanged) |
+| H02 | source implemented (unvalidated) | dual energy / EOS refresh (unchanged) |
+| C01 | external production-data dependency | loaders + refusals; tables absent |
+| C02 | source implemented (unvalidated) + external data | ion ladder; charge exchange a declared limitation |
+| C03 | source implemented (unvalidated, research) | `fidelityModelForRow`, hybrid shadow |
+| C04 | source implemented (unvalidated, research) | `ThermochemistryOperator::advanceRow` shadow |
+| I01 | source implemented (unvalidated) | unchanged |
+| I02 | source implemented (unvalidated, research) | SGS shear on level phases, exact face ledger |
+| S01 | source implemented (unvalidated) | endpoint birth, age 0 |
+| S02 | source implemented (unvalidated) + external data | exact event ages, publication-lag ledger/bound; yields absent |
+| F01 | source implemented (unvalidated) | mechanical deposition, collective-safe halo/deltas |
+| F02 | external production-data dependency | wind table absent; loader present |
+| D01 | source implemented (unvalidated) | collective-safe governed exchange, exact coverage |
+| A01 | source implemented (unvalidated) | unchanged |
+| A02 | source implemented (unvalidated) | post-children phase + face ledger |
+| A03 | source implemented (unvalidated) | unchanged |
+| A04 | source implemented (unvalidated, research) | `forecastStellarEvent` (unchanged) |
+| G01 | conditional pending qualification | by specification |
+| T01 | source implemented (unvalidated) | Strang plan, exactly-once events, event clock |
+| T02 | source implemented (unvalidated) | explicit physical event time + time-authority clip; exact face coverage |
+| M01 | **source incomplete** | destination-exchange streams closed; directed AMR peer exchange still has rank-local throw windows; library internals estimate-only |
+| M02 | source implemented (unvalidated) | unchanged |
+| V01 | source implemented (unvalidated) | ledgers, restart compat for the new key |
+| V02 | source implemented (unvalidated, research) | unchanged |
+| X01 | out of scope | no MHD/GRMHD, moving mesh, CHIMES/Grackle, new AGN, GPU requirement |
+
+Config/schema/reproducibility: new key `physics.ssp_max_event_publication_lag_years`
+(default 0; typed validation, normalized dump, restart projection accepts older
+checkpoints only at the default). No snapshot/restart field change. Default runs:
+unchanged physics and step sequence (the new ledger is diagnostic). Runs with
+`L > 0` take shorter steps (deterministic, rank-independent).
+
+Tests written but NOT RUN: `tests/unit/test_composition_lane_chunk_wire.cpp`
+(`testGovernedLeaseLifetime`), `tests/unit/test_stellar_population_feedback.cpp`
+(`testEventPhysicalTimeIsSubdivisionInvariant`).
+
+## Public interface changes and migration (`include/cosmosim/**`)
+
+* `parallel::GovernedRecords<T>` / `GovernedRecordBuffer`: member order is now
+  `lease, records|bytes`; types are move-only (copy deleted) and no longer
+  aggregates. Brace-initialization by position must be replaced by member
+  assignment; `.records`/`.bytes`/`.lease` access is unchanged. New
+  `releaseStorage()`.
+* New `parallel::exchangeDestinationRecordsInto`, `DestinationReceiveAllocator`
+  and template `parallel::exchangeGovernedRecords<T>`; prefer them over
+  `executeBlockingDestinationRecordExchange` (kept, ungoverned, same protocol).
+* `parallel::compositionLaneExchangeAdmissionBytes` now returns caller-owned
+  bytes only (smaller than before); callers that also counted the primitive's
+  receive buffer/bucket must not add them back.
+* `workflows::SourceRuntime::discreteEventStepEndLimitTimeCode` (virtual,
+  default +infinity: other implementations need no change).
+* `physics::{stellarEventCumulativeCount, stellarEventChannelHorizonYears,
+  stellarEventAgeYears, RealizedEventChronology, realizedEventChronology,
+  nextStellarEventAgeYears}` (additive).
+* `core::PhysicsConfig::ssp_max_event_publication_lag_years` (additive, default 0).
+
+## Open source items
+
+1. `executeBlockingDirectedAmrPatchPayloadExchange`: guarded per-peer protocol
+   (validate/plan/allocate per peer, then agree before the next peer message,
+   or a two-phase collective plan) — not done in patch 52.
+2. Association member routing scratch (`owner_of`, `local_leader`, outbound) is
+   allocated in a guarded phase but not separately admitted (bounded by the
+   admitted global descriptor set).
+3. Feedback-candidate index growth inside `setRemoteCandidates` is not
+   separately admitted.
+
+Later validation (not source gaps): build matrix; multi-rank low-memory fault
+injection on every vote above; event timestamp / lag-bound tests; face-ledger
+mismatch injection and recursive-vs-synchronized conservation; restart
+equivalence with `L > 0`; RSS/PSS reconciliation; four-mode workflows.
+
+---
+
 # CHUÍ — patch 51 source-completion record (supersedes the patch-50 matrix)
 
 Date: 2026-11-08. Branch `claude/intelligent-cray-m8rxdv`. Input audit:

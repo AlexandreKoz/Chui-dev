@@ -8,6 +8,10 @@
 //    chunk, a foreign layout signature, a stale sequence and a misaddressed
 //    record (exactly-once application per (cell, source));
 //  * the static wire bound covers the largest constructible layout;
+//  * patch 52 (P1-51-02): the governed typed exchange returns a lease that
+//    covers exactly the received bytes, survives moves, is released with the
+//    storage (releaseStorage / destruction) and a refused admission throws
+//    without leaving a committed reservation behind;
 //  * the C02 dataset energy contract parses ionization potentials and the
 //    energy convention, and a dataset without them reports no contract.
 #include <algorithm>
@@ -17,6 +21,7 @@
 #include <stdexcept>
 #include <vector>
 
+#include "cosmosim/core/memory_governor.hpp"
 #include "cosmosim/parallel/composition_exchange.hpp"
 #include "cosmosim/physics/baryon_composition.hpp"
 #include "cosmosim/physics/metal_ion_network.hpp"
@@ -97,6 +102,43 @@ void testRoundTripAndRefusals() {
   CHUI_REQUIRE(throws([] { (void)par::compositionLaneChunkCount(par::k_max_composition_layout_lanes + 1U); }));
 }
 
+void testGovernedLeaseLifetime() {
+  namespace core = cosmosim::core;
+  const par::MpiContext serial(false, 1, 0);
+  struct Rec {
+    std::uint64_t id = 0U;
+    double value = 0.0;
+  };
+  const std::vector<Rec> outbound{{1U, 1.0}, {2U, 2.0}, {3U, 3.0}};
+  const std::vector<int> destinations{0, 0, 0};
+  core::MemoryGovernor governor;
+  {
+    auto received = par::exchangeGovernedRecords<Rec>(serial, outbound, destinations, &governor, "test.lease");
+    CHUI_REQUIRE(received.records.size() == 3U);
+    CHUI_REQUIRE(received.lease.committed());
+    CHUI_REQUIRE(received.lease.bytes() == 3U * sizeof(Rec));
+    CHUI_REQUIRE(governor.snapshot().committed_bytes == 3U * sizeof(Rec));
+    par::GovernedRecords<Rec> moved;
+    moved = std::move(received);  // ownership transfer keeps one lease
+    CHUI_REQUIRE(governor.snapshot().committed_bytes == 3U * sizeof(Rec));
+    moved.releaseStorage();
+    CHUI_REQUIRE(moved.records.empty() && moved.records.capacity() == 0U);
+    CHUI_REQUIRE(governor.snapshot().committed_bytes == 0U);
+  }
+  CHUI_REQUIRE(governor.snapshot().committed_bytes == 0U);
+  core::MemoryGovernorPolicy tight;
+  tight.hard_limit_bytes = 8U;  // below one record: admission must refuse
+  core::MemoryGovernor refusing(tight);
+  CHUI_REQUIRE(throws([&] {
+    (void)par::exchangeGovernedRecords<Rec>(serial, outbound, destinations, &refusing, "test.refusal");
+  }));
+  CHUI_REQUIRE(refusing.snapshot().committed_bytes == 0U && refusing.snapshot().reserved_bytes == 0U);
+  // Empty stream on every rank: no admission, no allocation.
+  const auto empty = par::exchangeGovernedRecords<Rec>(serial, std::vector<Rec>{}, std::vector<int>{}, &governor,
+                                                       "test.empty");
+  CHUI_REQUIRE(empty.records.empty() && !empty.lease.valid());
+}
+
 void testIonEnergyContract() {
   const char* base =
       "schema chui_metal_ion_rates_v1\n"
@@ -133,6 +175,7 @@ void testIonEnergyContract() {
 int main() {
   testStaticBound();
   testRoundTripAndRefusals();
+  testGovernedLeaseLifetime();
   testIonEnergyContract();
   return 0;
 }
