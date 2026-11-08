@@ -955,6 +955,8 @@ struct SourceIntervalAccumulator {
   // level pre half and awaiting the post-children synchronization.
   std::vector<std::uint64_t> pending_interface_sync;
   std::uint64_t level_interface_syncs = 0U;
+  // T02 exactly-once discrete-event dispatch per interval.
+  std::uint64_t discrete_event_dispatches = 0U;
   physics::ChemistryShadowReport shadow{};
   physics::ChemistryAdaptiveReport adaptive{};
 };
@@ -1659,6 +1661,46 @@ class SourceRuntimeImpl final : public SourceRuntime {
     if (!plan.discrete_events) {
       throw std::logic_error("discrete source events requested by a smooth-only plan");
     }
+    // T02 discrete-event chronology (patch 51, specification-permitted
+    // stochastic-event separation, route v10 T01/T02 + section 4.6): births,
+    // SSP returns, winds/pre-SN, SN and BH events are NOT integrated by the
+    // smooth multirate level clocks. Their physical event time is the
+    // absolute end of the accepted coarse (or hierarchical-block) interval,
+    // which is also their only legal publication epoch: every AMR level and
+    // particle bin of the interval is synchronized there, no flux register or
+    // temporal history is open, and new particles may be created without
+    // violating KDK/regrid ownership. Stellar returns are integrated exactly
+    // over absolute stellar age [age_last, age_now] (cumulative cursors,
+    // gap/replay refusal), so the event budget is invariant under level
+    // cadence, refinement, rank count and retry; unresolved deposits are
+    // carried in the persistent enrichment-carry lanes. Exactly-once: one
+    // dispatch per source interval (counter below, restored by rollback).
+    std::exception_ptr epoch_failure;
+    try {
+      if (m_source_interval.discrete_event_dispatches != 0U) {
+        throw std::logic_error("discrete source events dispatched twice inside one source interval");
+      }
+      if (plan.event_time_code != plan.coarse_time_end_code) {
+        throw std::logic_error("discrete source event epoch is not the coarse interval end");
+      }
+      if (m_source_interval.recursive_levels) {
+        if (!context.state.pending_flux_registers.empty() ||
+            !context.state.amr_temporal_boundary_history.empty()) {
+          throw std::logic_error(
+              "discrete source events reached with open AMR flux registers or temporal histories (hierarchy not "
+              "synchronized: illegal event publication epoch)");
+        }
+        for (const std::uint64_t pending : m_source_interval.pending_interface_sync) {
+          if (pending > 1U) {
+            throw std::logic_error("discrete source events reached with an open coarse/fine interface split");
+          }
+        }
+      }
+    } catch (...) {
+      epoch_failure = std::current_exception();
+    }
+    m_mpi_context.rethrowCollectivePreparationFailure(epoch_failure, "discrete source event synchronization epoch");
+    ++m_source_interval.discrete_event_dispatches;
     const double source_evaluation_scale_factor = plan.event_scale_factor;
     if (!std::isfinite(source_evaluation_scale_factor) ||
         source_evaluation_scale_factor <= 0.0) {
