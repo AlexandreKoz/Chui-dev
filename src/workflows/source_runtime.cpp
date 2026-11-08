@@ -3330,19 +3330,51 @@ class SourceRuntimeImpl final : public SourceRuntime {
     // kinetic closure); identical on 1 and N ranks.
     fb_config.step_start_reference = true;
 
-    buildOwnedLeafCellMetadata(context);
-    std::vector<std::uint32_t> owned_leaf;
-    owned_leaf.reserve(state.cells.size());
-    for (std::uint32_t row = 0; row < state.cells.size(); ++row) {
-      if (row < m_owned_leaf_mask.size() && m_owned_leaf_mask[row] != 0U) owned_leaf.push_back(row);
-    }
     // Admission of the remote candidate storage handed to `deposition` by
     // importRemoteFeedbackCandidates; declared before `deposition` so the
     // storage is destroyed before the lease is released (patch 52).
     core::MemoryReservation remote_candidate_lease;
-    physics::MechanicalFeedbackDeposition deposition(fb_config, units);
-    deposition.setCandidates(state, std::move(owned_leaf));
-    physics::StellarPopulationStore store(state);
+    physics::MechanicalFeedbackDeposition deposition(fb_config, units);  // rank-uniform config check only
+    // Patch 52 (P1-51-01): every rank-local allocation of the stage prologue
+    // (owned-leaf metadata, candidate index, population store, sorted star
+    // rows) precedes one collective vote, so a local failure cannot strand
+    // peers in the first collective of the distributed feedback path.
+    std::optional<physics::StellarPopulationStore> store_storage;
+    std::vector<std::uint32_t> star_rows;
+    {
+      std::exception_ptr prologue_failure;
+      try {
+        buildOwnedLeafCellMetadata(context);
+        std::vector<std::uint32_t> owned_leaf;
+        owned_leaf.reserve(state.cells.size());
+        for (std::uint32_t row = 0; row < state.cells.size(); ++row) {
+          if (row < m_owned_leaf_mask.size() && m_owned_leaf_mask[row] != 0U) owned_leaf.push_back(row);
+        }
+        deposition.setCandidates(state, std::move(owned_leaf));
+        store_storage.emplace(state);
+        if (!context.active_set.particles_are_subset || context.active_set.particle_indices.empty()) {
+          star_rows.reserve(state.star_particles.size());
+          for (std::uint32_t s = 0; s < state.star_particles.size(); ++s) star_rows.push_back(s);
+        } else {
+          std::pmr::vector<std::uint32_t> rows(std::pmr::get_default_resource());
+          buildActiveStarRows(context, rows, std::pmr::get_default_resource());
+          star_rows.assign(rows.begin(), rows.end());
+        }
+        // Deterministic source order: stable particle id (not row / rank order).
+        std::sort(star_rows.begin(), star_rows.end(), [&](std::uint32_t a, std::uint32_t b) {
+          return state.particle_sidecar.particle_id[state.star_particles.particle_index[a]] <
+              state.particle_sidecar.particle_id[state.star_particles.particle_index[b]];
+        });
+      } catch (...) {
+        prologue_failure = std::current_exception();
+      }
+      if (distributed_feedback) {
+        m_mpi_context.rethrowCollectivePreparationFailure(prologue_failure, "stellar population stage prologue");
+      } else if (prologue_failure != nullptr) {
+        std::rethrow_exception(prologue_failure);
+      }
+    }
+    physics::StellarPopulationStore& store = *store_storage;
 
     struct StarUpdate {
       std::uint32_t star_index = 0;
@@ -3356,19 +3388,6 @@ class SourceRuntimeImpl final : public SourceRuntime {
       physics::StellarPopulationRecord record{};
     };
     std::vector<StarUpdate> updates;
-    std::vector<std::uint32_t> star_rows;
-    if (!context.active_set.particles_are_subset || context.active_set.particle_indices.empty()) {
-      for (std::uint32_t s = 0; s < state.star_particles.size(); ++s) star_rows.push_back(s);
-    } else {
-      std::pmr::vector<std::uint32_t> rows(std::pmr::get_default_resource());
-      buildActiveStarRows(context, rows, std::pmr::get_default_resource());
-      star_rows.assign(rows.begin(), rows.end());
-    }
-    // Deterministic source order: stable particle id (not row / rank order).
-    std::sort(star_rows.begin(), star_rows.end(), [&](std::uint32_t a, std::uint32_t b) {
-      return state.particle_sidecar.particle_id[state.star_particles.particle_index[a]] <
-          state.particle_sidecar.particle_id[state.star_particles.particle_index[b]];
-    });
     const double msun_code = physics::k_solar_mass_g / bridge.mass_code_to_g;
     const bool energy_coupled = m_physics_config.enable_feedback;
     std::uint64_t newborn_skipped = 0U, legacy_initialized = 0U;
