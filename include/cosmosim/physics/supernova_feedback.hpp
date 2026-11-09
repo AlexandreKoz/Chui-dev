@@ -244,6 +244,13 @@ class MechanicalFeedbackDeposition {
   [[nodiscard]] std::vector<FeedbackCellDelta> remoteDeltas(int source_rank) const;
   // Merge a delta delivered by another rank for a local cell (before commit).
   void addImportedDelta(const core::SimulationState& state, const FeedbackCellDelta& delta);
+  // Patch 53 (M01): admit (governor) and reserve capacity for
+  // `additional_rows` more staged per-cell deltas, capped at the candidate
+  // slot count (each candidate owns at most one delta). A source stencil
+  // touches at most neighbor_count candidates and an imported delta one row,
+  // so callers pass sources * neighbor_count before staging and the inbound
+  // delta count before importing; staging then never grows past admission.
+  void reserveStagedRows(std::size_t additional_rows);
   // Stage one source (no state mutation). Throws on invalid input.
   void stage(const core::SimulationState& state, const FeedbackSourceBudget& source);
   // Apply every staged delta; returns touched rows (sorted, unique).
@@ -283,6 +290,7 @@ class MechanicalFeedbackDeposition {
   // frees the storage first).
   core::MemoryReservation m_index_lease;   // m_sorted_rows + m_sorted_x + m_row_slot
   core::MemoryReservation m_remote_lease;  // m_remote (adopted exchange lease)
+  core::MemoryReservation m_rows_lease;    // m_rows capacity (reserveStagedRows)
   std::vector<std::uint32_t> m_sorted_rows;  // by x
   std::vector<double> m_sorted_x;
   std::vector<RowDelta> m_rows;

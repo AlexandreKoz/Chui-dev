@@ -235,3 +235,39 @@ qdot_HI/Γ_HI = 2.38 eV at z = 0.
 The decks are `configs/chui_final/*.param.txt`. They contain these data paths
 and checksums, and expect the derived files in `chui_data/` next to the run
 directory.
+
+## 2026-11-09 patch-53 acquisition, reproduction and C02 review
+
+Data-only commands; CHUI was not built or run. Details and fact fields:
+`dataset_registry.json`, `docs/chui_data_staging.md`.
+
+* **Reproduction.** `fetch_and_convert.sh` (pinned source hashes) regenerated
+  S02 `e2161646…`, F02 `ba232a1c…`, UVB `4bfc5d9b…` and C01 `4bbca8a9…`
+  byte-identically; `validate_ssp_yield_table.py`, `validate_treecool.py` and
+  `validate_metal_cooling_table.py` reported VALID. The supplied patch-53
+  bundle files have the same SHA-256 values.
+* **C01 (WSS09) acquired.** The SWIFT webstorage tarball (37 448 052 bytes,
+  Last-Modified 2019-10-12) matched the pinned SHA-256 `228ec928…1543`. The
+  converted 52 159 175-byte table matched `4bbca8a9…3410`; max float32
+  round-trip difference vs source 4.99e-9. No licence is stated by the authors;
+  the table stays user-local. **HM01 TREECOOL: still absent.**
+* **C02 (user package).** `build_c02_from_sources.py` regenerated
+  `633a66ee…2d00` byte-identically from its own TSVs and Gnat–Ferland payload
+  (self-consistency only). `validate_metal_ion_rate_table.py`: structurally
+  valid, 174 rate rows (58 stages × 3), 54 potentials, energy contract complete
+  for C, O, Si, Fe, no photo rows, `verification unverified`.
+  Independent cross-check: the 10 962 positive cooling efficiencies equal
+  log10 of the Gnat & Ferland 2012 ion-by-ion tables fetched from the
+  `pikarpov/CoolingCurve` mirror (C `c44bcf16…`, O `9281e9c3…`, Si `426c7e44…`,
+  Fe `8fbab3ff…`) within 0.0005 dex. The collisional-ionization (Voronov 1997)
+  and RR/DR coefficients could **not** be checked against primary sources
+  (`www.pa.uky.edu` blocked by the network policy): NOT INDEPENDENTLY
+  SOURCE-VERIFIED.
+* **C02 energy convention.** Gnat & Ferland 2012 §2 (arXiv:1111.6980v1, PDF
+  sha256 `cce27ad0…22b0`): electron kinetic energy removed by collisional
+  ionization is included in the efficiency; the ionization potential released
+  as recombination radiation is not (only recombining-electron kinetic
+  energy). This is CHUI's `collisional_ionization_work_in_cooling` convention:
+  thermal energy is cooled by `n_e Σ_k n_k L_k`, and the stored ion potential
+  (`metal_ion_potential_delta_erg`) is a diagnostic partition never subtracted
+  again. The C01 table query excludes ladder elements (no double count).

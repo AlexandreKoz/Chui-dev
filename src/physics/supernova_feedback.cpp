@@ -293,6 +293,24 @@ std::vector<std::pair<double, std::uint32_t>> MechanicalFeedbackDeposition::near
   return best;
 }
 
+void MechanicalFeedbackDeposition::reserveStagedRows(std::size_t additional_rows) {
+  const std::size_t target = std::min(core::checkedSizeAdd(m_rows.size(), additional_rows, "feedback staged rows"),
+                                      m_row_slot.size());
+  if (target <= m_rows.capacity()) return;
+  core::MemoryReservation lease;
+  if (m_governor != nullptr) {
+    // Old and new capacity coexist during the reallocation.
+    lease = m_governor->reserve(
+        core::MemoryClass::kPhaseResident,
+        core::checkedSizeMultiply(core::checkedSizeAdd(target, m_rows.capacity(), "feedback staged row realloc"),
+                                  sizeof(RowDelta), "feedback staged row bytes"),
+        "physics.feedback.staged_rows");
+    lease.commit();
+  }
+  m_rows.reserve(target);
+  m_rows_lease = std::move(lease);
+}
+
 MechanicalFeedbackDeposition::RowDelta& MechanicalFeedbackDeposition::delta(std::uint32_t row) {
   if (m_row_slot[row] == 0U) {
     m_rows.push_back(RowDelta{.row = row});

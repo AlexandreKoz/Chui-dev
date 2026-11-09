@@ -953,8 +953,24 @@ struct DiscreteEventChronologyLedger {
   std::uint64_t timed_events = 0U;
   std::uint64_t catch_up_events = 0U;
   double earliest_event_fraction = 1.0;  // (a_k - age_b) / (age_e - age_b)
+  double latest_event_fraction = 0.0;
   double max_publication_lag_years = 0.0;
   double sum_publication_lag_years = 0.0;
+  // Patch 53: timed events of records that the step-start forecast did not
+  // cover (cursor adopted in this interval); recorded, exempt from the bound.
+  std::uint64_t unforecast_timed_events = 0U;
+
+  // Policy label of this interval (patch 53, documentation in
+  // docs/time_integration_event_chronology.md): the default 0 means "lag
+  // bounded only by the accepted coarse interval", NOT "zero lag required".
+  [[nodiscard]] const char* lagPolicy() const noexcept {
+    return lag_bound_years > 0.0 ? "bounded_by_time_authority_clip" : "bounded_by_accepted_interval_only";
+  }
+  [[nodiscard]] double latestEventTimeCode() const noexcept {
+    return timed_events == 0U ? interval_end_code
+                              : interval_begin_code +
+            latest_event_fraction * (interval_end_code - interval_begin_code);
+  }
 
   [[nodiscard]] double earliestEventTimeCode() const noexcept {
     return timed_events == 0U ? interval_end_code
@@ -978,6 +994,9 @@ struct DiscreteEventChronologyLedger {
     sum_publication_lag_years += static_cast<double>(timed) * age_end_years - chronology.sum_age_years;
     earliest_event_fraction =
         std::min(earliest_event_fraction, (chronology.earliest_age_years - age_begin_years) / span);
+    latest_event_fraction =
+        std::max(latest_event_fraction, (chronology.latest_age_years - age_begin_years) / span);
+    if (!enforce_lag_bound) unforecast_timed_events += timed;
     // Relative 1e-6 covers the code-time <-> stellar-years conversion
     // round-off between the forecast and the accepted interval.
     if (enforce_lag_bound && lag_bound_years > 0.0 && lag > lag_bound_years * (1.0 + 1.0e-6)) {
@@ -3747,6 +3766,8 @@ class SourceRuntimeImpl final : public SourceRuntime {
       }
       std::exception_ptr stage_failure;
       try {
+        deposition.reserveStagedRows(core::checkedSizeMultiply(
+            staged_budgets.size(), static_cast<std::size_t>(fb_config.neighbor_count), "feedback staged row bound"));
         for (const physics::FeedbackSourceBudget& budget : staged_budgets) deposition.stage(state, budget);
       } catch (...) {
         stage_failure = std::current_exception();
@@ -3774,6 +3795,7 @@ class SourceRuntimeImpl final : public SourceRuntime {
           std::sort(inbound.records.begin(), inbound.records.end(), [](const auto& l, const auto& r) {
             return l.gas_cell_id != r.gas_cell_id ? l.gas_cell_id < r.gas_cell_id : l.source_rank < r.source_rank;
           });
+          deposition.reserveStagedRows(inbound.records.size());
           for (const auto& d : inbound.records) deposition.addImportedDelta(state, d);
         } catch (...) {
           stage_failure = std::current_exception();
@@ -3870,7 +3892,14 @@ class SourceRuntimeImpl final : public SourceRuntime {
                       {"sum_event_publication_lag_years",
                        std::to_string(m_last_event_chronology.sum_publication_lag_years)},
                       {"event_publication_lag_bound_years",
-                       std::to_string(m_last_event_chronology.lag_bound_years)}}});
+                       std::to_string(m_last_event_chronology.lag_bound_years)},
+                      {"latest_event_time_code", std::to_string(m_last_event_chronology.latestEventTimeCode())},
+                      {"unforecast_timed_discrete_events",
+                       std::to_string(m_last_event_chronology.unforecast_timed_events)},
+                      {"event_lag_policy", m_last_event_chronology.lagPolicy()},
+                      {"event_deposition_semantics",
+                       "deposited at the synchronized interval end (publication epoch), not at the physical event "
+                       "time; physical times are model-defined threshold crossings"}}});
     }
   }
 
