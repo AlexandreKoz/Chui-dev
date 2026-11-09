@@ -3009,10 +3009,10 @@ class SourceRuntimeImpl final : public SourceRuntime {
   // Patch 52 (P1-51-01/02): every rank-local preparation (query build,
   // response build, candidate import) runs in a guarded phase followed by a
   // collective vote, and both streams are received directly into governed
-  // typed buffers (no ungoverned byte buffer + second typed copy). The
-  // returned lease covers the remote candidate storage now owned by
-  // `deposition`; the caller keeps it alive at least as long as that object.
-  [[nodiscard]] core::MemoryReservation importRemoteFeedbackCandidates(
+  // typed buffers (no ungoverned byte buffer + second typed copy). Patch 53:
+  // the candidate storage AND its lease are handed to `deposition`, which
+  // owns both (and admits its own index growth) for its whole lifetime.
+  void importRemoteFeedbackCandidates(
       const core::SimulationState& state,
       physics::MechanicalFeedbackDeposition& deposition,
       std::span<const physics::FeedbackSourceBudget> budgets,
@@ -3115,14 +3115,11 @@ class SourceRuntimeImpl final : public SourceRuntime {
         m_mpi_context, responses, response_destinations, m_memory_governor,
         "sources.feedback.remote_halo_candidate_exchange");
     try {
-      deposition.setRemoteCandidates(state, std::move(remote.records));
+      deposition.setRemoteCandidates(state, std::move(remote.records), std::move(remote.lease));
     } catch (...) {
       failure = std::current_exception();
     }
     m_mpi_context.rethrowCollectivePreparationFailure(failure, "remote feedback halo import");
-    // Ownership transfer: the candidate storage now lives in `deposition`;
-    // its admission travels with it to the caller.
-    return std::move(remote.lease);
   }
 
   // G0.3: decomposition-independent association discovery and merge.
@@ -3227,10 +3224,48 @@ class SourceRuntimeImpl final : public SourceRuntime {
     // collective vote before the member exchange; members are received into
     // a governed typed buffer and appended to `kept` in a guarded phase
     // (the final merge has no further collective in this function).
+    // Patch 53 (P1-52-02): every coexisting routing/merge buffer is admitted
+    // before it grows, with its lease declared before the storage it covers:
+    //   routing_lease: outbound + destinations + kept (reserved at local
+    //     size, so routing pushes never reallocate);
+    //   routing_scratch_lease (inside the routing scope): owner_of,
+    //     id_to_leader, local_leader;
+    //   merge_lease: kept regrowth to local + received (old and new capacity
+    //     coexist during the reallocation), members and merged (each <= the
+    //     member count). The received member records carry their own lease
+    //     (governed exchange) and are not charged again.
+    core::MemoryReservation routing_lease;
+    core::MemoryReservation merge_lease;
     std::vector<MemberRecord> outbound;
     std::vector<int> destinations;
     std::vector<MemberRecord> kept;
     try {
+      const std::size_t n_local = local.size();
+      if (m_memory_governor != nullptr && n_local != 0U) {
+        routing_lease = m_memory_governor->reserve(
+            core::MemoryClass::kPhaseResident,
+            core::checkedSizeMultiply(n_local, 2U * sizeof(MemberRecord) + sizeof(int),
+                                      "association routing buffer bytes"),
+            "sources.associations.routing");
+        routing_lease.commit();
+      }
+      outbound.reserve(n_local);
+      destinations.reserve(n_local);
+      kept.reserve(n_local);
+      core::MemoryReservation routing_scratch_lease;
+      if (m_memory_governor != nullptr && (global.size() + n_local) != 0U) {
+        routing_scratch_lease = m_memory_governor->reserve(
+            core::MemoryClass::kPhaseResident,
+            core::checkedSizeAdd(
+                core::checkedSizeMultiply(global.size(),
+                                          sizeof(std::pair<std::uint64_t, int>) +
+                                              sizeof(std::pair<std::uint64_t, std::uint64_t>),
+                                          "association owner/leader index bytes"),
+                core::checkedSizeMultiply(n_local, sizeof(std::uint64_t), "association local leader bytes"),
+                "association routing scratch bytes"),
+            "sources.associations.routing_scratch");
+        routing_scratch_lease.commit();
+      }
       // Leader id -> owner rank (the descriptor whose id equals the leader).
       std::vector<std::pair<std::uint64_t, int>> owner_of;
       owner_of.reserve(global.size());
@@ -3279,7 +3314,32 @@ class SourceRuntimeImpl final : public SourceRuntime {
       auto received = parallel::exchangeGovernedRecords<MemberRecord>(
           m_mpi_context, outbound, destinations, m_memory_governor, "sources.associations.member_exchange");
       try {
+        const std::size_t members_total = core::checkedSizeAdd(kept.size(), received.records.size(),
+                                                               "association member count");
+        if (m_memory_governor != nullptr && members_total != 0U) {
+          merge_lease = m_memory_governor->reserve(
+              core::MemoryClass::kPhaseResident,
+              core::checkedSizeAdd(
+                  core::checkedSizeMultiply(members_total, sizeof(MemberRecord), "association kept regrowth bytes"),
+                  core::checkedSizeMultiply(members_total, 2U * sizeof(physics::FeedbackSourceBudget),
+                                            "association members/merged bytes"),
+                  "association merge bytes"),
+              "sources.associations.merge");
+          merge_lease.commit();
+        }
+        kept.reserve(members_total);
         kept.insert(kept.end(), received.records.begin(), received.records.end());
+      } catch (...) {
+        failure = std::current_exception();
+      }
+    } else if (m_memory_governor != nullptr && !kept.empty()) {
+      try {
+        merge_lease = m_memory_governor->reserve(
+            core::MemoryClass::kPhaseResident,
+            core::checkedSizeMultiply(kept.size(), 2U * sizeof(physics::FeedbackSourceBudget),
+                                      "association members/merged bytes"),
+            "sources.associations.merge");
+        merge_lease.commit();
       } catch (...) {
         failure = std::current_exception();
       }
@@ -3287,10 +3347,12 @@ class SourceRuntimeImpl final : public SourceRuntime {
     std::vector<physics::FeedbackSourceBudget> merged;
     try {
       if (failure != nullptr) std::rethrow_exception(failure);
+      merged.reserve(kept.size());
       std::sort(kept.begin(), kept.end(), [](const MemberRecord& l, const MemberRecord& r) {
         return l.leader_id != r.leader_id ? l.leader_id < r.leader_id : l.budget.source_id < r.budget.source_id;
       });
       std::vector<physics::FeedbackSourceBudget> members;
+      members.reserve(kept.size());
       std::size_t begin = 0U;
       while (begin < kept.size()) {
         std::size_t end = begin + 1U;
@@ -3359,11 +3421,10 @@ class SourceRuntimeImpl final : public SourceRuntime {
     // kinetic closure); identical on 1 and N ranks.
     fb_config.step_start_reference = true;
 
-    // Admission of the remote candidate storage handed to `deposition` by
-    // importRemoteFeedbackCandidates; declared before `deposition` so the
-    // storage is destroyed before the lease is released (patch 52).
-    core::MemoryReservation remote_candidate_lease;
+    // Patch 53: `deposition` owns its candidate indices, the remote candidate
+    // storage and their leases (setMemoryGovernor / setRemoteCandidates).
     physics::MechanicalFeedbackDeposition deposition(fb_config, units);  // rank-uniform config check only
+    deposition.setMemoryGovernor(m_memory_governor);
     // Patch 52 (P1-51-01): every rank-local allocation of the stage prologue
     // (owned-leaf metadata, candidate index, population store, sorted star
     // rows) precedes one collective vote, so a local failure cannot strand
@@ -3416,6 +3477,10 @@ class SourceRuntimeImpl final : public SourceRuntime {
       std::array<double, 3> channel_energy{};
       physics::StellarPopulationRecord record{};
     };
+    // Patch 53 (M01): per-star stage staging (updates, budgets, association
+    // birth times) admitted at the active star count before it grows; the
+    // lease is declared before the storage it covers.
+    core::MemoryReservation ssp_stage_lease;
     std::vector<StarUpdate> updates;
     const double msun_code = physics::k_solar_mass_g / bridge.mass_code_to_g;
     const bool energy_coupled = m_physics_config.enable_feedback;
@@ -3436,6 +3501,18 @@ class SourceRuntimeImpl final : public SourceRuntime {
     (void)transaction.prepare([&] {
       std::exception_ptr loop_failure;
       try {
+      if (m_memory_governor != nullptr && !star_rows.empty()) {
+        ssp_stage_lease = m_memory_governor->reserve(
+            core::MemoryClass::kPhaseResident,
+            core::checkedSizeMultiply(star_rows.size(),
+                                      sizeof(StarUpdate) + sizeof(physics::FeedbackSourceBudget) + sizeof(double),
+                                      "SSP stage per-star staging bytes"),
+            "sources.stellar_population.stage");
+        ssp_stage_lease.commit();
+      }
+      updates.reserve(star_rows.size());
+      staged_budgets.reserve(star_rows.size());
+      association_birth_years.reserve(star_rows.size());
       for (const std::uint32_t s : star_rows) {
         const std::uint32_t p = state.star_particles.particle_index[s];
         const std::uint64_t pid = state.particle_sidecar.particle_id[p];
@@ -3614,8 +3691,7 @@ class SourceRuntimeImpl final : public SourceRuntime {
             context.integrator_state.step_index);
       }
       if (distributed_feedback) {
-        remote_candidate_lease =
-            importRemoteFeedbackCandidates(state, deposition, staged_budgets, context.integrator_state.step_index);
+        importRemoteFeedbackCandidates(state, deposition, staged_budgets, context.integrator_state.step_index);
       }
       std::exception_ptr stage_failure;
       try {

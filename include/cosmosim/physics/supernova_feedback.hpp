@@ -7,6 +7,7 @@
 #include <span>
 #include <vector>
 
+#include "cosmosim/core/memory_governor.hpp"
 #include "cosmosim/physics/baryon_composition.hpp"
 
 namespace cosmosim::core {
@@ -214,11 +215,22 @@ class MechanicalFeedbackDeposition {
  public:
   MechanicalFeedbackDeposition(MechanicalFeedbackConfig config, FeedbackUnits units);
 
-  // Candidate cells: owned leaf rows. Builds an x-sorted index.
+  // Patch 53 (P1-52-02): optional MemoryGovernor for the candidate indices
+  // (kPhaseResident). Set before setCandidates; null = accounting disabled
+  // (no-governor policy of the memory specification).
+  void setMemoryGovernor(core::MemoryGovernor* governor) noexcept { m_governor = governor; }
+  // Candidate cells: owned leaf rows. Builds an x-sorted index. The index
+  // (sorted rows, sorted x, row-slot map) is admitted before it is built.
   void setCandidates(const core::SimulationState& state, std::vector<std::uint32_t> owned_leaf_rows);
   // Part 3: append remote candidates (after setCandidates). Deterministic:
   // candidates are ordered by (x, stable id) and k-NN ties by stable id.
-  void setRemoteCandidates(const core::SimulationState& state, std::vector<FeedbackRemoteCandidate> remote);
+  // Patch 53: strongly exception-safe (the new index is built beside the old
+  // one and swapped in only after validation, so a failure leaves the local
+  // index intact); the new index is admitted with old/new coexistence before
+  // it is allocated; `remote_storage_lease` (the governed exchange lease of
+  // `remote`) is adopted together with the storage it covers.
+  void setRemoteCandidates(const core::SimulationState& state, std::vector<FeedbackRemoteCandidate> remote,
+                           core::MemoryReservation remote_storage_lease = {});
   // Squared distance of the k-th nearest LOCAL candidate (infinity if fewer
   // than k local candidates). Any remote cell closer than this may enter the
   // global stencil, so it bounds the remote halo query of a source.
@@ -266,6 +278,11 @@ class MechanicalFeedbackDeposition {
 
   MechanicalFeedbackConfig m_config;
   FeedbackUnits m_units;
+  core::MemoryGovernor* m_governor = nullptr;
+  // Leases are declared before the storage they cover (implicit destruction
+  // frees the storage first).
+  core::MemoryReservation m_index_lease;   // m_sorted_rows + m_sorted_x + m_row_slot
+  core::MemoryReservation m_remote_lease;  // m_remote (adopted exchange lease)
   std::vector<std::uint32_t> m_sorted_rows;  // by x
   std::vector<double> m_sorted_x;
   std::vector<RowDelta> m_rows;

@@ -1,5 +1,7 @@
 #include "cosmosim/physics/supernova_feedback.hpp"
 
+#include "cosmosim/core/checked_arithmetic.hpp"
+
 #include <algorithm>
 #include <cmath>
 #include <limits>
@@ -27,26 +29,55 @@ MechanicalFeedbackDeposition::MechanicalFeedbackDeposition(MechanicalFeedbackCon
   }
 }
 
+namespace {
+// Bytes of a candidate index over `sorted` candidates and `slots` row slots.
+[[nodiscard]] std::size_t feedbackCandidateIndexBytes(std::size_t sorted, std::size_t slots) {
+  return core::checkedSizeAdd(
+      core::checkedSizeMultiply(sorted, sizeof(std::uint32_t) + sizeof(double), "feedback candidate index bytes"),
+      core::checkedSizeMultiply(slots, sizeof(std::uint32_t), "feedback row-slot bytes"),
+      "feedback candidate index total bytes");
+}
+}  // namespace
+
 void MechanicalFeedbackDeposition::setCandidates(const core::SimulationState& state,
                                                  std::vector<std::uint32_t> owned_leaf_rows) {
+  // New index beside the old one (both admitted), then a noexcept swap.
+  core::MemoryReservation new_lease;
+  if (m_governor != nullptr) {
+    new_lease = m_governor->reserve(
+        core::MemoryClass::kPhaseResident,
+        feedbackCandidateIndexBytes(owned_leaf_rows.size(), state.cells.size()),
+        "physics.feedback.candidate_index");
+    new_lease.commit();
+  }
   std::sort(owned_leaf_rows.begin(), owned_leaf_rows.end(), [&](std::uint32_t a, std::uint32_t b) {
     const double xa = state.cells.center_x_comoving[a], xb = state.cells.center_x_comoving[b];
     return xa < xb || (xa == xb && a < b);
   });
+  std::vector<double> sorted_x(owned_leaf_rows.size());
+  for (std::size_t i = 0; i < owned_leaf_rows.size(); ++i) sorted_x[i] = state.cells.center_x_comoving[owned_leaf_rows[i]];
+  std::vector<std::uint32_t> row_slot(state.cells.size(), 0U);
+  // Commit (noexcept from here).
   m_sorted_rows = std::move(owned_leaf_rows);
-  m_sorted_x.resize(m_sorted_rows.size());
-  for (std::size_t i = 0; i < m_sorted_rows.size(); ++i) m_sorted_x[i] = state.cells.center_x_comoving[m_sorted_rows[i]];
+  m_sorted_x = std::move(sorted_x);
+  m_row_slot = std::move(row_slot);
+  m_index_lease = std::move(new_lease);  // old storage freed above, then old lease released
   m_local_count = static_cast<std::uint32_t>(state.cells.size());
   m_remote.clear();
-  m_row_slot.assign(state.cells.size(), 0U);
+  m_remote.shrink_to_fit();
+  m_remote_lease.release();
   m_rows.clear();
   m_ledger = FeedbackLedger{};
 }
 
 void MechanicalFeedbackDeposition::setRemoteCandidates(const core::SimulationState& state,
-                                                       std::vector<FeedbackRemoteCandidate> remote) {
+                                                       std::vector<FeedbackRemoteCandidate> remote,
+                                                       core::MemoryReservation remote_storage_lease) {
   if (!m_rows.empty()) {
     throw std::logic_error("feedback remote candidates must be set before any source is staged");
+  }
+  if (!m_remote.empty()) {
+    throw std::logic_error("feedback remote candidates were already set for this candidate index");
   }
   std::sort(remote.begin(), remote.end(),
             [](const FeedbackRemoteCandidate& l, const FeedbackRemoteCandidate& r) { return l.gas_cell_id < r.gas_cell_id; });
@@ -55,21 +86,54 @@ void MechanicalFeedbackDeposition::setRemoteCandidates(const core::SimulationSta
                              return l.gas_cell_id == r.gas_cell_id;
                            }),
                remote.end());
-  m_remote = std::move(remote);
-  for (std::uint32_t i = 0; i < m_remote.size(); ++i) {
-    if (m_remote[i].gas_cell_id == 0U || state.rowForGasCellId(m_remote[i].gas_cell_id).has_value()) {
+  for (const FeedbackRemoteCandidate& candidate : remote) {
+    if (candidate.gas_cell_id == 0U || state.rowForGasCellId(candidate.gas_cell_id).has_value()) {
       throw std::invalid_argument("feedback remote candidate is zero or already local");
     }
-    m_sorted_rows.push_back(m_local_count + i);
   }
-  std::sort(m_sorted_rows.begin(), m_sorted_rows.end(), [&](std::uint32_t a, std::uint32_t b) {
-    const CandidateProps pa = props(state, a);
-    const CandidateProps pb = props(state, b);
-    return pa.center[0] < pb.center[0] || (pa.center[0] == pb.center[0] && pa.stable_id < pb.stable_id);
+  if (static_cast<std::uint64_t>(m_local_count) + remote.size() > std::numeric_limits<std::uint32_t>::max()) {
+    throw std::overflow_error("feedback candidate count exceeds the 32-bit candidate index");
+  }
+  // Old index (still live) + new index coexist until the swap below.
+  const std::size_t new_sorted = core::checkedSizeAdd(m_sorted_rows.size(), remote.size(), "feedback sorted candidates");
+  const std::size_t new_slots = core::checkedSizeAdd(static_cast<std::size_t>(m_local_count), remote.size(),
+                                                     "feedback candidate slots");
+  core::MemoryReservation new_lease;
+  if (m_governor != nullptr) {
+    new_lease = m_governor->reserve(core::MemoryClass::kPhaseResident,
+                                    feedbackCandidateIndexBytes(new_sorted, new_slots),
+                                    "physics.feedback.candidate_index");
+    new_lease.commit();
+  }
+  std::vector<std::uint32_t> sorted_rows;
+  sorted_rows.reserve(new_sorted);
+  sorted_rows.assign(m_sorted_rows.begin(), m_sorted_rows.end());
+  for (std::uint32_t i = 0; i < remote.size(); ++i) sorted_rows.push_back(m_local_count + i);
+  // props() resolves remote candidates through m_remote, so order the new
+  // index against the candidate vector it will be committed with.
+  const auto prop_x = [&](std::uint32_t candidate) {
+    return candidate >= m_local_count ? remote[candidate - m_local_count].center_comoving[0]
+                                      : props(state, candidate).center[0];
+  };
+  const auto prop_id = [&](std::uint32_t candidate) {
+    return candidate >= m_local_count ? remote[candidate - m_local_count].gas_cell_id
+                                      : props(state, candidate).stable_id;
+  };
+  std::sort(sorted_rows.begin(), sorted_rows.end(), [&](std::uint32_t a, std::uint32_t b) {
+    const double xa = prop_x(a);
+    const double xb = prop_x(b);
+    return xa < xb || (xa == xb && prop_id(a) < prop_id(b));
   });
-  m_sorted_x.resize(m_sorted_rows.size());
-  for (std::size_t i = 0; i < m_sorted_rows.size(); ++i) m_sorted_x[i] = props(state, m_sorted_rows[i]).center[0];
-  m_row_slot.assign(static_cast<std::size_t>(m_local_count) + m_remote.size(), 0U);
+  std::vector<double> sorted_x(sorted_rows.size());
+  for (std::size_t i = 0; i < sorted_rows.size(); ++i) sorted_x[i] = prop_x(sorted_rows[i]);
+  std::vector<std::uint32_t> row_slot(new_slots, 0U);
+  // Commit (noexcept from here): storage first, then leases.
+  m_remote = std::move(remote);
+  m_remote_lease = std::move(remote_storage_lease);
+  m_sorted_rows = std::move(sorted_rows);
+  m_sorted_x = std::move(sorted_x);
+  m_row_slot = std::move(row_slot);
+  m_index_lease = std::move(new_lease);
 }
 
 MechanicalFeedbackDeposition::CandidateProps MechanicalFeedbackDeposition::props(
