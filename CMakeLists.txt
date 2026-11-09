@@ -1945,6 +1945,22 @@ if(COSMOSIM_ENABLE_TESTS)
       mpi hdf5 distributed amr hydro gas workflow directed_exchange reflux integration)
   endif()
 
+  if(COSMOSIM_ENABLE_MPI)
+    # Patch 53 (P0-52-01): directed AMR exchange fault injection. The TIMEOUT
+    # is the deadlock oracle; every scenario must reach a collective verdict.
+    add_executable(test_integration_directed_amr_exchange_fault_injection_mpi
+      tests/integration/test_directed_amr_exchange_fault_injection_mpi.cpp)
+    target_link_libraries(test_integration_directed_amr_exchange_fault_injection_mpi PRIVATE cosmosim_all)
+    add_test(
+      NAME integration_directed_amr_exchange_fault_injection_mpi_three_rank
+      COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 3 ${MPIEXEC_PREFLAGS}
+              $<TARGET_FILE:test_integration_directed_amr_exchange_fault_injection_mpi> ${MPIEXEC_POSTFLAGS})
+    set_tests_properties(
+      integration_directed_amr_exchange_fault_injection_mpi_three_rank
+      PROPERTIES PROCESSORS 3 TIMEOUT 60
+                 LABELS "mpi;distributed;amr;directed_exchange;fault_injection")
+  endif()
+
   if(COSMOSIM_ENABLE_MPI AND COSMOSIM_ENABLE_HDF5)
     add_executable(test_integration_distributed_gas_cell_migration_mpi
       tests/integration/test_distributed_gas_cell_migration_mpi.cpp)

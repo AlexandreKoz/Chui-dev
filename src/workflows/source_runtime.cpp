@@ -2923,8 +2923,22 @@ class SourceRuntimeImpl final : public SourceRuntime {
   // local patch, with its step-start centre and velocity; the patch metadata
   // gives its level and cell width. Ranks without patches still participate.
   void importRemoteStarFormationNeighbors(core::StepContext& context) {
-    const auto local_patch_records =
-        internal::buildMigrationAmrPatchPayloadRecords(context.state, m_mpi_context.worldRank());
+    // Patch 53 (P0-52-01): local descriptor build voted before the exchange.
+    std::vector<parallel::AmrPatchPayloadRecord> local_patch_records;
+    {
+      std::exception_ptr build_failure;
+      try {
+        local_patch_records =
+            internal::buildMigrationAmrPatchPayloadRecords(context.state, m_mpi_context.worldRank());
+      } catch (...) {
+        build_failure = std::current_exception();
+      }
+      m_mpi_context.rethrowCollectivePreparationFailure(build_failure, "star-formation patch descriptor build");
+    }
+    // Received boundary cells (2x: geometric growth of the staging vector)
+    // and their decoded RemoteCell coexist; admitted per peer inside the
+    // stream's guarded admission phase (reservations declared first).
+    std::vector<core::MemoryReservation> admitted;
     std::vector<parallel::AmrPatchCellPayloadRecord> received;
     const auto exchange = parallel::executeBlockingDirectedAmrPatchPayloadExchange(
         m_mpi_context, local_patch_records,
@@ -2936,11 +2950,26 @@ class SourceRuntimeImpl final : public SourceRuntime {
         [&received](int, std::span<const parallel::AmrPatchCellPayloadRecord> records) {
           received.insert(received.end(), records.begin(), records.end());
         },
-        {}, 0U, context.integrator_state.step_index,
+        [this, &admitted](int, std::span<const parallel::AmrPatchPayloadRecord>,
+                          std::span<const parallel::AmrPatchBoundaryCellRequest>, std::uint64_t record_count) {
+          if (m_memory_governor == nullptr || record_count == 0U) return;
+          core::MemoryReservation reservation = m_memory_governor->reserve(
+              core::MemoryClass::kPhaseResident,
+              core::checkedSizeMultiply(
+                  core::checkedIntegralNarrow<std::size_t>(record_count, "star-formation remote cell count"),
+                  2U * sizeof(parallel::AmrPatchCellPayloadRecord) +
+                      sizeof(internal::StarFormationNeighborIndex::RemoteCell),
+                  "star-formation remote cell bytes"),
+              "sources.star_formation.remote_neighbours");
+          reservation.commit();
+          admitted.push_back(std::move(reservation));
+        },
+        0U, context.integrator_state.step_index,
         parallel::AmrInterfaceTopologyOptions{
             .periodic_box_extent_comoving = m_hydro_boundary == core::BoundaryCondition::kPeriodic
                 ? m_box_extent_comoving : std::array<double, 3>{0.0, 0.0, 0.0},
-            .ghost_layers = 1U});
+            .ghost_layers = 1U},
+        m_memory_governor);
     // Patch 52 (P1-51-01): the decode and index import are a guarded phase
     // with a collective vote, because the star-formation batch rounds that
     // follow enter collectives; a local failure must not strand peers there.
