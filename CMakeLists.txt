@@ -1399,6 +1399,12 @@ if(COSMOSIM_ENABLE_TESTS)
   add_executable(test_unit_composition_lane_chunk_wire tests/unit/test_composition_lane_chunk_wire.cpp)
   target_link_libraries(test_unit_composition_lane_chunk_wire PRIVATE cosmosim_all)
   add_test(NAME unit_composition_lane_chunk_wire COMMAND test_unit_composition_lane_chunk_wire)
+  # CHUI patch 53 C02 dataset integration (NOT RUN — USER-RESERVED). Set
+  # CHUI_C02_TABLE to the user-local unverified C/O/Si/Fe table to enable the
+  # real-dataset cases.
+  add_executable(test_unit_c02_metal_ion_dataset tests/unit/test_c02_metal_ion_dataset.cpp)
+  target_link_libraries(test_unit_c02_metal_ion_dataset PRIVATE cosmosim_all)
+  add_test(NAME unit_c02_metal_ion_dataset COMMAND test_unit_c02_metal_ion_dataset)
   add_executable(test_unit_cooling_f2_complete_interval tests/unit/test_cooling_f2_complete_interval.cpp)
   target_link_libraries(test_unit_cooling_f2_complete_interval PRIVATE cosmosim_all)
   add_test(NAME unit_cooling_f2_complete_interval COMMAND test_unit_cooling_f2_complete_interval)

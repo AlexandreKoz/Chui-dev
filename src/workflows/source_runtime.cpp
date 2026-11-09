@@ -1178,6 +1178,57 @@ class SourceRuntimeImpl final : public SourceRuntime {
     return true;
   }
 
+  // Patch 53 (C5/V01): one runtime record of every loaded external data
+  // product with its checksum, declared verification state and declared
+  // model limitations (IMF/metallicity coverage of the wind table, unverified
+  // C02 rates, UVB compatibility decision of the metal table). The normalized
+  // configuration (paths + SHA-256, opt-ins) remains the restart/provenance
+  // authority; this event makes the scientific assumptions explicit in the
+  // run log. Diagnostic only: never mutates state.
+  void reportDataAssumptionsOnce(const core::StepContext& context) {
+    if (m_data_assumptions_reported || context.profiler_session == nullptr) return;
+    m_data_assumptions_reported = true;
+    std::unordered_map<std::string, std::string> payload;
+    if (m_ssp_yield_table != nullptr) {
+      payload.emplace("ssp_yield_table_sha256", m_ssp_yield_table->sha256());
+      payload.emplace("ssp_yield_table_citation", m_ssp_yield_table->citation());
+      payload.emplace("ssp_yield_table_license", m_ssp_yield_table->license());
+    }
+    if (m_wind_table != nullptr) {
+      payload.emplace("ssp_wind_table_source", m_wind_table->source());
+      payload.emplace("ssp_wind_table_metallicities", std::to_string(m_wind_table->metallicityCount()));
+      payload.emplace("ssp_wind_table_limitations", m_wind_table->limitations());
+    }
+    if (m_baryonic_data.uv_background != nullptr) {
+      payload.emplace("uv_background_table_sha256", m_baryonic_data.uv_background->provenance().sha256_hex);
+      payload.emplace("uv_background_metal_photorates", "none (TREECOOL supplies H/He rates only)");
+    }
+    if (m_baryonic_data.metal_cooling_table != nullptr) {
+      payload.emplace("metal_cooling_uv_background_compatible",
+                           m_baryonic_data.uv_background_compatibility.compatible ? "true" : "false");
+      payload.emplace("metal_cooling_uv_background_mismatch_accepted",
+                           m_baryonic_data.uv_background_compatibility.accepted_mismatch ? "true" : "false");
+    }
+    if (m_baryonic_data.metal_ion_rate_table != nullptr) {
+      const physics::MetalIonRateTable& ions = *m_baryonic_data.metal_ion_rate_table;
+      payload.emplace("metal_ion_rate_table_provenance", ions.provenance());
+      payload.emplace("metal_ion_rate_table_license", ions.license());
+      payload.emplace("metal_ion_rate_table_verification",
+                           ions.declaredVerified() ? "verified_against_source (declared)" : "unverified");
+      payload.emplace("metal_ion_energy_convention", ions.energyConvention());
+    }
+    if (payload.empty()) return;
+    context.profiler_session->recordEvent(core::RuntimeEvent{
+        .event_kind = "sources.data_assumptions",
+        .severity = core::RuntimeEventSeverity::kInfo,
+        .subsystem = "physics.data",
+        .step_index = context.integrator_state.step_index,
+        .simulation_time_code = context.integrator_state.current_time_code,
+        .scale_factor = context.integrator_state.current_scale_factor,
+        .message = "external physics data products, checksums, verification state and declared limitations",
+        .payload = std::move(payload)});
+  }
+
   // T02 (patch 52): event-aware time-authority input (see SourceRuntime).
   [[nodiscard]] double discreteEventStepEndLimitTimeCode(const core::SimulationState& state,
                                                          double current_time_code) const override {
@@ -1849,6 +1900,7 @@ class SourceRuntimeImpl final : public SourceRuntime {
     // The controller publishes exactly once per Strang interval, after every
     // half (and every AMR level half) contributed its observations.
     if (plan.closes_interval) closeSourceInterval(context);
+    reportDataAssumptionsOnce(context);
   }
 
  private:
@@ -5002,6 +5054,7 @@ class SourceRuntimeImpl final : public SourceRuntime {
   std::unique_ptr<physics::SspModel> m_ssp_model;
   physics::FeedbackLedger m_last_feedback_ledger{};
   DiscreteEventChronologyLedger m_last_event_chronology{};
+  bool m_data_assumptions_reported = false;
   std::unique_ptr<internal::StarFormationNeighborIndex> m_sf_neighbor_index;
   std::array<double, 3> m_box_extent_comoving{};
   std::uint64_t m_sf_gradient_unavailable_cells = 0U;

@@ -41,6 +41,12 @@ StellarWindTable StellarWindTable::loadFromString(const std::string& text, const
     if (line.empty()) continue;
     if (line.rfind("# chui_ssp_wind_table_v1", 0) == 0) { header = true; continue; }
     if (line.rfind("# source =", 0) == 0) { table.m_source = line.substr(10); continue; }
+    if (line.rfind("# limitation =", 0) == 0) {
+      if (!table.m_limitations.empty()) table.m_limitations += "; ";
+      const std::size_t first = line.find_first_not_of(" \t", 14);
+      if (first != std::string::npos) table.m_limitations += line.substr(first);
+      continue;
+    }
     if (line[0] == '#') continue;
     std::istringstream fields(line);
     std::string word;

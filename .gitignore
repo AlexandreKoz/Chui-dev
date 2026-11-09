@@ -39,3 +39,8 @@ __pycache__/
 # Windows alternate-data-stream sidecars
 *Zone.Identifier*
 *#Uf03aZone.Identifier*
+
+# Patch 53: user-local physics data (third-party tables are never committed;
+# see tools/chui_data/dataset_registry.json and docs/chui_data_staging.md)
+/chui_data/
+/chui_data_local/

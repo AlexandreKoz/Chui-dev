@@ -1884,6 +1884,16 @@ void validatePart2BaryonicPhysics(const SimulationConfig& config) {
           "physics.chemistry_metal_ion_elements requires physics.metal_ion_rate_table_path "
           "(schema chui_metal_ion_rates_v1; no metal-ion rate coefficients are bundled)");
     }
+    // Patch 53 (C02/C03): demoted hybrid rows carry no ion ladder; the ladder
+    // elements' losses on those rows must come from the element table.
+    if (p.chemistry_adaptive_selection != ChemistryAdaptiveSelectionConfig::kOff &&
+        p.metal_cooling_mode != MetalCoolingModeConfig::kElementTable &&
+        p.metal_cooling_mode != MetalCoolingModeConfig::kElementTableAndFineStructure) {
+      throw ConfigError(
+          "physics.chemistry_metal_ion_elements with chemistry_adaptive_selection requires metal_cooling_mode = "
+          "element_table or element_table_and_fine_structure (demoted hybrid rows have no ion ladder and would "
+          "otherwise lose the cooling of the ladder elements)");
+    }
   } else if (!p.metal_ion_rate_table_path.empty()) {
     throw ConfigError(
         "physics.metal_ion_rate_table_path is set but physics.chemistry_metal_ion_elements = none "
