@@ -953,8 +953,24 @@ struct DiscreteEventChronologyLedger {
   std::uint64_t timed_events = 0U;
   std::uint64_t catch_up_events = 0U;
   double earliest_event_fraction = 1.0;  // (a_k - age_b) / (age_e - age_b)
+  double latest_event_fraction = 0.0;
   double max_publication_lag_years = 0.0;
   double sum_publication_lag_years = 0.0;
+  // Patch 53: timed events of records that the step-start forecast did not
+  // cover (cursor adopted in this interval); recorded, exempt from the bound.
+  std::uint64_t unforecast_timed_events = 0U;
+
+  // Policy label of this interval (patch 53, documentation in
+  // docs/time_integration_event_chronology.md): the default 0 means "lag
+  // bounded only by the accepted coarse interval", NOT "zero lag required".
+  [[nodiscard]] const char* lagPolicy() const noexcept {
+    return lag_bound_years > 0.0 ? "bounded_by_time_authority_clip" : "bounded_by_accepted_interval_only";
+  }
+  [[nodiscard]] double latestEventTimeCode() const noexcept {
+    return timed_events == 0U ? interval_end_code
+                              : interval_begin_code +
+            latest_event_fraction * (interval_end_code - interval_begin_code);
+  }
 
   [[nodiscard]] double earliestEventTimeCode() const noexcept {
     return timed_events == 0U ? interval_end_code
@@ -978,6 +994,9 @@ struct DiscreteEventChronologyLedger {
     sum_publication_lag_years += static_cast<double>(timed) * age_end_years - chronology.sum_age_years;
     earliest_event_fraction =
         std::min(earliest_event_fraction, (chronology.earliest_age_years - age_begin_years) / span);
+    latest_event_fraction =
+        std::max(latest_event_fraction, (chronology.latest_age_years - age_begin_years) / span);
+    if (!enforce_lag_bound) unforecast_timed_events += timed;
     // Relative 1e-6 covers the code-time <-> stellar-years conversion
     // round-off between the forecast and the accepted interval.
     if (enforce_lag_bound && lag_bound_years > 0.0 && lag > lag_bound_years * (1.0 + 1.0e-6)) {
@@ -1176,6 +1195,57 @@ class SourceRuntimeImpl final : public SourceRuntime {
           : std::numeric_limits<double>::infinity();
     }
     return true;
+  }
+
+  // Patch 53 (C5/V01): one runtime record of every loaded external data
+  // product with its checksum, declared verification state and declared
+  // model limitations (IMF/metallicity coverage of the wind table, unverified
+  // C02 rates, UVB compatibility decision of the metal table). The normalized
+  // configuration (paths + SHA-256, opt-ins) remains the restart/provenance
+  // authority; this event makes the scientific assumptions explicit in the
+  // run log. Diagnostic only: never mutates state.
+  void reportDataAssumptionsOnce(const core::StepContext& context) {
+    if (m_data_assumptions_reported || context.profiler_session == nullptr) return;
+    m_data_assumptions_reported = true;
+    std::unordered_map<std::string, std::string> payload;
+    if (m_ssp_yield_table != nullptr) {
+      payload.emplace("ssp_yield_table_sha256", m_ssp_yield_table->sha256());
+      payload.emplace("ssp_yield_table_citation", m_ssp_yield_table->citation());
+      payload.emplace("ssp_yield_table_license", m_ssp_yield_table->license());
+    }
+    if (m_wind_table != nullptr) {
+      payload.emplace("ssp_wind_table_source", m_wind_table->source());
+      payload.emplace("ssp_wind_table_metallicities", std::to_string(m_wind_table->metallicityCount()));
+      payload.emplace("ssp_wind_table_limitations", m_wind_table->limitations());
+    }
+    if (m_baryonic_data.uv_background != nullptr) {
+      payload.emplace("uv_background_table_sha256", m_baryonic_data.uv_background->provenance().sha256_hex);
+      payload.emplace("uv_background_metal_photorates", "none (TREECOOL supplies H/He rates only)");
+    }
+    if (m_baryonic_data.metal_cooling_table != nullptr) {
+      payload.emplace("metal_cooling_uv_background_compatible",
+                           m_baryonic_data.uv_background_compatibility.compatible ? "true" : "false");
+      payload.emplace("metal_cooling_uv_background_mismatch_accepted",
+                           m_baryonic_data.uv_background_compatibility.accepted_mismatch ? "true" : "false");
+    }
+    if (m_baryonic_data.metal_ion_rate_table != nullptr) {
+      const physics::MetalIonRateTable& ions = *m_baryonic_data.metal_ion_rate_table;
+      payload.emplace("metal_ion_rate_table_provenance", ions.provenance());
+      payload.emplace("metal_ion_rate_table_license", ions.license());
+      payload.emplace("metal_ion_rate_table_verification",
+                           ions.declaredVerified() ? "verified_against_source (declared)" : "unverified");
+      payload.emplace("metal_ion_energy_convention", ions.energyConvention());
+    }
+    if (payload.empty()) return;
+    context.profiler_session->recordEvent(core::RuntimeEvent{
+        .event_kind = "sources.data_assumptions",
+        .severity = core::RuntimeEventSeverity::kInfo,
+        .subsystem = "physics.data",
+        .step_index = context.integrator_state.step_index,
+        .simulation_time_code = context.integrator_state.current_time_code,
+        .scale_factor = context.integrator_state.current_scale_factor,
+        .message = "external physics data products, checksums, verification state and declared limitations",
+        .payload = std::move(payload)});
   }
 
   // T02 (patch 52): event-aware time-authority input (see SourceRuntime).
@@ -1849,6 +1919,7 @@ class SourceRuntimeImpl final : public SourceRuntime {
     // The controller publishes exactly once per Strang interval, after every
     // half (and every AMR level half) contributed its observations.
     if (plan.closes_interval) closeSourceInterval(context);
+    reportDataAssumptionsOnce(context);
   }
 
  private:
@@ -2923,8 +2994,22 @@ class SourceRuntimeImpl final : public SourceRuntime {
   // local patch, with its step-start centre and velocity; the patch metadata
   // gives its level and cell width. Ranks without patches still participate.
   void importRemoteStarFormationNeighbors(core::StepContext& context) {
-    const auto local_patch_records =
-        internal::buildMigrationAmrPatchPayloadRecords(context.state, m_mpi_context.worldRank());
+    // Patch 53 (P0-52-01): local descriptor build voted before the exchange.
+    std::vector<parallel::AmrPatchPayloadRecord> local_patch_records;
+    {
+      std::exception_ptr build_failure;
+      try {
+        local_patch_records =
+            internal::buildMigrationAmrPatchPayloadRecords(context.state, m_mpi_context.worldRank());
+      } catch (...) {
+        build_failure = std::current_exception();
+      }
+      m_mpi_context.rethrowCollectivePreparationFailure(build_failure, "star-formation patch descriptor build");
+    }
+    // Received boundary cells (2x: geometric growth of the staging vector)
+    // and their decoded RemoteCell coexist; admitted per peer inside the
+    // stream's guarded admission phase (reservations declared first).
+    std::vector<core::MemoryReservation> admitted;
     std::vector<parallel::AmrPatchCellPayloadRecord> received;
     const auto exchange = parallel::executeBlockingDirectedAmrPatchPayloadExchange(
         m_mpi_context, local_patch_records,
@@ -2936,11 +3021,26 @@ class SourceRuntimeImpl final : public SourceRuntime {
         [&received](int, std::span<const parallel::AmrPatchCellPayloadRecord> records) {
           received.insert(received.end(), records.begin(), records.end());
         },
-        {}, 0U, context.integrator_state.step_index,
+        [this, &admitted](int, std::span<const parallel::AmrPatchPayloadRecord>,
+                          std::span<const parallel::AmrPatchBoundaryCellRequest>, std::uint64_t record_count) {
+          if (m_memory_governor == nullptr || record_count == 0U) return;
+          core::MemoryReservation reservation = m_memory_governor->reserve(
+              core::MemoryClass::kPhaseResident,
+              core::checkedSizeMultiply(
+                  core::checkedIntegralNarrow<std::size_t>(record_count, "star-formation remote cell count"),
+                  2U * sizeof(parallel::AmrPatchCellPayloadRecord) +
+                      sizeof(internal::StarFormationNeighborIndex::RemoteCell),
+                  "star-formation remote cell bytes"),
+              "sources.star_formation.remote_neighbours");
+          reservation.commit();
+          admitted.push_back(std::move(reservation));
+        },
+        0U, context.integrator_state.step_index,
         parallel::AmrInterfaceTopologyOptions{
             .periodic_box_extent_comoving = m_hydro_boundary == core::BoundaryCondition::kPeriodic
                 ? m_box_extent_comoving : std::array<double, 3>{0.0, 0.0, 0.0},
-            .ghost_layers = 1U});
+            .ghost_layers = 1U},
+        m_memory_governor);
     // Patch 52 (P1-51-01): the decode and index import are a guarded phase
     // with a collective vote, because the star-formation batch rounds that
     // follow enter collectives; a local failure must not strand peers there.
@@ -2980,10 +3080,10 @@ class SourceRuntimeImpl final : public SourceRuntime {
   // Patch 52 (P1-51-01/02): every rank-local preparation (query build,
   // response build, candidate import) runs in a guarded phase followed by a
   // collective vote, and both streams are received directly into governed
-  // typed buffers (no ungoverned byte buffer + second typed copy). The
-  // returned lease covers the remote candidate storage now owned by
-  // `deposition`; the caller keeps it alive at least as long as that object.
-  [[nodiscard]] core::MemoryReservation importRemoteFeedbackCandidates(
+  // typed buffers (no ungoverned byte buffer + second typed copy). Patch 53:
+  // the candidate storage AND its lease are handed to `deposition`, which
+  // owns both (and admits its own index growth) for its whole lifetime.
+  void importRemoteFeedbackCandidates(
       const core::SimulationState& state,
       physics::MechanicalFeedbackDeposition& deposition,
       std::span<const physics::FeedbackSourceBudget> budgets,
@@ -3086,14 +3186,11 @@ class SourceRuntimeImpl final : public SourceRuntime {
         m_mpi_context, responses, response_destinations, m_memory_governor,
         "sources.feedback.remote_halo_candidate_exchange");
     try {
-      deposition.setRemoteCandidates(state, std::move(remote.records));
+      deposition.setRemoteCandidates(state, std::move(remote.records), std::move(remote.lease));
     } catch (...) {
       failure = std::current_exception();
     }
     m_mpi_context.rethrowCollectivePreparationFailure(failure, "remote feedback halo import");
-    // Ownership transfer: the candidate storage now lives in `deposition`;
-    // its admission travels with it to the caller.
-    return std::move(remote.lease);
   }
 
   // G0.3: decomposition-independent association discovery and merge.
@@ -3198,10 +3295,48 @@ class SourceRuntimeImpl final : public SourceRuntime {
     // collective vote before the member exchange; members are received into
     // a governed typed buffer and appended to `kept` in a guarded phase
     // (the final merge has no further collective in this function).
+    // Patch 53 (P1-52-02): every coexisting routing/merge buffer is admitted
+    // before it grows, with its lease declared before the storage it covers:
+    //   routing_lease: outbound + destinations + kept (reserved at local
+    //     size, so routing pushes never reallocate);
+    //   routing_scratch_lease (inside the routing scope): owner_of,
+    //     id_to_leader, local_leader;
+    //   merge_lease: kept regrowth to local + received (old and new capacity
+    //     coexist during the reallocation), members and merged (each <= the
+    //     member count). The received member records carry their own lease
+    //     (governed exchange) and are not charged again.
+    core::MemoryReservation routing_lease;
+    core::MemoryReservation merge_lease;
     std::vector<MemberRecord> outbound;
     std::vector<int> destinations;
     std::vector<MemberRecord> kept;
     try {
+      const std::size_t n_local = local.size();
+      if (m_memory_governor != nullptr && n_local != 0U) {
+        routing_lease = m_memory_governor->reserve(
+            core::MemoryClass::kPhaseResident,
+            core::checkedSizeMultiply(n_local, 2U * sizeof(MemberRecord) + sizeof(int),
+                                      "association routing buffer bytes"),
+            "sources.associations.routing");
+        routing_lease.commit();
+      }
+      outbound.reserve(n_local);
+      destinations.reserve(n_local);
+      kept.reserve(n_local);
+      core::MemoryReservation routing_scratch_lease;
+      if (m_memory_governor != nullptr && (global.size() + n_local) != 0U) {
+        routing_scratch_lease = m_memory_governor->reserve(
+            core::MemoryClass::kPhaseResident,
+            core::checkedSizeAdd(
+                core::checkedSizeMultiply(global.size(),
+                                          sizeof(std::pair<std::uint64_t, int>) +
+                                              sizeof(std::pair<std::uint64_t, std::uint64_t>),
+                                          "association owner/leader index bytes"),
+                core::checkedSizeMultiply(n_local, sizeof(std::uint64_t), "association local leader bytes"),
+                "association routing scratch bytes"),
+            "sources.associations.routing_scratch");
+        routing_scratch_lease.commit();
+      }
       // Leader id -> owner rank (the descriptor whose id equals the leader).
       std::vector<std::pair<std::uint64_t, int>> owner_of;
       owner_of.reserve(global.size());
@@ -3250,7 +3385,32 @@ class SourceRuntimeImpl final : public SourceRuntime {
       auto received = parallel::exchangeGovernedRecords<MemberRecord>(
           m_mpi_context, outbound, destinations, m_memory_governor, "sources.associations.member_exchange");
       try {
+        const std::size_t members_total = core::checkedSizeAdd(kept.size(), received.records.size(),
+                                                               "association member count");
+        if (m_memory_governor != nullptr && members_total != 0U) {
+          merge_lease = m_memory_governor->reserve(
+              core::MemoryClass::kPhaseResident,
+              core::checkedSizeAdd(
+                  core::checkedSizeMultiply(members_total, sizeof(MemberRecord), "association kept regrowth bytes"),
+                  core::checkedSizeMultiply(members_total, 2U * sizeof(physics::FeedbackSourceBudget),
+                                            "association members/merged bytes"),
+                  "association merge bytes"),
+              "sources.associations.merge");
+          merge_lease.commit();
+        }
+        kept.reserve(members_total);
         kept.insert(kept.end(), received.records.begin(), received.records.end());
+      } catch (...) {
+        failure = std::current_exception();
+      }
+    } else if (m_memory_governor != nullptr && !kept.empty()) {
+      try {
+        merge_lease = m_memory_governor->reserve(
+            core::MemoryClass::kPhaseResident,
+            core::checkedSizeMultiply(kept.size(), 2U * sizeof(physics::FeedbackSourceBudget),
+                                      "association members/merged bytes"),
+            "sources.associations.merge");
+        merge_lease.commit();
       } catch (...) {
         failure = std::current_exception();
       }
@@ -3258,10 +3418,12 @@ class SourceRuntimeImpl final : public SourceRuntime {
     std::vector<physics::FeedbackSourceBudget> merged;
     try {
       if (failure != nullptr) std::rethrow_exception(failure);
+      merged.reserve(kept.size());
       std::sort(kept.begin(), kept.end(), [](const MemberRecord& l, const MemberRecord& r) {
         return l.leader_id != r.leader_id ? l.leader_id < r.leader_id : l.budget.source_id < r.budget.source_id;
       });
       std::vector<physics::FeedbackSourceBudget> members;
+      members.reserve(kept.size());
       std::size_t begin = 0U;
       while (begin < kept.size()) {
         std::size_t end = begin + 1U;
@@ -3330,11 +3492,10 @@ class SourceRuntimeImpl final : public SourceRuntime {
     // kinetic closure); identical on 1 and N ranks.
     fb_config.step_start_reference = true;
 
-    // Admission of the remote candidate storage handed to `deposition` by
-    // importRemoteFeedbackCandidates; declared before `deposition` so the
-    // storage is destroyed before the lease is released (patch 52).
-    core::MemoryReservation remote_candidate_lease;
+    // Patch 53: `deposition` owns its candidate indices, the remote candidate
+    // storage and their leases (setMemoryGovernor / setRemoteCandidates).
     physics::MechanicalFeedbackDeposition deposition(fb_config, units);  // rank-uniform config check only
+    deposition.setMemoryGovernor(m_memory_governor);
     // Patch 52 (P1-51-01): every rank-local allocation of the stage prologue
     // (owned-leaf metadata, candidate index, population store, sorted star
     // rows) precedes one collective vote, so a local failure cannot strand
@@ -3387,6 +3548,10 @@ class SourceRuntimeImpl final : public SourceRuntime {
       std::array<double, 3> channel_energy{};
       physics::StellarPopulationRecord record{};
     };
+    // Patch 53 (M01): per-star stage staging (updates, budgets, association
+    // birth times) admitted at the active star count before it grows; the
+    // lease is declared before the storage it covers.
+    core::MemoryReservation ssp_stage_lease;
     std::vector<StarUpdate> updates;
     const double msun_code = physics::k_solar_mass_g / bridge.mass_code_to_g;
     const bool energy_coupled = m_physics_config.enable_feedback;
@@ -3407,6 +3572,18 @@ class SourceRuntimeImpl final : public SourceRuntime {
     (void)transaction.prepare([&] {
       std::exception_ptr loop_failure;
       try {
+      if (m_memory_governor != nullptr && !star_rows.empty()) {
+        ssp_stage_lease = m_memory_governor->reserve(
+            core::MemoryClass::kPhaseResident,
+            core::checkedSizeMultiply(star_rows.size(),
+                                      sizeof(StarUpdate) + sizeof(physics::FeedbackSourceBudget) + sizeof(double),
+                                      "SSP stage per-star staging bytes"),
+            "sources.stellar_population.stage");
+        ssp_stage_lease.commit();
+      }
+      updates.reserve(star_rows.size());
+      staged_budgets.reserve(star_rows.size());
+      association_birth_years.reserve(star_rows.size());
       for (const std::uint32_t s : star_rows) {
         const std::uint32_t p = state.star_particles.particle_index[s];
         const std::uint64_t pid = state.particle_sidecar.particle_id[p];
@@ -3585,11 +3762,12 @@ class SourceRuntimeImpl final : public SourceRuntime {
             context.integrator_state.step_index);
       }
       if (distributed_feedback) {
-        remote_candidate_lease =
-            importRemoteFeedbackCandidates(state, deposition, staged_budgets, context.integrator_state.step_index);
+        importRemoteFeedbackCandidates(state, deposition, staged_budgets, context.integrator_state.step_index);
       }
       std::exception_ptr stage_failure;
       try {
+        deposition.reserveStagedRows(core::checkedSizeMultiply(
+            staged_budgets.size(), static_cast<std::size_t>(fb_config.neighbor_count), "feedback staged row bound"));
         for (const physics::FeedbackSourceBudget& budget : staged_budgets) deposition.stage(state, budget);
       } catch (...) {
         stage_failure = std::current_exception();
@@ -3617,6 +3795,7 @@ class SourceRuntimeImpl final : public SourceRuntime {
           std::sort(inbound.records.begin(), inbound.records.end(), [](const auto& l, const auto& r) {
             return l.gas_cell_id != r.gas_cell_id ? l.gas_cell_id < r.gas_cell_id : l.source_rank < r.source_rank;
           });
+          deposition.reserveStagedRows(inbound.records.size());
           for (const auto& d : inbound.records) deposition.addImportedDelta(state, d);
         } catch (...) {
           stage_failure = std::current_exception();
@@ -3713,7 +3892,14 @@ class SourceRuntimeImpl final : public SourceRuntime {
                       {"sum_event_publication_lag_years",
                        std::to_string(m_last_event_chronology.sum_publication_lag_years)},
                       {"event_publication_lag_bound_years",
-                       std::to_string(m_last_event_chronology.lag_bound_years)}}});
+                       std::to_string(m_last_event_chronology.lag_bound_years)},
+                      {"latest_event_time_code", std::to_string(m_last_event_chronology.latestEventTimeCode())},
+                      {"unforecast_timed_discrete_events",
+                       std::to_string(m_last_event_chronology.unforecast_timed_events)},
+                      {"event_lag_policy", m_last_event_chronology.lagPolicy()},
+                      {"event_deposition_semantics",
+                       "deposited at the synchronized interval end (publication epoch), not at the physical event "
+                       "time; physical times are model-defined threshold crossings"}}});
     }
   }
 
@@ -4897,6 +5083,7 @@ class SourceRuntimeImpl final : public SourceRuntime {
   std::unique_ptr<physics::SspModel> m_ssp_model;
   physics::FeedbackLedger m_last_feedback_ledger{};
   DiscreteEventChronologyLedger m_last_event_chronology{};
+  bool m_data_assumptions_reported = false;
   std::unique_ptr<internal::StarFormationNeighborIndex> m_sf_neighbor_index;
   std::array<double, 3> m_box_extent_comoving{};
   std::uint64_t m_sf_gradient_unavailable_cells = 0U;

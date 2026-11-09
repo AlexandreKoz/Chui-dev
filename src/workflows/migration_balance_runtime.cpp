@@ -1796,36 +1796,49 @@ void exchangeAndValidateAmrPatchPayloads(
     int world_rank,
     std::uint64_t step_index,
     core::ProfilerSession* profiler) {
-  const std::vector<parallel::AmrPatchPayloadRecord> local_records =
-      buildMigrationAmrPatchPayloadRecords(state, world_rank);
-  std::unordered_map<std::uint64_t, std::uint32_t> expected_cell_count_by_patch_id;
-  expected_cell_count_by_patch_id.reserve(local_records.size());
-  for (const parallel::AmrPatchPayloadRecord& record : local_records) {
-    const auto [it, inserted] = expected_cell_count_by_patch_id.emplace(record.patch_id, record.cell_count);
-    if (!inserted) {
-      throw std::runtime_error("AMR owner-local validation detected duplicate authoritative patch payloads");
+  const bool distributed = mpi_context.isEnabled() && mpi_context.worldSize() > 1;
+  // Patch 53 (P0-52-01): owner-local validation is a guarded phase voted
+  // before the directed exchange (local rethrow without MPI).
+  std::vector<parallel::AmrPatchPayloadRecord> local_records;
+  std::exception_ptr validation_failure;
+  try {
+    local_records = buildMigrationAmrPatchPayloadRecords(state, world_rank);
+    std::unordered_map<std::uint64_t, std::uint32_t> expected_cell_count_by_patch_id;
+    expected_cell_count_by_patch_id.reserve(local_records.size());
+    for (const parallel::AmrPatchPayloadRecord& record : local_records) {
+      const auto [it, inserted] = expected_cell_count_by_patch_id.emplace(record.patch_id, record.cell_count);
+      if (!inserted) {
+        throw std::runtime_error("AMR owner-local validation detected duplicate authoritative patch payloads");
+      }
+      if (record.owner_rank != world_rank) {
+        throw std::runtime_error("AMR owner-local validation found stale patch owner metadata");
+      }
     }
-    if (record.owner_rank != world_rank) {
-      throw std::runtime_error("AMR owner-local validation found stale patch owner metadata");
+    for (const parallel::AmrPatchPayloadRecord& record : local_records) {
+      if (static_cast<std::uint64_t>(record.first_cell) + record.cell_count > state.cells.size()) {
+        throw std::runtime_error(
+            "AMR owner-local validation patch range exceeds authoritative cell storage for patch_id=" +
+            std::to_string(record.patch_id));
+      }
+      const std::uint64_t geometry_count = static_cast<std::uint64_t>(record.cell_dim_x) *
+          record.cell_dim_y * record.cell_dim_z;
+      if (geometry_count != record.cell_count) {
+        throw std::runtime_error(
+            "AMR owner-local validation patch geometry/cell-count mismatch for patch_id=" +
+            std::to_string(record.patch_id));
+      }
     }
+  } catch (...) {
+    validation_failure = std::current_exception();
   }
-  for (const parallel::AmrPatchPayloadRecord& record : local_records) {
-    if (static_cast<std::uint64_t>(record.first_cell) + record.cell_count > state.cells.size()) {
-      throw std::runtime_error(
-          "AMR owner-local validation patch range exceeds authoritative cell storage for patch_id=" +
-          std::to_string(record.patch_id));
-    }
-    const std::uint64_t geometry_count = static_cast<std::uint64_t>(record.cell_dim_x) *
-        record.cell_dim_y * record.cell_dim_z;
-    if (geometry_count != record.cell_count) {
-      throw std::runtime_error(
-          "AMR owner-local validation patch geometry/cell-count mismatch for patch_id=" +
-          std::to_string(record.patch_id));
-    }
+  if (distributed) {
+    mpi_context.rethrowCollectivePreparationFailure(validation_failure, "AMR owner-local patch validation");
+  } else if (validation_failure != nullptr) {
+    std::rethrow_exception(validation_failure);
   }
 
   parallel::DirectedAmrExchangeDiagnostics diagnostics;
-  if (mpi_context.isEnabled() && mpi_context.worldSize() > 1) {
+  if (distributed) {
     std::set<std::pair<std::uint64_t, std::uint32_t>> remote_cell_keys;
     const parallel::DirectedAmrPatchPayloadExchange directed = parallel::executeBlockingDirectedAmrPatchPayloadExchange(
         mpi_context,
@@ -1853,17 +1866,23 @@ void exchangeAndValidateAmrPatchPayloads(
         step_index);
     diagnostics = directed.diagnostics;
 
-    std::unordered_map<std::uint64_t, parallel::AmrPatchPayloadRecord> remote_patch_by_id;
-    remote_patch_by_id.reserve(directed.patch_payloads_received.size());
-    for (const parallel::AmrPatchPayloadRecord& record : directed.patch_payloads_received) {
-      if (record.owner_rank == world_rank) {
-        throw std::runtime_error("directed AMR validation received local authoritative patch as a remote ghost");
+    std::exception_ptr decode_failure;
+    try {
+      std::unordered_map<std::uint64_t, parallel::AmrPatchPayloadRecord> remote_patch_by_id;
+      remote_patch_by_id.reserve(directed.patch_payloads_received.size());
+      for (const parallel::AmrPatchPayloadRecord& record : directed.patch_payloads_received) {
+        if (record.owner_rank == world_rank) {
+          throw std::runtime_error("directed AMR validation received local authoritative patch as a remote ghost");
+        }
+        const auto [it, inserted] = remote_patch_by_id.emplace(record.patch_id, record);
+        if (!inserted) {
+          throw std::runtime_error("directed AMR validation received duplicate remote patch metadata");
+        }
       }
-      const auto [it, inserted] = remote_patch_by_id.emplace(record.patch_id, record);
-      if (!inserted) {
-        throw std::runtime_error("directed AMR validation received duplicate remote patch metadata");
-      }
+    } catch (...) {
+      decode_failure = std::current_exception();
     }
+    mpi_context.rethrowCollectivePreparationFailure(decode_failure, "directed AMR validation decode");
   }
 
   if (profiler != nullptr) {

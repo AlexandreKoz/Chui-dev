@@ -55,12 +55,17 @@ class StellarWindTable {
   [[nodiscard]] StellarWindIntervalBudget interval(double age_begin_years, double age_end_years,
                                                    double metallicity) const;
   [[nodiscard]] const std::string& source() const noexcept { return m_source; }
+  // Patch 53: declared model limitations ('# limitation =' header lines, e.g.
+  // the SB99 Kroupa IMF vs the CHUI Chabrier SSP IMF, single metallicity),
+  // joined with '; ' and surfaced in the run's data-assumption record.
+  [[nodiscard]] const std::string& limitations() const noexcept { return m_limitations; }
   [[nodiscard]] std::size_t metallicityCount() const noexcept { return m_z.size(); }
   [[nodiscard]] std::size_t ageCount() const noexcept { return m_log_age.size(); }
 
  private:
   [[nodiscard]] double cumulative(std::size_t quantity, double age_years, double metallicity, bool& clamped) const;
   std::string m_source;
+  std::string m_limitations;
   std::vector<double> m_z;
   std::vector<double> m_log_age;
   // [age][z][quantity] flattened, quantity 0 = energy, 1 = momentum.

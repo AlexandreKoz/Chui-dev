@@ -81,9 +81,20 @@ RemoteDiffusionCellGather gatherRemoteDiffusionCells(
     std::uint64_t sequence) {
   RemoteDiffusionCellGather gather;
   const int rank = mpi_context.worldRank();
-  const auto local_patch_records = buildMigrationAmrPatchPayloadRecords(state, rank);
-  std::vector<parallel::AmrPatchCellPayloadRecord> received;
+  // Patch 53 (P0-52-01): local descriptor build voted before the exchange.
+  std::vector<parallel::AmrPatchPayloadRecord> local_patch_records;
+  {
+    std::exception_ptr build_failure;
+    try {
+      local_patch_records = buildMigrationAmrPatchPayloadRecords(state, rank);
+    } catch (...) {
+      build_failure = std::current_exception();
+    }
+    mpi_context.rethrowCollectivePreparationFailure(build_failure, "distributed diffusion patch descriptor build");
+  }
+  // Admissions of received cells are declared before the staging they cover.
   std::vector<core::MemoryReservation> admitted;
+  std::vector<parallel::AmrPatchCellPayloadRecord> received;
   const auto exchange = parallel::executeBlockingDirectedAmrPatchPayloadExchange(
       mpi_context, local_patch_records,
       [&state, rank](std::span<const parallel::AmrPatchBoundaryCellRequest> requests, std::uint64_t first_record,
@@ -107,7 +118,8 @@ RemoteDiffusionCellGather gatherRemoteDiffusionCells(
       0U, sequence,
       parallel::AmrInterfaceTopologyOptions{
           .periodic_box_extent_comoving = periodic ? periodic_box_extent_comoving : std::array<double, 3>{0.0, 0.0, 0.0},
-          .ghost_layers = 1U});
+          .ghost_layers = 1U},
+      governor);
 
   std::exception_ptr failure;
   try {

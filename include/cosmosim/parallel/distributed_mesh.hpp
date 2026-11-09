@@ -10,6 +10,7 @@
 #include <memory_resource>
 
 #include "cosmosim/core/checked_arithmetic.hpp"
+#include "cosmosim/core/memory_governor.hpp"
 
 namespace cosmosim::core {
 class MemoryGovernor;
@@ -236,7 +237,14 @@ struct DirectedAmrExchangeDiagnostics {
   std::uint64_t outbound_reflux_count = 0;
 };
 
+// Result of the directed AMR patch exchange. Patch 53 (P0-52-01): the
+// remote descriptors are staged and handed to the caller ONLY after the
+// final collective agreement of the exchange; `patch_payload_lease` (declared
+// first, so the storage is freed before the admission is released) covers
+// the reserved capacity of `patch_payloads_received` when a governor was
+// supplied. Move-only.
 struct DirectedAmrPatchPayloadExchange {
+  core::MemoryReservation patch_payload_lease;
   std::vector<AmrPatchPayloadRecord> patch_payloads_received;
   DirectedAmrExchangeDiagnostics diagnostics{};
 };
@@ -332,6 +340,41 @@ planDirectedAmrPatchBoundaryCellRequests(
     std::span<const AmrPatchPayloadRecord> remote_patch_records,
     const AmrInterfaceTopologyOptions& topology = {});
 
+// Directed (interface-scoped) AMR patch descriptor + boundary-cell exchange.
+//
+// Patch 53 collective-safety protocol (M01 / memory spec v0.2 section 7.2).
+// Every rank calls it in the same order, possibly with no patches.
+//   E0 [local, guarded] validate local records, local patch index, callback
+//      presence, envelope, control-plane admission + allocation
+//      -> collective vote "directed AMR exchange preflight";
+//   E1 [collective] MPI_Allgather of fixed-size rank envelopes;
+//   E2 [local, guarded] symmetric candidate-peer graph (each pair decided on
+//      the rank-ordered envelope pair, so both ranks evaluate the identical
+//      expression), staged-result capacity admission and reservation from
+//      the gathered peer patch counts -> collective vote;
+//   E3 pairwise epochs in ascending peer rank (= lexicographic (min,max)
+//      edge order, identical on both sides of every pair => no cyclic wait).
+//      Each pair epoch opens with a health handshake: a rank that already
+//      failed keeps visiting every remaining peer and announces the failure
+//      instead of disappearing, so no peer is left blocked. Inside an epoch,
+//      every fallible local step (descriptor admission/validation, request
+//      planning, maps, staging, admission callback, producer, consumer) is
+//      followed by a pairwise readiness message before the next payload
+//      message of that pair; both ranks then stop the epoch at the same
+//      message. Local checks after the last message of an epoch only mark
+//      this rank as failed;
+//   E4 [collective] final vote "directed AMR exchange"; on agreement the
+//      staged descriptors are returned, otherwise every rank throws and the
+//      staging is discarded (no partial result is published).
+// Consumer callbacks run inside E3 and must write only caller-local staging
+// that the caller discards when the exchange throws (all production callers
+// do). An MPI error return remains fatal for the communicator (default MPI
+// error handler); it is not claimed recoverable.
+// `memory_governor` (optional) admits the control plane, per-peer descriptor
+// receive buffers, per-peer planning scratch, the staged result (returned
+// lease) and -- only when transport_round_limit_bytes == 0, i.e. the caller
+// did not size and admit the transport window itself -- the two streaming
+// chunks of each pair.
 [[nodiscard]] DirectedAmrPatchPayloadExchange executeBlockingDirectedAmrPatchPayloadExchange(
     const MpiContext& mpi_context,
     std::span<const AmrPatchPayloadRecord> local_patch_records,
@@ -340,7 +383,8 @@ planDirectedAmrPatchBoundaryCellRequests(
     const DirectedAmrPatchCellAdmission& cell_payload_admission = {},
     std::size_t transport_round_limit_bytes = 0U,
     std::uint64_t exchange_sequence = 0,
-    const AmrInterfaceTopologyOptions& topology = {});
+    const AmrInterfaceTopologyOptions& topology = {},
+    core::MemoryGovernor* memory_governor = nullptr);
 
 [[nodiscard]] DirectedAmrPatchCellTransferPlan planDirectedAmrPatchCellTransfer(
     std::uint64_t logical_record_count,
@@ -363,6 +407,27 @@ planDirectedAmrPatchBoundaryCellRequests(
     const AmrPatchPayloadRecord& patch,
     std::uint8_t boundary_face_mask);
 
+// Patch 53 governed result of the flux-register exchange: the inbound
+// admission lives as long as the records (lease declared first).
+struct AmrFluxRegisterExchangeResult {
+  core::MemoryReservation lease;
+  std::vector<AmrFluxRegisterPayloadRecord> records;
+};
+
+// Owner-targeted flux-register exchange. Patch 53: local validation, count
+// preparation, inbound admission and per-peer staging are guarded phases with
+// collective votes; the per-peer loop uses the same pair-health handshake as
+// the directed patch exchange and ends with one collective vote, so a
+// rank-local failure (bad_alloc, refused admission, stale metadata) cannot
+// leave a peer blocked.
+[[nodiscard]] AmrFluxRegisterExchangeResult executeGovernedAmrFluxRegisterPayloadExchange(
+    const MpiContext& mpi_context,
+    std::span<const AmrFluxRegisterPayloadRecord> local_records,
+    std::uint64_t exchange_sequence = 0,
+    core::MemoryGovernor* memory_governor = nullptr);
+
+// Compatibility wrapper (same protocol). The inbound admission is released
+// when it returns, so production callers use the governed variant above.
 [[nodiscard]] std::vector<AmrFluxRegisterPayloadRecord> executeBlockingAmrFluxRegisterPayloadExchange(
     const MpiContext& mpi_context,
     std::span<const AmrFluxRegisterPayloadRecord> local_records,

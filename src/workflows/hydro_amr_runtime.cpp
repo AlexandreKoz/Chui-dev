@@ -2139,13 +2139,15 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
   // by the synchronized distributed sweep and every level clock of the
   // distributed recursive driver. level_filter empty = all local patches.
   // Collective; admission failures are agreed before any payload moves.
+  // Patch 53: reservations are declared before the storage they cover, so
+  // implicit destruction frees remote ghost storage before its admission.
   struct DirectedHydroGhostExchange {
+    core::MemoryReservation transport_reservation;
+    std::vector<core::MemoryReservation> sparse_ghost_reservations;
     std::vector<parallel::AmrPatchPayloadRecord> local_patch_records;
     std::vector<amr::DistributedAmrRemotePatch> remote_patches;
     std::unordered_map<std::uint64_t, int> owner_rank_by_patch_id;
     parallel::DirectedAmrExchangeDiagnostics diagnostics{};
-    core::MemoryReservation transport_reservation;
-    std::vector<core::MemoryReservation> sparse_ghost_reservations;
   };
 
   [[nodiscard]] DirectedHydroGhostExchange exchangeDirectedHydroGhosts(
@@ -2154,17 +2156,6 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
       std::span<const int> level_filter,
       std::uint64_t sequence) {
     DirectedHydroGhostExchange result;
-    result.local_patch_records =
-        internal::buildMigrationAmrPatchPayloadRecords(
-            context.state, m_mpi_context.worldRank());
-    if (!level_filter.empty()) {
-      // G1.1: only patches whose state is current at this level clock take
-      // part (every rank applies the same rule, so requests stay matched).
-      std::erase_if(result.local_patch_records, [level_filter](const parallel::AmrPatchPayloadRecord& record) {
-        return std::find(level_filter.begin(), level_filter.end(), static_cast<int>(record.level)) ==
-            level_filter.end();
-      });
-    }
     const auto& local_patch_records = result.local_patch_records;
     parallel::DirectedAmrExchangeDiagnostics& directed_amr_diagnostics = result.diagnostics;
     const std::size_t wire_record_bytes = sizeof(parallel::AmrPatchCellPayloadRecord);
@@ -2172,6 +2163,19 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
     core::MemoryReservation& transport_reservation = result.transport_reservation;
     std::exception_ptr transport_admission_failure;
     try {
+      // Patch 53 (P0-52-01): the local descriptor build is part of the
+      // guarded phase that precedes the first collective of this exchange.
+      result.local_patch_records =
+          internal::buildMigrationAmrPatchPayloadRecords(
+              context.state, m_mpi_context.worldRank());
+      if (!level_filter.empty()) {
+        // G1.1: only patches whose state is current at this level clock take
+        // part (every rank applies the same rule, so requests stay matched).
+        std::erase_if(result.local_patch_records, [level_filter](const parallel::AmrPatchPayloadRecord& record) {
+          return std::find(level_filter.begin(), level_filter.end(), static_cast<int>(record.level)) ==
+              level_filter.end();
+        });
+      }
       if (m_memory_governor != nullptr) {
         const std::uint64_t simultaneous_record_bytes =
             core::checkedMemoryBytesAdd(
@@ -2387,9 +2391,14 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
                 amr_options.physical_boundary_kind == hydro::HydroBoundaryKind::kPeriodic
                     ? amr_options.periodic_box_extent_comoving
                     : std::array<double, 3>{0.0, 0.0, 0.0},
-            .ghost_layers = amr::productionAmrHydroGhostLayers(amr_options)});
+            .ghost_layers = amr::productionAmrHydroGhostLayers(amr_options)},
+        m_memory_governor);
     directed_amr_diagnostics = directed_amr_exchange.diagnostics;
 
+    // Patch 53 (P0-52-01): the decode of the agreed exchange is a guarded
+    // phase voted before the caller's next collective.
+    std::exception_ptr decode_failure;
+    try {
     std::unordered_map<std::uint64_t, int>& owner_rank_by_patch_id = result.owner_rank_by_patch_id;
     owner_rank_by_patch_id.reserve(local_patch_records.size() + directed_amr_exchange.patch_payloads_received.size());
     for (const auto& record : local_patch_records) {
@@ -2455,6 +2464,10 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
         remote_ghost_resident_high_water);
     m_last_communication_traffic_bytes =
         directed_amr_diagnostics.patch_cell_payload_bytes;
+    } catch (...) {
+      decode_failure = std::current_exception();
+    }
+    m_mpi_context.rethrowCollectivePreparationFailure(decode_failure, "directed AMR hydro ghost decode");
     return result;
   }
 
@@ -2591,8 +2604,11 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
         failure = std::current_exception();
       }
       reduceFailure(failure, "distributed recursive AMR register packing");
-      const auto global = parallel::executeBlockingAmrFluxRegisterPayloadExchange(
-          m_runtime.m_mpi_context, payloads, nextSequence(), m_runtime.m_memory_governor);
+      // Patch 53: governed result (inbound lease lives with the records).
+      const parallel::AmrFluxRegisterExchangeResult global_exchange =
+          parallel::executeGovernedAmrFluxRegisterPayloadExchange(
+              m_runtime.m_mpi_context, payloads, nextSequence(), m_runtime.m_memory_governor);
+      const std::vector<parallel::AmrFluxRegisterPayloadRecord>& global = global_exchange.records;
       try {
         std::vector<std::pair<int, std::size_t>> mine;
         for (std::size_t g = 0; g < global.size(); ++g) {
@@ -3035,16 +3051,25 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
       auto& owner_rank_by_patch_id = ghost_exchange.owner_rank_by_patch_id;
       std::vector<amr::DistributedAmrRemotePatch>& remote_patches = ghost_exchange.remote_patches;
       remote_patch_count = remote_patches.size();
-      regrid_remote_neighbors.reserve(remote_patches.size());
-      for (const amr::DistributedAmrRemotePatch& remote : remote_patches) {
-        regrid_remote_neighbors.push_back(remote.patch);
-        if (distributed_composition) {
-          for (const amr::AmrHydroSparseRemoteCell& cell : remote.boundary_cells) {
-            remote_cell_owner.emplace_back(cell.gas_cell_id, remote.owner_rank);
+      {
+        // Patch 53 (P0-52-01): guarded + voted before the distributed sweep.
+        std::exception_ptr neighbor_failure;
+        try {
+          regrid_remote_neighbors.reserve(remote_patches.size());
+          for (const amr::DistributedAmrRemotePatch& remote : remote_patches) {
+            regrid_remote_neighbors.push_back(remote.patch);
+            if (distributed_composition) {
+              for (const amr::AmrHydroSparseRemoteCell& cell : remote.boundary_cells) {
+                remote_cell_owner.emplace_back(cell.gas_cell_id, remote.owner_rank);
+              }
+            }
           }
+          std::sort(remote_cell_owner.begin(), remote_cell_owner.end());
+        } catch (...) {
+          neighbor_failure = std::current_exception();
         }
+        m_mpi_context.rethrowCollectivePreparationFailure(neighbor_failure, "distributed AMR remote neighbour index");
       }
-      std::sort(remote_cell_owner.begin(), remote_cell_owner.end());
       std::vector<amr::FluxRegisterEntry> outbound_remote_entries;
       std::vector<amr::FluxRegisterEntry> deferred_local_entries;
       if (amr::hasProductionAmrHydroCoverage(context.state)) {
@@ -3068,19 +3093,33 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
         throw std::runtime_error(
             "distributed AMR hydro rank has partial local patch coverage; only an explicitly empty rank may skip advancement");
       }
+      // Patch 53 (P0-52-01): packing is a guarded phase voted before the
+      // exchange's first collective; the result is the governed variant.
       std::vector<parallel::AmrFluxRegisterPayloadRecord> local_flux_payloads;
-      local_flux_payloads.reserve(outbound_remote_entries.size());
-      for (const amr::FluxRegisterEntry& entry : outbound_remote_entries) {
-        const auto owner_it = owner_rank_by_patch_id.find(entry.coarse_patch_id);
-        if (owner_it == owner_rank_by_patch_id.end()) {
-          throw std::runtime_error("distributed AMR hydro remote reflux entry has unknown coarse patch owner");
+      std::exception_ptr packing_failure;
+      try {
+        local_flux_payloads.reserve(outbound_remote_entries.size());
+        for (const amr::FluxRegisterEntry& entry : outbound_remote_entries) {
+          const auto owner_it = owner_rank_by_patch_id.find(entry.coarse_patch_id);
+          if (owner_it == owner_rank_by_patch_id.end()) {
+            throw std::runtime_error("distributed AMR hydro remote reflux entry has unknown coarse patch owner");
+          }
+          local_flux_payloads.push_back(fluxRegisterPayloadFromEntry(
+              entry, m_mpi_context.worldRank(), owner_it->second, context.state));
         }
-        local_flux_payloads.push_back(fluxRegisterPayloadFromEntry(
-            entry, m_mpi_context.worldRank(), owner_it->second, context.state));
+      } catch (...) {
+        packing_failure = std::current_exception();
       }
-      const auto global_flux_payloads = parallel::executeBlockingAmrFluxRegisterPayloadExchange(
-          m_mpi_context, local_flux_payloads, context.integrator_state.step_index,
-          m_memory_governor);
+      m_mpi_context.rethrowCollectivePreparationFailure(packing_failure, "distributed AMR reflux packing");
+      const parallel::AmrFluxRegisterExchangeResult global_flux_exchange =
+          parallel::executeGovernedAmrFluxRegisterPayloadExchange(
+              m_mpi_context, local_flux_payloads, context.integrator_state.step_index,
+              m_memory_governor);
+      const std::vector<parallel::AmrFluxRegisterPayloadRecord>& global_flux_payloads = global_flux_exchange.records;
+      // Patch 53 (P0-52-01): inbound decode, merge and the remote reflux are
+      // one guarded phase voted before the composition transport collectives.
+      std::exception_ptr remote_reflux_failure;
+      try {
       directed_amr_diagnostics.outbound_reflux_count = static_cast<std::uint64_t>(local_flux_payloads.size());
       directed_amr_diagnostics.inbound_reflux_count = static_cast<std::uint64_t>(global_flux_payloads.size());
       directed_amr_diagnostics.directed_flux_records_sent = static_cast<std::uint64_t>(local_flux_payloads.size());
@@ -3159,6 +3198,10 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
         amr_diagnostics.reflux.dual_energy_reflux_thermal_correction_code +=
             remote_reflux.dual_energy_reflux_thermal_correction_code;
       }
+      } catch (...) {
+        remote_reflux_failure = std::current_exception();
+      }
+      m_mpi_context.rethrowCollectivePreparationFailure(remote_reflux_failure, "distributed AMR remote reflux");
     } else if (m_config.numerics.amr_time_stepping == core::AmrTimeSteppingConfigMode::kRecursiveSubcycling) {
       // CHUI Part 3 Milestone I: recursive multilevel subcycling of the gas
       // hierarchy inside the coordinator's accepted interval (the interval

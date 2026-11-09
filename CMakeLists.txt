@@ -1399,6 +1399,12 @@ if(COSMOSIM_ENABLE_TESTS)
   add_executable(test_unit_composition_lane_chunk_wire tests/unit/test_composition_lane_chunk_wire.cpp)
   target_link_libraries(test_unit_composition_lane_chunk_wire PRIVATE cosmosim_all)
   add_test(NAME unit_composition_lane_chunk_wire COMMAND test_unit_composition_lane_chunk_wire)
+  # CHUI patch 53 C02 dataset integration (NOT RUN — USER-RESERVED). Set
+  # CHUI_C02_TABLE to the user-local unverified C/O/Si/Fe table to enable the
+  # real-dataset cases.
+  add_executable(test_unit_c02_metal_ion_dataset tests/unit/test_c02_metal_ion_dataset.cpp)
+  target_link_libraries(test_unit_c02_metal_ion_dataset PRIVATE cosmosim_all)
+  add_test(NAME unit_c02_metal_ion_dataset COMMAND test_unit_c02_metal_ion_dataset)
   add_executable(test_unit_cooling_f2_complete_interval tests/unit/test_cooling_f2_complete_interval.cpp)
   target_link_libraries(test_unit_cooling_f2_complete_interval PRIVATE cosmosim_all)
   add_test(NAME unit_cooling_f2_complete_interval COMMAND test_unit_cooling_f2_complete_interval)
@@ -1943,6 +1949,22 @@ if(COSMOSIM_ENABLE_TESTS)
     cosmosim_mark_runtime_truth_test(
       integration_reference_workflow_distributed_amr_mpi_two_rank
       mpi hdf5 distributed amr hydro gas workflow directed_exchange reflux integration)
+  endif()
+
+  if(COSMOSIM_ENABLE_MPI)
+    # Patch 53 (P0-52-01): directed AMR exchange fault injection. The TIMEOUT
+    # is the deadlock oracle; every scenario must reach a collective verdict.
+    add_executable(test_integration_directed_amr_exchange_fault_injection_mpi
+      tests/integration/test_directed_amr_exchange_fault_injection_mpi.cpp)
+    target_link_libraries(test_integration_directed_amr_exchange_fault_injection_mpi PRIVATE cosmosim_all)
+    add_test(
+      NAME integration_directed_amr_exchange_fault_injection_mpi_three_rank
+      COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 3 ${MPIEXEC_PREFLAGS}
+              $<TARGET_FILE:test_integration_directed_amr_exchange_fault_injection_mpi> ${MPIEXEC_POSTFLAGS})
+    set_tests_properties(
+      integration_directed_amr_exchange_fault_injection_mpi_three_rank
+      PROPERTIES PROCESSORS 3 TIMEOUT 60
+                 LABELS "mpi;distributed;amr;directed_exchange;fault_injection")
   endif()
 
   if(COSMOSIM_ENABLE_MPI AND COSMOSIM_ENABLE_HDF5)

@@ -619,7 +619,23 @@ RuntimeExecutionPlan RuntimeModuleRegistry::freezeAndInstantiate(
   for (const std::size_t descriptor_index : order) {
     const RuntimeModuleDescriptor& descriptor = m_descriptors[descriptor_index];
     plan.m_ordered_module_ids.push_back(descriptor.module_id);
-    RuntimeModuleInstance instance = descriptor.factory(context);
+    // Patch 53 (M01 sec. 7.2 / C5): module construction loads external data
+    // tables (SSP yields, winds, UVB, metal cooling, metal-ion rates) and
+    // verifies their checksums on every rank. A rank-local failure (missing
+    // file on one node, checksum mismatch, refused admission) is agreed
+    // collectively before any later module constructor or stage can enter a
+    // collective, so no rank is stranded and every rank reports the cause.
+    RuntimeModuleInstance instance;
+    {
+      std::exception_ptr construction_failure;
+      try {
+        instance = descriptor.factory(context);
+      } catch (...) {
+        construction_failure = std::current_exception();
+      }
+      FailureCoordinator(context.services).rethrowCollectiveFailure(
+          construction_failure, "runtime module construction '" + descriptor.module_id + "'");
+    }
 
     std::unordered_map<std::string, RuntimeStageTaskContribution*> contribution_by_id;
     for (RuntimeStageTaskContribution& contribution : instance.stage_tasks) {

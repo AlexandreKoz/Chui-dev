@@ -28,6 +28,21 @@ ThermochemistryOperator::ThermochemistryOperator(ThermochemistryOperatorConfig c
     // reservoir); the hybrid model owns no metal-ion state.
     hybrid.metal_ion_table = nullptr;
     hybrid.metal_ion_elements = {};
+    // Patch 53 (C02/C03): a demoted row has no ladder, so the losses of the
+    // ladder elements (C, O, Si, Fe) on that row can only come from the
+    // element-resolved metal table (the hybrid solver queries it without the
+    // ladder exclusion). Without such a table those losses would silently
+    // vanish on every demoted row (C/O keep only their cold fine-structure
+    // terms; Si/Fe keep nothing). Refuse that combination instead.
+    const bool element_table = m_config.solver.metal_mode == MetalCoolingMode::kElementTable ||
+        m_config.solver.metal_mode == MetalCoolingMode::kElementTableAndFineStructure;
+    if (!m_config.solver.metal_ion_elements.empty() && !element_table) {
+      throw SourceModelUnavailableError(
+          "adaptive chemistry fidelity with metal-ion ladders '" + m_config.solver.metal_ion_elements.label() +
+          "' requires an element-resolved metal cooling table (metal_cooling_mode = element_table or "
+          "element_table_and_fine_structure): demoted hybrid rows carry no ion ladder and would otherwise lose the "
+          "cooling of these elements. Configure the table or disable chemistry_adaptive_selection");
+    }
     m_hybrid_solver = std::make_unique<ThermochemistrySolver>(hybrid);
   }
   if (m_config.shadow.sample_fraction > 0.0 && m_config.shadow.max_cells > 0U &&

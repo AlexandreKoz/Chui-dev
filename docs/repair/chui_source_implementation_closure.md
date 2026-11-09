@@ -1,3 +1,188 @@
+# CHUÍ — patch 53 source-completion record (supersedes the patch-52 matrix)
+
+Date: 2026-11-09. Branch `claude/nifty-ritchie-x69law`, restarted from
+`origin/main` `f9ba682` (merge of PR #132 = patch 52). The supplied
+`Cosmology-Simulator-main(52).zip` is byte-identical to that tree (`diff -r`:
+0 differences). Input audit: `03_AUDITORIA_PATCH52.md`.
+
+**Executed:** source inspection, `git diff --check`, SHA-256 checks, and
+data-only Python commands (download, conversion, validation; see §WP-C).
+**Not executed:** CMake, compiler, linker, any CHUI test or executable, MPI
+job, simulation, benchmark or sanitizer. No statement below is a runtime,
+deadlock-freedom, convergence or RSS claim.
+
+**Final label: SOURCE-COMPLETE, EXTERNAL-DATA-INCOMPLETE** (rationale at the
+end). Scientific validation remains a future phase.
+
+## WP-A (P0-52-01) — directed AMR MPI protocol
+
+`parallel::executeBlockingDirectedAmrPatchPayloadExchange`
+(`src/parallel/distributed_memory_amr.cpp`):
+
+| Epoch | Rank-local fallible work (all guarded) | Agreement | Next communication |
+|---|---|---|---|
+| E0 | local patch index (admitted `parallel.directed_amr.local_patch_index`), record validation, owner check, callback presence; envelope (validates records), control-plane admission + allocation | folded into vote "directed AMR envelope preflight" | `MPI_Allgather` envelopes (return code checked) |
+| E2a | envelope rank check; symmetric peer graph (each pair evaluated on the rank-ordered envelope pair, so both members compute the identical floating-point expression); remote descriptor upper bound from gathered patch counts | vote "directed AMR candidate peer graph" | — |
+| E2b | staged-result admission (`…remote_patch_descriptors`) + reserve at the bound | vote "directed AMR staged descriptor admission" | first pair epoch |
+| E3 per pair, ascending peer rank (= lexicographic (min,max) edge order on both sides; no cyclic wait) | pair-health handshake first: a rank that already failed keeps visiting every remaining peer and sends 0, both sides skip that pair | pairwise | descriptor count |
+| E3 (a) | descriptor receive admission + resize (`exchangePodRecordsWithPeer`) | pairwise readiness | descriptor payload rounds (int-safe, bounded) |
+| E3 (b) | descriptor validation, owner check, peer-count bound, planning admission, request planning both directions, request/patch indices, coverage counters, staging append within reserved capacity, traffic arithmetic | pairwise "plan ready" | symmetric skip if both request sets are empty, else cell stream |
+| E3 (c) | limit narrowing, transfer plans, caller admission callback, chunk admission (only when the caller did not size the window) + chunk capacity, diagnostics | pairwise admission readiness | per round: producer callback + count check → producer readiness → payload → consumer callback → consumer readiness |
+| E3 (d) | coverage checks after the pair's last message | marks this rank failed (announced at its next pair entries) | next pair |
+| E4 | — | vote "directed AMR patch exchange" | result (with lease) published only on unanimous success; otherwise every rank throws and the staging is discarded |
+
+Call-path proof sketch: inside an epoch every throwing statement either
+precedes a pairwise readiness message (both ranks then stop at the same
+message) or follows the epoch's last message; between epochs only the health
+handshake runs; a failed rank never skips an epoch its peer will enter.
+Remaining exception: an MPI error return is communicator-fatal (default MPI
+error handler) and is not claimed recoverable.
+
+`executeGovernedAmrFluxRegisterPayloadExchange` (new; the legacy vector-return
+wrapper is kept) follows the same pattern: guarded validation + count control
+plane → vote → `MPI_Alltoall` → guarded active-peer/inbound admission → vote →
+pair-health epochs with a staging readiness message → final vote. The result
+carries its inbound lease.
+
+Callers (pre-exchange descriptor builds and post-exchange decodes are now
+guarded + voted): `HydroAmrRuntimeImpl::exchangeDirectedHydroGhosts` (also
+reservations declared before storage), the non-recursive distributed branch
+(remote neighbour index, reflux packing, remote reflux decode/apply),
+`DistributedRecursiveHooks` register exchange (governed result),
+`gatherRemoteDiffusionCells`, `importRemoteStarFormationNeighbors` (now
+admitted per peer), `exchangeAndValidateAmrPatchPayloads`.
+Future test source (not run): `tests/integration/test_directed_amr_exchange_fault_injection_mpi.cpp`
+(3 ranks: baseline, consumer/producer/admission failure, unilateral governor
+refusal, one-record rounds, periodic topology, flux stale metadata; the ctest
+TIMEOUT is the deadlock oracle).
+
+## WP-B (P1-52-02) and M01 ownership
+
+| Buffer | Admission (owner label) | Lifetime |
+|---|---|---|
+| association routing outbound/destinations/kept | `sources.associations.routing` (reserved at local size) | routing → merge |
+| owner_of / id_to_leader / local_leader | `sources.associations.routing_scratch` | routing scope |
+| kept regrowth, members, merged | `sources.associations.merge` (old+new capacity) | merge scope; merged supersedes the caller's larger staged_budgets |
+| received member records | exchange lease (not charged again) | until appended |
+| feedback candidate index (sorted rows/x, row-slot) | `physics.feedback.candidate_index` (old/new coexistence, strong exception safety) | deposition object |
+| remote candidate storage | exchange lease adopted by the deposition object | deposition object |
+| staged per-cell deltas | `physics.feedback.staged_rows` (sources × k, + inbound deltas) | deposition object |
+| SSP stage per-star staging | `sources.stellar_population.stage` | stage |
+
+M01 sweep (source-derived; not measured): canonical state, AMR geometry/
+histories/flux registers, hydro batches, remote ghosts, composition exchanges,
+directed AMR exchange, rollback state copy (`time.global_step_rollback.state_copy`),
+treePM/PM owned fields and communication arenas (`gravity.estimate.*`),
+restart/snapshot streaming, chemistry adaptive rows and the node pool are
+admitted with named owners. **Estimate-only by design (M01):** FFTW plans and
+internal buffers, HDF5 library chunk caches, MPI library internal buffers
+(`external_runtime_reserve_bytes`). **Known not separately admitted:** the
+`std::set` of remote cell keys in the migration validation exchange
+(diagnostic path, bounded by received boundary cells) and the transient
+`localCandidatesWithin` result vectors (≤ k entries each).
+
+## WP-C — data products
+
+All four expected SHA-256 values matched the supplied bytes. Data-only
+reproduction: `fetch_and_convert.sh` regenerated S02 `e2161646…`, F02
+`ba232a1c…`, UVB `4bfc5d9b…` and **C01 `4bbca8a9…`** byte-identically from
+pinned upstream sources (WSS09 tarball `228ec928…` downloaded in this
+session). C02 `633a66ee…` regenerates byte-identically from its own package;
+its 10 962 cooling values match an independent Gnat & Ferland 2012 mirror
+within 0.0005 dex; its CI/RR/DR coefficients are **NOT INDEPENDENTLY
+SOURCE-VERIFIED** (primary archive blocked). No data file is committed.
+Fact fields per product: `tools/chui_data/dataset_registry.json`; staging:
+`docs/chui_data_staging.md`.
+
+Source integration added in this patch: per-module collective agreement of
+data-load/checksum failures (`RuntimeModuleRegistry::freezeAndInstantiate`);
+adaptive + ladder requires an element table (config + operator); wind-table
+limitations retained; one-time `sources.data_assumptions` record. Verified
+existing seams: per-rank SHA-256 enforcement for every table (config requires
+a 64-hex hash whenever a path is set), unverified-C02 opt-in gate, energy
+contract gate, photo-rate/UVB coherence gate, ladder exclusion from the C01
+query, C/O fine-structure exclusion under ladders, `-inf` as exact zero in
+interpolation, HM01/FG20 mismatch refusal by default, restart compatibility of
+all data keys through the normalized configuration.
+
+C02 labels: **C02_DATA_ASSEMBLED_UNQUALIFIED, C02_LOADER_INTEGRATED**.
+Not supported: C02_SOURCE_CROSS_CHECKED (only the cooling channel is
+cross-checked), C02_SCIENCE_QUALIFIED, C02_PRODUCTION_READY.
+C01: bytes present and reproducible (user-local), loader integrated; **no
+HM01-consistent UVB** exists, so a consistent C01 + UVB model is
+EXTERNAL-DATA-BLOCKED (only the explicit mismatch opt-in runs it).
+
+## WP-D — T02 chronology
+
+`docs/time_integration_event_chronology.md`. Default `0` keeps its meaning
+("extra bound disabled"); the ledger now records the policy label, earliest
+and latest physical event times, unforecast timed events and catch-up events,
+and states that deposition happens at the publication epoch. The forecast is
+MIN-reduced across ranks before the clip; the publisher enforces the bound for
+forecast-covered records. Face-identity ledger and phase-tagged handshake:
+re-read, no new source gap found.
+
+## H01–V02/X01 evidence matrix
+
+Columns: SG = source gap, ED = external-data gap, CQ = conditional
+qualification, FV = future validation. "Fixed" = a previous finding fixed in
+source in this patch.
+
+| ID | Obligation (modes) | Production entry → state → MPI/AMR → rollback/restart/provenance | Source evidence | SG | ED | CQ | FV | Fixed |
+|---|---|---|---|---|---|---|---|---|
+| H01 | MUSCL/CTU/PPM, HLLC→HLLE (gas modes) | hydro stage → `HydroCoreSolver` (`src/hydro/hydro_core_solver.cpp`) → AMR sweeps / ghost exchange → step rollback copy | unchanged | no | — | — | convergence, positivity | — |
+| H02 | dual energy, EOS/CFL consistency | `hydro_core_solver.cpp` dual-energy paths, effective EOS closure | unchanged | no | — | — | Mach sweep | — |
+| C01 | hybrid network + element-table metal cooling | `ThermochemistrySolver::coolingHeating` → `MetalCoolingTable::evaluate` → per-rank load + SHA → normalized config | loader, UVB-mismatch gate, ladder exclusion | no | HM01-consistent UVB absent; WSS09 not redistributable | rates unqualified (opt-in) | cooling histories | collective load failure (this patch) |
+| C02 | detailed reference incl. metal ions | `MetalIonRateTable::parse/loadFromFile`, `MetalIonLadderSolver`, `ThermochemistryOperator::advanceRow` → ion sidecar lanes → composition exchange/migration/snapshot | grammar, opt-in gate, energy contract, adaptive guard (this patch), validator | no | CI/RR/DR primary-source check; rights | research only | 58×3 coverage, subsets, restart, ranks | adaptive-row cooling loss (this patch) |
+| C03 | adaptive fidelity | `decideChemistryFidelity`, hybrid solver for demoted rows | ladder + table requirement added | no | — | research | switching error | yes (guard) |
+| C04 | sampled shadow | `ThermochemistryOperator` shadow, `updateGlobalChemistryControl` | unchanged | no | — | research | shadow thresholds | — |
+| I01 | effective / resolved ISM | `EffectiveIsmThermodynamicClosure`, regime config | unchanged | no | — | — | no double cooling | — |
+| I02 | SGS reservoir | SGS shear on level phases, face ledger | unchanged (patch 52) | no | — | research | energy transfer | — |
+| S01 | conservative stochastic births | `StarFormation::applyFromInputs` at the interval end, age 0 | unchanged | no | — | — | rank independence | — |
+| S02 | yields, event chronology | `SspYieldTable`, `executePart2StellarPopulation`, population sidecar | staging admission (this patch) | no | rights review | yield-set qualification | restart chronology | — |
+| F01 | mechanical feedback, closure refresh | `MechanicalFeedbackDeposition` stage/commit, halo + delta exchanges | index/staging governance, strong exception safety (this patch) | no | — | — | conservation, MPI | yes (P1-52-02) |
+| F02 | winds / pre-SN | `StellarWindTable::interval` | limitations retained + reported | no | Chabrier/multi-Z wind data; rights | IMF mismatch decision | budgets | — |
+| D01 | elements, transport, diffusion | composition exchange, `DistributedElementDiffusionCoupling`, directed AMR gather | directed exchange protocol (this patch) | no | — | — | patch/level/MPI transport | yes (P0-52-01) |
+| A01 | production regrid | `runAutomaticAmrRegrid` | unchanged | no | — | — | evolving AMR | — |
+| A02 | distributed recursive subcycling | `advanceProductionAmrHydroRecursive`, `DistributedRecursiveHooks` | governed flux result; ghost decode vote (this patch) | no | — | — | recursive vs synchronized | yes (P0-52-01) |
+| A03 | physics-aware indicators | regrid planner incl. cooling times | unchanged | no | — | — | resolved error | — |
+| A04 | predictive refinement | `forecastStellarEvent` | unchanged | no | — | research | — | — |
+| G01 | TreePM/KDK, fine-gas force | `src/gravity/tree_pm_coupling.cpp`, `GravityRuntime` | unchanged | no | — | **conditional (v10)** | force accuracy | — |
+| T01 | one time authority, Strang, events | `TimeCoordinator` global loop, `SourceStagePlan` | event clip ordered with outputs (patch 52) | no | — | — | temporal convergence | — |
+| T02 | multirate coupling, event semantics | level clocks, face ledger, event ledger | policy record (this patch) | no | — | lag value is a scientific choice | event timing, face conservation | P1-52-03 made explicit |
+| M01 | governed memory, §7.2 collective safety | governor + node pool; all exchanges above | directed AMR + flux protocol, routing/index/staging admission, module-construction vote | no known unprotected rank-local hazard in the directed AMR exchange and its callers | — | library internals estimate-only | RSS/PSS, low-memory fault injection | yes (P0-52-01, P1-52-02) |
+| M02 | CPU scalar/OpenMP/MPI | unchanged | — | no | — | — | scaling | — |
+| V01 | ledgers, restart, provenance | normalized config (paths + SHA), `sources.data_assumptions`, event ledger | this patch | no | — | — | restart equivalence | — |
+| V02 | error/resource coordination | unchanged | — | no | — | research | — | — |
+| X01 | out of scope | no MHD/GRMHD, moving mesh, generalized RT, new AGN, GPU requirement | — | — | — | — | — | — |
+
+## Open items
+
+* External data: HM01-consistent H/He UVB; primary-source verification of the
+  C02 CI/RR/DR coefficients and NIST potentials; low-T DR resonances; metal
+  photo-rates from a spectral UVB; redistribution rights for every product;
+  Chabrier-IMF / multi-Z wind tables.
+* Test-source defect observed (pre-existing, not run):
+  `tests/unit/test_baryonic_source_stage_rollback.cpp::testCoolingTimePromotion`
+  builds an adaptive operator with `fixed_hybrid`, which the operator refuses
+  ("adaptive chemistry fidelity requires the fixed_detailed backend"); it will
+  throw when executed and needs a detailed-layout fixture.
+* Validation campaign: everything in `docs/validation_plan.md` (patch 52/53
+  sections).
+
+## Label rationale
+
+Every mandatory production-source contract named by the patch-52 audit and
+found in this sweep is implemented and wired (directed AMR/flux MPI protocol,
+governed routing/index/staging, data loaders, gates and provenance). The
+selected full model is nevertheless missing required external bytes (an
+HM01-consistent UVB for C01; primary-source-verified C02 coefficients), and
+the available data are unqualified and not rights-cleared. Hence
+**SOURCE-COMPLETE, EXTERNAL-DATA-INCOMPLETE** — not DATA-READY, and not a
+scientific-qualification claim.
+
+---
+
 # CHUÍ — patch 52 source-completion record (supersedes the patch-51 matrix)
 
 Date: 2026-11-08. Branch `claude/nifty-ritchie-x69law` (base: `180b5bb`, the

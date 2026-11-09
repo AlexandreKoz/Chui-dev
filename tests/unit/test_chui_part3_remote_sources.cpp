@@ -30,6 +30,7 @@
 #include <string>
 #include <vector>
 
+#include "cosmosim/core/memory_governor.hpp"
 #include "cosmosim/core/simulation_state.hpp"
 #include "cosmosim/physics/baryon_composition.hpp"
 #include "cosmosim/physics/element_diffusion.hpp"
@@ -419,11 +420,52 @@ void testAssociationDiscoveryPeriodicWrap() {
 
 }  // namespace
 
+// Patch 53 (P1-52-02, NOT RUN): the candidate indices and the adopted remote
+// storage lease are owned by the deposition; a rejected remote candidate set
+// leaves the local index and the governor accounting unchanged (strong
+// exception safety), and destruction releases every lease.
+void testFeedbackCandidateIndexIsGovernedAndTransactional() {
+  core::SimulationState state = makeCube();
+  const ph::MechanicalFeedbackConfig config{.neighbor_count = 8, .step_start_reference = true};
+  core::MemoryGovernor governor;
+  {
+    ph::MechanicalFeedbackDeposition dep(config, testUnits());
+    dep.setMemoryGovernor(&governor);
+    std::vector<std::uint32_t> rows(27);
+    for (std::uint32_t r = 0; r < 27; ++r) rows[r] = r;
+    dep.setCandidates(state, rows);
+    const std::uint64_t local_index_bytes = governor.snapshot().committed_bytes;
+    CHUI_REQUIRE(local_index_bytes > 0U);
+    // An already-local id is refused: nothing new is admitted or kept.
+    std::vector<ph::FeedbackRemoteCandidate> bad{ph::FeedbackRemoteCandidate{
+        .gas_cell_id = state.gas_cells.gas_cell_id[0], .owner_rank = 1}};
+    bool threw = false;
+    try {
+      dep.setRemoteCandidates(state, bad);
+    } catch (const std::exception&) {
+      threw = true;
+    }
+    CHUI_REQUIRE(threw);
+    CHUI_REQUIRE(governor.snapshot().committed_bytes == local_index_bytes);
+    // A valid remote set replaces the index lease (old released after swap).
+    std::vector<ph::FeedbackRemoteCandidate> good{ph::FeedbackRemoteCandidate{
+        .gas_cell_id = 9000001U, .owner_rank = 1, .center_comoving = {5.0, 5.0, 5.0}, .mass_code = 1.0,
+        .density_code = 1.0, .hydrogen_mass_fraction = 0.76}};
+    core::MemoryReservation storage = governor.reserve(core::MemoryClass::kCommunication,
+                                                       sizeof(ph::FeedbackRemoteCandidate), "test.remote_storage");
+    storage.commit();
+    dep.setRemoteCandidates(state, std::move(good), std::move(storage));
+    CHUI_REQUIRE(governor.snapshot().committed_bytes > local_index_bytes);
+  }
+  CHUI_REQUIRE(governor.snapshot().committed_bytes == 0U);
+}
+
 int main() {
   testElementDiffusionConservesAndPreservesConstraints();
   testElementDiffusionRefusalIsTransactional();
   testRemoteFeedbackMatchesLocalDeposition();
   testStepStartReferenceClosesEnergyForSharedCells();
+  testFeedbackCandidateIndexIsGovernedAndTransactional();
   testWindTable();
   testAssociationsPreserveBudgets();
   testAssociationDiscoveryIsPartitionIndependent();

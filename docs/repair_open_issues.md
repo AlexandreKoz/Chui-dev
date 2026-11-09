@@ -946,3 +946,30 @@ composition deferred-donor CFL refusal (patch-51 item 2).
 Validation (owner-reserved): low-memory fault injection on every new vote;
 event-lag bound and subdivision invariance; face-ledger mismatch injection;
 restart equivalence with a positive lag bound; RSS/PSS reconciliation.
+
+## Patch 53 (2026-11-09) — open items after static source work and data-only checks
+
+Record: [`repair/chui_source_implementation_closure.md`](repair/chui_source_implementation_closure.md).
+Label: **SOURCE-COMPLETE, EXTERNAL-DATA-INCOMPLETE** (no compilation, test or
+simulation was run).
+
+Closed in source (unvalidated): P0-52-01 (directed AMR and flux-register MPI
+exchanges: guarded epochs, pair-health handshakes, final votes, governed
+results; callers' pre/post phases voted), P1-52-02 (association routing,
+feedback candidate index, staged feedback rows, SSP stage staging admitted;
+strongly exception-safe candidate index), collective agreement of data-load
+failures at module construction, adaptive + metal-ion ladder requires an
+element table, T02 lag policy made explicit (P1-52-03, default unchanged).
+Patch-52 items 1 and 2 are closed.
+
+Still open (external or validation, not source):
+
+1. HM01-consistent H/He UVB absent: C01 (WSS09, now reproducible user-local)
+   runs only with `metal_cooling_accept_uv_background_mismatch = true`.
+2. C02: CI/RR/DR coefficients and ionization potentials not independently
+   verified against primary sources; no metal photo-rates; low-T DR
+   resonances missing; redistribution rights unconfirmed. Research opt-in only.
+3. Rights review for S02, F02, FG20, WSS09, C02; none is committed.
+4. Pre-existing test-source defect: `test_baryonic_source_stage_rollback.cpp`
+   `testCoolingTimePromotion` (adaptive operator with `fixed_hybrid`).
+5. Validation (owner-reserved): see `docs/validation_plan.md` patch-52/53.

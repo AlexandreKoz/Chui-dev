@@ -890,3 +890,17 @@ Additional campaign checks to run on top of the unit tests:
   pre half and the post-children closure; expect the collective
   "interface face ledger close" refusal. Recursive-vs-synchronized diffusion/SGS
   conservation and accuracy remain the patch-51 targets.
+
+## Patch 53 validation targets (authored, NOT RUN) — 20261109
+
+* `integration_directed_amr_exchange_fault_injection_mpi_three_rank`:
+  unilateral consumer/producer/admission/governor failures and stale flux
+  metadata must give a collective verdict on every rank (TIMEOUT = deadlock).
+* `unit_c02_metal_ion_dataset` (set `CHUI_C02_TABLE` for the real-dataset
+  cases): grammar refusals, opt-in gate, adaptive-ladder guard, all element
+  subsets, 58 stages, boundary zero rates, range policy, wrong-SHA refusal.
+* `test_chui_part3_remote_sources.cpp::testFeedbackCandidateIndexIsGovernedAndTransactional`.
+* Multi-rank run with a data file missing on one node: every rank must fail at
+  "runtime module construction 'sources'" with the same diagnostic.
+* Science (Layer B–D): C02 versus CHIANTI/ADAS where legitimate; C01 + UVB
+  consistency once an HM01 photo-rate table exists; event-lag impact study.
