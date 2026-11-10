@@ -16,6 +16,7 @@
 #include <optional>
 #include <memory_resource>
 #include <span>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <unordered_set>
@@ -1221,6 +1222,39 @@ class SourceRuntimeImpl final : public SourceRuntime {
       payload.emplace("ssp_yield_table_sha256", m_ssp_yield_table->sha256());
       payload.emplace("ssp_yield_table_citation", m_ssp_yield_table->citation());
       payload.emplace("ssp_yield_table_license", m_ssp_yield_table->license());
+      // S02: configured IMF channel ranges versus the tabulated grid. Masses
+      // or metallicities outside the grid use the edge row and are counted in
+      // ssp_table_clamps; this records up front where that will happen. No
+      // extrapolation or substitute yields are introduced here.
+      if (m_ssp_model != nullptr) {
+        const physics::SspConfig& ssp = m_ssp_model->config();
+        const auto range_text = [](double lo, double hi) {
+          std::ostringstream text;
+          text.precision(6);
+          text << lo << ".." << hi;
+          return text.str();
+        };
+        const std::array<std::pair<double, double>, 2> configured{
+            std::pair{ssp.imf_mass_min_msun, std::min(ssp.imf_mass_max_msun, ssp.cc_mass_min_msun)},
+            std::pair{std::max(ssp.imf_mass_min_msun, ssp.cc_mass_min_msun),
+                      std::min(ssp.imf_mass_max_msun, ssp.cc_mass_max_msun)}};
+        const std::array<const char*, 2> names{"agb", "cc"};
+        for (std::size_t channel = 0; channel < 2U; ++channel) {
+          const physics::SspYieldTable::Coverage coverage = m_ssp_yield_table->channelCoverage(channel);
+          const auto [lo, hi] = configured[channel];
+          const std::string prefix = std::string("ssp_yield_") + names[channel];
+          payload.emplace(prefix + "_configured_mass_msun", range_text(lo, hi));
+          payload.emplace(prefix + "_tabulated_mass_msun",
+                          range_text(coverage.mass_min_msun, coverage.mass_max_msun));
+          payload.emplace(prefix + "_tabulated_metallicity",
+                          range_text(coverage.metallicity_min, coverage.metallicity_max));
+          payload.emplace(prefix + "_mass_range_clamped",
+                          (hi > lo && (lo < coverage.mass_min_msun || hi > coverage.mass_max_msun)) ? "true"
+                                                                                                     : "false");
+        }
+        const physics::SspYieldTable::Coverage ia = m_ssp_yield_table->channelCoverage(2U);
+        payload.emplace("ssp_yield_ia_tabulated_metallicity", range_text(ia.metallicity_min, ia.metallicity_max));
+      }
     }
     if (m_wind_table != nullptr) {
       payload.emplace("ssp_wind_table_source", m_wind_table->source());

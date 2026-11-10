@@ -1,3 +1,18 @@
+## Post-patch-56 v10 final source closure — 2026-11-10 (static, NOT RUN)
+
+Repaired in source (uncommitted, unverified): restart v25 group-schema
+regression (temporal-history group now written as 3, pending flux-register
+group restored to 2; reader/validator/write-time verifier bind group identity
+to the outer schema). Explicit AMR domain contract: production refuses a
+populated hierarchy that does not tile its bounding box. S02 yield coverage
+reported against configured channel ranges.
+
+Open: owner build/tests (incl. MPI/HDF5); external data C01/C02/S02/F02;
+model decisions (yield edge-clamp acceptance, machine-readable wind IMF);
+conditional D01 grain collisions, G01 fine-level force correction; optional
+C04 shadow hydro, T02 level-local events and IMEX/SDC. See
+[`repair/chui_post_patch56_v10_final_source_closure.md`](repair/chui_post_patch56_v10_final_source_closure.md).
+
 ## Post-patch-55 v10 source closure — 2026-11-10 (static, NOT RUN)
 
 Implemented in source (uncommitted, unverified): P1-55-01 dual-energy AMR

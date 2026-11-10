@@ -2906,30 +2906,68 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
   // or reflective closure inside the domain. Collective: every rank calls it
   // from runProductionAmrHydroPath. Returns zero extents when no rank owns a
   // populated patch (domain undeclared).
+  //
+  // Domain authority (v10 H01/A02 operating-mode contract): the hydro domain
+  // is the root tiling materialized from the gas-cell layout
+  // (materializeRootHydroPatchIfMissing / IC patch geometry), which is not
+  // required to coincide with cosmology.box_size_* (the gravity/PM extent of
+  // isolated modes). Refinement replaces a parent by its leaf children, so the
+  // populated patches are disjoint leaves whose union must equal that tiling.
+  // The supported restriction is therefore stated and enforced explicitly
+  // here, collectively and before any ghost fill: the populated leaves must
+  // tile their bounding box completely (no holes, no overlaps). Internal holes
+  // are never reinterpreted as physical boundaries; a non-rectangular or
+  // perforated hierarchy is refused with the measured coverage. Every rank
+  // receives identical reduced values, so the refusal is collective.
   [[nodiscard]] std::pair<std::array<double, 3>, std::array<double, 3>> globalAmrHierarchyDomain(
       const core::SimulationState& state) const {
     const double inf = std::numeric_limits<double>::infinity();
     std::array<double, 3> local_lower{inf, inf, inf};
     std::array<double, 3> local_negative_upper{inf, inf, inf};
+    double local_covered_volume = 0.0;
     const auto& p = state.patches;
     for (std::size_t patch = 0; patch < p.size(); ++patch) {
       if (p.cell_count[patch] == 0U || p.level[patch] < 0) continue;
       const std::array<double, 3> origin{p.origin_x_comoving[patch], p.origin_y_comoving[patch], p.origin_z_comoving[patch]};
       const std::array<double, 3> extent{p.extent_x_comoving[patch], p.extent_y_comoving[patch], p.extent_z_comoving[patch]};
+      double patch_volume = 1.0;
       for (std::size_t axis = 0; axis < 3U; ++axis) {
-        if (!(extent[axis] > 0.0) || !std::isfinite(origin[axis]) || !std::isfinite(extent[axis])) continue;
+        if (!(extent[axis] > 0.0) || !std::isfinite(origin[axis]) || !std::isfinite(extent[axis])) {
+          patch_volume = 0.0;
+          continue;
+        }
+        patch_volume *= extent[axis];
         local_lower[axis] = std::min(local_lower[axis], origin[axis]);
         local_negative_upper[axis] = std::min(local_negative_upper[axis], -(origin[axis] + extent[axis]));
       }
+      local_covered_volume += patch_volume;
     }
     std::array<double, 3> origin{0.0, 0.0, 0.0};
     std::array<double, 3> extent{0.0, 0.0, 0.0};
+    bool all_axes_declared = true;
     for (std::size_t axis = 0; axis < 3U; ++axis) {
       const double lower = m_mpi_context.allreduceMinDouble(local_lower[axis]);
       const double upper = -m_mpi_context.allreduceMinDouble(local_negative_upper[axis]);
       if (std::isfinite(lower) && std::isfinite(upper) && upper > lower) {
         origin[axis] = lower;
         extent[axis] = upper - lower;
+      } else {
+        all_axes_declared = false;
+      }
+    }
+    const double covered_volume = m_mpi_context.allreduceSumDouble(local_covered_volume);
+    if (all_axes_declared) {
+      const double box_volume = extent[0] * extent[1] * extent[2];
+      // Leaves are dyadic subdivisions of the root tiling; the tolerance only
+      // absorbs the summation rounding of many patch volumes.
+      constexpr double k_coverage_relative_tolerance = 1.0e-9;
+      if (!(box_volume > 0.0) ||
+          std::abs(covered_volume - box_volume) > k_coverage_relative_tolerance * box_volume) {
+        throw std::runtime_error(
+            "production AMR hydro requires the populated patch hierarchy to tile its bounding box "
+            "completely (supported domain contract: rectangular, hole-free root coverage); covered volume " +
+            std::to_string(covered_volume) + " vs bounding-box volume " + std::to_string(box_volume) +
+            " (comoving)");
       }
     }
     return {origin, extent};

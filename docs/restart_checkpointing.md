@@ -28,6 +28,14 @@ The restart schema (`cosmosim_restart_v25`) persists:
   covered by the v25 canonical SHA-256 / legacy digests (NaN digested as one canonical
   quiet-NaN pattern) and by post-write verification. The AMR migration wire record is v5
   (the same two lanes per history cell).
+- Group layout identities are versioned per group and bound to the outer schema:
+  `/state/amr_temporal_boundary_history/@schema_version` is exactly `3` in v25 and `1`/`2`
+  in v18–v24; `/state/amr_pending_flux_registers/@schema_version` is `2` in every supported
+  schema (v25 did not change its layout). `validateRestartCheckpointSchema`,
+  `readAmrTemporalBoundaryHistoryGroup`, `readPendingFluxRegisterGroup` and the write-time
+  `verifyRestartCheckpointHdf5` all enforce this; a mismatch is refused, never coerced. The
+  unreleased patch-56 writer (pending `3`, temporal `2`) produced self-inconsistent v25 files
+  that the current reader refuses.
 - v24 `/gravity_force_cache/hierarchical_endpoint`: at a closed hierarchical KDK block the
   Tree and PM split components and the nearest direct-pair separation squared for every
   particle, so the next block opens with the same force in uninterrupted and resumed runs,
