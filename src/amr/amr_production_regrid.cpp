@@ -364,9 +364,26 @@ ProductionAmrRegridPlan planProductionAmrRegrid(
     return true;
   };
 
+  // One operation per target patch: the planner below visits each local leaf
+  // exactly once, so a duplicated descriptor would duplicate an operation and
+  // its ID reservation. Fail closed on corrupt patch metadata instead.
+  for (std::size_t index = 1U; index < local.size(); ++index) {
+    if (local[index].patch_id == local[index - 1U].patch_id) {
+      throw std::logic_error(
+          "production AMR regrid found duplicate local patch id " +
+          std::to_string(local[index].patch_id));
+    }
+  }
+
   if (policy.pass == AmrRegridPassKind::kRefineOnly) {
-    // R1: mandatory (resolution) requests are scheduled before optional
-    // (structure-tracking) ones; the budget truncates optional ones first.
+    // R1/V02: single deterministic candidate planner. Every local leaf is
+    // classified once; mandatory (resolution) requests are ranked first by
+    // patch id and bypass every optional ceiling (max_operations and the V02
+    // cell-step/MPI-face/churn/memory budgets); optional requests are ranked
+    // by V02 benefit/cost when enabled (else by patch id) and consume only
+    // the remaining optional budget. Memory pressure for mandatory work is
+    // handled by the admitted transactional applier, never by silently
+    // violating a hard scientific resolution criterion.
     struct Candidate {
       bool mandatory = false;
       bool forced = false;
@@ -446,25 +463,18 @@ ProductionAmrRegridPlan planProductionAmrRegrid(
       const bool mandatory = candidate.mandatory;
       const PatchDescriptor& patch = *candidate.patch;
       ++plan.refine_requests;
+      // A mandatory request that cannot be emitted is COUNTED, never
+      // dropped silently: the runtime reduces these counters across ranks and
+      // fails collectively (hydro_amr_runtime.cpp, runAutomaticAmrRegrid), so
+      // no rank throws alone while its peers enter the regrid collectives.
       if (patch.level >= policy.max_level) {
         ++plan.blocked_by_max_level;
-        if (mandatory) {
-          throw std::runtime_error(
-              "mandatory AMR refinement of patch " +
-              std::to_string(patch.patch_id) +
-              " cannot be satisfied at numerics.amr_max_level");
-        }
+        if (mandatory) ++plan.mandatory_blocked_by_max_level;
         continue;
       }
       if (!neighbourLevelsAtLeast(patch, static_cast<int>(patch.level), {})) {
         ++plan.blocked_by_balance;
-        if (mandatory) {
-          throw std::runtime_error(
-              "mandatory AMR refinement of patch " +
-              std::to_string(patch.patch_id) +
-              " is blocked by the current 2:1 neighbour hierarchy; "
-              "refine/rebalance the coarser neighbour first");
-        }
+        if (mandatory) ++plan.mandatory_blocked_by_balance;
         continue;
       }
       const bool below_force_resolution = policy.gravity_softening_code > 0.0 &&
@@ -536,53 +546,6 @@ ProductionAmrRegridPlan planProductionAmrRegrid(
         }
       }
     }
-    // R1/V02: mandatory (resolution) requests are never discarded by the
-    // optional operation budget.  Two deterministic passes avoid the former
-    // candidate vector + std::stable_partition scratch allocation entirely:
-    // mandatory requests are emitted first, then optional requests consume
-    // only the remaining configured budget.  Memory pressure is handled by
-    // the admitted transactional applier, not by silently violating a hard
-    // scientific resolution criterion.
-    const auto schedule_pass = [&](bool schedule_mandatory) {
-      for (const PatchDescriptor& patch : local) {
-        bool forced = false;
-        bool mandatory = false;
-        if (patchDecision(state, patch, policy, forced, &mandatory) != RefinementDecision::kRefine ||
-            mandatory != schedule_mandatory) {
-          continue;
-        }
-        ++plan.refine_requests;
-        if (mandatory) {
-          ++plan.mandatory_refine_requests;
-        } else {
-          ++plan.optional_refine_requests;
-        }
-        if (patch.level >= policy.max_level) {
-          ++plan.blocked_by_max_level;
-          if (mandatory) ++plan.mandatory_blocked_by_max_level;
-          continue;
-        }
-        if (!neighbourLevelsAtLeast(patch, static_cast<int>(patch.level), {})) {
-          ++plan.blocked_by_balance;
-          if (mandatory) ++plan.mandatory_blocked_by_balance;
-          continue;
-        }
-        if (!mandatory && plan.operations.size() >= policy.max_operations) {
-          ++plan.truncated_by_budget;
-          ++plan.optional_truncated_by_budget;
-          continue;
-        }
-        if (policy.gravity_softening_code > 0.0 && 0.5 * minCellWidth(patch) < policy.gravity_softening_code) {
-          ++plan.refined_below_gravity_softening;
-        }
-        const std::size_t cells = core::checkedSizeMultiply(cellCount(patch), 8U, "regrid refine cells");
-        plan.operations.push_back(ProductionAmrRegridOperation{
-            .kind = AmrRegridOperationKind::kRefine, .patch = patch,
-            .new_patch_ids = 8U, .new_gas_cell_ids = cells});
-      }
-    };
-    schedule_pass(true);
-    schedule_pass(false);
   } else {
     // Group local leaves by parent id (deterministic: std::map ordered by id).
     std::map<std::uint64_t, std::vector<PatchDescriptor>> octets;

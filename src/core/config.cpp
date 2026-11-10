@@ -711,6 +711,14 @@ parseInitialConditionMissingFieldPolicy(
   throw ConfigError("key 'physics.ssp_wind_model': invalid value '" + value + "' (expected none or table_v1)");
 }
 
+[[nodiscard]] SspEventPublicationModeConfig parseSspEventPublicationModeConfig(const std::string& value) {
+  const std::string lower = toLower(trim(value));
+  if (lower == "coarse_endpoint") return SspEventPublicationModeConfig::kCoarseEndpoint;
+  if (lower == "physical_event_barrier") return SspEventPublicationModeConfig::kPhysicalEventBarrier;
+  throw ConfigError("key 'physics.ssp_event_publication_mode': invalid value '" + value +
+                    "' (expected coarse_endpoint or physical_event_barrier)");
+}
+
 [[nodiscard]] AmrTimeSteppingConfigMode parseAmrTimeSteppingConfigMode(const std::string& value) {
   const std::string lower = toLower(trim(value));
   if (lower == "synchronized") return AmrTimeSteppingConfigMode::kSynchronized;
@@ -1710,6 +1718,7 @@ struct ConfigKeySpec {
       {"physics.ssp_association_radius_code", "0.0"},
       {"physics.ssp_association_time_window_years", "3.0e6"},
       {"physics.ssp_max_event_publication_lag_years", "0.0"},
+      {"physics.ssp_event_publication_mode", "coarse_endpoint"},
       {"physics.ssp_wind_model", "none"},
       {"physics.ssp_wind_table_path", ""},
       {"physics.ssp_wind_table_sha256", ""},
@@ -2026,6 +2035,18 @@ void validatePart2BaryonicPhysics(const SimulationConfig& config) {
         "physics.ssp_max_event_publication_lag_years > 0 bounds the publication lag of discrete stochastic SN "
         "events; it requires a Part 2 stellar_population_model with ssp_stochastic_sn_events=true (expectation "
         "mode has no discrete event times)");
+  }
+  if (p.ssp_event_publication_mode == SspEventPublicationModeConfig::kPhysicalEventBarrier) {
+    if (p.stellar_population_model == StellarPopulationModelConfig::kLegacyTable || !p.ssp_stochastic_sn_events) {
+      throw ConfigError(
+          "physics.ssp_event_publication_mode=physical_event_barrier publishes discrete stochastic SN events at "
+          "their physical times; it requires a Part 2 stellar_population_model with ssp_stochastic_sn_events=true");
+    }
+    if (p.ssp_max_event_publication_lag_years != 0.0) {
+      throw ConfigError(
+          "physics.ssp_event_publication_mode=physical_event_barrier defines the publication lag itself; "
+          "physics.ssp_max_event_publication_lag_years must stay 0 (use coarse_endpoint for a finite lag bound)");
+    }
   }
   if (p.ssp_clustered_associations &&
       (p.ssp_association_radius_code == 0.0 || p.stellar_population_model == StellarPopulationModelConfig::kLegacyTable)) {
@@ -3507,6 +3528,8 @@ class NormalizedConfigStream {
   stream << "ssp_association_radius_code = " << frozen.config.physics.ssp_association_radius_code << '\n';
   stream << "ssp_association_time_window_years = " << frozen.config.physics.ssp_association_time_window_years << '\n';
   stream << "ssp_max_event_publication_lag_years = " << frozen.config.physics.ssp_max_event_publication_lag_years << '\n';
+  stream << "ssp_event_publication_mode = "
+         << sspEventPublicationModeConfigToString(frozen.config.physics.ssp_event_publication_mode) << '\n';
   stream << "ssp_wind_model = " << sspWindModelConfigToString(frozen.config.physics.ssp_wind_model) << '\n';
   stream << "ssp_wind_table_path = " << frozen.config.physics.ssp_wind_table_path << '\n';
   stream << "ssp_wind_table_sha256 = " << frozen.config.physics.ssp_wind_table_sha256 << '\n';
@@ -4641,6 +4664,8 @@ class NormalizedConfigStream {
   frozen.config.physics.ssp_max_event_publication_lag_years = parseFloating(
       requireString(entries, consumed, "physics.ssp_max_event_publication_lag_years", "0.0"),
       "physics.ssp_max_event_publication_lag_years");
+  frozen.config.physics.ssp_event_publication_mode = parseSspEventPublicationModeConfig(
+      requireString(entries, consumed, "physics.ssp_event_publication_mode", "coarse_endpoint"));
   frozen.config.physics.ssp_wind_model = parseSspWindModelConfig(
       requireString(entries, consumed, "physics.ssp_wind_model", "none"));
   frozen.config.physics.ssp_wind_table_path =
@@ -5258,6 +5283,14 @@ std::string sspWindModelConfigToString(SspWindModelConfig mode) {
     case SspWindModelConfig::kTableV1: return "table_v1";
   }
   throw ConfigError("unhandled SspWindModelConfig enum value during serialization");
+}
+
+std::string sspEventPublicationModeConfigToString(SspEventPublicationModeConfig mode) {
+  switch (mode) {
+    case SspEventPublicationModeConfig::kCoarseEndpoint: return "coarse_endpoint";
+    case SspEventPublicationModeConfig::kPhysicalEventBarrier: return "physical_event_barrier";
+  }
+  throw ConfigError("unhandled SspEventPublicationModeConfig enum value during serialization");
 }
 
 std::string amrTimeSteppingConfigModeToString(AmrTimeSteppingConfigMode mode) {

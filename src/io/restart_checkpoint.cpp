@@ -3618,6 +3618,17 @@ std::string restartConfigurationCompatibilityRecord(
     }
     removeKeyLines({"ssp_max_event_publication_lag_years"});
   }
+  // Post-patch-53 key (P1-TIME-01 event publication-time contract). A
+  // checkpoint written before it ran the coarse-endpoint contract; only that
+  // default is accepted on resume (the event cursor/queue semantics differ).
+  if (projected.find("\nssp_event_publication_mode = ") != std::string::npos &&
+      restart.normalized_config_text.find("\nssp_event_publication_mode = ") == std::string::npos) {
+    if (current.config.physics.ssp_event_publication_mode !=
+        core::SspEventPublicationModeConfig::kCoarseEndpoint) {
+      fail("checkpoint predates physics.ssp_event_publication_mode; only its default coarse_endpoint is accepted");
+    }
+    removeKeyLines({"ssp_event_publication_mode"});
+  }
   const std::string after_part1_projection = projected;
   // Support exact predecessor groups, not arbitrary missing keys.
   if (projected != restart.normalized_config_text) {

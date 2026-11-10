@@ -713,6 +713,11 @@ bitwise.
   records and star ages, and the per-interval event chronology ledger and the
   coarse/fine face-identity ledger are runtime state that is always empty at a
   legal restart boundary (step rollback restores/drops them).
+* Post patch 53 (P1-TIME-01): `physics.ssp_event_publication_mode` joins the
+  normalized configuration. A checkpoint written before it resumes only with
+  the default `coarse_endpoint` (the key line is projected away); no
+  checkpoint field changed (the barrier is re-derived from persisted
+  population cursors and star ages each step).
 * Reproducibility impact (T02): under `amr_time_stepping = recursive_subcycling`
   element diffusion and SGS shear now integrate on AMR level clocks instead of
   the coarse halves, so recursive runs are not bit-comparable with patch 49.

@@ -94,7 +94,11 @@ class SourceRuntime {
   // that every discrete stochastic SN event realized in it is published (at
   // the synchronized interval end) at most
   // physics.ssp_max_event_publication_lag_years after its model-defined
-  // physical time. +infinity when the bound is disabled or no local
+  // physical time (coarse_endpoint contract), or within
+  // core::k_ssp_event_barrier_tolerance_years of it when
+  // physics.ssp_event_publication_mode = physical_event_barrier (the global
+  // coarse step, a legal synchronization point of every recursive AMR level,
+  // then ends at the next physical event). +infinity when the bound is disabled or no local
   // population has a pending event. A pure function of the persistent
   // population records and star ages in `state` (restored by rollback,
   // checkpointed by restart), so no extra clock state exists. The time

@@ -32,6 +32,57 @@ std::size_t HydroPatchGeometry::cellCount() const {
   return core::checkedSizeProduct3(nx, ny, nz, "HydroPatchGeometry::cellCount");
 }
 
+std::size_t hydroEdgeGhostCount(std::size_t nx, std::size_t ny, std::size_t nz, std::size_t depth) {
+  if (depth == 0U) {
+    return 0U;
+  }
+  const std::array<std::size_t, 3> extent{nx, ny, nz};
+  std::size_t count = 0U;
+  for (std::size_t n = 0U; n < 3U; ++n) {
+    for (std::size_t t = 0U; t < 3U; ++t) {
+      if (t == n || extent[t] <= 1U) continue;
+      const std::size_t u = 3U - n - t;
+      // 2 normal sides x 2 transverse sides x depth x extent[u].
+      count = core::checkedSizeAdd(
+          count,
+          core::checkedSizeMultiply(core::checkedSizeMultiply(4U, depth, "edge ghost depth"),
+                                    extent[u], "edge ghost block"),
+          "edge ghost count");
+    }
+  }
+  return count;
+}
+
+std::size_t HydroPatchGeometry::edgeGhostSlot(
+    std::size_t normal_axis, std::size_t normal_side,
+    std::size_t transverse_axis, std::size_t transverse_side,
+    std::size_t depth, std::size_t third_index) const {
+  if (edge_ghost_depth == 0U || edge_ghost_slot_begin == k_invalid_ghost_cell_slot ||
+      normal_axis > 2U || transverse_axis > 2U || transverse_axis == normal_axis ||
+      normal_side > 1U || transverse_side > 1U || depth == 0U || depth > edge_ghost_depth) {
+    return k_invalid_ghost_cell_slot;
+  }
+  const std::array<std::size_t, 3> extent{nx, ny, nz};
+  const std::size_t d = edge_ghost_depth;
+  std::size_t offset = 0U;
+  for (std::size_t n = 0U; n < 3U; ++n) {
+    for (std::size_t side = 0U; side < 2U; ++side) {
+      for (std::size_t t = 0U; t < 3U; ++t) {
+        if (t == n || extent[t] <= 1U) continue;
+        const std::size_t u = 3U - n - t;
+        if (n == normal_axis && side == normal_side && t == transverse_axis) {
+          if (third_index >= extent[u]) return k_invalid_ghost_cell_slot;
+          const std::size_t slot = edge_ghost_slot_begin + offset +
+              (transverse_side * d + (depth - 1U)) * extent[u] + third_index;
+          return slot < ghost_cells.size() ? slot : k_invalid_ghost_cell_slot;
+        }
+        offset += 2U * d * extent[u];
+      }
+    }
+  }
+  return k_invalid_ghost_cell_slot;
+}
+
 std::size_t HydroPatchGeometry::totalCellStorageCount() const {
   return core::checkedSizeAdd(cellCount(), ghost_cells.size(), "HydroPatchGeometry::totalCellStorageCount");
 }

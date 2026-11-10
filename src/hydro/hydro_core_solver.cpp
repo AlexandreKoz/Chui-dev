@@ -1152,9 +1152,11 @@ void setPositiveAxisNormal(HydroFace& face, std::size_t axis) {
 
 // Resolve a layer-1 boundary ghost in the same normal face slab as `ghost`,
 // displaced along a tangential axis. AMR geometry emits the standard shell in
-// deterministic X/Y/Z, lower/upper order before its deep normal layers. The
-// metadata checks make this fail closed for custom geometries that do not use
-// that layout; those faces retain the explicit normal-only CTU fallback.
+// deterministic X/Y/Z, lower/upper order before its deep normal layers. A
+// displacement that leaves the patch along the tangential axis resolves to
+// the edge stencil ghost block (P1-HYDRO-02) when the geometry provides it.
+// The metadata checks make this fail closed for custom geometries that do not
+// use that layout; those faces retain the explicit counted CTU fallback.
 [[nodiscard]] std::size_t tangentialGhostCell(
     const HydroPatchGeometry& geometry,
     const HydroGhostCell& ghost,
@@ -1169,7 +1171,36 @@ void setPositiveAxisNormal(HydroFace& face, std::size_t axis) {
   const std::size_t extent = axisCellCount(geometry, transverse_axis);
   const std::ptrdiff_t shifted = static_cast<std::ptrdiff_t>(ijk[transverse_axis]) + displacement;
   if (shifted < 0 || shifted >= static_cast<std::ptrdiff_t>(extent)) {
-    return k_invalid_cell_index;
+    // Edge stencil ghost: one normal layer beyond the face AND
+    // `depth` cells beyond the tangential patch face, keyed by position.
+    const std::size_t normal_axis = faceAxisIndex(ghost.axis);
+    const std::size_t third_axis = 3U - normal_axis - transverse_axis;
+    const std::size_t transverse_side = shifted < 0 ? 0U : 1U;
+    const std::size_t depth = shifted < 0
+        ? static_cast<std::size_t>(-shifted)
+        : static_cast<std::size_t>(shifted - static_cast<std::ptrdiff_t>(extent) + 1);
+    const std::size_t edge_slot = geometry.edgeGhostSlot(
+        normal_axis, ghost.side == HydroFaceSide::kLower ? 0U : 1U,
+        transverse_axis, transverse_side, depth, ijk[third_axis]);
+    if (edge_slot == k_invalid_ghost_cell_slot) {
+      return k_invalid_cell_index;
+    }
+    const HydroGhostCell& edge = geometry.ghost_cells[edge_slot];
+    const std::int8_t expected_offset = static_cast<std::int8_t>(
+        transverse_side == 0U ? -static_cast<int>(depth) : static_cast<int>(depth));
+    if (edge.axis != ghost.axis || edge.side != ghost.side ||
+        edge.transverse_axis != transverse_axis || edge.transverse_offset != expected_offset ||
+        edge.ghost_slot != edge_slot || edge.ghost_cell != real_cells + edge_slot ||
+        edge.owner_real_cell >= real_cells) {
+      return k_invalid_cell_index;
+    }
+    std::array<std::size_t, 3> edge_owner = geometry.cellIjk(edge.owner_real_cell);
+    std::array<std::size_t, 3> expected_owner = ijk;
+    expected_owner[transverse_axis] = transverse_side == 0U ? 0U : extent - 1U;
+    if (edge_owner != expected_owner) {
+      return k_invalid_cell_index;
+    }
+    return edge.ghost_cell;
   }
   ijk[transverse_axis] = static_cast<std::size_t>(shifted);
   const std::size_t shifted_owner = geometry.linearCellIndex(ijk[0], ijk[1], ijk[2]);
@@ -1201,15 +1232,15 @@ void setPositiveAxisNormal(HydroFace& face, std::size_t axis) {
 }
 
 // Real cell whose CTU transverse increment describes the given face side.
-// Periodic ghosts map to their wrapped source cell. Open/reflective/imported
-// ghosts return invalid here and are resolved separately from the immutable
-// tangential ghost slab when its selected-order stencil is complete.
+// Real cells map to themselves and periodic ghosts map to their wrapped
+// source cell. Open/reflective/imported ghosts return invalid here: they are
+// resolved first from the immutable tangential ghost slab when its
+// selected-order stencil is complete, and only then (imported ghosts only)
+// through the counted one-sided owner proxy below.
 [[nodiscard]] std::size_t transverseSourceCell(
     const HydroPatchGeometry& geometry,
     std::size_t cell_index,
-    std::size_t real_cell_count,
-    bool& used_boundary_proxy) {
-  used_boundary_proxy = false;
+    std::size_t real_cell_count) {
   if (cell_index < real_cell_count) {
     return cell_index;
   }
@@ -1221,18 +1252,33 @@ void setPositiveAxisNormal(HydroFace& face, std::size_t axis) {
   if (ghost.boundary_kind == HydroBoundaryKind::kPeriodic) {
     return ghost.source_real_cell;
   }
-  // Distributed/same-level/coarse-fine AMR ghosts contain a valid imported
-  // normal predictor but do not own the transverse neighbor faces needed to
-  // construct a second local CTU delta. Use the adjacent real owner cell's
-  // transverse increment as the one-sided boundary closure. Physical open /
-  // reflective boundaries intentionally keep their existing normal-only
-  // fallback.
-  if (ghost.mutation_rights == HydroGhostMutationRights::kReadOnlyImported &&
-      ghost.owner_real_cell < real_cell_count) {
-    used_boundary_proxy = true;
-    return ghost.owner_real_cell;
-  }
   return k_invalid_cell_index;
+}
+
+// One-sided CTU boundary closure for an imported (distributed, same-level or
+// coarse-fine AMR) ghost whose tangential slab stencil is incomplete, i.e.
+// the face edge/corner region where the ghost slab crosses a second patch
+// interface. The imported ghost carries a valid normal predictor but owns no
+// transverse neighbor faces, so the adjacent real owner cell's transverse
+// increment is used. This is a lower-order spatial closure of the transverse
+// term (time centering is retained) and is always counted as
+// ctu_transverse_boundary_proxy_states. Physical open/reflective boundaries
+// never take this path; they keep the explicit normal-only fallback.
+[[nodiscard]] std::size_t boundaryProxySourceCell(
+    const HydroPatchGeometry& geometry,
+    std::size_t cell_index,
+    std::size_t real_cell_count) {
+  if (cell_index == k_invalid_cell_index || cell_index < real_cell_count ||
+      cell_index - real_cell_count >= geometry.ghost_cells.size()) {
+    return k_invalid_cell_index;
+  }
+  const HydroGhostCell& ghost = geometry.ghost_cells[cell_index - real_cell_count];
+  if (ghost.boundary_kind == HydroBoundaryKind::kPeriodic ||
+      ghost.mutation_rights != HydroGhostMutationRights::kReadOnlyImported ||
+      ghost.owner_real_cell >= real_cell_count) {
+    return k_invalid_cell_index;
+  }
+  return ghost.owner_real_cell;
 }
 
 [[nodiscard]] bool admissiblePrimitive(const HydroPrimitiveState& state, double rho_floor, double pressure_floor) {
@@ -1487,8 +1533,11 @@ void HydroCoreSolver::advancePatchActiveSetBatchedWithScratch(
   // valid for same-level, restricted/prolongated coarse-fine and MPI slabs
   // because ghost fill has already represented them on the target control
   // volume. A full selected-order stencil is mandatory: where it crosses a
-  // second patch interface (the face edge/corner region), no unilateral proxy
-  // is manufactured and the final face state takes the counted fallback.
+  // second patch interface (the face edge/corner region), the slab is left
+  // incomplete: an imported AMR/MPI ghost then takes the counted one-sided
+  // owner proxy (ctu_transverse_boundary_proxy_states) and a physical
+  // open/reflective ghost takes the counted normal-only fallback
+  // (ctu_transverse_degraded_states). Neither is reported as full-order CTU.
   if (use_ctu) {
     const int stencil_radius = reconstruction.requiredStencilHalfWidth();
     if (stencil_radius < 1 || stencil_radius > 3) {
@@ -1535,6 +1584,15 @@ void HydroCoreSolver::advancePatchActiveSetBatchedWithScratch(
           slab_cells[static_cast<std::size_t>(static_cast<int>(k_center) + offset)] = cell;
         }
         if (!complete) {
+          // P1-HYDRO-02: with an edge stencil block at least as deep as the
+          // stencil, every ordinary interface slab is complete by
+          // construction (the ghost filler fails closed when its data is
+          // missing). An incomplete slab there is a geometry defect, never a
+          // reason to fall back to a lower-order closure.
+          if (geometry.edge_ghost_depth >= static_cast<std::uint8_t>(stencil_radius)) {
+            throw std::logic_error(
+                "CTU ghost slab is incomplete although the patch provides the edge stencil ghost block");
+          }
           continue;
         }
         std::array<HydroPrimitiveState, 7> slab_primitives{};
@@ -1608,51 +1666,92 @@ void HydroCoreSolver::advancePatchActiveSetBatchedWithScratch(
   }
 
   // Half of the CTU transverse increment of `cell` excluding `face_axis`.
-  // imported_ghost is true only when the correction was reconstructed from a
-  // complete non-periodic ghost slab rather than an authoritative real cell.
+  // Provenance precedence (exactly one source per side state):
+  //   1. real cell / periodic wrapped source cell (authoritative pass-1 delta);
+  //   2. complete non-periodic tangential ghost slab (selected-order stencil,
+  //      `provenance = kGhostSlab`);
+  //   3. imported AMR/MPI ghost with an incomplete slab: one-sided owner proxy
+  //      (`provenance = kBoundaryProxy`, counted lower-order closure);
+  //   otherwise false -> the caller keeps the normal-only predictor and counts
+  //   ctu_transverse_degraded_states.
+  enum class CtuTransverseProvenance : std::uint8_t { kCell, kGhostSlab, kBoundaryProxy };
+  const auto sumRealCellTransverse = [&](std::size_t source_cell, std::size_t face_axis,
+                                         HydroConservedState& out) -> bool {
+    const std::size_t touched = findTouchedSlot(scratch, source_cell);
+    if (touched == k_invalid_touched_slot) {
+      return false;
+    }
+    out = HydroConservedState{};
+    for (std::size_t axis = 0; axis < 3U; ++axis) {
+      if (axis != face_axis) {
+        out += scratch.ctu_transverse_delta[touched][axis];
+      }
+    }
+    out = 0.5 * out;
+    return true;
+  };
   const auto halfTransverse = [&](std::size_t cell, std::size_t face_axis,
                                   HydroConservedState& out,
-                                  bool& imported_ghost) -> bool {
-    imported_ghost = false;
+                                  CtuTransverseProvenance& provenance) -> bool {
+    provenance = CtuTransverseProvenance::kCell;
     const std::size_t source_cell = transverseSourceCell(geometry, cell, real_cell_count);
     if (source_cell != k_invalid_cell_index) {
-      const std::size_t touched = findTouchedSlot(scratch, source_cell);
-      if (touched == k_invalid_touched_slot) {
-        return false;
-      }
-      out = HydroConservedState{};
-      for (std::size_t axis = 0; axis < 3U; ++axis) {
-        if (axis != face_axis) {
-          out += scratch.ctu_transverse_delta[touched][axis];
-        }
-      }
-      out = 0.5 * out;
-      return true;
-                                  bool& used_boundary_proxy) -> bool {
-    const std::size_t source_cell = transverseSourceCell(
-        geometry, cell, real_cell_count, used_boundary_proxy);
-    if (source_cell == k_invalid_cell_index) {
-      return false;
+      return sumRealCellTransverse(source_cell, face_axis, out);
     }
     if (cell == k_invalid_cell_index || cell < real_cell_count ||
         cell - real_cell_count >= geometry.ghost_cells.size()) {
       return false;
     }
     const std::size_t ghost_slot = cell - real_cell_count;
-    out = HydroConservedState{};
+    HydroConservedState slab_sum{};
+    bool slab_complete = true;
     for (std::size_t axis = 0; axis < 3U; ++axis) {
       if (axis == face_axis || axisCellCount(geometry, axis) == 1U) {
         continue;
       }
       const std::uint8_t axis_bit = static_cast<std::uint8_t>(1U << axis);
       if ((scratch.ctu_ghost_transverse_axis_mask[ghost_slot] & axis_bit) == 0U) {
-        return false;
+        slab_complete = false;
+        break;
       }
-      out += scratch.ctu_ghost_transverse_delta[ghost_slot][axis];
+      slab_sum += scratch.ctu_ghost_transverse_delta[ghost_slot][axis];
     }
-    out = 0.5 * out;
-    imported_ghost = true;
-    return true;
+    if (slab_complete) {
+      out = 0.5 * slab_sum;
+      provenance = CtuTransverseProvenance::kGhostSlab;
+      return true;
+    }
+    // The counted one-sided proxy exists only for geometries WITHOUT the edge
+    // stencil block (fixed-grid / custom geometries); with the block every
+    // interface ghost has a complete slab (enforced above).
+    const std::size_t proxy_cell = geometry.edge_ghost_depth == 0U
+        ? boundaryProxySourceCell(geometry, cell, real_cell_count)
+        : k_invalid_cell_index;
+    if (proxy_cell != k_invalid_cell_index && sumRealCellTransverse(proxy_cell, face_axis, out)) {
+      provenance = CtuTransverseProvenance::kBoundaryProxy;
+      return true;
+    }
+    return false;
+  };
+  const auto correctSideState = [&](std::size_t cell, std::size_t face_axis,
+                                    HydroPrimitiveState& side_state) {
+    HydroConservedState half_transverse;
+    CtuTransverseProvenance provenance = CtuTransverseProvenance::kCell;
+    if (!halfTransverse(cell, face_axis, half_transverse, provenance)) {
+      ++ctu_degraded;
+      return;
+    }
+    if (!applyTransverseCorrection(side_state, half_transverse,
+            m_adiabatic_index, k_state_floor, k_state_floor)) {
+      ++ctu_inadmissible;
+      return;
+    }
+    ++ctu_corrected;
+    if (provenance == CtuTransverseProvenance::kGhostSlab) {
+      ++ctu_ghost_corrected;
+    } else if (provenance == CtuTransverseProvenance::kBoundaryProxy) {
+      ++ctu_boundary_proxy;
+    }
   };
 
   // CTU pass 1: first-order-in-time transverse fluxes from normal-predicted
@@ -1707,34 +1806,9 @@ void HydroCoreSolver::advancePatchActiveSetBatchedWithScratch(
       for (std::size_t slot = 0; slot < batch_count; ++slot) {
         const HydroFace& face = geometry.faces[active_set.active_faces[batch_begin + slot]];
         const std::size_t axis = faceAxisIndex(face.axis);
-        HydroConservedState half_transverse;
-        bool imported_ghost = false;
-        if (halfTransverse(face.owner_cell, axis, half_transverse, imported_ghost)) {
-        bool boundary_proxy = false;
-        if (halfTransverse(face.owner_cell, axis, half_transverse, boundary_proxy)) {
-          if (boundary_proxy) ++ctu_boundary_proxy;
-          if (applyTransverseCorrection(scratch.left_states[slot], half_transverse,
-                  m_adiabatic_index, k_state_floor, k_state_floor)) {
-            ++ctu_corrected;
-            ctu_ghost_corrected += imported_ghost ? 1U : 0U;
-          } else {
-            ++ctu_inadmissible;
-          }
-        } else {
-          ++ctu_degraded;
-        }
-        boundary_proxy = false;
-        if (face.neighbor_cell != k_invalid_cell_index &&
-            halfTransverse(face.neighbor_cell, axis, half_transverse, imported_ghost)) {
-            halfTransverse(face.neighbor_cell, axis, half_transverse, boundary_proxy)) {
-          if (boundary_proxy) ++ctu_boundary_proxy;
-          if (applyTransverseCorrection(scratch.right_states[slot], half_transverse,
-                  m_adiabatic_index, k_state_floor, k_state_floor)) {
-            ++ctu_corrected;
-            ctu_ghost_corrected += imported_ghost ? 1U : 0U;
-          } else {
-            ++ctu_inadmissible;
-          }
+        correctSideState(face.owner_cell, axis, scratch.left_states[slot]);
+        if (face.neighbor_cell != k_invalid_cell_index) {
+          correctSideState(face.neighbor_cell, axis, scratch.right_states[slot]);
         } else {
           ++ctu_degraded;
         }

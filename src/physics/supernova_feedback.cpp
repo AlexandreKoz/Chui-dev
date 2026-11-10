@@ -174,11 +174,20 @@ double MechanicalFeedbackDeposition::localStencilRadius2(const core::SimulationS
 
 std::vector<std::uint32_t> MechanicalFeedbackDeposition::localCandidatesWithin(
     const core::SimulationState& state, const std::array<double, 3>& position, double r2_max) const {
+  std::vector<std::pair<double, std::uint32_t>> heap_scratch;
   std::vector<std::uint32_t> rows;
-  for (const auto& [r2, candidate] : nearest(state, position)) {
+  localCandidatesWithin(state, position, r2_max, heap_scratch, rows);
+  return rows;
+}
+
+void MechanicalFeedbackDeposition::localCandidatesWithin(
+    const core::SimulationState& state, const std::array<double, 3>& position, double r2_max,
+    std::vector<std::pair<double, std::uint32_t>>& heap_scratch, std::vector<std::uint32_t>& rows) const {
+  rows.clear();
+  nearestInto(state, position, heap_scratch);
+  for (const auto& [r2, candidate] : heap_scratch) {
     if (candidate < m_local_count && r2 <= r2_max) rows.push_back(candidate);
   }
-  return rows;
 }
 
 std::vector<FeedbackCellDelta> MechanicalFeedbackDeposition::remoteDeltas(int source_rank) const {
@@ -223,9 +232,17 @@ void MechanicalFeedbackDeposition::addImportedDelta(const core::SimulationState&
 
 std::vector<std::pair<double, std::uint32_t>> MechanicalFeedbackDeposition::nearest(
     const core::SimulationState& state, const std::array<double, 3>& p) const {
-  std::vector<std::pair<double, std::uint32_t>> best;  // (r^2, row), max-heap by r^2
+  std::vector<std::pair<double, std::uint32_t>> best;
+  nearestInto(state, p, best);
+  return best;
+}
+
+void MechanicalFeedbackDeposition::nearestInto(
+    const core::SimulationState& state, const std::array<double, 3>& p,
+    std::vector<std::pair<double, std::uint32_t>>& best) const {
+  best.clear();  // (r^2, row), max-heap by r^2
   const std::size_t n = m_sorted_rows.size();
-  if (n == 0U) return best;
+  if (n == 0U) return;
   const std::size_t k = std::min<std::size_t>(m_config.neighbor_count, n);
   const auto image = [&](double d, int axis) {
     if (m_units.periodic && m_units.box_extent_comoving[axis] > 0.0) {
@@ -290,7 +307,6 @@ std::vector<std::pair<double, std::uint32_t>> MechanicalFeedbackDeposition::near
     }
   }
   std::sort(best.begin(), best.end(), key_less);
-  return best;
 }
 
 void MechanicalFeedbackDeposition::reserveStagedRows(std::size_t additional_rows) {

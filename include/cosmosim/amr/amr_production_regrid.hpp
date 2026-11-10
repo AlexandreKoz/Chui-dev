@@ -31,9 +31,16 @@
 //    at level > child level (else blocked). Octets split across ranks are
 //    skipped (`skipped_remote_sibling`) — migration consolidation is the
 //    balance runtime's job.
-//  * Operations are ordered by ascending patch id. Mandatory refinement is
-//    emitted before optional requests and bypasses `max_operations`; only
-//    optional operations are truncated by that deterministic resource budget.
+//  * Refine operations come from ONE deterministic candidate planner that
+//    visits every local leaf once (at most one operation per patch; a
+//    duplicated local patch id is a hard error). Mandatory refinement is
+//    emitted first (ascending patch id) and bypasses `max_operations` and the
+//    V02 optional ceilings; optional requests follow, ranked by V02
+//    benefit/cost when `optional_control.enabled` (else ascending patch id),
+//    and are the only operations truncated by those budgets. A mandatory
+//    request blocked by max_level or 2:1 balance is counted in
+//    `mandatory_blocked_by_*`; the runtime reduces those counters and fails
+//    collectively. Derefine operations are ordered by ascending parent id.
 //
 // Indicators (typed, A03 seam): cell mass, normalized density/pressure jump
 // (contact and shock), comoving Truelove-Jeans resolution

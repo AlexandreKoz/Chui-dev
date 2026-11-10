@@ -14,6 +14,15 @@ deadlock-freedom, convergence or RSS claim.
 **Final label: SOURCE-COMPLETE, EXTERNAL-DATA-INCOMPLETE** (rationale at the
 end). Scientific validation remains a future phase.
 
+> **Post-patch-53 correction (2026-11-10).** Static inspection of the patch-53
+> tree contradicted the label above: the CTU transverse-correction lambda in
+> `src/hydro/hydro_core_solver.cpp` was malformed (merge `efe31de`), the
+> production regrid refine pass double-scheduled patches, and the
+> memory-aware regrid budget was overwritten. See
+> `docs/repair/chui_post_patch53_source_closure.md` for the repairs and the
+> remaining open source items. The historical record below is retained
+> unchanged.
+
 ## WP-A (P0-52-01) — directed AMR MPI protocol
 
 `parallel::executeBlockingDirectedAmrPatchPayloadExchange`

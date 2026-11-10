@@ -133,9 +133,9 @@ struct ProductionAmrHydroOptions {
   // time-integration family (MUSCL-Hancock / CTU) and dual-energy policy are
   // owned by the HydroCoreSolver passed to the advance entry points. PPM uses
   // the multi-layer normal shell. CTU reconstructs imported/physical ghost
-  // transverse increments from complete tangential face-slab stencils; only
-  // the edge/corner region where the selected reconstruction's full stencil
-  // crosses a second interface uses the explicit counted normal-only fallback.
+  // transverse increments from complete tangential face-slab stencils; with
+  // ctu_edge_stencils the edge stencil ghost block makes that slab complete
+  // across patch edges/corners (P1-HYDRO-02).
   hydro::HydroReconstructionScheme reconstruction_scheme = hydro::HydroReconstructionScheme::kPiecewiseLinear;
   hydro::HydroSlopeLimiter slope_limiter = hydro::HydroSlopeLimiter::kMonotonizedCentral;
   // Periodic box extent in the patch coordinate frame (comoving), required
@@ -152,6 +152,13 @@ struct ProductionAmrHydroOptions {
   // coarse/fine and rank interfaces. A non-zero value overrides (tests).
   std::uint8_t ghost_layers = 0;
   AmrThermodynamicCachePolicy thermodynamic_cache{};
+  // P1-HYDRO-02: the solver integrates with CTU. Every patch geometry then
+  // carries the edge stencil ghost block (depth = ghost layers), local ghost
+  // sources include edge/corner-adjacent patches, and the distributed
+  // exchange must use productionAmrHydroEdgeStencilDepth(...) as
+  // AmrInterfaceTopologyOptions::edge_stencil_layers so the diagonal remote
+  // cells are delivered. Must agree with the HydroCoreSolver scheme.
+  bool ctu_edge_stencils = false;
 };
 
 // Complete physical workspace for immutable step-start ghost snapshots.
@@ -263,6 +270,8 @@ struct ProductionAmrRegridDiagnostics {
 // ProductionAmrHydroOptions::ghost_layers). The distributed exchange planner
 // must request the same depth (parallel::AmrInterfaceTopologyOptions).
 [[nodiscard]] std::uint8_t productionAmrHydroGhostLayers(const ProductionAmrHydroOptions& options);
+// Edge stencil ghost depth (0 unless ctu_edge_stencils).
+[[nodiscard]] std::uint8_t productionAmrHydroEdgeStencilDepth(const ProductionAmrHydroOptions& options);
 
 [[nodiscard]] bool patchStateRowHasExplicitGeometry(
     const core::SimulationState& state,

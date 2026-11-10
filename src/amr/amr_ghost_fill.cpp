@@ -175,6 +175,11 @@ struct CellSelection {
   std::array<double, 3> point = cellCenter(patch_geometry.patch, ghost.owner_real_cell);
   point[axisIndex(ghost.axis)] += sideSign(ghost.side) * static_cast<double>(std::max<std::uint8_t>(layer, 1U)) *
       cellWidth(patch_geometry.geometry, ghost.axis);
+  if (ghost.transverse_axis < 3U) {
+    // P1-HYDRO-02 edge stencil ghost: also displaced along the transverse axis.
+    const auto widths = patchCellWidths(patch_geometry.patch);
+    point[ghost.transverse_axis] += static_cast<double>(ghost.transverse_offset) * widths[ghost.transverse_axis];
+  }
   return internal::wrapPoint(frame, point);
 }
 
@@ -218,6 +223,10 @@ struct CellSelection {
   const auto target_widths = patchCellWidths(target_patch);
   center[axisIndex(ghost.axis)] += sideSign(ghost.side) *
       static_cast<double>(std::max<std::uint8_t>(layer, 1U)) * target_widths[axisIndex(ghost.axis)];
+  if (ghost.transverse_axis < 3U) {
+    center[ghost.transverse_axis] +=
+        static_cast<double>(ghost.transverse_offset) * target_widths[ghost.transverse_axis];
+  }
   std::array<std::array<double, 3>, 2> bounds{};
   for (std::size_t axis = 0; axis < 3U; ++axis) {
     bounds[0][axis] = center[axis] - 0.5 * target_widths[axis];
@@ -431,12 +440,14 @@ void requireSourceCellAvailable(
     AmrHydroBoundaryClass boundary_class,
     std::span<AmrHydroGhostFillPatch> patches,
     std::span<const AmrHydroSparseGhostSource> remote_sources,
-    CellSelection& selection) {
+    CellSelection& selection,
+    bool force_any_relation = false) {
   const internal::AmrPeriodicFrame frame = frameForTarget(target);
   const auto probe = ghostProbePoint(*target.geometry, ghost, layer, frame);
-  // Deep stencil-only layers (layer > 1) may cross into a patch of another
-  // level than the face-adjacent layer; any legal level relation is accepted.
-  const bool any_relation = layer > 1U;
+  // Deep stencil-only layers (layer > 1) and edge stencil ghosts may cross
+  // into a patch of another level than the face-adjacent layer (2:1 balance
+  // is a FACE property); any legal level relation is accepted.
+  const bool any_relation = force_any_relation || layer > 1U || ghost.transverse_axis < 3U;
   const PatchDescriptor& target_patch = target.geometry->patch;
   selection.cells.clear();
 
@@ -725,27 +736,102 @@ void fillAmrGhost(
     std::span<const AmrHydroSparseGhostSource> remote_sources,
     double adiabatic_index,
     AmrHydroGhostFillDiagnostics& diagnostics,
-    CellSelection& selection) {
-  const hydro::HydroGhostCell& ghost =
-      target.geometry->geometry.ghost_cells.at(descriptor.ghost_slot);
-  selectSourceCells(target, ghost, descriptor.ghost_layer, descriptor.boundary_class,
-                    patches, remote_sources, selection);
-  if (selection.cells.empty() && descriptor.ghost_layer > 1U) {
+    CellSelection& selection,
+    const hydro::HydroGhostCell* probe_ghost = nullptr,
+    std::uint8_t probe_layer = 0U) {
+  const hydro::HydroGhostCell& ghost = probe_ghost != nullptr
+      ? *probe_ghost
+      : target.geometry->geometry.ghost_cells.at(descriptor.ghost_slot);
+  const std::uint8_t layer = probe_ghost != nullptr ? probe_layer : descriptor.ghost_layer;
+  selectSourceCells(target, ghost, layer, descriptor.boundary_class,
+                    patches, remote_sources, selection, descriptor.edge_stencil);
+  if (selection.cells.empty() && descriptor.ghost_layer > 1U && !descriptor.edge_stencil) {
     // Deep stencil-only layer whose probe leaves every patch (non-periodic
-    // domain edge behind a thin neighbour patch): zero-gradient continuation
-    // of the previous layer of the same column, i.e. an explicit, counted
-    // first-order reduction of that reconstruction stencil. Never used for
-    // a face-adjacent ghost (those must resolve or fail closed below).
-    for (const AmrHydroGhostDescriptor& previous : target.geometry->ghosts) {
-      if (previous.ghost_layer + 1U != descriptor.ghost_layer) continue;
-      const hydro::HydroGhostCell& previous_ghost =
-          target.geometry->geometry.ghost_cells.at(previous.ghost_slot);
-      if (previous_ghost.owner_real_cell != ghost.owner_real_cell ||
-          previous_ghost.axis != ghost.axis || previous_ghost.side != ghost.side) {
-        continue;
+    // domain edge behind a neighbour patch thinner than the stencil). The
+    // face-adjacent layer always resolves (or fails closed below), and the
+    // column's layers are filled in ascending order, so the shallower layers
+    // of this column are already final. Let m be the deepest layer of the
+    // column that resolved to a real source; the domain wall then lies at
+    // (m + 1/2) cell widths from the owner along the outward normal.
+    //  * reflective domain: layer L is the mirror image of column position
+    //    k = 2m + 1 - L (k >= 1: column ghost, k == 0: owner cell, k < 0:
+    //    target interior cell |k| widths inward), with the normal momentum
+    //    reversed. This is the exact reflective closure, counted separately.
+    //  * any other kind: zero-gradient continuation of layer L - 1 (the
+    //    outflow closure), counted as deep_layer_extrapolated_ghosts. Where
+    //    a reflective mirror source would fall outside the target patch the
+    //    same counted continuation is used rather than fabricating a state.
+    // Never used for a face-adjacent ghost.
+    const auto& ghost_cells = target.geometry->geometry.ghost_cells;
+    const auto sameColumn = [&](const AmrHydroGhostDescriptor& other) {
+      if (other.edge_stencil) return false;  // edge stencil ghosts are not column layers
+      const hydro::HydroGhostCell& other_ghost = ghost_cells.at(other.ghost_slot);
+      return other_ghost.owner_real_cell == ghost.owner_real_cell &&
+          other_ghost.axis == ghost.axis && other_ghost.side == ghost.side;
+    };
+    const auto deepFilled = [](AmrHydroGhostFillStatus status) {
+      return status == AmrHydroGhostFillStatus::kFilledDeepLayerExtrapolated ||
+          status == AmrHydroGhostFillStatus::kFilledDeepLayerReflected;
+    };
+    const AmrHydroGhostDescriptor* previous_layer = nullptr;
+    std::uint8_t last_resolved_layer = 0U;
+    for (const AmrHydroGhostDescriptor& other : target.geometry->ghosts) {
+      if (other.ghost_layer >= descriptor.ghost_layer || !sameColumn(other)) continue;
+      if (other.ghost_layer + 1U == descriptor.ghost_layer) previous_layer = &other;
+      if (!deepFilled(other.fill_status)) {
+        last_resolved_layer = std::max(last_resolved_layer, other.ghost_layer);
       }
+    }
+    if (target.physical_boundary_kind == hydro::HydroBoundaryKind::kReflective &&
+        last_resolved_layer > 0U) {
+      const int mirror_position = 2 * static_cast<int>(last_resolved_layer) + 1 -
+          static_cast<int>(descriptor.ghost_layer);
+      std::size_t mirror_cell = hydro::k_invalid_cell_index;
+      if (mirror_position >= 1) {
+        for (const AmrHydroGhostDescriptor& other : target.geometry->ghosts) {
+          if (static_cast<int>(other.ghost_layer) == mirror_position && sameColumn(other)) {
+            mirror_cell = other.ghost_cell;
+            break;
+          }
+        }
+      } else {
+        const hydro::HydroPatchGeometry& patch_geometry = target.geometry->geometry;
+        const std::size_t axis = static_cast<std::size_t>(axisIndex(ghost.axis));
+        std::array<std::size_t, 3> ijk = patch_geometry.cellIjk(ghost.owner_real_cell);
+        const std::size_t extent = axis == 0U ? patch_geometry.nx
+            : (axis == 1U ? patch_geometry.ny : patch_geometry.nz);
+        // Inward is opposite to the outward side sign.
+        const std::ptrdiff_t inward_shift =
+            (ghost.side == hydro::HydroFaceSide::kLower ? 1 : -1) *
+            static_cast<std::ptrdiff_t>(-mirror_position);
+        const std::ptrdiff_t shifted = static_cast<std::ptrdiff_t>(ijk[axis]) + inward_shift;
+        if (shifted >= 0 && shifted < static_cast<std::ptrdiff_t>(extent)) {
+          ijk[axis] = static_cast<std::size_t>(shifted);
+          mirror_cell = patch_geometry.linearCellIndex(ijk[0], ijk[1], ijk[2]);
+        }
+      }
+      if (mirror_cell != hydro::k_invalid_cell_index) {
+        hydro::HydroConservedState mirrored = target.conserved->loadCell(mirror_cell);
+        switch (ghost.axis) {
+          case hydro::HydroFaceAxis::kX:
+            mirrored.momentum_density_x_comoving = -mirrored.momentum_density_x_comoving;
+            break;
+          case hydro::HydroFaceAxis::kY:
+            mirrored.momentum_density_y_comoving = -mirrored.momentum_density_y_comoving;
+            break;
+          case hydro::HydroFaceAxis::kZ:
+            mirrored.momentum_density_z_comoving = -mirrored.momentum_density_z_comoving;
+            break;
+        }
+        target.conserved->storeCell(descriptor.ghost_cell, mirrored);
+        descriptor.fill_status = AmrHydroGhostFillStatus::kFilledDeepLayerReflected;
+        ++diagnostics.deep_layer_reflected_ghosts;
+        return;
+      }
+    }
+    if (previous_layer != nullptr) {
       target.conserved->storeCell(descriptor.ghost_cell,
-                                  target.conserved->loadCell(previous.ghost_cell));
+                                  target.conserved->loadCell(previous_layer->ghost_cell));
       descriptor.fill_status = AmrHydroGhostFillStatus::kFilledDeepLayerExtrapolated;
       ++diagnostics.deep_layer_extrapolated_ghosts;
       return;
@@ -893,6 +979,173 @@ void fillAmrGhost(
   target.conserved->storeCell(descriptor.ghost_cell, averageSourceState(selection));
   descriptor.fill_status = AmrHydroGhostFillStatus::kFilledCoarseToFine;
   ++diagnostics.coarse_to_fine_ghosts_filled;
+}
+
+// P1-HYDRO-02: edge stencil ghost fill. The ghost sits one layer beyond the
+// owner's normal face (axis n) and d cells beyond its transverse face (axis
+// t). On each crossed target face that is a NON-PERIODIC physical domain face
+// the physical closure is applied exactly as the face/deep physical ghosts
+// do: open -> zero-gradient (the crossed displacement collapses onto the
+// boundary row), reflective -> mirror (outward depth k maps to inward depth
+// k-1) with the normal momentum of that axis reversed. The remaining
+// displacement is then a legal ghost location of this patch:
+//   none        -> a target real cell (both faces physical),
+//   n only      -> the owner' face ghost position (layer 1 along n),
+//   t only      -> the owner' deep position (layer d along t),
+//   n and t     -> the edge position itself (diagonal neighbour patch),
+// resolved with any legal level relation (same-level, coarse->fine with the
+// temporal history, fine->coarse conservative average, local or sparse MPI,
+// periodic wrap through the frame). A probe that wraps into the target patch
+// itself (in-patch periodic axis) reads the target real cell. Missing source
+// data fails closed exactly as for face ghosts; nothing is extrapolated.
+[[nodiscard]] std::size_t standardShellGhostSlot(
+    const hydro::HydroPatchGeometry& geometry, std::size_t normal_axis, std::size_t side,
+    const std::array<std::size_t, 3>& ijk) {
+  const std::size_t nx = geometry.nx;
+  const std::size_t ny = geometry.ny;
+  const std::size_t nz = geometry.nz;
+  switch (normal_axis) {
+    case 0U: return 2U * (ijk[2] * ny + ijk[1]) + side;
+    case 1U: return 2U * ny * nz + 2U * (ijk[2] * nx + ijk[0]) + side;
+    default: return 2U * (ny * nz + nx * nz) + 2U * (ijk[1] * nx + ijk[0]) + side;
+  }
+}
+
+void reverseMomentumComponent(hydro::HydroConservedState& state, std::size_t axis) {
+  switch (axis) {
+    case 0U: state.momentum_density_x_comoving = -state.momentum_density_x_comoving; break;
+    case 1U: state.momentum_density_y_comoving = -state.momentum_density_y_comoving; break;
+    default: state.momentum_density_z_comoving = -state.momentum_density_z_comoving; break;
+  }
+}
+
+void fillEdgeStencilGhost(
+    AmrHydroGhostFillPatch& target,
+    AmrHydroGhostDescriptor& descriptor,
+    std::span<AmrHydroGhostFillPatch> patches,
+    std::span<const AmrHydroSparseGhostSource> remote_sources,
+    double adiabatic_index,
+    AmrHydroGhostFillDiagnostics& diagnostics,
+    CellSelection& selection) {
+  const hydro::HydroPatchGeometry& geometry = target.geometry->geometry;
+  const hydro::HydroGhostCell& ghost = geometry.ghost_cells.at(descriptor.ghost_slot);
+  const std::size_t n = static_cast<std::size_t>(axisIndex(ghost.axis));
+  const std::size_t t = ghost.transverse_axis;
+  if (t > 2U || t == n || ghost.transverse_offset == 0) {
+    throw std::logic_error("fillAmrHydroGhostCells: malformed edge stencil ghost metadata");
+  }
+  const std::array<std::size_t, 3> extent{geometry.nx, geometry.ny, geometry.nz};
+  const std::size_t normal_side = ghost.side == hydro::HydroFaceSide::kLower ? 0U : 1U;
+  const std::size_t transverse_side = ghost.transverse_offset < 0 ? 0U : 1U;
+  const std::size_t depth = static_cast<std::size_t>(
+      ghost.transverse_offset < 0 ? -static_cast<int>(ghost.transverse_offset)
+                                  : static_cast<int>(ghost.transverse_offset));
+  std::array<std::size_t, 3> owner_ijk = geometry.cellIjk(ghost.owner_real_cell);
+  const auto crossedFaceIsDomainWall = [&](std::size_t axis, std::size_t side) {
+    const std::size_t slot = standardShellGhostSlot(geometry, axis, side, owner_ijk);
+    const AmrHydroGhostDescriptor& face = target.geometry->ghosts.at(slot);
+    const hydro::HydroGhostCell& face_ghost = geometry.ghost_cells.at(slot);
+    if (face.edge_stencil || face.ghost_layer != 1U || face_ghost.owner_real_cell != ghost.owner_real_cell) {
+      throw std::logic_error("fillAmrHydroGhostCells: standard ghost shell layout mismatch for an edge ghost");
+    }
+    return face.boundary_class == AmrHydroBoundaryClass::kPhysical &&
+        face_ghost.boundary_kind != hydro::HydroBoundaryKind::kPeriodic;
+  };
+  const bool reflective = target.physical_boundary_kind == hydro::HydroBoundaryKind::kReflective;
+  bool normal_outside = true;
+  bool transverse_outside = true;
+  bool reverse_normal = false;
+  bool reverse_transverse = false;
+  bool physical_closure = false;
+  bool degenerate = false;
+  if (crossedFaceIsDomainWall(n, normal_side)) {
+    // Layer 1 beyond the wall: open copies the boundary row, reflective
+    // mirrors onto the boundary row (inward depth 0) with u_n reversed.
+    normal_outside = false;
+    reverse_normal = reflective;
+    physical_closure = true;
+  }
+  if (crossedFaceIsDomainWall(t, transverse_side)) {
+    transverse_outside = false;
+    physical_closure = true;
+    if (reflective) {
+      reverse_transverse = true;
+      const std::size_t inward = depth - 1U;
+      if (inward >= extent[t]) {
+        // Patch thinner than the mirror depth along t: the mirror cell lies
+        // beyond the opposite face. Justified numerical degeneracy, counted.
+        degenerate = true;
+        reverse_transverse = false;
+      } else {
+        owner_ijk[t] = transverse_side == 0U ? inward : extent[t] - 1U - inward;
+      }
+    }
+  }
+  const std::size_t mapped_owner = geometry.linearCellIndex(owner_ijk[0], owner_ijk[1], owner_ijk[2]);
+  hydro::HydroGhostCell probe = ghost;
+  probe.owner_real_cell = mapped_owner;
+  probe.transverse_axis = 3U;
+  probe.transverse_offset = 0;
+  std::uint8_t probe_layer = 1U;
+  bool inside_target = false;
+  if (normal_outside && transverse_outside) {
+    probe = ghost;  // unmapped edge position (diagonal neighbour region)
+  } else if (normal_outside) {
+    // Face ghost position of the mapped owner along n.
+  } else if (transverse_outside) {
+    switch (t) {
+      case 0U: probe.axis = hydro::HydroFaceAxis::kX; break;
+      case 1U: probe.axis = hydro::HydroFaceAxis::kY; break;
+      default: probe.axis = hydro::HydroFaceAxis::kZ; break;
+    }
+    probe.side = transverse_side == 0U ? hydro::HydroFaceSide::kLower : hydro::HydroFaceSide::kUpper;
+    probe_layer = static_cast<std::uint8_t>(depth);
+  } else {
+    inside_target = true;
+  }
+  const internal::AmrPeriodicFrame frame = frameForTarget(target);
+  if (!inside_target) {
+    const auto point = ghostProbePoint(*target.geometry, probe, probe_layer, frame);
+    if (containsPoint(target.geometry->patch, point)) {
+      // In-patch periodic wrap: the stencil cell is a real cell of this patch.
+      const std::size_t cell = cellContainingPoint(target.geometry->patch, point);
+      owner_ijk = geometry.cellIjk(cell);
+      inside_target = true;
+    }
+  }
+  const auto applyClosure = [&](hydro::HydroConservedState state) {
+    if (reverse_normal) reverseMomentumComponent(state, n);
+    if (reverse_transverse) reverseMomentumComponent(state, t);
+    return state;
+  };
+  if (inside_target) {
+    const std::size_t cell = geometry.linearCellIndex(owner_ijk[0], owner_ijk[1], owner_ijk[2]);
+    target.conserved->storeCell(descriptor.ghost_cell, applyClosure(target.conserved->loadCell(cell)));
+    descriptor.fill_status = AmrHydroGhostFillStatus::kFilledSameLevel;
+    if (descriptor.source_gas_cell_id == 0U && cell < target.geometry->gas_cell_ids.size()) {
+      descriptor.source_gas_cell_id = target.geometry->gas_cell_ids[cell];
+    }
+  } else {
+    fillAmrGhost(target, descriptor, patches, remote_sources, adiabatic_index, diagnostics, selection,
+                 &probe, probe_layer);
+    if (reverse_normal || reverse_transverse) {
+      target.conserved->storeCell(descriptor.ghost_cell,
+                                  applyClosure(target.conserved->loadCell(descriptor.ghost_cell)));
+    }
+    // Stable source identity of a single-cell source (dual-energy seeding).
+    if (descriptor.source_gas_cell_id == 0U && selection.cells.size() == 1U) {
+      const SelectedSourceCell& source = selection.cells.front();
+      if (source.patch != nullptr && source.cell < source.patch->geometry->gas_cell_ids.size()) {
+        descriptor.source_gas_cell_id = source.patch->geometry->gas_cell_ids[source.cell];
+      } else if (source.sparse_remote != nullptr) {
+        const AmrHydroSparseRemoteCell* remote = findSparseRemoteCell(*source.sparse_remote, source.cell);
+        if (remote != nullptr) descriptor.source_gas_cell_id = remote->gas_cell_id;
+      }
+    }
+  }
+  ++diagnostics.edge_stencil_ghosts_filled;
+  if (physical_closure) ++diagnostics.edge_stencil_physical_closures;
+  if (degenerate) ++diagnostics.edge_stencil_degenerate_closures;
 }
 
 void markStaleRemoteTarget(
@@ -1275,6 +1528,11 @@ AmrHydroGhostFillDiagnostics fillAmrHydroGhostCells(
     }
     hydro::fillHydroBoundaryGhostCells(*patch.conserved, patch.geometry->geometry, adiabatic_index);
     for (AmrHydroGhostDescriptor& ghost : patch.geometry->ghosts) {
+      if (ghost.edge_stencil) {
+        fillEdgeStencilGhost(
+            patch, ghost, patches, remote_sources, adiabatic_index, diagnostics, selection);
+        continue;
+      }
       if (ghost.boundary_class == AmrHydroBoundaryClass::kPhysical) {
         ghost.fill_status = AmrHydroGhostFillStatus::kFilledPhysicalBoundary;
         ++diagnostics.physical_ghosts_filled;

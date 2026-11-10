@@ -464,9 +464,116 @@ void linkDeepGhostStencils(
   }
 }
 
+// ---------------------------------------------------------------------------
+// P1-HYDRO-02: edge stencil ghost block.
+//
+// The CTU transverse predictor of a face ghost g (normal axis n) needs the
+// tangential slab g + o e_t, |o| <= stencil half-width, for both transverse
+// axes t. Where g + o e_t leaves the patch along t, the slab cell lies beyond
+// the patch along BOTH n and t (a face-edge region; with two such axes the
+// patch corner region is covered by the two one-dimensional slabs, so no
+// three-axis corner cell is ever read). Those cells are keyed by position:
+// (n, normal side, t, transverse side, depth along t, index along the third
+// axis), appended after the deep layers in the order of
+// hydro::HydroPatchGeometry::edgeGhostSlot. Each is stencil-only and
+// read-only (kReadOnlyImported, kImportedMpi), so the physical boundary
+// filler never writes it and no face or flux register refers to it.
+// ---------------------------------------------------------------------------
+[[nodiscard]] std::size_t standardShellSlot(
+    const hydro::HydroPatchGeometry& geometry, std::size_t normal_axis, std::size_t side,
+    const std::array<std::size_t, 3>& ijk) {
+  const std::size_t nx = geometry.nx;
+  const std::size_t ny = geometry.ny;
+  const std::size_t nz = geometry.nz;
+  switch (normal_axis) {
+    case 0U: return 2U * (ijk[2] * ny + ijk[1]) + side;
+    case 1U: return 2U * ny * nz + 2U * (ijk[2] * nx + ijk[0]) + side;
+    default: return 2U * (ny * nz + nx * nz) + 2U * (ijk[1] * nx + ijk[0]) + side;
+  }
+}
+
+void appendEdgeStencilGhosts(
+    AmrHydroPatchGeometry& patch_geometry,
+    const AmrHydroGeometryOptions& options) {
+  auto& geometry = patch_geometry.geometry;
+  const std::size_t depth = options.edge_stencil_depth;
+  if (depth == 0U) {
+    return;
+  }
+  if (depth > static_cast<std::size_t>(std::numeric_limits<std::int8_t>::max())) {
+    throw std::invalid_argument("buildAmrHydroPatchGeometry: edge stencil depth exceeds the int8 offset range");
+  }
+  const std::array<std::size_t, 3> extent{geometry.nx, geometry.ny, geometry.nz};
+  const std::size_t real_cells = geometry.cellCount();
+  const std::size_t expected = hydro::hydroEdgeGhostCount(geometry.nx, geometry.ny, geometry.nz, depth);
+  if (core::checkedSizeAdd(geometry.ghost_cells.size(), expected, "edge ghost capacity") >
+          geometry.ghost_cells.capacity() ||
+      patch_geometry.ghosts.size() + expected > patch_geometry.ghosts.capacity()) {
+    throw std::length_error("buildAmrHydroPatchGeometry: edge stencil ghosts exceed the admitted capacity");
+  }
+  geometry.edge_ghost_slot_begin = geometry.ghost_cells.size();
+  geometry.edge_ghost_depth = static_cast<std::uint8_t>(depth);
+  constexpr std::array<hydro::HydroFaceAxis, 3> k_axes{
+      hydro::HydroFaceAxis::kX, hydro::HydroFaceAxis::kY, hydro::HydroFaceAxis::kZ};
+  for (std::size_t n = 0U; n < 3U; ++n) {
+    for (std::size_t side = 0U; side < 2U; ++side) {
+      for (std::size_t t = 0U; t < 3U; ++t) {
+        if (t == n || extent[t] <= 1U) continue;
+        const std::size_t u = 3U - n - t;
+        for (std::size_t transverse_side = 0U; transverse_side < 2U; ++transverse_side) {
+          for (std::size_t d = 1U; d <= depth; ++d) {
+            for (std::size_t third = 0U; third < extent[u]; ++third) {
+              std::array<std::size_t, 3> ijk{};
+              ijk[n] = side == 0U ? 0U : extent[n] - 1U;
+              ijk[t] = transverse_side == 0U ? 0U : extent[t] - 1U;
+              ijk[u] = third;
+              const std::size_t owner = geometry.linearCellIndex(ijk[0], ijk[1], ijk[2]);
+              const std::size_t standard_slot = standardShellSlot(geometry, n, side, ijk);
+              const hydro::HydroGhostCell standard = geometry.ghost_cells.at(standard_slot);
+              if (standard.owner_real_cell != owner || standard.axis != k_axes[n] ||
+                  standard.side != (side == 0U ? hydro::HydroFaceSide::kLower : hydro::HydroFaceSide::kUpper)) {
+                throw std::logic_error("buildAmrHydroPatchGeometry: standard ghost shell layout mismatch");
+              }
+              const AmrHydroGhostDescriptor standard_descriptor = patch_geometry.ghosts.at(standard_slot);
+              const std::size_t slot = geometry.ghost_cells.size();
+              hydro::HydroGhostCell edge = standard;
+              edge.source_real_cell = owner;  // metadata only; never read (read-only imported)
+              edge.ghost_slot = slot;
+              edge.ghost_cell = real_cells + slot;
+              edge.boundary_kind = hydro::HydroBoundaryKind::kImportedMpi;
+              edge.mutation_rights = hydro::HydroGhostMutationRights::kReadOnlyImported;
+              edge.origin_gas_cell_id = 0U;
+              edge.origin_rank = -1;
+              edge.transverse_axis = static_cast<std::uint8_t>(t);
+              edge.transverse_offset = static_cast<std::int8_t>(
+                  transverse_side == 0U ? -static_cast<int>(d) : static_cast<int>(d));
+              geometry.ghost_cells.push_back(edge);
+              AmrHydroGhostDescriptor descriptor = standard_descriptor;
+              descriptor.ghost_slot = slot;
+              descriptor.ghost_cell = edge.ghost_cell;
+              descriptor.ghost_layer = 1U;
+              descriptor.source_patch_id = 0U;
+              descriptor.source_gas_cell_id = 0U;
+              descriptor.edge_stencil = true;
+              patch_geometry.ghosts.push_back(descriptor);
+              if (geometry.edgeGhostSlot(n, side, t, transverse_side, d, third) != slot) {
+                throw std::logic_error("buildAmrHydroPatchGeometry: edge ghost slot formula mismatch");
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  if (geometry.ghost_cells.size() - geometry.edge_ghost_slot_begin != expected) {
+    throw std::logic_error("buildAmrHydroPatchGeometry: edge ghost count mismatch");
+  }
+}
+
 }  // namespace
 
-AmrHydroGeometryCapacity amrHydroGeometryCapacity(const PatchDescriptor& patch, std::uint8_t ghost_layers) {
+AmrHydroGeometryCapacity amrHydroGeometryCapacity(
+    const PatchDescriptor& patch, std::uint8_t ghost_layers, std::uint8_t edge_stencil_depth) {
   const std::size_t nx = patch.cell_dims[0];
   const std::size_t ny = patch.cell_dims[1];
   const std::size_t nz = patch.cell_dims[2];
@@ -479,7 +586,8 @@ AmrHydroGeometryCapacity amrHydroGeometryCapacity(const PatchDescriptor& patch, 
   };
   const std::size_t surface = add(add(mul(nx, ny), mul(nx, nz)), mul(ny, nz));
   const std::size_t face_ghosts = mul(2U, surface);
-  const std::size_t ghosts = mul(face_ghosts, std::max<std::size_t>(1U, ghost_layers));
+  const std::size_t ghosts = add(mul(face_ghosts, std::max<std::size_t>(1U, ghost_layers)),
+      hydro::hydroEdgeGhostCount(nx, ny, nz, edge_stencil_depth));
   const std::size_t internal = add(add(mul(nx - 1U, mul(ny, nz)),
       mul(ny - 1U, mul(nx, nz))), mul(nz - 1U, mul(nx, ny)));
   const std::size_t faces = add(internal, face_ghosts);
@@ -580,7 +688,7 @@ AmrHydroPatchGeometry buildAmrHydroPatchGeometry(
       result.geometry.cell_width_y_comoving *
       result.geometry.cell_width_z_comoving;
 
-  const auto capacity = amrHydroGeometryCapacity(patch, options.ghost_layers);
+  const auto capacity = amrHydroGeometryCapacity(patch, options.ghost_layers, options.edge_stencil_depth);
   result.geometry.faces.reserve(capacity.faces);
   result.geometry.ghost_cells.reserve(capacity.ghost_cells);
   result.geometry.flux_register_faces.reserve(capacity.faces);
@@ -679,6 +787,7 @@ AmrHydroPatchGeometry buildAmrHydroPatchGeometry(
     appendDeepGhostLayers(result, options, layer_info);
     linkDeepGhostStencils(result, layer_info);
   }
+  appendEdgeStencilGhosts(result, options);
 
   result.faces.reserve(result.geometry.faces.size());
   for (std::size_t face_index = 0; face_index < result.geometry.faces.size(); ++face_index) {

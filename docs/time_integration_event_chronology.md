@@ -44,6 +44,39 @@ chronology is explicit and auditable, not hidden.
   `L·(1 + 10⁻⁶)`. The criterion never shortens a step below `L`.
 * Requires a Part 2 `stellar_population_model` with stochastic SN events.
 
+## `physics.ssp_event_publication_mode` (post patch 53, P1-TIME-01)
+
+* `coarse_endpoint` (default): exactly the contract above. Existing parameter
+  files and checkpoints keep their meaning; `ssp_max_event_publication_lag_years = 0`
+  is **not** reinterpreted.
+* `physical_event_barrier`: strict exact-time publication. The time authority
+  uses the same guarded forecast + MIN reduction with the fixed barrier
+  resolution `core::k_ssp_event_barrier_tolerance_years = 1 yr` in place of
+  `L`, so every global coarse step ends at the next global physical event time
+  (+ ≤ 1 yr). The coarse step end is the synchronization point of every
+  recursive AMR level and multirate clock, so the deposition happens at a
+  legal barrier and conservation/rollback are unchanged (the step and its
+  retries remain transactional; the cursor/threshold state is the only event
+  queue and is persisted). Forecast-covered events whose lag exceeds the
+  resolution fail closed; `event_lag_policy = physical_event_barrier`.
+  Requires `ssp_max_event_publication_lag_years = 0` and stochastic Part 2 SN
+  events. Cost: one coarse step per distinct global event time.
+* Legacy records (P1-TIME-01 follow-up): the forecast now covers stars
+  without a record (it builds the same deterministic legacy record the stage
+  builds from immutable birth data) and records without an absolute cursor
+  (cursor adopted at the next interval begin). Thresholds already crossed are
+  catch-up events (counted, exempt, physical time before the interval); every
+  TIMED event of every star is held to the enforced bound, so
+  `unforecast_timed_discrete_events` is always 0.
+* Residual gap (not source-complete): events are still deposited only at
+  coarse-step endpoints. Exact publication is achieved by shortening the
+  GLOBAL coarse step (fidelity is the barrier resolution); there is no
+  level-local publication inside a recursive coarse interval. That would need
+  per-star contiguous cursors over level substeps, a level-restricted SSP
+  stage whose feedback stencil stays within cells of the publishing level or
+  finer, and deposition after the level's temporal-history end capture with
+  open flux registers — a restructuring of the SSP stage not done here.
+
 ## Exceptions, rollback and restart
 
 * **Legacy catch-up.** A population record without an absolute cursor (stars

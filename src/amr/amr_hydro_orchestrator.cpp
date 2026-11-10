@@ -209,6 +209,9 @@ constexpr double k_geometry_tol = 1.0e-10;
   const auto widths = cellWidths(patch_geometry.patch);
   point[axisIndex(ghost.axis)] += sideSign(ghost.side) *
       static_cast<double>(std::max<std::uint8_t>(layer, 1U)) * widths[axisIndex(ghost.axis)];
+  if (ghost.transverse_axis < 3U) {
+    point[ghost.transverse_axis] += static_cast<double>(ghost.transverse_offset) * widths[ghost.transverse_axis];
+  }
   return internal::wrapPoint(frame, point);
 }
 
@@ -273,6 +276,54 @@ constexpr double k_geometry_tol = 1.0e-10;
     }
   }
   return true;
+}
+
+// P1-HYDRO-02: a candidate patch can supply an edge stencil ghost of
+// `target` when it touches one of target's face planes (minimum image on
+// periodic axes) and overlaps, with positive extent, target's transverse
+// intervals widened by `depth` target cells (periodic images included).
+// Edge-only contact never creates a face or a flux register; this predicate
+// only selects read-only ghost SOURCES.
+[[nodiscard]] bool edgeStencilSourceTouches(
+    const PatchDescriptor& target,
+    const PatchDescriptor& candidate,
+    std::uint8_t depth,
+    const internal::AmrPeriodicFrame& frame) {
+  const auto widths = cellWidths(target);
+  const auto overlapsWidened = [&](int axis) {
+    const double margin = static_cast<double>(depth) * widths[static_cast<std::size_t>(axis)];
+    const double a0 = target.origin_comov[axis] - margin;
+    const double a1 = target.origin_comov[axis] + target.extent_comov[axis] + margin;
+    const double b0 = candidate.origin_comov[axis];
+    const double b1 = b0 + candidate.extent_comov[axis];
+    if (intervalsOverlap(a0, a1, b0, b1)) return true;
+    if (frame.axisPeriodic(static_cast<std::size_t>(axis))) {
+      const double length = frame.extent_comoving[static_cast<std::size_t>(axis)];
+      return intervalsOverlap(a0, a1, b0 + length, b1 + length) ||
+          intervalsOverlap(a0, a1, b0 - length, b1 - length);
+    }
+    return false;
+  };
+  for (int normal = 0; normal < 3; ++normal) {
+    for (const double sign : {-1.0, 1.0}) {
+      const double target_face = sign < 0.0
+          ? target.origin_comov[normal]
+          : target.origin_comov[normal] + target.extent_comov[normal];
+      const double candidate_face = sign < 0.0
+          ? candidate.origin_comov[normal] + candidate.extent_comov[normal]
+          : candidate.origin_comov[normal];
+      const double scale = std::max({1.0, std::abs(target_face), std::abs(candidate_face)});
+      const double gap = internal::minImageDifference(
+          frame, static_cast<std::size_t>(normal), target_face, candidate_face);
+      if (std::abs(gap) > k_geometry_tol * scale) continue;
+      bool all = true;
+      for (int other = 0; other < 3 && all; ++other) {
+        if (other != normal) all = overlapsWidened(other);
+      }
+      if (all) return true;
+    }
+  }
+  return false;
 }
 
 // Periodic AMR topology (CHUI Part 3 Checkpoint A; box convention [0, L)
@@ -1195,6 +1246,10 @@ std::uint8_t productionAmrHydroGhostLayers(const ProductionAmrHydroOptions& opti
   return amrHydroGhostLayersForOptions(options);
 }
 
+std::uint8_t productionAmrHydroEdgeStencilDepth(const ProductionAmrHydroOptions& options) {
+  return options.ctu_edge_stencils ? amrHydroGhostLayersForOptions(options) : std::uint8_t{0U};
+}
+
 bool hasProductionAmrHydroCoverage(const core::SimulationState& state) {
   if (state.cells.size() == 0U || state.patches.size() == 0U) {
     return false;
@@ -1277,7 +1332,11 @@ void populateAmrHydroFluxRegisterFaces(
   // (possibly different, possibly wrapped) source patch so that their stable
   // source gas-cell identity and dual-energy source can be traced.
   for (AmrHydroGhostDescriptor& deep : patch_geometry.ghosts) {
-    if (deep.ghost_layer <= 1U || deep.boundary_class == AmrHydroBoundaryClass::kPhysical) {
+    // Edge stencil ghosts (P1-HYDRO-02) are traced like deep layers; one whose
+    // probe leaves the domain keeps source 0 (the filler applies the physical
+    // closure and records the resolved source identity itself).
+    if (!deep.edge_stencil &&
+        (deep.ghost_layer <= 1U || deep.boundary_class == AmrHydroBoundaryClass::kPhysical)) {
       continue;
     }
     const hydro::HydroGhostCell& ghost = patch_geometry.geometry.ghost_cells.at(deep.ghost_slot);
@@ -2427,6 +2486,7 @@ struct AmrSynchronizedSweepWorkspace {
   const internal::AmrPeriodicFrame periodic_frame =
       internal::makeAmrPeriodicFrame(periodic_box, options.periodic_box_extent_comoving);
   const std::uint8_t ghost_layers = amrHydroGhostLayersForOptions(options);
+  const std::uint8_t edge_stencil_depth = productionAmrHydroEdgeStencilDepth(options);
 
   const bool all_cells_active = active_cell_rows.empty();
   // Sparse active membership is a sorted, phase-local index rather than a
@@ -2464,7 +2524,7 @@ struct AmrSynchronizedSweepWorkspace {
       descriptors.size(), sizeof(AmrHydroPatchGeometry), "AMR geometry objects"));
   std::uint64_t row_scratch_bytes = 0U;
   for (const PatchDescriptor& patch : descriptors) {
-    const auto capacity = amrHydroGeometryCapacity(patch, ghost_layers);
+    const auto capacity = amrHydroGeometryCapacity(patch, ghost_layers, edge_stencil_depth);
     geometry_bytes = core::checkedMemoryBytesAdd(
         geometry_bytes, capacity.retained_bytes, "AMR geometry live set");
     row_scratch_bytes = std::max(row_scratch_bytes, capacity.construction_scratch_bytes);
@@ -2490,6 +2550,7 @@ struct AmrSynchronizedSweepWorkspace {
     AmrHydroGeometryOptions geometry_options;
     geometry_options.physical_boundary_kind = options.physical_boundary_kind;
     geometry_options.ghost_layers = ghost_layers;
+    geometry_options.edge_stencil_depth = edge_stencil_depth;
     geometry_options.boundary_classes = {
         boundaryClassForSide(patch, all_descriptors, hydro::HydroFaceAxis::kX, hydro::HydroFaceSide::kLower, periodic_frame),
         boundaryClassForSide(patch, all_descriptors, hydro::HydroFaceAxis::kX, hydro::HydroFaceSide::kUpper, periodic_frame),
@@ -2506,7 +2567,7 @@ struct AmrSynchronizedSweepWorkspace {
     populateAmrHydroFluxRegisterFaces(geometries.back(), all_descriptors,
         periodic_box ? options.periodic_box_extent_comoving : std::array<double, 3>{0.0, 0.0, 0.0});
     const std::uint64_t actual = geometries.back().ownedCapacityBytes();
-    if (actual > amrHydroGeometryCapacity(patch, ghost_layers).retained_bytes) {
+    if (actual > amrHydroGeometryCapacity(patch, ghost_layers, edge_stencil_depth).retained_bytes) {
       throw std::runtime_error("AMR geometry physical capacity exceeds admitted topology bound");
     }
     diagnostics.geometry_capacity_bytes = core::checkedMemoryBytesAdd(
@@ -2593,6 +2654,10 @@ struct AmrSynchronizedSweepWorkspace {
     target.missing_source_records += source.missing_source_records;
     target.unresolved_ghosts += source.unresolved_ghosts;
     target.deep_layer_extrapolated_ghosts += source.deep_layer_extrapolated_ghosts;
+    target.deep_layer_reflected_ghosts += source.deep_layer_reflected_ghosts;
+    target.edge_stencil_ghosts_filled += source.edge_stencil_ghosts_filled;
+    target.edge_stencil_physical_closures += source.edge_stencil_physical_closures;
+    target.edge_stencil_degenerate_closures += source.edge_stencil_degenerate_closures;
   };
 
   // Snapshot only the ghost shell needed by each active local patch while the
@@ -2652,6 +2717,13 @@ struct AmrSynchronizedSweepWorkspace {
         touches = touches || touchesOnSide(
             geometries[patch_index].patch, geometries[source_index].patch,
             axis, hydro::HydroFaceSide::kUpper, periodic_frame);
+      }
+      // P1-HYDRO-02: edge stencil ghosts also read patches that touch the
+      // target only along an edge/corner region within the stencil depth.
+      if (!touches && edge_stencil_depth != 0U) {
+        touches = edgeStencilSourceTouches(
+            geometries[patch_index].patch, geometries[source_index].patch,
+            edge_stencil_depth, periodic_frame);
       }
       return touches;
     };
@@ -2751,7 +2823,8 @@ struct AmrSynchronizedSweepWorkspace {
         .enable_temporal_coarse_to_fine = options.enable_temporal_coarse_to_fine,
         .requires_ghost_fill = true,
         .periodic_box_extent_comoving = periodic_box
-            ? options.periodic_box_extent_comoving : std::array<double, 3>{0.0, 0.0, 0.0}});
+            ? options.periodic_box_extent_comoving : std::array<double, 3>{0.0, 0.0, 0.0},
+        .physical_boundary_kind = options.physical_boundary_kind});
     for (std::size_t slot = 0; slot < local_source_indices.size(); ++slot) {
       ghost_views.push_back(AmrHydroGhostFillPatch{
           .geometry = &geometries[local_source_indices[slot]],

@@ -950,6 +950,11 @@ struct DiscreteEventChronologyLedger {
   double interval_begin_code = 0.0;
   double interval_end_code = 0.0;  // publication epoch
   double lag_bound_years = 0.0;    // 0: bounded by the interval only
+  // P1-TIME-01: physics.ssp_event_publication_mode = physical_event_barrier.
+  // The time authority ended this interval at the next global physical event
+  // time (+ k_ssp_event_barrier_tolerance_years); lag_bound_years then holds
+  // that barrier resolution and is enforced for every forecast-covered event.
+  bool physical_event_barrier = false;
   std::uint64_t timed_events = 0U;
   std::uint64_t catch_up_events = 0U;
   double earliest_event_fraction = 1.0;  // (a_k - age_b) / (age_e - age_b)
@@ -964,6 +969,7 @@ struct DiscreteEventChronologyLedger {
   // docs/time_integration_event_chronology.md): the default 0 means "lag
   // bounded only by the accepted coarse interval", NOT "zero lag required".
   [[nodiscard]] const char* lagPolicy() const noexcept {
+    if (physical_event_barrier) return "physical_event_barrier";
     return lag_bound_years > 0.0 ? "bounded_by_time_authority_clip" : "bounded_by_accepted_interval_only";
   }
   [[nodiscard]] double latestEventTimeCode() const noexcept {
@@ -1002,8 +1008,11 @@ struct DiscreteEventChronologyLedger {
     if (enforce_lag_bound && lag_bound_years > 0.0 && lag > lag_bound_years * (1.0 + 1.0e-6)) {
       throw std::runtime_error(
           "discrete SN event of star " + std::to_string(particle_id) + " would be published " +
-          std::to_string(lag) + " yr after its physical time, above physics.ssp_max_event_publication_lag_years = " +
-          std::to_string(lag_bound_years) + " (time-authority event clip not honoured)");
+          std::to_string(lag) + " yr after its physical time, above " +
+          (physical_event_barrier
+               ? std::string("the physical_event_barrier resolution = ")
+               : std::string("physics.ssp_max_event_publication_lag_years = ")) +
+          std::to_string(lag_bound_years) + " yr (time-authority event clip not honoured)");
     }
   }
 };
@@ -1249,9 +1258,37 @@ class SourceRuntimeImpl final : public SourceRuntime {
   }
 
   // T02 (patch 52): event-aware time-authority input (see SourceRuntime).
+  // Deterministic legacy population record (stars created before Part 2 or
+  // restored without a record): primordial H/He + solar-pattern metals at the
+  // stored birth metallicity, unknown birth time, immutable birth key stream.
+  // Shared by the SSP stage and the time-authority forecast so both see the
+  // identical thresholds.
+  [[nodiscard]] physics::StellarPopulationRecord legacyStellarPopulationRecord(
+      const core::SimulationState& state, std::uint32_t s) const {
+    const double z = std::clamp(state.star_particles.metallicity_mass_fraction[s], 0.0, 0.5);
+    const auto masses = physics::initialElementMasses(1.0, z, physics::primordialPolicyFromConfig(m_physics_config));
+    physics::StellarPopulationRecord record =
+        physics::makeStellarPopulationRecord(masses, 0.0, state.star_particles.birth_key[s]);
+    record.chronology_initialized = 0U;
+    return record;
+  }
+
+  // P1-TIME-01: the enforced publication-lag bound of the configured
+  // contract. coarse_endpoint: the optional configured lag (0 = bounded only
+  // by the accepted interval). physical_event_barrier: the fixed barrier
+  // resolution, so the global step ends at the next physical event time.
+  [[nodiscard]] bool physicalEventBarrier() const noexcept {
+    return m_physics_config.ssp_event_publication_mode ==
+        core::SspEventPublicationModeConfig::kPhysicalEventBarrier;
+  }
+  [[nodiscard]] double enforcedEventLagBoundYears() const noexcept {
+    return physicalEventBarrier() ? core::k_ssp_event_barrier_tolerance_years
+                                  : m_physics_config.ssp_max_event_publication_lag_years;
+  }
+
   [[nodiscard]] double discreteEventStepEndLimitTimeCode(const core::SimulationState& state,
                                                          double current_time_code) const override {
-    const double lag_years = m_physics_config.ssp_max_event_publication_lag_years;
+    const double lag_years = enforcedEventLagBoundYears();
     double limit = std::numeric_limits<double>::infinity();
     if (!(lag_years > 0.0) || m_ssp_model == nullptr || !m_ssp_model->config().stochastic_events ||
         state.star_particles.size() == 0U) {
@@ -1267,16 +1304,38 @@ class SourceRuntimeImpl final : public SourceRuntime {
     for (std::uint32_t s = 0; s < state.star_particles.size(); ++s) {
       const std::uint32_t p = state.star_particles.particle_index[s];
       const std::uint64_t pid = state.particle_sidecar.particle_id[p];
-      // A star without a record, or a legacy record without an absolute
-      // cursor, is initialized by its next interval; its past chronology is
-      // catch-up (counted, exempt), so it does not constrain this step.
-      if (!store.has(pid)) continue;
-      const physics::StellarPopulationRecord record = store.get(pid);
-      if (record.initialized == 0U || record.chronology_initialized == 0U) continue;
-      const double age_now = std::max(state.star_particles.stellar_age_years_last[s], 0.0) +
-          std::max(current_time_code - record.chronology_time_code, 0.0) * years_per_code;
+      // P1-TIME-01 (post patch 53): legacy stars are forecast too. A star
+      // without a record gets, in its next interval, exactly the record the
+      // stage constructs deterministically from immutable birth data
+      // (legacyStellarPopulationRecord); a record without an absolute cursor
+      // adopts the next interval begin (= current_time_code) as its cursor.
+      // Thresholds already crossed at age_now are catch-up events (counted,
+      // exempt: their physical time precedes the interval); they are
+      // advanced past here so the forecast is the first TIMED event.
+      physics::StellarPopulationRecord record;
+      bool legacy = false;
+      if (store.has(pid)) {
+        record = store.get(pid);
+      }
+      if (record.initialized == 0U) {
+        record = legacyStellarPopulationRecord(state, s);
+        legacy = true;
+      } else if (record.chronology_initialized == 0U) {
+        legacy = true;
+      }
+      const double age_last = std::max(state.star_particles.stellar_age_years_last[s], 0.0);
+      const double age_now = legacy
+          ? age_last
+          : age_last + std::max(current_time_code - record.chronology_time_code, 0.0) * years_per_code;
+      const double birth_msun = state.star_particles.birth_mass_code[s] / msun_code;
+      if (legacy) {
+        double z = 0.0;
+        for (std::size_t e = 2; e < physics::k_chemical_element_count; ++e) z += record.birth_element_mass_fraction[e];
+        (void)physics::realizeEvents(record, 0U, m_ssp_model->ccCumulativeNumber(age_now, z) * birth_msun);
+        (void)physics::realizeEvents(record, 1U, m_ssp_model->iaCumulativeNumber(age_now) * birth_msun);
+      }
       const double next_age = physics::nextStellarEventAgeYears(
-          *m_ssp_model, record, age_now, state.star_particles.birth_mass_code[s] / msun_code);
+          *m_ssp_model, record, age_now, birth_msun);
       if (!std::isfinite(next_age)) continue;
       const double event_time_code = current_time_code + (next_age - age_now) / years_per_code;
       limit = std::min(limit, event_time_code + lag_years / years_per_code);
@@ -3146,19 +3205,36 @@ class SourceRuntimeImpl final : public SourceRuntime {
       const std::size_t response_bound = core::checkedSizeMultiply(
           inbound.records.size(), static_cast<std::size_t>(std::max<std::uint32_t>(m_physics_config.fb_neighbor_count, 1U)),
           "remote feedback halo response bound");
+      // P2-MEMORY-01: one phase-reused k-NN heap and candidate-row buffer
+      // (capacity k each) serve every inbound query; they are admitted with
+      // the responses and never reallocate inside the query loop.
+      const std::size_t knn_capacity =
+          static_cast<std::size_t>(std::max<std::uint32_t>(m_physics_config.fb_neighbor_count, 1U));
       if (m_memory_governor != nullptr && response_bound != 0U) {
         response_lease = m_memory_governor->reserve(
             core::MemoryClass::kCommunication,
-            core::checkedSizeMultiply(response_bound, sizeof(physics::FeedbackRemoteCandidate) + sizeof(int),
-                                      "remote feedback halo response bytes"),
+            core::checkedSizeAdd(
+                core::checkedSizeMultiply(response_bound, sizeof(physics::FeedbackRemoteCandidate) + sizeof(int),
+                                          "remote feedback halo response bytes"),
+                core::checkedSizeMultiply(knn_capacity,
+                                          sizeof(std::pair<double, std::uint32_t>) + sizeof(std::uint32_t),
+                                          "remote feedback halo k-NN scratch bytes"),
+                "remote feedback halo response and scratch bytes"),
             "sources.feedback.remote_halo_responses");
         response_lease.commit();
+      }
+      std::vector<std::pair<double, std::uint32_t>> knn_heap_scratch;
+      std::vector<std::uint32_t> knn_rows;
+      if (!inbound.records.empty()) {
+        knn_heap_scratch.reserve(knn_capacity);
+        knn_rows.reserve(knn_capacity);
       }
       for (const Query& query : inbound.records) {
         if (query.requester_rank < 0 || query.requester_rank >= ranks || query.requester_rank == rank) {
           throw std::runtime_error("remote feedback halo: query from an invalid requester rank");
         }
-        for (const std::uint32_t row : deposition.localCandidatesWithin(state, query.position, query.radius2)) {
+        deposition.localCandidatesWithin(state, query.position, query.radius2, knn_heap_scratch, knn_rows);
+        for (const std::uint32_t row : knn_rows) {
           physics::FeedbackRemoteCandidate candidate;
           candidate.gas_cell_id = state.gas_cells.gas_cell_id[row];
           candidate.owner_rank = rank;
@@ -3568,7 +3644,8 @@ class SourceRuntimeImpl final : public SourceRuntime {
     DiscreteEventChronologyLedger event_chronology;
     event_chronology.interval_begin_code = event_interval_begin_code;
     event_chronology.interval_end_code = event_interval_end_code;
-    event_chronology.lag_bound_years = m_physics_config.ssp_max_event_publication_lag_years;
+    event_chronology.lag_bound_years = enforcedEventLagBoundYears();
+    event_chronology.physical_event_barrier = physicalEventBarrier();
     (void)transaction.prepare([&] {
       std::exception_ptr loop_failure;
       try {
@@ -3599,19 +3676,18 @@ class SourceRuntimeImpl final : public SourceRuntime {
           // birth mixture = primordial H/He + solar-pattern metals at the
           // stored birth metallicity; birth time unknown (0); stream key =
           // the immutable birth key. Counted, never silent.
-          const double z = std::clamp(state.star_particles.metallicity_mass_fraction[s], 0.0, 0.5);
-          const auto masses = physics::initialElementMasses(1.0, z, physics::primordialPolicyFromConfig(m_physics_config));
-          record = physics::makeStellarPopulationRecord(masses, 0.0, state.star_particles.birth_key[s]);
+          record = legacyStellarPopulationRecord(state, s);
           // A legacy star has no absolute event cursor. Its cumulative age
           // lanes/ordinals remain authoritative for past evolution; the
           // current interval establishes the first absolute boundary.
           record.chronology_initialized = 0U;
           ++legacy_initialized;
         }
-        // Only a record with an absolute cursor at step start was seen by the
-        // time authority's event forecast, so only its events are held to
-        // the publication-lag bound (legacy/v1 records adopt a cursor now).
-        const bool event_forecast_covered = record.chronology_initialized != 0U;
+        // P1-TIME-01: the time authority forecasts every star, legacy records
+        // included (discreteEventStepEndLimitTimeCode builds the same legacy
+        // record and cursor adoption), so every TIMED event is held to the
+        // enforced bound; catch-up events stay counted and exempt.
+        const bool event_forecast_covered = true;
         physics::advanceStellarPopulationChronology(
             record,
             event_interval_begin_code,
@@ -3898,8 +3974,12 @@ class SourceRuntimeImpl final : public SourceRuntime {
                        std::to_string(m_last_event_chronology.unforecast_timed_events)},
                       {"event_lag_policy", m_last_event_chronology.lagPolicy()},
                       {"event_deposition_semantics",
-                       "deposited at the synchronized interval end (publication epoch), not at the physical event "
-                       "time; physical times are model-defined threshold crossings"}}});
+                       m_last_event_chronology.physical_event_barrier
+                           ? "deposited at the synchronized interval end, which the time authority placed at the "
+                             "next global physical event time (barrier resolution event_publication_lag_bound_years); "
+                             "unforecast legacy-record events are counted and exempt"
+                           : "deposited at the synchronized interval end (publication epoch), not at the physical "
+                             "event time; physical times are model-defined threshold crossings"}}});
     }
   }
 

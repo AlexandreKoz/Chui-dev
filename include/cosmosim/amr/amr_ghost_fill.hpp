@@ -41,6 +41,15 @@ struct AmrHydroGhostFillPatch {
   // across the periodic box boundary resolve to their real (local or remote)
   // patch instead of being treated as missing.
   std::array<double, 3> periodic_box_extent_comoving{0.0, 0.0, 0.0};
+  // P1-HYDRO-02: physical (domain) boundary condition of the hierarchy. Used
+  // only for deep stencil-only layers (ghost_layer > 1) of an interface
+  // ghost column whose probe leaves every patch, i.e. a non-periodic domain
+  // edge behind a neighbour patch thinner than the stencil. kReflective
+  // mirrors the column across that wall (normal momentum reversed, exactly
+  // the physical reflective closure); every other kind keeps the zero-gradient
+  // continuation (the open/outflow closure). Appended last so existing
+  // designated initializers keep their meaning; default preserves old callers.
+  hydro::HydroBoundaryKind physical_boundary_kind = hydro::HydroBoundaryKind::kOpen;
 };
 
 struct AmrHydroSparseRemoteCell {
@@ -84,6 +93,17 @@ struct AmrHydroGhostFillDiagnostics {
   // Deep stencil-only layers continued by zero gradient (domain edge behind a
   // thin neighbour patch): counted reconstruction-order reductions.
   std::size_t deep_layer_extrapolated_ghosts = 0;
+  // Deep stencil-only layers behind a reflective domain wall filled by the
+  // exact mirror image of the column (not an order reduction).
+  std::size_t deep_layer_reflected_ghosts = 0;
+  // P1-HYDRO-02 edge stencil ghosts: filled (any route), filled through the
+  // physical domain closure on at least one crossed axis (open copy or
+  // reflective mirror: exact, not an order reduction), and the counted
+  // degenerate subset (reflective mirror depth exceeds the patch extent, the
+  // only edge case that falls back to zero-gradient continuation).
+  std::size_t edge_stencil_ghosts_filled = 0;
+  std::size_t edge_stencil_physical_closures = 0;
+  std::size_t edge_stencil_degenerate_closures = 0;
 };
 
 [[nodiscard]] std::uint64_t amrPatchGeometryFingerprint(const PatchDescriptor& patch);
