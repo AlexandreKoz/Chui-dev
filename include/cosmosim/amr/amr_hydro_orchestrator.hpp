@@ -159,12 +159,26 @@ struct ProductionAmrHydroOptions {
   // AmrInterfaceTopologyOptions::edge_stencil_layers so the diagonal remote
   // cells are delivered. Must agree with the HydroCoreSolver scheme.
   bool ctu_edge_stencils = false;
+  // P1-55-02: global hierarchy domain [origin, origin + extent) in the patch
+  // frame, forwarded to every ghost-fill target view. On non-periodic axes a
+  // deep/edge stencil ghost may use the physical closure only beyond these
+  // walls, and a face without any neighbour must lie on them (otherwise the
+  // fill fails closed as missing interface data). Extent 0 = undeclared
+  // (standalone/validation callers): only faces that are themselves
+  // kPhysical count as walls. Production passes the collectively reduced
+  // bounding box of the patch hierarchy (hydro_amr_runtime).
+  std::array<double, 3> domain_origin_comoving{0.0, 0.0, 0.0};
+  std::array<double, 3> domain_extent_comoving{0.0, 0.0, 0.0};
 };
 
 // Complete physical workspace for immutable step-start ghost snapshots.
 // The patch count includes inactive patches; only active shells consume state.
 [[nodiscard]] std::uint64_t amrPreparedGhostWorkspaceBytes(
     std::size_t patch_count, std::size_t prepared_ghost_count);
+// P1-55-01: with dual_energy_auxiliary the snapshot also retains one rho*e
+// per prepared ghost (+64 B alignment). The two-argument form is `false`.
+[[nodiscard]] std::uint64_t amrPreparedGhostWorkspaceBytes(
+    std::size_t patch_count, std::size_t prepared_ghost_count, bool dual_energy_auxiliary);
 
 struct ProductionAmrHydroDiagnostics {
   // Numerical-method telemetry accumulated from per-patch HydroProfileEvent.
@@ -180,8 +194,10 @@ struct ProductionAmrHydroDiagnostics {
   std::uint64_t ctu_transverse_ghost_axes = 0;
   std::uint64_t ctu_transverse_inadmissible_states = 0;
   std::uint64_t dual_energy_auxiliary_cells = 0;
-  // Ghost rows whose auxiliary energy could not be resolved from a local
-  // source cell (remote sources): dual-energy protection degraded there.
+  // Ghost rows of advanced patches whose auxiliary rho*e is explicitly
+  // invalid (NaN) because a source contributing to the ghost's conserved
+  // state had no auxiliary value (e.g. e <= 0, or a temporal history captured
+  // before v25): dual-energy protection uses E - K there (P1-55-01).
   std::uint64_t dual_energy_unresolved_ghosts = 0;
   // Sum over patches of HydroConservationReport::dual_energy_sync_delta
   // (non-conservative thermal correction applied by the scatter).

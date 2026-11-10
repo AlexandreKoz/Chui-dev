@@ -55,6 +55,7 @@ constexpr std::uint32_t k_restart_schema_v21 = 21;
 constexpr std::uint32_t k_restart_schema_v22 = 22;
 constexpr std::uint32_t k_restart_schema_v23 = 23;
 constexpr std::uint32_t k_restart_schema_v24 = 24;
+constexpr std::uint32_t k_restart_schema_v25 = 25;
 constexpr std::string_view k_restart_schema_name_v14 = "cosmosim_restart_v14";
 constexpr std::string_view k_restart_schema_name_v15 = "cosmosim_restart_v15";
 constexpr std::string_view k_restart_schema_name_v16 = "cosmosim_restart_v16";
@@ -65,6 +66,7 @@ constexpr std::string_view k_restart_schema_name_v20 = "cosmosim_restart_v20";
 constexpr std::string_view k_restart_schema_name_v21 = "cosmosim_restart_v21";
 constexpr std::string_view k_restart_schema_name_v22 = "cosmosim_restart_v22";
 constexpr std::string_view k_restart_schema_name_v23 = "cosmosim_restart_v23";
+constexpr std::string_view k_restart_schema_name_v24 = "cosmosim_restart_v24";
 constexpr std::string_view k_hierarchical_endpoint_group = "/gravity_force_cache/hierarchical_endpoint";
 constexpr std::string_view k_gas_identity_row_policy = "explicit_dense_local_cell_row";
 constexpr std::string_view k_gas_cell_scheduler_identity_key = "gas_cell_id";
@@ -897,6 +899,10 @@ void validateRestartCheckpointSchema(hid_t file, std::uint32_t schema_version) {
       requireHdf5Dataset1d(file, "/state/amr_temporal_boundary_history/start_metal_mass_density_comoving");
       requireHdf5Dataset1d(file, "/state/amr_temporal_boundary_history/end_metal_mass_density_comoving");
     }
+    if (schema_version >= k_restart_schema_v25) {
+      requireHdf5Dataset1d(file, "/state/amr_temporal_boundary_history/start_internal_energy_density_comoving");
+      requireHdf5Dataset1d(file, "/state/amr_temporal_boundary_history/end_internal_energy_density_comoving");
+    }
   }
   requireHdf5Dataset1d(file, "/state/species_count_by_species");
   requireHdf5Link(file, "/state/module_sidecars");
@@ -1442,7 +1448,9 @@ void readGasCellIdentityGroup(hid_t state_group, core::SimulationState& state, s
 
 void writePendingFluxRegisterGroup(hid_t state_group, const core::PendingFluxRegisterStore& store) {
   Hdf5Handle group(openOrCreateGroup(state_group, "amr_pending_flux_registers"));
-  writeScalarU32Attribute(group.get(), "schema_version", 2U);
+  // Group schema 3 (restart v25, P1-55-01): dual-energy auxiliary rho*e
+  // endpoints per cell; NaN = unknown.
+  writeScalarU32Attribute(group.get(), "schema_version", 3U);
   const auto records = store.records();
   std::vector<std::uint64_t> register_key;
   std::vector<std::uint64_t> coarse_patch_id;
@@ -1679,6 +1687,8 @@ void writeAmrTemporalBoundaryHistoryGroup(
   std::vector<double> end_momentum_density_z_comoving;
   std::vector<double> end_total_energy_density_comoving;
   std::vector<double> end_metal_mass_density_comoving;
+  std::vector<double> start_internal_energy_density_comoving;
+  std::vector<double> end_internal_energy_density_comoving;
   const auto records = store.records();
   patch_id.reserve(records.size());
   std::uint64_t offset = 0U;
@@ -1707,6 +1717,8 @@ void writeAmrTemporalBoundaryHistoryGroup(
       end_momentum_density_z_comoving.push_back(cell.end_momentum_density_z_comoving);
       end_total_energy_density_comoving.push_back(cell.end_total_energy_density_comoving);
       end_metal_mass_density_comoving.push_back(cell.end_metal_mass_density_comoving);
+      start_internal_energy_density_comoving.push_back(cell.start_internal_energy_density_comoving);
+      end_internal_energy_density_comoving.push_back(cell.end_internal_energy_density_comoving);
       ++offset;
     }
   }
@@ -1733,6 +1745,8 @@ void writeAmrTemporalBoundaryHistoryGroup(
   writeDataset1d(group.get(), "end_momentum_density_z_comoving", H5T_IEEE_F64LE, H5T_NATIVE_DOUBLE, end_momentum_density_z_comoving);
   writeDataset1d(group.get(), "end_total_energy_density_comoving", H5T_IEEE_F64LE, H5T_NATIVE_DOUBLE, end_total_energy_density_comoving);
   writeDataset1d(group.get(), "end_metal_mass_density_comoving", H5T_IEEE_F64LE, H5T_NATIVE_DOUBLE, end_metal_mass_density_comoving);
+  writeDataset1d(group.get(), "start_internal_energy_density_comoving", H5T_IEEE_F64LE, H5T_NATIVE_DOUBLE, start_internal_energy_density_comoving);
+  writeDataset1d(group.get(), "end_internal_energy_density_comoving", H5T_IEEE_F64LE, H5T_NATIVE_DOUBLE, end_internal_energy_density_comoving);
 }
 
 void readAmrTemporalBoundaryHistoryGroup(
@@ -1758,7 +1772,7 @@ void readAmrTemporalBoundaryHistoryGroup(
     throw std::runtime_error("restart reader: v18 restart is missing /state/amr_temporal_boundary_history");
   }
   const std::uint32_t temporal_schema_version = readScalarU32Attribute(group.get(), "schema_version");
-  if (temporal_schema_version != 1U && temporal_schema_version != 2U) {
+  if (temporal_schema_version != 1U && temporal_schema_version != 2U && temporal_schema_version != 3U) {
     throw std::runtime_error("restart reader: unsupported /state/amr_temporal_boundary_history schema_version");
   }
   const auto patch_id = readDataset1d<std::uint64_t>(group.get(), "patch_id", H5T_NATIVE_UINT64);
@@ -1791,6 +1805,21 @@ void readAmrTemporalBoundaryHistoryGroup(
       H5Lexists(group.get(), "end_metal_mass_density_comoving", H5P_DEFAULT) > 0
           ? readDataset1d<double>(group.get(), "end_metal_mass_density_comoving", H5T_NATIVE_DOUBLE)
           : std::vector<double>(nc, 0.0);
+  // P1-55-01: v25 histories carry the dual-energy auxiliary endpoints. An
+  // older history restores them as NaN (unknown), so temporal ghosts formed
+  // from it are explicitly invalid in the auxiliary lane (counted E - K
+  // fallback) instead of borrowing a current-time value.
+  const bool auxiliary_present = schema_version >= k_restart_schema_v25;
+  if (auxiliary_present && temporal_schema_version < 3U) {
+    throw std::runtime_error(
+        "restart reader: v25 /state/amr_temporal_boundary_history must use group schema_version 3");
+  }
+  const auto start_internal_energy_density_comoving = auxiliary_present
+      ? readDataset1d<double>(group.get(), "start_internal_energy_density_comoving", H5T_NATIVE_DOUBLE)
+      : std::vector<double>(nc, std::numeric_limits<double>::quiet_NaN());
+  const auto end_internal_energy_density_comoving = auxiliary_present
+      ? readDataset1d<double>(group.get(), "end_internal_energy_density_comoving", H5T_NATIVE_DOUBLE)
+      : std::vector<double>(nc, std::numeric_limits<double>::quiet_NaN());
   const std::size_t n = patch_id.size();
   const bool record_sizes = patch_level.size() == n && patch_geometry_fingerprint.size() == n &&
       gas_cell_identity_generation.size() == n && interval_start_code.size() == n && interval_end_code.size() == n &&
@@ -1800,7 +1829,8 @@ void readAmrTemporalBoundaryHistoryGroup(
       start_momentum_density_z_comoving.size() == nc && start_total_energy_density_comoving.size() == nc &&
       start_metal_mass_density_comoving.size() == nc && end_mass_density_comoving.size() == nc && end_momentum_density_x_comoving.size() == nc &&
       end_momentum_density_y_comoving.size() == nc && end_momentum_density_z_comoving.size() == nc &&
-      end_total_energy_density_comoving.size() == nc && end_metal_mass_density_comoving.size() == nc;
+      end_total_energy_density_comoving.size() == nc && end_metal_mass_density_comoving.size() == nc &&
+      start_internal_energy_density_comoving.size() == nc && end_internal_energy_density_comoving.size() == nc;
   if (!record_sizes || !cell_sizes) {
     throw std::runtime_error("/state/amr_temporal_boundary_history datasets must have matching lengths");
   }
@@ -1839,7 +1869,9 @@ void readAmrTemporalBoundaryHistoryGroup(
           .end_momentum_density_y_comoving = end_momentum_density_y_comoving[k],
           .end_momentum_density_z_comoving = end_momentum_density_z_comoving[k],
           .end_total_energy_density_comoving = end_total_energy_density_comoving[k],
-          .end_metal_mass_density_comoving = end_metal_mass_density_comoving[k]});
+          .end_metal_mass_density_comoving = end_metal_mass_density_comoving[k],
+          .start_internal_energy_density_comoving = start_internal_energy_density_comoving[k],
+          .end_internal_energy_density_comoving = end_internal_energy_density_comoving[k]});
     }
     records.push_back(std::move(record));
   }
@@ -1875,6 +1907,14 @@ void validateAmrTemporalBoundaryHistoryForRestart(const core::SimulationState& s
           cell.start_metal_mass_density_comoving > cell.start_mass_density_comoving ||
           cell.end_metal_mass_density_comoving > cell.end_mass_density_comoving) {
         throw std::runtime_error("restart reader: temporal history contains inadmissible conserved state");
+      }
+      // Auxiliary rho*e endpoints: NaN (unknown) or finite and positive.
+      const auto admissible_auxiliary = [](double value) {
+        return std::isnan(value) || (std::isfinite(value) && value > 0.0);
+      };
+      if (!admissible_auxiliary(cell.start_internal_energy_density_comoving) ||
+          !admissible_auxiliary(cell.end_internal_energy_density_comoving)) {
+        throw std::runtime_error("restart reader: temporal history contains an inadmissible auxiliary internal energy");
       }
       for (std::size_t j = 0; j < i; ++j) {
         if (record.cells[j].gas_cell_id == cell.gas_cell_id ||
@@ -2647,6 +2687,7 @@ GravityForceCachePersistentView makeGravityForceCachePersistentView(
 
 bool isRestartSchemaCompatible(std::uint32_t file_schema_version) {
   return file_schema_version == restartSchema().version ||
+      file_schema_version == k_restart_schema_v24 ||
       file_schema_version == k_restart_schema_v23 ||
       file_schema_version == k_restart_schema_v22 ||
       file_schema_version == k_restart_schema_v21 ||
@@ -2693,6 +2734,7 @@ RestartIntegrityDigests restartPayloadIntegrityDigestsImpl(
     bool include_output_time_cadence,
     bool include_star_formation_v22,
     bool include_hierarchical_endpoint_v24,
+    bool include_dual_energy_history_v25,
     core::MemoryGovernor* memory_governor = nullptr) {
   if (payload.persistent_state.simulation_state == nullptr || payload.integrator_state == nullptr || payload.scheduler == nullptr) {
     throw std::invalid_argument("restart payload must provide state, integrator_state, and scheduler");
@@ -3029,6 +3071,15 @@ RestartIntegrityDigests restartPayloadIntegrityDigestsImpl(
         append_u64(std::bit_cast<std::uint64_t>(cell.end_momentum_density_z_comoving));
         append_u64(std::bit_cast<std::uint64_t>(cell.end_total_energy_density_comoving));
         if (include_star_formation_v22) append_u64(std::bit_cast<std::uint64_t>(cell.end_metal_mass_density_comoving));
+        if (include_dual_energy_history_v25) {
+          // NaN (unknown) is digested as one canonical quiet-NaN pattern.
+          const auto canonical_bits = [](double value) {
+            return std::bit_cast<std::uint64_t>(
+                std::isnan(value) ? std::numeric_limits<double>::quiet_NaN() : value);
+          };
+          append_u64(canonical_bits(cell.start_internal_energy_density_comoving));
+          append_u64(canonical_bits(cell.end_internal_energy_density_comoving));
+        }
       }
     }
   }
@@ -3291,7 +3342,7 @@ RestartIntegrityDigests restartPayloadIntegrityDigestsImpl(
 
 std::uint64_t restartPayloadIntegrityHash(
     const RestartWritePayload& payload, core::MemoryGovernor* governor) {
-  return restartPayloadIntegrityDigestsImpl(payload, true, true, true, true, true, true, true, true, governor).legacy_fnv1a;
+  return restartPayloadIntegrityDigestsImpl(payload, true, true, true, true, true, true, true, true, true, governor).legacy_fnv1a;
 }
 
 std::string restartPayloadIntegrityHashHex(
@@ -3405,9 +3456,10 @@ std::string restartConfigurationCompatibilityRecord(
   // older or unknown schemas rather than treating them as equivalent.
   const auto restart_version = restart.diagnostics.restart_schema_version;
   if (!restart.payload_integrity_verified ||
-      (restart_version != k_restart_schema_v23 && restart_version != k_restart_schema_v24) ||
+      (restart_version != k_restart_schema_v23 && restart_version != k_restart_schema_v24 &&
+       restart_version != k_restart_schema_v25) ||
       restart.payload_integrity_algorithm != "sha256-canonical-le-v1" || restart.payload_integrity_sha256_hex.size() != 64U) {
-    fail("migration requires a complete, integrity-verified v23/v24 checkpoint");
+    fail("migration requires a complete, integrity-verified v23/v24/v25 checkpoint");
   }
   const auto& original = restart.provenance;
   if (original.schema_version != "provenance_v7" || original.config_schema_name != "cosmosim_config" ||
@@ -3761,7 +3813,7 @@ void writeRestartCheckpointHdf5(
   }
 
   const RestartIntegrityDigests integrity =
-      restartPayloadIntegrityDigestsImpl(payload, true, true, true, true, true, true, true, true,
+      restartPayloadIntegrityDigestsImpl(payload, true, true, true, true, true, true, true, true, true,
                                         policy.memory_governor);
 
   const auto& shared_names = sharedIoContractNames();
@@ -4455,6 +4507,8 @@ RestartVerificationResult verifyRestartCheckpointHdf5(
     verify_temporal_cells("end_momentum_density_z_comoving", &core::AmrTemporalBoundaryHistoryCellRecord::end_momentum_density_z_comoving, H5T_NATIVE_DOUBLE);
     verify_temporal_cells("end_total_energy_density_comoving", &core::AmrTemporalBoundaryHistoryCellRecord::end_total_energy_density_comoving, H5T_NATIVE_DOUBLE);
     verify_temporal_cells("end_metal_mass_density_comoving", &core::AmrTemporalBoundaryHistoryCellRecord::end_metal_mass_density_comoving, H5T_NATIVE_DOUBLE);
+    verify_temporal_cells("start_internal_energy_density_comoving", &core::AmrTemporalBoundaryHistoryCellRecord::start_internal_energy_density_comoving, H5T_NATIVE_DOUBLE);
+    verify_temporal_cells("end_internal_energy_density_comoving", &core::AmrTemporalBoundaryHistoryCellRecord::end_internal_energy_density_comoving, H5T_NATIVE_DOUBLE);
 #undef VERIFY_TEMPORAL_RECORD
 
     VERIFY_SPAN("/state/star_particles/particle_index", std::uint32_t, H5T_NATIVE_UINT32, state.star_particles.particle_index);
@@ -4610,7 +4664,7 @@ RestartVerificationResult verifyRestartCheckpointHdf5(
     verifyDistributedRestartStateChunked(file.get(), expected.distributed_gravity_state, w, result);
 
     const RestartIntegrityDigests expected_integrity = restartPayloadIntegrityDigestsImpl(
-        expected, true, true, true, true, true, true, true, true, policy.memory_governor);
+        expected, true, true, true, true, true, true, true, true, true, policy.memory_governor);
     result.legacy_payload_hash = readScalarU64Attribute(file.get(), "payload_integrity_hash");
     result.payload_sha256_hex = readScalarStringAttribute(file.get(), "payload_integrity_sha256_hex");
     if (result.legacy_payload_hash != expected_integrity.legacy_fnv1a ||
@@ -4695,9 +4749,11 @@ RestartReadResult readRestartCheckpointHdf5(
       schema_name == k_restart_schema_name_v21 && schema_version == k_restart_schema_v21;
   const bool legacy_v23_schema =
       schema_name == k_restart_schema_name_v23 && schema_version == k_restart_schema_v23;
+  const bool legacy_v24_schema =
+      schema_name == k_restart_schema_name_v24 && schema_version == k_restart_schema_v24;
   if ((!current_schema && !legacy_v14_schema && !legacy_v15_schema && !legacy_v16_schema &&
        !legacy_v17_schema && !legacy_v18_schema && !legacy_v19_schema && !legacy_v20_schema &&
-       !legacy_v21_schema && !legacy_v23_schema) ||
+       !legacy_v21_schema && !legacy_v23_schema && !legacy_v24_schema) ||
       !isRestartSchemaCompatible(schema_version)) {
     throw std::runtime_error(
         "restart schema is not compatible: file='" + schema_name + "' v" + std::to_string(schema_version) +
@@ -4923,7 +4979,8 @@ RestartReadResult readRestartCheckpointHdf5(
           schema_version >= k_restart_schema_v20,
           schema_version >= k_restart_schema_v21,
           schema_version >= k_restart_schema_v22,
-          schema_version >= k_restart_schema_v24);
+          schema_version >= k_restart_schema_v24,
+          schema_version >= k_restart_schema_v25);
   if (computed_integrity.legacy_fnv1a != result.payload_hash ||
       hexU64(computed_integrity.legacy_fnv1a) != result.payload_hash_hex) {
     throw std::runtime_error("restart legacy payload integrity hash mismatch");

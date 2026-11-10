@@ -95,3 +95,8 @@ Static source edits only (uncommitted). No build, test or run.
 | P1-TIME-01 level-local publication | open | — | Exact publication is achieved by global coarse-step clipping (barrier resolution 1 yr). | Level-local SSP publication inside a recursive coarse interval: per-star contiguous cursors across level substeps, level-restricted feedback stencils (cells of level >= L), deposition after the level temporal-history end capture with open flux registers, and level-local rollback. Not implemented. |
 | G01 | not_required_conditional | — | unchanged | needs a mandatory resolution contract |
 | D01 | not_required_conditional | — | unchanged | needs authoritative rate data/specification |
+
+> **Superseded in part (2026-11-10, post patch 55):** the Campaign 2 "counted
+> degeneracy" (reflective mirror depth > patch extent) and the NaN fine->coarse
+> auxiliary lane are replaced by the implementations recorded in
+> [`chui_post_patch55_source_closure.md`](chui_post_patch55_source_closure.md).

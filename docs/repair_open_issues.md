@@ -1,3 +1,16 @@
+## Post-patch-55 v10 source closure — 2026-11-10 (static, NOT RUN)
+
+Implemented in source (uncommitted, unverified): P1-55-01 dual-energy AMR
+ghost transfer (restart v25, migration wire v5); P1-55-02 in-domain deep
+ghosts fail closed + collective vote of the synchronized distributed advance;
+P2-55-03 thin-patch reflective mirrors through neighbour patches; P2-55-04
+CTU ghost scratch sized by the face-ghost prefix.
+
+Open: owner build/tests (incl. MPI); data-blocked C01/C02/S02/F02;
+conditional D01 shattering/coagulation and G01; optional T02 level-local
+events, IMEX/SDC, C04 shadow hydro. See
+[`repair/chui_post_patch55_source_closure.md`](repair/chui_post_patch55_source_closure.md).
+
 ## Final data and closure, pass 2 — 2026-11-04
 
 Closed in source (NOT RUN):

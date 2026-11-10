@@ -318,8 +318,11 @@ void appendAxisBoundaryGhosts(
 // hydro::fillHydroBoundaryGhostCells):
 //   open        -> the boundary owner cell (zero-gradient extrapolation),
 //   reflective  -> mirror cell at depth d-1 inside the patch (normal velocity
-//                  reflected by the filler); omitted when the patch is
-//                  narrower than d cells along the axis (counted reduction),
+//                  reflected by the filler). When the patch is narrower than
+//                  d cells along the axis the mirror lies beyond the opposite
+//                  face: the layer is created with a provisional owner source
+//                  and physical_closure_mapped = true, and the AMR ghost
+//                  filler resolves the exact mirror (P2-55-03),
 //   periodic    -> never created (the stencil already wraps to real cells).
 // Deep NON-PHYSICAL ghosts (same-level, coarse/fine, remote) are filled by the
 // AMR ghost filler from the source patch cell containing the probe at
@@ -378,10 +381,14 @@ void appendDeepGhostLayers(
     }
     for (std::uint8_t layer = 2U; layer <= options.ghost_layers; ++layer) {
       std::size_t source = standard.owner_real_cell;
+      bool closure_mapped = false;
       if (physical && options.physical_boundary_kind == hydro::HydroBoundaryKind::kReflective) {
         source = mirrorCellAtDepth(geometry, standard.owner_real_cell, standard.axis, standard.side, layer);
         if (source == hydro::k_invalid_cell_index) {
-          break;
+          // Provisional, always-valid source for the boundary filler; the
+          // AMR ghost filler overwrites it with the exact mirror state.
+          source = standard.owner_real_cell;
+          closure_mapped = true;
         }
       }
       const std::size_t ghost_slot = geometry.ghost_cells.size();
@@ -396,7 +403,8 @@ void appendDeepGhostLayers(
       descriptor.ghost_cell = ghost_cell;
       descriptor.ghost_layer = layer;
       descriptor.source_patch_id = 0U;
-      descriptor.source_gas_cell_id = physical ? patch_geometry.gas_cell_ids.at(source) : 0U;
+      descriptor.source_gas_cell_id = physical && !closure_mapped ? patch_geometry.gas_cell_ids.at(source) : 0U;
+      descriptor.physical_closure_mapped = closure_mapped;
       patch_geometry.ghosts.push_back(descriptor);
       layer_info.push_back(DeepGhostLayerInfo{.standard_slot = standard_slot, .layer = layer});
     }
@@ -778,6 +786,9 @@ AmrHydroPatchGeometry buildAmrHydroPatchGeometry(
   appendAxisBoundaryGhosts(result, options, hydro::HydroFaceAxis::kX);
   appendAxisBoundaryGhosts(result, options, hydro::HydroFaceAxis::kY);
   appendAxisBoundaryGhosts(result, options, hydro::HydroFaceAxis::kZ);
+  // P2-55-04: the face-adjacent shell is the only face-carrying ghost prefix;
+  // deep layers and the edge block below are stencil-only.
+  result.geometry.face_ghost_slot_count = result.geometry.ghost_cells.size();
   // Reconstruction stencils through the standard one-layer shell (periodic
   // wraps stay in-patch), then the deep stencil-only layers (Part 3) give
   // full PLM/PPM order across patch/rank/coarse-fine/open/reflective faces.
@@ -911,6 +922,9 @@ AmrHydroPatchGeometry buildRemoteAmrHydroPatchGeometry(
   appendAxisBoundaryGhosts(result, options, hydro::HydroFaceAxis::kX);
   appendAxisBoundaryGhosts(result, options, hydro::HydroFaceAxis::kY);
   appendAxisBoundaryGhosts(result, options, hydro::HydroFaceAxis::kZ);
+  // P2-55-04: the face-adjacent shell is the only face-carrying ghost prefix;
+  // deep layers and the edge block below are stencil-only.
+  result.geometry.face_ghost_slot_count = result.geometry.ghost_cells.size();
   // Reconstruction stencils through the standard one-layer shell (periodic
   // wraps stay in-patch), then the deep stencil-only layers (Part 3) give
   // full PLM/PPM order across patch/rank/coarse-fine/open/reflective faces.

@@ -541,6 +541,15 @@ struct AmrTemporalBoundaryHistoryCellRecord {
   double end_momentum_density_z_comoving = 0.0;
   double end_total_energy_density_comoving = 0.0;
   double end_metal_mass_density_comoving = 0.0;
+  // P1-55-01 / H02 (restart v25): dual-energy auxiliary internal-energy
+  // density rho*e (comoving, same convention as the total energy density) at
+  // the interval endpoints, captured from the canonical specific internal
+  // energy. Temporal coarse->fine ghosts interpolate it with the SAME alpha
+  // as the conserved state. NaN = unknown (e <= 0 at capture, or a history
+  // restored from a pre-v25 checkpoint): such ghosts are explicitly invalid
+  // and the solver's E - K fallback is counted. Appended last.
+  double start_internal_energy_density_comoving = std::numeric_limits<double>::quiet_NaN();
+  double end_internal_energy_density_comoving = std::numeric_limits<double>::quiet_NaN();
 };
 
 struct AmrTemporalBoundaryHistoryRecord {

@@ -44,7 +44,13 @@ std::uint32_t CompositionFluxAccumulator::resolveRow(std::size_t storage_row, bo
     is_real = true;
     return m_dense_row_by_real_cell[storage_row];
   }
-  for (std::size_t slot = 0; slot < m_geometry->ghost_cells.size(); ++slot) {
+  // M01: ghost storage rows are normally cellCount() + slot (Cartesian and
+  // AMR geometries); take that slot directly and keep the linear search only
+  // as the fallback for custom layouts, instead of O(ghosts) per face.
+  const std::size_t direct_slot = storage_row - m_geometry->cellCount();
+  const bool direct = direct_slot < m_geometry->ghost_cells.size() &&
+      m_geometry->ghost_cells[direct_slot].ghost_cell == storage_row;
+  for (std::size_t slot = direct ? direct_slot : 0U; slot < m_geometry->ghost_cells.size(); ++slot) {
     const hydro::HydroGhostCell& ghost = m_geometry->ghost_cells[slot];
     if (ghost.ghost_cell != storage_row) continue;
     std::uint64_t origin = slot < m_ghost_origin_by_slot.size() ? m_ghost_origin_by_slot[slot] : 0U;
