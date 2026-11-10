@@ -1795,7 +1795,8 @@ void exchangeAndValidateAmrPatchPayloads(
     const parallel::MpiContext& mpi_context,
     int world_rank,
     std::uint64_t step_index,
-    core::ProfilerSession* profiler) {
+    core::ProfilerSession* profiler,
+    core::MemoryGovernor* memory_governor) {
   const bool distributed = mpi_context.isEnabled() && mpi_context.worldSize() > 1;
   // Patch 53 (P0-52-01): owner-local validation is a guarded phase voted
   // before the directed exchange (local rethrow without MPI).
@@ -1839,7 +1840,18 @@ void exchangeAndValidateAmrPatchPayloads(
 
   parallel::DirectedAmrExchangeDiagnostics diagnostics;
   if (distributed) {
-    std::set<std::pair<std::uint64_t, std::uint32_t>> remote_cell_keys;
+    // P2-MEMORY-01: the remote boundary-cell keys of this validation exchange
+    // live in one flat vector whose capacity is admitted per peer from the
+    // exact logical receive count BEFORE that peer's payload rounds (inside
+    // the exchange's guarded admission phase). The governor lease covers the
+    // old + new capacity coexistence of each growth; the consumer then only
+    // appends within reserved capacity (no allocation and no throw inside the
+    // round loop), and duplicates are detected after the exchange in the
+    // collectively voted decode phase below. This replaces a node-allocated
+    // std::set that was not admitted.
+    using RemoteCellKey = std::pair<std::uint64_t, std::uint32_t>;
+    std::vector<RemoteCellKey> remote_cell_keys;
+    core::MemoryReservation remote_cell_key_lease;
     const parallel::DirectedAmrPatchPayloadExchange directed = parallel::executeBlockingDirectedAmrPatchPayloadExchange(
         mpi_context,
         local_records,
@@ -1854,20 +1866,52 @@ void exchangeAndValidateAmrPatchPayloads(
         [&remote_cell_keys](
             int,
             std::span<const parallel::AmrPatchCellPayloadRecord> records) {
+          if (records.size() > remote_cell_keys.capacity() - remote_cell_keys.size()) {
+            throw std::logic_error(
+                "directed AMR validation received more boundary-cell payloads than were admitted");
+          }
           for (const auto& record : records) {
-            if (!remote_cell_keys.emplace(record.patch_id, record.local_cell_offset).second) {
-              throw std::runtime_error(
-                  "directed AMR validation received duplicate remote boundary-cell payload");
-            }
+            remote_cell_keys.emplace_back(record.patch_id, record.local_cell_offset);
           }
         },
-        {},
+        [&remote_cell_keys, &remote_cell_key_lease, memory_governor](
+            int,
+            std::span<const parallel::AmrPatchPayloadRecord>,
+            std::span<const parallel::AmrPatchBoundaryCellRequest>,
+            std::uint64_t record_count) {
+          if (record_count == 0U) return;
+          const std::size_t required = core::checkedSizeAdd(
+              remote_cell_keys.size(),
+              core::checkedIntegralNarrow<std::size_t>(record_count, "directed AMR validation receive count"),
+              "directed AMR validation key count");
+          if (required <= remote_cell_keys.capacity()) return;
+          if (memory_governor != nullptr) {
+            const std::size_t coexistence_bytes = core::checkedSizeMultiply(
+                core::checkedSizeAdd(remote_cell_keys.capacity(), required,
+                                     "directed AMR validation key coexistence"),
+                sizeof(RemoteCellKey), "directed AMR validation key bytes");
+            core::MemoryReservation grown = memory_governor->reserve(
+                core::MemoryClass::kDiagnostic,
+                static_cast<std::uint64_t>(coexistence_bytes),
+                "migration.amr_validation.remote_cell_keys");
+            grown.commit();
+            remote_cell_keys.reserve(required);
+            remote_cell_key_lease = std::move(grown);  // new lease first, old released after
+          } else {
+            remote_cell_keys.reserve(required);
+          }
+        },
         0U,
         step_index);
     diagnostics = directed.diagnostics;
 
     std::exception_ptr decode_failure;
     try {
+      std::sort(remote_cell_keys.begin(), remote_cell_keys.end());
+      if (std::adjacent_find(remote_cell_keys.begin(), remote_cell_keys.end()) != remote_cell_keys.end()) {
+        throw std::runtime_error(
+            "directed AMR validation received duplicate remote boundary-cell payload");
+      }
       std::unordered_map<std::uint64_t, parallel::AmrPatchPayloadRecord> remote_patch_by_id;
       remote_patch_by_id.reserve(directed.patch_payloads_received.size());
       for (const parallel::AmrPatchPayloadRecord& record : directed.patch_payloads_received) {
@@ -2418,7 +2462,8 @@ struct CompactDmoMigrationCommitResult {
     return false;  // unchanged legacy behaviour: no exchange when nothing moves
   }
   if (!rebalance.should_rebalance) {
-    exchangeAndValidateAmrPatchPayloads(state, mpi_context, world_rank, step_index, profiler);
+    exchangeAndValidateAmrPatchPayloads(
+        state, mpi_context, world_rank, step_index, profiler, services.memory_governor);
     recordRuntimeRebalanceDecision(profiler, rebalance, step_index);
     return false;
   }
@@ -2800,7 +2845,8 @@ struct CompactDmoMigrationCommitResult {
           state, mpi_context, expected_global_particle_ids, "runtime rebalance particle migration commit");
     }
   }
-  exchangeAndValidateAmrPatchPayloads(state, mpi_context, world_rank, step_index, profiler);
+  exchangeAndValidateAmrPatchPayloads(
+      state, mpi_context, world_rank, step_index, profiler, services.memory_governor);
   if (restore_compact_dmo_after_commit) {
     if (!state.compactHomogeneousDmoMetadata(static_cast<std::uint32_t>(world_rank))) {
       throw std::runtime_error(

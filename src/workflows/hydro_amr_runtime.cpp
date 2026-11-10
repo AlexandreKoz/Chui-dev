@@ -3565,6 +3565,16 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
     std::vector<std::uint32_t> forced_rows;
     std::uint64_t local_forecast_events = 0U;
     std::exception_ptr failure;
+    // Regrid epoch: this pass runs after the hydro stage has advanced the gas
+    // rows to the END of the current coarse step and before the timeline
+    // commits (integrator_state.current_scale_factor still holds a_begin).
+    // Every indicator evaluated on those rows (comoving Jeans length, cooling
+    // time from physical density/redshift, predictive feedback lookahead)
+    // therefore uses a_end, so the indicators and the state they read share
+    // one epoch.
+    const double regrid_scale_factor = m_mode_policy.cosmological_comoving_frame
+        ? std::max(context.timeline_step.scale_factor_end, 1.0e-12)
+        : 1.0;
 
     try {
       policy.criteria.use_mass_threshold = m_config.numerics.amr_refine_cell_mass_code > 0.0;
@@ -3590,9 +3600,7 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
       policy.pass = (epoch % 2U == 1U)
           ? amr::AmrRegridPassKind::kRefineOnly
           : amr::AmrRegridPassKind::kDerefineOnly;
-      policy.scale_factor = m_mode_policy.cosmological_comoving_frame
-          ? std::max(context.timeline_step.scale_factor_end, 1.0e-12)
-          : 1.0;
+      policy.scale_factor = regrid_scale_factor;
       policy.periodic = amr_options.physical_boundary_kind == hydro::HydroBoundaryKind::kPeriodic;
       policy.periodic_box_extent_comoving = amr_options.periodic_box_extent_comoving;
       const double softening_kpc = m_config.numerics.gravity_softening_gas_kpc_comoving > 0.0
@@ -3636,7 +3644,7 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
         // t_cool = e / (Lambda_net n_H^2 / rho) with physical density; net
         // heating (Lambda_net <= 0) imposes no cooling-length constraint (+inf).
         constexpr double k_proton_mass_g = 1.67262192369e-24;
-        const double a = std::max(context.integrator_state.current_scale_factor, 1.0e-12);
+        const double a = regrid_scale_factor;
         const bool comoving = m_config.units.coordinate_frame == core::CoordinateFrame::kComoving;
         const double redshift = m_mode_policy.cosmological_comoving_frame ? std::max(0.0, 1.0 / a - 1.0) : 0.0;
         cooling_time_code.assign(context.state.cells.size(), std::numeric_limits<double>::infinity());
@@ -3686,23 +3694,10 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
       m_mpi_context.rethrowCollectivePreparationFailure(
           cooling_time_failure, "regrid cooling-time evaluation");
     }
-    policy.max_level = static_cast<std::uint8_t>(std::clamp(m_config.numerics.amr_max_level, 0, 255));
-    policy.max_operations = static_cast<std::size_t>(m_config.numerics.amr_regrid_max_operations);
-    // Alternating passes keep the 2:1 balance without exchanging decisions.
-    policy.pass = (epoch % 2U == 1U) ? amr::AmrRegridPassKind::kRefineOnly : amr::AmrRegridPassKind::kDerefineOnly;
-    policy.scale_factor = context.integrator_state.current_scale_factor > 0.0
-        ? context.integrator_state.current_scale_factor : 1.0;
-    policy.periodic = amr_options.physical_boundary_kind == hydro::HydroBoundaryKind::kPeriodic;
-    policy.periodic_box_extent_comoving = amr_options.periodic_box_extent_comoving;
-    {
-      const double softening_kpc = m_config.numerics.gravity_softening_gas_kpc_comoving > 0.0
-          ? m_config.numerics.gravity_softening_gas_kpc_comoving
-          : m_config.numerics.gravity_softening_kpc_comoving;
-      const core::UnitSystem units = core::makeUnitSystem(
-          m_config.units.length_unit, m_config.units.mass_unit, m_config.units.velocity_unit);
-      constexpr double k_kpc_m = 3.0856775814913673e19;
-      policy.gravity_softening_code = softening_kpc > 0.0 ? softening_kpc * k_kpc_m / units.length_si_per_code : 0.0;
-    }
+    // P1-AMR-02: the policy above is the single initialization. In
+    // particular policy.max_operations keeps the memory-aware optional budget
+    // recorded in m_last_regrid_optional_budget (the planner input that the
+    // telemetry publishes); it is not reset to the raw configured maximum.
     policy.force_resolution_action =
         m_config.numerics.amr_force_resolution_policy ==
                 core::AmrForceResolutionPolicy::kAllowCountedReference
@@ -3844,7 +3839,7 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
         constexpr double k_solar_mass_kg = 1.98847e30;
         constexpr double k_year_s = 3.15576e7;
         const double msun_code = k_solar_mass_kg / m_units.mass_si_per_code;
-        const double a = std::max(context.integrator_state.current_scale_factor, 1.0e-12);
+        const double a = regrid_scale_factor;
         const double drift_scale = m_config.units.coordinate_frame == core::CoordinateFrame::kComoving
             ? 1.0 / a : 1.0;
         const double lookahead_code = lookahead_years * k_year_s / m_units.timeSiPerCode();

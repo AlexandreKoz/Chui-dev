@@ -36,6 +36,7 @@ enum class AmrHydroGhostFillStatus : std::uint8_t {
   kRejectedTemporalFineToCoarseMismatch,
   kMissingSource,
   kFilledDeepLayerExtrapolated,
+  kFilledDeepLayerReflected,
 };
 
 struct AmrHydroGeometryOptions {

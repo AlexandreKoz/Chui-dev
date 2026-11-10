@@ -2593,6 +2593,7 @@ struct AmrSynchronizedSweepWorkspace {
     target.missing_source_records += source.missing_source_records;
     target.unresolved_ghosts += source.unresolved_ghosts;
     target.deep_layer_extrapolated_ghosts += source.deep_layer_extrapolated_ghosts;
+    target.deep_layer_reflected_ghosts += source.deep_layer_reflected_ghosts;
   };
 
   // Snapshot only the ghost shell needed by each active local patch while the
@@ -2751,7 +2752,8 @@ struct AmrSynchronizedSweepWorkspace {
         .enable_temporal_coarse_to_fine = options.enable_temporal_coarse_to_fine,
         .requires_ghost_fill = true,
         .periodic_box_extent_comoving = periodic_box
-            ? options.periodic_box_extent_comoving : std::array<double, 3>{0.0, 0.0, 0.0}});
+            ? options.periodic_box_extent_comoving : std::array<double, 3>{0.0, 0.0, 0.0},
+        .physical_boundary_kind = options.physical_boundary_kind});
     for (std::size_t slot = 0; slot < local_source_indices.size(); ++slot) {
       ghost_views.push_back(AmrHydroGhostFillPatch{
           .geometry = &geometries[local_source_indices[slot]],

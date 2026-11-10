@@ -973,3 +973,7 @@ Still open (external or validation, not source):
 4. Pre-existing test-source defect: `test_baryonic_source_stage_rollback.cpp`
    `testCoolingTimePromotion` (adaptive operator with `fixed_hybrid`).
 5. Validation (owner-reserved): see `docs/validation_plan.md` patch-52/53.
+6. Post-patch-53 (2026-11-10, static only): open source items P1-HYDRO-02
+   edge/corner ghost provenance for full-order CTU at multi-interface
+   edges, and P1-TIME-01 fine-level event barriers inside a recursive coarse
+   interval. See `docs/repair/chui_post_patch53_source_closure.md`.

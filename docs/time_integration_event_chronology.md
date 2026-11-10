@@ -44,6 +44,31 @@ chronology is explicit and auditable, not hidden.
   `L·(1 + 10⁻⁶)`. The criterion never shortens a step below `L`.
 * Requires a Part 2 `stellar_population_model` with stochastic SN events.
 
+## `physics.ssp_event_publication_mode` (post patch 53, P1-TIME-01)
+
+* `coarse_endpoint` (default): exactly the contract above. Existing parameter
+  files and checkpoints keep their meaning; `ssp_max_event_publication_lag_years = 0`
+  is **not** reinterpreted.
+* `physical_event_barrier`: strict exact-time publication. The time authority
+  uses the same guarded forecast + MIN reduction with the fixed barrier
+  resolution `core::k_ssp_event_barrier_tolerance_years = 1 yr` in place of
+  `L`, so every global coarse step ends at the next global physical event time
+  (+ ≤ 1 yr). The coarse step end is the synchronization point of every
+  recursive AMR level and multirate clock, so the deposition happens at a
+  legal barrier and conservation/rollback are unchanged (the step and its
+  retries remain transactional; the cursor/threshold state is the only event
+  queue and is persisted). Forecast-covered events whose lag exceeds the
+  resolution fail closed; `event_lag_policy = physical_event_barrier`.
+  Requires `ssp_max_event_publication_lag_years = 0` and stochastic Part 2 SN
+  events. Cost: one coarse step per distinct global event time.
+* Residual gap (not source-complete): events are still deposited only at
+  coarse-step endpoints. Exact publication therefore shortens the GLOBAL
+  coarse step; there is no fine-level event barrier inside a recursive coarse
+  interval (that would need intra-interval discrete deposition on level
+  clocks with reflux and level-local rollback). Legacy-record events whose
+  cursor is adopted in the interval (`unforecast_timed_discrete_events`) are
+  counted and exempt, as in `coarse_endpoint`.
+
 ## Exceptions, rollback and restart
 
 * **Legacy catch-up.** A population record without an absolute cursor (stars

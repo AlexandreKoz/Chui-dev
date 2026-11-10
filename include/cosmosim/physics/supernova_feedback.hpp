@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <span>
+#include <utility>
 #include <vector>
 
 #include "cosmosim/core/memory_governor.hpp"
@@ -240,6 +241,16 @@ class MechanicalFeedbackDeposition {
   [[nodiscard]] std::vector<std::uint32_t> localCandidatesWithin(const core::SimulationState& state,
                                                                  const std::array<double, 3>& position,
                                                                  double r2_max) const;
+  // P2-MEMORY-01: phase-reused variant for per-query loops (remote halo
+  // responses). `heap_scratch` and `rows` are caller-owned buffers; `rows` is
+  // cleared and filled with the same rows, in the same order, as the
+  // allocating overload. With capacity >= neighbor_count reserved (and
+  // admitted) once by the caller, no allocation happens per query.
+  void localCandidatesWithin(const core::SimulationState& state,
+                             const std::array<double, 3>& position,
+                             double r2_max,
+                             std::vector<std::pair<double, std::uint32_t>>& heap_scratch,
+                             std::vector<std::uint32_t>& rows) const;
   // Deltas staged on remote candidates, for delivery to their owners.
   [[nodiscard]] std::vector<FeedbackCellDelta> remoteDeltas(int source_rank) const;
   // Merge a delta delivered by another rank for a local cell (before commit).
@@ -281,6 +292,10 @@ class MechanicalFeedbackDeposition {
   [[nodiscard]] CandidateProps props(const core::SimulationState& state, std::uint32_t candidate) const;
   [[nodiscard]] std::vector<std::pair<double, std::uint32_t>> nearest(const core::SimulationState& state,
                                                                       const std::array<double, 3>& p) const;
+  // Allocation-free k-NN core of nearest(): fills `best` (cleared first)
+  // sorted by (r^2, stable id). Reuses the caller's capacity.
+  void nearestInto(const core::SimulationState& state, const std::array<double, 3>& p,
+                   std::vector<std::pair<double, std::uint32_t>>& best) const;
   RowDelta& delta(std::uint32_t row);
 
   MechanicalFeedbackConfig m_config;

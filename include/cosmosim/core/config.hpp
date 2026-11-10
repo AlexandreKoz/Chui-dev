@@ -63,6 +63,27 @@ enum class SspWindModelConfig {
   kTableV1,
 };
 
+// P1-TIME-01 (post patch 53): publication-time contract of discrete
+// stochastic SN events. kCoarseEndpoint (default, the pre-existing semantics)
+// deposits every event at the synchronized coarse-interval end; its lag is
+// bounded by the accepted interval, or by
+// physics.ssp_max_event_publication_lag_years when that is > 0.
+// kPhysicalEventBarrier makes the time authority end every global coarse step
+// (a legal synchronization point for all recursive AMR levels and multirate
+// clocks) at the next pending physical event time (global MIN over ranks)
+// plus the fixed barrier resolution k_ssp_event_barrier_tolerance_years, so
+// every forecast event is published within that resolution of its physical
+// time; violations fail closed.
+enum class SspEventPublicationModeConfig : std::uint8_t {
+  kCoarseEndpoint = 0,
+  kPhysicalEventBarrier = 1,
+};
+
+// Barrier resolution of kPhysicalEventBarrier: far above the stellar-age /
+// code-time round-off (<~1e-5 yr for ages <= 1e10 yr) and far below any
+// stellar-evolution or hydrodynamic time scale of the SN channels (>= Myr).
+inline constexpr double k_ssp_event_barrier_tolerance_years = 1.0;
+
 // CHUI Part 3 Milestone I: gas AMR time stepping. kSynchronized (default)
 // advances every level with the coordinator interval; kRecursiveSubcycling
 // advances level L with dt / r^(L - L_min) (Berger-Oliger, nested temporal
@@ -738,6 +759,10 @@ struct PhysicsConfig {
   // published at most this many years after its physical time; the source
   // stage refuses (fail closed) an interval that violates it.
   double ssp_max_event_publication_lag_years = 0.0;
+  // P1-TIME-01: explicit publication-time contract (see
+  // SspEventPublicationModeConfig). kPhysicalEventBarrier requires
+  // ssp_max_event_publication_lag_years = 0 (the barrier defines the lag).
+  SspEventPublicationModeConfig ssp_event_publication_mode = SspEventPublicationModeConfig::kCoarseEndpoint;
   SspWindModelConfig ssp_wind_model = SspWindModelConfig::kNone;
   std::string ssp_wind_table_path;
   std::string ssp_wind_table_sha256;
@@ -1076,6 +1101,7 @@ void writeNormalizedConfigSnapshot(
 [[nodiscard]] std::string v02ControlModeToString(V02ControlMode mode);
 [[nodiscard]] std::string amrTimeSteppingConfigModeToString(AmrTimeSteppingConfigMode mode);
 [[nodiscard]] std::string sspWindModelConfigToString(SspWindModelConfig mode);
+[[nodiscard]] std::string sspEventPublicationModeConfigToString(SspEventPublicationModeConfig mode);
 [[nodiscard]] std::string nodeMemoryAdmissionModeToString(NodeMemoryAdmissionMode mode);
 [[nodiscard]] std::string coordinateFrameToString(CoordinateFrame frame);
 [[nodiscard]] std::string initialConditionConventionToString(

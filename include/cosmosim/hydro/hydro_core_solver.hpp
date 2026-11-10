@@ -478,8 +478,11 @@ struct HydroProfileEvent {
   // Imported AMR/MPI ghost side corrected with the adjacent owner's
   // transverse increment. This one-sided CTU closure preserves temporal
   // centering at a distributed/coarse-fine interface without pretending the
-  // remote ghost owns a local transverse-flux stencil. Qualification still
-  // requires the boundary convergence tests.
+  // remote ghost owns a local transverse-flux stencil. It is used only when
+  // the ghost's tangential slab stencil is incomplete (edge/corner region);
+  // a complete slab always takes precedence. Subset of
+  // ctu_transverse_corrected_states, disjoint from the ghost-slab subset.
+  // Qualification still requires the boundary convergence tests.
   std::uint64_t ctu_transverse_boundary_proxy_states = 0;
   // Imported/physical ghost side states whose transverse increment was
   // reconstructed from a complete tangential face-slab stencil (subset of

@@ -732,20 +732,90 @@ void fillAmrGhost(
                     patches, remote_sources, selection);
   if (selection.cells.empty() && descriptor.ghost_layer > 1U) {
     // Deep stencil-only layer whose probe leaves every patch (non-periodic
-    // domain edge behind a thin neighbour patch): zero-gradient continuation
-    // of the previous layer of the same column, i.e. an explicit, counted
-    // first-order reduction of that reconstruction stencil. Never used for
-    // a face-adjacent ghost (those must resolve or fail closed below).
-    for (const AmrHydroGhostDescriptor& previous : target.geometry->ghosts) {
-      if (previous.ghost_layer + 1U != descriptor.ghost_layer) continue;
-      const hydro::HydroGhostCell& previous_ghost =
-          target.geometry->geometry.ghost_cells.at(previous.ghost_slot);
-      if (previous_ghost.owner_real_cell != ghost.owner_real_cell ||
-          previous_ghost.axis != ghost.axis || previous_ghost.side != ghost.side) {
-        continue;
+    // domain edge behind a neighbour patch thinner than the stencil). The
+    // face-adjacent layer always resolves (or fails closed below), and the
+    // column's layers are filled in ascending order, so the shallower layers
+    // of this column are already final. Let m be the deepest layer of the
+    // column that resolved to a real source; the domain wall then lies at
+    // (m + 1/2) cell widths from the owner along the outward normal.
+    //  * reflective domain: layer L is the mirror image of column position
+    //    k = 2m + 1 - L (k >= 1: column ghost, k == 0: owner cell, k < 0:
+    //    target interior cell |k| widths inward), with the normal momentum
+    //    reversed. This is the exact reflective closure, counted separately.
+    //  * any other kind: zero-gradient continuation of layer L - 1 (the
+    //    outflow closure), counted as deep_layer_extrapolated_ghosts. Where
+    //    a reflective mirror source would fall outside the target patch the
+    //    same counted continuation is used rather than fabricating a state.
+    // Never used for a face-adjacent ghost.
+    const auto& ghost_cells = target.geometry->geometry.ghost_cells;
+    const auto sameColumn = [&](const AmrHydroGhostDescriptor& other) {
+      const hydro::HydroGhostCell& other_ghost = ghost_cells.at(other.ghost_slot);
+      return other_ghost.owner_real_cell == ghost.owner_real_cell &&
+          other_ghost.axis == ghost.axis && other_ghost.side == ghost.side;
+    };
+    const auto deepFilled = [](AmrHydroGhostFillStatus status) {
+      return status == AmrHydroGhostFillStatus::kFilledDeepLayerExtrapolated ||
+          status == AmrHydroGhostFillStatus::kFilledDeepLayerReflected;
+    };
+    const AmrHydroGhostDescriptor* previous_layer = nullptr;
+    std::uint8_t last_resolved_layer = 0U;
+    for (const AmrHydroGhostDescriptor& other : target.geometry->ghosts) {
+      if (other.ghost_layer >= descriptor.ghost_layer || !sameColumn(other)) continue;
+      if (other.ghost_layer + 1U == descriptor.ghost_layer) previous_layer = &other;
+      if (!deepFilled(other.fill_status)) {
+        last_resolved_layer = std::max(last_resolved_layer, other.ghost_layer);
       }
+    }
+    if (target.physical_boundary_kind == hydro::HydroBoundaryKind::kReflective &&
+        last_resolved_layer > 0U) {
+      const int mirror_position = 2 * static_cast<int>(last_resolved_layer) + 1 -
+          static_cast<int>(descriptor.ghost_layer);
+      std::size_t mirror_cell = hydro::k_invalid_cell_index;
+      if (mirror_position >= 1) {
+        for (const AmrHydroGhostDescriptor& other : target.geometry->ghosts) {
+          if (static_cast<int>(other.ghost_layer) == mirror_position && sameColumn(other)) {
+            mirror_cell = other.ghost_cell;
+            break;
+          }
+        }
+      } else {
+        const hydro::HydroPatchGeometry& patch_geometry = target.geometry->geometry;
+        const std::size_t axis = static_cast<std::size_t>(axisIndex(ghost.axis));
+        std::array<std::size_t, 3> ijk = patch_geometry.cellIjk(ghost.owner_real_cell);
+        const std::size_t extent = axis == 0U ? patch_geometry.nx
+            : (axis == 1U ? patch_geometry.ny : patch_geometry.nz);
+        // Inward is opposite to the outward side sign.
+        const std::ptrdiff_t inward_shift =
+            (ghost.side == hydro::HydroFaceSide::kLower ? 1 : -1) *
+            static_cast<std::ptrdiff_t>(-mirror_position);
+        const std::ptrdiff_t shifted = static_cast<std::ptrdiff_t>(ijk[axis]) + inward_shift;
+        if (shifted >= 0 && shifted < static_cast<std::ptrdiff_t>(extent)) {
+          ijk[axis] = static_cast<std::size_t>(shifted);
+          mirror_cell = patch_geometry.linearCellIndex(ijk[0], ijk[1], ijk[2]);
+        }
+      }
+      if (mirror_cell != hydro::k_invalid_cell_index) {
+        hydro::HydroConservedState mirrored = target.conserved->loadCell(mirror_cell);
+        switch (ghost.axis) {
+          case hydro::HydroFaceAxis::kX:
+            mirrored.momentum_density_x_comoving = -mirrored.momentum_density_x_comoving;
+            break;
+          case hydro::HydroFaceAxis::kY:
+            mirrored.momentum_density_y_comoving = -mirrored.momentum_density_y_comoving;
+            break;
+          case hydro::HydroFaceAxis::kZ:
+            mirrored.momentum_density_z_comoving = -mirrored.momentum_density_z_comoving;
+            break;
+        }
+        target.conserved->storeCell(descriptor.ghost_cell, mirrored);
+        descriptor.fill_status = AmrHydroGhostFillStatus::kFilledDeepLayerReflected;
+        ++diagnostics.deep_layer_reflected_ghosts;
+        return;
+      }
+    }
+    if (previous_layer != nullptr) {
       target.conserved->storeCell(descriptor.ghost_cell,
-                                  target.conserved->loadCell(previous.ghost_cell));
+                                  target.conserved->loadCell(previous_layer->ghost_cell));
       descriptor.fill_status = AmrHydroGhostFillStatus::kFilledDeepLayerExtrapolated;
       ++diagnostics.deep_layer_extrapolated_ghosts;
       return;

@@ -98,7 +98,14 @@ layers (one for PCM, two for PLM and three for PPM), and the ghost filler
 resolves each layer at the step-start/temporally interpolated level clock.
 Only a physically thin patch that cannot provide the required reflected/open
 continuation may reduce order; every such reduction is reported by
-`stencil_degradation_count` and `deep_layer_extrapolated_ghosts`.
+`stencil_degradation_count` and `deep_layer_extrapolated_ghosts`. A deep
+stencil-only interface layer whose probe leaves every patch (domain edge
+behind a neighbour patch thinner than the stencil) is filled with the
+physical domain closure (post-patch-53 P1-HYDRO-02): for an open domain the
+zero-gradient continuation (`deep_layer_extrapolated_ghosts`); for a
+reflective domain the exact mirror image of the column across the wall with
+reversed normal momentum (`deep_layer_reflected_ghosts`). A reflective mirror
+source outside the target patch falls back to the counted continuation.
 
 ## 4. CTU (simplified Colella 1990 in 3D)
 
@@ -127,11 +134,17 @@ non-periodic ghost side, the solver uses the immutable AMR/MPI face slab and
 the selected PCM/PLM/PPM reconstruction to evaluate the lower/upper flux in
 each tangential direction on the target control volume. The term is accepted
 only if the complete selected-order stencil exists. At face edges/corners,
-where it crosses a second interface and the slab is incomplete, the whole
-ghost correction stays normal-only and is reported by
-`ctu_transverse_degraded_states`; there is no unilateral high-order proxy.
-Successful imported corrections are reported by
-`ctu_transverse_ghost_corrected_states`. Periodic ghosts use their wrapped
+where it crosses a second interface and the slab is incomplete, the
+precedence is (post-patch-53 P0-HYDRO-01, one coherent provenance per side
+state): an imported (MPI / same-level / coarse-fine) ghost takes the adjacent
+real owner cell's transverse increment as a one-sided, lower-order closure,
+counted in `ctu_transverse_boundary_proxy_states`; a physical open/reflective
+ghost keeps the normal-only predictor, counted in
+`ctu_transverse_degraded_states`. A complete slab always takes precedence over
+the proxy. Successful slab corrections are reported by
+`ctu_transverse_ghost_corrected_states`; the slab and proxy counts are
+disjoint subsets of `ctu_transverse_corrected_states`, so the CTU order is
+full only where neither proxy nor degraded counts are non-zero. Periodic ghosts use their wrapped
 real cell, so periodic boxes are corrected on both sides. Inadmissible corrected states keep the normal-only state
 (`ctu_transverse_inadmissible_states`). For partial active sets the
 transverse increment of a cell uses exactly the active faces, i.e. the same
