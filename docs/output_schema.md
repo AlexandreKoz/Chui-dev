@@ -100,12 +100,25 @@ See `docs/snapshot_hdf5_io.md` for the detailed contract.
 Current restart identity:
 
 - `name = cosmosim_restart_v25`
+- `version = 25`
 
 Schema v25 adds `/state/amr_temporal_boundary_history/start_internal_energy_density_comoving`
 and `end_internal_energy_density_comoving` (float64, one row per history cell, group
 `schema_version = 3`): the dual-energy auxiliary `rho*e` endpoints used by temporal
 coarse-to-fine AMR ghosts (NaN = unknown; v24 and older restore NaN).
-- `version = 24`
+
+Per-group layout identities (`@schema_version` on the group), bound to the outer schema:
+
+| Group | v18–v24 | v25 |
+|---|---|---|
+| `/state/amr_pending_flux_registers` | 2 (metal lanes optional by presence) | 2 (layout unchanged) |
+| `/state/amr_temporal_boundary_history` | 1 or 2 | exactly 3 |
+
+The schema validator, the reader and the write-time readback verifier all reject a v25
+file whose temporal-history group is not schema 3 or whose pending flux-register group is
+not schema 2, and the reader rejects group schema 3 inside a pre-v25 file. Files from the
+unreleased patch-56 writer (pending group 3, temporal group 2) are therefore refused
+rather than coerced.
 
 Schema v24 adds `/gravity_force_cache/hierarchical_endpoint` (attributes `valid`,
 `pm_field_version`; float64 datasets `tree_accel_{x,y,z}_comoving`,

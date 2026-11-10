@@ -102,8 +102,17 @@ thinner than the mirror depth) is described by the target-relative index of
 the stencil cell it represents. On every non-periodic axis on which that
 index leaves the patch, the global boundary is classified from the declared
 hierarchy domain (`ProductionAmrHydroOptions::domain_{origin,extent}_comoving`,
-production: the collectively reduced bounding box of all patches) or, when no
-domain is declared, from a target face that is itself `kPhysical`. Only beyond
+production: the collectively reduced bounding box of all populated leaf
+patches) or, when no domain is declared, from a target face that is itself
+`kPhysical`. **Supported domain contract (patch 56 closure):** the hydro domain
+is the root tiling built from the gas-cell layout, not `cosmology.box_size_*`
+(the gravity/PM extent of isolated modes); production AMR therefore requires
+the populated leaves to tile their bounding box completely.
+`globalAmrHierarchyDomain` (`hydro_amr_runtime.cpp`) sums the leaf volumes
+collectively and refuses, before any ghost fill and identically on every
+rank, a hierarchy whose covered volume differs from the bounding-box volume
+(relative 1e-9): internal holes or non-rectangular tilings are never treated as
+physical walls. Only beyond
 such a wall is the physical closure applied: open -> zero-gradient onto the
 last in-domain row (`deep_layer_extrapolated_ghosts`); reflective -> mirror
 `i' = 2w - 1 - i` with that axis' momentum reversed, repeated for a domain
@@ -282,10 +291,15 @@ Selectable: `hydro_dual_energy = off` (reference: thermal energy is always
   `rho Z` in every mode. With dual energy on, `HydroConservedStateSoa` carries
   an auxiliary lane `rho e_aux` (not a flux lane) initialized each advance
   from the canonical `e` - never from `E - K`, whose cancellation error is the
-  problem being solved. Physical ghosts copy their source; same-level and
-  coarse/fine AMR ghosts and imported MPI ghosts are "unknown" (NaN): their
-  primitive state uses `E - K` (not counted per ghost); a real cell whose lane
-  is unknown at step start is counted in `dual_energy_unknown_auxiliary_cells`.
+  problem being solved. Since P1-55-01 every AMR ghost row (physical,
+  same-level, coarse/fine, temporal, MPI, deep/edge stencil) carries the
+  auxiliary value formed with the same source coverage, weights and time as
+  its conserved state (see the AMR paragraph below); a ghost row whose source
+  `e` is unknown (for example a temporal ghost interpolated from a pre-v25
+  restored history) is NaN, its primitive state uses `E - K`, and it is
+  counted once per prepared ghost in the AMR diagnostic
+  `dual_energy_unresolved_ghosts`. A real cell whose lane is unknown at step
+  start is counted in the solver's `dual_energy_unknown_auxiliary_cells`.
 * **Primitive selection (reconstruction, Riemann, sources).** For a cell with
   `E - K <= 0` or `E - K < eta E` and a positive auxiliary value, `e`, `P` and
   `c^2` come from `rho e_aux`; otherwise from `E - K`. Effective-ISM closures

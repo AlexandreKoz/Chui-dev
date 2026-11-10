@@ -256,6 +256,20 @@ SspYieldTable::Row SspYieldTable::massive(std::size_t channel, double mass_msun,
   return out;
 }
 
+SspYieldTable::Coverage SspYieldTable::channelCoverage(std::size_t channel) const {
+  const Channel& ch = m_channels.at(channel);
+  Coverage coverage;
+  if (!ch.mass.empty()) {
+    coverage.mass_min_msun = ch.mass.front();
+    coverage.mass_max_msun = ch.mass.back();
+  }
+  if (!ch.metallicity.empty()) {
+    coverage.metallicity_min = ch.metallicity.front();
+    coverage.metallicity_max = ch.metallicity.back();
+  }
+  return coverage;
+}
+
 SspYieldTable::Row SspYieldTable::snia(double metallicity, bool& clamped) const {
   const Channel& ch = m_channels[2];
   if (ch.metallicity.size() == 1U) {

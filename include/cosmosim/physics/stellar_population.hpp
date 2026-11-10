@@ -71,6 +71,17 @@ class SspYieldTable {
   };
   [[nodiscard]] Row massive(std::size_t channel, double mass_msun, double metallicity, bool& clamped) const;
   [[nodiscard]] Row snia(double metallicity, bool& clamped) const;
+  // Tabulated axis coverage of a channel (0=AGB, 1=CC, 2=Ia; Ia has no mass
+  // axis, reported as {0, 0}). Read-only: used to report, before any event,
+  // where the configured IMF channel ranges exceed the tabulated grid so the
+  // runtime clamping (counted in SspModel::table_clamps) is never implicit.
+  struct Coverage {
+    double mass_min_msun = 0.0;
+    double mass_max_msun = 0.0;
+    double metallicity_min = 0.0;
+    double metallicity_max = 0.0;
+  };
+  [[nodiscard]] Coverage channelCoverage(std::size_t channel) const;
   [[nodiscard]] const std::string& citation() const noexcept { return m_citation; }
   [[nodiscard]] const std::string& license() const noexcept { return m_license; }
   [[nodiscard]] const std::string& sha256() const noexcept { return m_sha256; }

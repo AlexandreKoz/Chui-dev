@@ -1,5 +1,15 @@
 # Repair state recap (post-repair audit snapshot)
 
+## 2026-11-10 — post-patch-56 v10 final source closure (static, NOT RUN)
+
+Restart v25 group identities repaired (`src/io/restart_checkpoint.cpp`);
+explicit complete-coverage AMR domain contract
+(`src/workflows/hydro_amr_runtime.cpp` `globalAmrHierarchyDomain`); S02 yield
+coverage report (`SspYieldTable::channelCoverage`, `sources.data_assumptions`).
+No new config key; restart remains v25 (writer corrected, no layout change);
+AMR wire remains v5. Ledger:
+`docs/repair/chui_post_patch56_v10_final_source_closure.md`.
+
 ## 2026-11-04 — design conformance A1/A2 source checkpoint
 
 Recursive-driver working-set admission precedes allocation, and temporal-history

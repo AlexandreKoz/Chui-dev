@@ -63,7 +63,19 @@ Regenerate both with `chui_data.py emit-config --profile {safe_default,research_
   normalized configuration and in the `sources.data_assumptions` event).
 * SB99 winds assume a Kroupa IMF; the CHUI SSP uses Chabrier. Single Z.
 * NuGrid yields cover 1–25 M☉ and Z = 10⁻⁴–0.02; W7 is single-Z; 11.8% of
-  the W7 ejecta are untracked.
+  the W7 ejecta are untracked. Out-of-grid masses/metallicities use the edge
+  row (no extrapolation) and are counted in `ssp_table_clamps`; since patch 56
+  closure the `sources.data_assumptions` event also records, before any event,
+  the configured AGB/CC mass ranges against the tabulated grid
+  (`ssp_yield_{agb,cc}_{configured,tabulated}_mass_msun`,
+  `ssp_yield_{agb,cc}_tabulated_metallicity`, `ssp_yield_{agb,cc}_mass_range_clamped`,
+  `ssp_yield_ia_tabulated_metallicity`). With the default CC range 8–40 M☉ and
+  the 1–25 M☉ NuGrid grid, `ssp_yield_cc_mass_range_clamped = true`. Whether edge
+  clamping is scientifically acceptable or must be refused is an unsettled
+  model-contract decision; no refusal key is added.
+* The SB99 wind-table IMF is recorded only as a `# limitation =` header line
+  (surfaced as `ssp_wind_table_limitations`); the table schema has no
+  machine-readable IMF field, so no automatic Kroupa/Chabrier gate exists.
 * C02: 10⁴–10⁸ K, optically thin, collisional; no metal photo-rates; no
   low-T dielectronic resonances; Voronov-rounded potentials. With
   `chemistry_adaptive_selection` an element table is required (demoted rows).

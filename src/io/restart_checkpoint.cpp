@@ -56,6 +56,15 @@ constexpr std::uint32_t k_restart_schema_v22 = 22;
 constexpr std::uint32_t k_restart_schema_v23 = 23;
 constexpr std::uint32_t k_restart_schema_v24 = 24;
 constexpr std::uint32_t k_restart_schema_v25 = 25;
+// Per-group layout identities, versioned independently of the outer restart
+// schema. /state/amr_pending_flux_registers has carried group schema 2 since
+// it was introduced (the v22 metal flux lanes are optional by presence) and
+// is unchanged by v25. /state/amr_temporal_boundary_history uses group schema
+// 1/2 up to v24 and group schema 3 from v25, which adds the dual-energy
+// auxiliary {start,end}_internal_energy_density_comoving endpoints.
+constexpr std::uint32_t k_pending_flux_register_group_schema = 2U;
+constexpr std::uint32_t k_temporal_history_group_schema_legacy_max = 2U;
+constexpr std::uint32_t k_temporal_history_group_schema_v25 = 3U;
 constexpr std::string_view k_restart_schema_name_v14 = "cosmosim_restart_v14";
 constexpr std::string_view k_restart_schema_name_v15 = "cosmosim_restart_v15";
 constexpr std::string_view k_restart_schema_name_v16 = "cosmosim_restart_v16";
@@ -857,6 +866,11 @@ void validateRestartCheckpointSchema(hid_t file, std::uint32_t schema_version) {
   if (schema_version >= k_restart_schema_v18) {
     Hdf5Handle pending_group = openRequiredGroup(file, "/state/amr_pending_flux_registers");
     requireHdf5Attribute(pending_group.get(), "/state/amr_pending_flux_registers", "schema_version");
+    if (schema_version >= k_restart_schema_v25 &&
+        readScalarU32Attribute(pending_group.get(), "schema_version") != k_pending_flux_register_group_schema) {
+      throw std::runtime_error(
+          "restart schema: v25 /state/amr_pending_flux_registers must use group schema_version 2");
+    }
     for (std::string_view dataset : {"register_key", "coarse_patch_id", "coarse_gas_cell_id",
                                      "coarse_cell_index", "level", "axis", "orientation",
                                      "expected_area_comov", "coarse_area_accumulated_comov",
@@ -884,6 +898,11 @@ void validateRestartCheckpointSchema(hid_t file, std::uint32_t schema_version) {
   if (schema_version >= k_restart_schema_v18) {
     Hdf5Handle temporal_group = openRequiredGroup(file, "/state/amr_temporal_boundary_history");
     requireHdf5Attribute(temporal_group.get(), "/state/amr_temporal_boundary_history", "schema_version");
+    if (schema_version >= k_restart_schema_v25 &&
+        readScalarU32Attribute(temporal_group.get(), "schema_version") != k_temporal_history_group_schema_v25) {
+      throw std::runtime_error(
+          "restart schema: v25 /state/amr_temporal_boundary_history must use group schema_version 3");
+    }
     for (std::string_view dataset : {"patch_id", "patch_level", "patch_geometry_fingerprint",
                                      "gas_cell_identity_generation", "interval_start_code",
                                      "interval_end_code", "end_state_valid", "cell_offset", "cell_count",
@@ -1448,9 +1467,10 @@ void readGasCellIdentityGroup(hid_t state_group, core::SimulationState& state, s
 
 void writePendingFluxRegisterGroup(hid_t state_group, const core::PendingFluxRegisterStore& store) {
   Hdf5Handle group(openOrCreateGroup(state_group, "amr_pending_flux_registers"));
-  // Group schema 3 (restart v25, P1-55-01): dual-energy auxiliary rho*e
-  // endpoints per cell; NaN = unknown.
-  writeScalarU32Attribute(group.get(), "schema_version", 3U);
+  // The pending flux-register layout is unchanged by restart v25; its group
+  // identity stays at schema 2 (the dual-energy auxiliary endpoints belong to
+  // /state/amr_temporal_boundary_history, see below).
+  writeScalarU32Attribute(group.get(), "schema_version", k_pending_flux_register_group_schema);
   const auto records = store.records();
   std::vector<std::uint64_t> register_key;
   std::vector<std::uint64_t> coarse_patch_id;
@@ -1563,6 +1583,19 @@ void readPendingFluxRegisterGroup(hid_t state_group, core::SimulationState& stat
     state.pending_flux_registers.clear();
     return;
   }
+  // The pending flux-register group has a single layout identity (schema 2)
+  // in every supported restart schema; v25 did not change it. A value of 3 was
+  // only ever produced by the unreleased, self-inconsistent patch-56 writer and
+  // is rejected rather than silently accepted. Pre-v18 files may lack the
+  // attribute; v18+ files are required to carry it by the schema validator.
+  if (hdf5AttributeExists(group.get(), "schema_version")) {
+    const std::uint32_t pending_schema_version = readScalarU32Attribute(group.get(), "schema_version");
+    if (pending_schema_version < 1U || pending_schema_version > k_pending_flux_register_group_schema) {
+      throw std::runtime_error(
+          "restart reader: unsupported /state/amr_pending_flux_registers schema_version " +
+          std::to_string(pending_schema_version) + " for restart schema v" + std::to_string(schema_version));
+    }
+  }
   const auto register_key = readDataset1d<std::uint64_t>(group.get(), "register_key", H5T_NATIVE_UINT64);
   const auto coarse_patch_id = readDataset1d<std::uint64_t>(group.get(), "coarse_patch_id", H5T_NATIVE_UINT64);
   const auto coarse_gas_cell_id = readDataset1d<std::uint64_t>(group.get(), "coarse_gas_cell_id", H5T_NATIVE_UINT64);
@@ -1663,7 +1696,10 @@ void writeAmrTemporalBoundaryHistoryGroup(
     hid_t state_group,
     const core::AmrTemporalBoundaryHistoryStore& store) {
   Hdf5Handle group(openOrCreateGroup(state_group, "amr_temporal_boundary_history"));
-  writeScalarU32Attribute(group.get(), "schema_version", 2U);
+  // Group schema 3 (restart v25, P1-55-01): adds the dual-energy auxiliary
+  // rho*e endpoints per history cell (NaN = unknown). Written unconditionally,
+  // including for an empty history, because the v25 reader requires it.
+  writeScalarU32Attribute(group.get(), "schema_version", k_temporal_history_group_schema_v25);
   std::vector<std::uint64_t> patch_id;
   std::vector<std::uint8_t> patch_level;
   std::vector<std::uint64_t> patch_geometry_fingerprint;
@@ -1772,8 +1808,19 @@ void readAmrTemporalBoundaryHistoryGroup(
     throw std::runtime_error("restart reader: v18 restart is missing /state/amr_temporal_boundary_history");
   }
   const std::uint32_t temporal_schema_version = readScalarU32Attribute(group.get(), "schema_version");
-  if (temporal_schema_version != 1U && temporal_schema_version != 2U && temporal_schema_version != 3U) {
-    throw std::runtime_error("restart reader: unsupported /state/amr_temporal_boundary_history schema_version");
+  // The group identity is bound to the outer restart schema: v25 files carry
+  // exactly group schema 3; v18..v24 files carry group schema 1 or 2. A
+  // mismatch in either direction is an inconsistent writer, never coerced.
+  if (schema_version >= k_restart_schema_v25) {
+    if (temporal_schema_version != k_temporal_history_group_schema_v25) {
+      throw std::runtime_error(
+          "restart reader: v25 /state/amr_temporal_boundary_history must use group schema_version 3 (found " +
+          std::to_string(temporal_schema_version) + ")");
+    }
+  } else if (temporal_schema_version < 1U || temporal_schema_version > k_temporal_history_group_schema_legacy_max) {
+    throw std::runtime_error(
+        "restart reader: unsupported /state/amr_temporal_boundary_history schema_version " +
+        std::to_string(temporal_schema_version) + " for restart schema v" + std::to_string(schema_version));
   }
   const auto patch_id = readDataset1d<std::uint64_t>(group.get(), "patch_id", H5T_NATIVE_UINT64);
   const auto patch_level = readDataset1d<std::uint8_t>(group.get(), "patch_level", H5T_NATIVE_UINT8);
@@ -1809,11 +1856,7 @@ void readAmrTemporalBoundaryHistoryGroup(
   // older history restores them as NaN (unknown), so temporal ghosts formed
   // from it are explicitly invalid in the auxiliary lane (counted E - K
   // fallback) instead of borrowing a current-time value.
-  const bool auxiliary_present = schema_version >= k_restart_schema_v25;
-  if (auxiliary_present && temporal_schema_version < 3U) {
-    throw std::runtime_error(
-        "restart reader: v25 /state/amr_temporal_boundary_history must use group schema_version 3");
-  }
+  const bool auxiliary_present = temporal_schema_version >= k_temporal_history_group_schema_v25;
   const auto start_internal_energy_density_comoving = auxiliary_present
       ? readDataset1d<double>(group.get(), "start_internal_energy_density_comoving", H5T_NATIVE_DOUBLE)
       : std::vector<double>(nc, std::numeric_limits<double>::quiet_NaN());
@@ -4416,6 +4459,19 @@ RestartVerificationResult verifyRestartCheckpointHdf5(
     verifyDataset1dChunked<std::uint32_t>(file.get(), "/state/gas_cell_identity/local_cell_row", state.gas_cell_identity.size(),
         [&](std::size_t i){ return static_cast<std::uint32_t>(i); }, H5T_NATIVE_UINT32, w, result);
 
+    // Group layout identities are part of the written contract: a readback
+    // that matches every dataset but carries the wrong group schema would be
+    // rejected by the reader, so the verifier rejects it at write time.
+    {
+      Hdf5Handle pending_group(H5Gopen2(file.get(), "/state/amr_pending_flux_registers", H5P_DEFAULT));
+      if (!pending_group.valid()) throw std::runtime_error("restart verifier: missing /state/amr_pending_flux_registers");
+      require_u32_attr(pending_group.get(), "schema_version", k_pending_flux_register_group_schema,
+          "/state/amr_pending_flux_registers/@schema_version");
+      Hdf5Handle temporal_group(H5Gopen2(file.get(), "/state/amr_temporal_boundary_history", H5P_DEFAULT));
+      if (!temporal_group.valid()) throw std::runtime_error("restart verifier: missing /state/amr_temporal_boundary_history");
+      require_u32_attr(temporal_group.get(), "schema_version", k_temporal_history_group_schema_v25,
+          "/state/amr_temporal_boundary_history/@schema_version");
+    }
     const auto pending_records = state.pending_flux_registers.records();
 #define VERIFY_PENDING(NAME, TYPE, MEMTYPE, EXPR) \
     verifyDataset1dChunked<TYPE>(file.get(), "/state/amr_pending_flux_registers/" NAME, pending_records.size(), \
