@@ -193,7 +193,8 @@ struct AmrRankEnvelopeRecord {
 
 // Reach in cells: deep ghost layers need up to ghost_layers source widths.
 [[nodiscard]] double topologyReachScale(const AmrInterfaceTopologyOptions& topology) noexcept {
-  return static_cast<double>(std::max<std::uint16_t>(topology.ghost_layers, 1U));
+  return static_cast<double>(std::max<std::uint16_t>(
+      std::max(topology.ghost_layers, topology.edge_stencil_layers), 1U));
 }
 
 [[nodiscard, maybe_unused]] bool amrEnvelopeMayNeedPeer(
@@ -820,16 +821,29 @@ void exchangeAmrPatchCellRecordStreamWithPeer(
   const std::array<double, 3> remote_max{
       amrPatchMaxX(remote), amrPatchMaxY(remote), amrPatchMaxZ(remote)};
   const double tolerance = amrInterfaceTolerance(local, remote);
+  // P1-HYDRO-02: `remote` is the TARGET of the request; its transverse
+  // intervals are widened by the edge stencil depth in target cells.
+  const auto widened_overlap = [&](std::size_t axis) {
+    const std::array<std::uint16_t, 3> dims{remote.cell_dim_x, remote.cell_dim_y, remote.cell_dim_z};
+    const std::array<double, 3> extents{
+        remote.extent_x_comoving, remote.extent_y_comoving, remote.extent_z_comoving};
+    const double dim = static_cast<double>(std::max<std::uint16_t>(dims[axis], 1U));
+    const double margin = static_cast<double>(topology.edge_stencil_layers) * extents[axis] / dim;
+    const double r0 = remote_min[axis] - margin;
+    const double r1 = remote_max[axis] + margin;
+    if (amrIntervalsShareArea(local_min[axis], local_max[axis], r0, r1, tolerance)) return true;
+    const double length = topologyAxisLength(topology, axis);
+    if (margin > 0.0 && length > 0.0) {
+      return amrIntervalsShareArea(local_min[axis], local_max[axis], r0 + length, r1 + length, tolerance) ||
+          amrIntervalsShareArea(local_min[axis], local_max[axis], r0 - length, r1 - length, tolerance);
+    }
+    return false;
+  };
   std::uint8_t mask = 0U;
   for (std::size_t axis = 0; axis < 3U; ++axis) {
     const std::size_t transverse_a = (axis + 1U) % 3U;
     const std::size_t transverse_b = (axis + 2U) % 3U;
-    if (!amrIntervalsShareArea(
-            local_min[transverse_a], local_max[transverse_a],
-            remote_min[transverse_a], remote_max[transverse_a], tolerance) ||
-        !amrIntervalsShareArea(
-            local_min[transverse_b], local_max[transverse_b],
-            remote_min[transverse_b], remote_max[transverse_b], tolerance)) {
+    if (!widened_overlap(transverse_a) || !widened_overlap(transverse_b)) {
       continue;
     }
     // Minimum-image normal gap on periodic axes (CHUI Part 3): a lower box

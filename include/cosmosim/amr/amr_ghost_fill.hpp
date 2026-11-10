@@ -96,6 +96,14 @@ struct AmrHydroGhostFillDiagnostics {
   // Deep stencil-only layers behind a reflective domain wall filled by the
   // exact mirror image of the column (not an order reduction).
   std::size_t deep_layer_reflected_ghosts = 0;
+  // P1-HYDRO-02 edge stencil ghosts: filled (any route), filled through the
+  // physical domain closure on at least one crossed axis (open copy or
+  // reflective mirror: exact, not an order reduction), and the counted
+  // degenerate subset (reflective mirror depth exceeds the patch extent, the
+  // only edge case that falls back to zero-gradient continuation).
+  std::size_t edge_stencil_ghosts_filled = 0;
+  std::size_t edge_stencil_physical_closures = 0;
+  std::size_t edge_stencil_degenerate_closures = 0;
 };
 
 [[nodiscard]] std::uint64_t amrPatchGeometryFingerprint(const PatchDescriptor& patch);

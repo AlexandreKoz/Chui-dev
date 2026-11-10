@@ -1258,6 +1258,21 @@ class SourceRuntimeImpl final : public SourceRuntime {
   }
 
   // T02 (patch 52): event-aware time-authority input (see SourceRuntime).
+  // Deterministic legacy population record (stars created before Part 2 or
+  // restored without a record): primordial H/He + solar-pattern metals at the
+  // stored birth metallicity, unknown birth time, immutable birth key stream.
+  // Shared by the SSP stage and the time-authority forecast so both see the
+  // identical thresholds.
+  [[nodiscard]] physics::StellarPopulationRecord legacyStellarPopulationRecord(
+      const core::SimulationState& state, std::uint32_t s) const {
+    const double z = std::clamp(state.star_particles.metallicity_mass_fraction[s], 0.0, 0.5);
+    const auto masses = physics::initialElementMasses(1.0, z, physics::primordialPolicyFromConfig(m_physics_config));
+    physics::StellarPopulationRecord record =
+        physics::makeStellarPopulationRecord(masses, 0.0, state.star_particles.birth_key[s]);
+    record.chronology_initialized = 0U;
+    return record;
+  }
+
   // P1-TIME-01: the enforced publication-lag bound of the configured
   // contract. coarse_endpoint: the optional configured lag (0 = bounded only
   // by the accepted interval). physical_event_barrier: the fixed barrier
@@ -1289,16 +1304,38 @@ class SourceRuntimeImpl final : public SourceRuntime {
     for (std::uint32_t s = 0; s < state.star_particles.size(); ++s) {
       const std::uint32_t p = state.star_particles.particle_index[s];
       const std::uint64_t pid = state.particle_sidecar.particle_id[p];
-      // A star without a record, or a legacy record without an absolute
-      // cursor, is initialized by its next interval; its past chronology is
-      // catch-up (counted, exempt), so it does not constrain this step.
-      if (!store.has(pid)) continue;
-      const physics::StellarPopulationRecord record = store.get(pid);
-      if (record.initialized == 0U || record.chronology_initialized == 0U) continue;
-      const double age_now = std::max(state.star_particles.stellar_age_years_last[s], 0.0) +
-          std::max(current_time_code - record.chronology_time_code, 0.0) * years_per_code;
+      // P1-TIME-01 (post patch 53): legacy stars are forecast too. A star
+      // without a record gets, in its next interval, exactly the record the
+      // stage constructs deterministically from immutable birth data
+      // (legacyStellarPopulationRecord); a record without an absolute cursor
+      // adopts the next interval begin (= current_time_code) as its cursor.
+      // Thresholds already crossed at age_now are catch-up events (counted,
+      // exempt: their physical time precedes the interval); they are
+      // advanced past here so the forecast is the first TIMED event.
+      physics::StellarPopulationRecord record;
+      bool legacy = false;
+      if (store.has(pid)) {
+        record = store.get(pid);
+      }
+      if (record.initialized == 0U) {
+        record = legacyStellarPopulationRecord(state, s);
+        legacy = true;
+      } else if (record.chronology_initialized == 0U) {
+        legacy = true;
+      }
+      const double age_last = std::max(state.star_particles.stellar_age_years_last[s], 0.0);
+      const double age_now = legacy
+          ? age_last
+          : age_last + std::max(current_time_code - record.chronology_time_code, 0.0) * years_per_code;
+      const double birth_msun = state.star_particles.birth_mass_code[s] / msun_code;
+      if (legacy) {
+        double z = 0.0;
+        for (std::size_t e = 2; e < physics::k_chemical_element_count; ++e) z += record.birth_element_mass_fraction[e];
+        (void)physics::realizeEvents(record, 0U, m_ssp_model->ccCumulativeNumber(age_now, z) * birth_msun);
+        (void)physics::realizeEvents(record, 1U, m_ssp_model->iaCumulativeNumber(age_now) * birth_msun);
+      }
       const double next_age = physics::nextStellarEventAgeYears(
-          *m_ssp_model, record, age_now, state.star_particles.birth_mass_code[s] / msun_code);
+          *m_ssp_model, record, age_now, birth_msun);
       if (!std::isfinite(next_age)) continue;
       const double event_time_code = current_time_code + (next_age - age_now) / years_per_code;
       limit = std::min(limit, event_time_code + lag_years / years_per_code);
@@ -3639,19 +3676,18 @@ class SourceRuntimeImpl final : public SourceRuntime {
           // birth mixture = primordial H/He + solar-pattern metals at the
           // stored birth metallicity; birth time unknown (0); stream key =
           // the immutable birth key. Counted, never silent.
-          const double z = std::clamp(state.star_particles.metallicity_mass_fraction[s], 0.0, 0.5);
-          const auto masses = physics::initialElementMasses(1.0, z, physics::primordialPolicyFromConfig(m_physics_config));
-          record = physics::makeStellarPopulationRecord(masses, 0.0, state.star_particles.birth_key[s]);
+          record = legacyStellarPopulationRecord(state, s);
           // A legacy star has no absolute event cursor. Its cumulative age
           // lanes/ordinals remain authoritative for past evolution; the
           // current interval establishes the first absolute boundary.
           record.chronology_initialized = 0U;
           ++legacy_initialized;
         }
-        // Only a record with an absolute cursor at step start was seen by the
-        // time authority's event forecast, so only its events are held to
-        // the publication-lag bound (legacy/v1 records adopt a cursor now).
-        const bool event_forecast_covered = record.chronology_initialized != 0U;
+        // P1-TIME-01: the time authority forecasts every star, legacy records
+        // included (discreteEventStepEndLimitTimeCode builds the same legacy
+        // record and cursor adoption), so every TIMED event is held to the
+        // enforced bound; catch-up events stay counted and exempt.
+        const bool event_forecast_covered = true;
         physics::advanceStellarPopulationChronology(
             record,
             event_interval_begin_code,

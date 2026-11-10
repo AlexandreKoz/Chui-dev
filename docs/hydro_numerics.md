@@ -133,15 +133,38 @@ At patch boundaries the owner side uses its ordinary pass-1 divergence. For a
 non-periodic ghost side, the solver uses the immutable AMR/MPI face slab and
 the selected PCM/PLM/PPM reconstruction to evaluate the lower/upper flux in
 each tangential direction on the target control volume. The term is accepted
-only if the complete selected-order stencil exists. At face edges/corners,
-where it crosses a second interface and the slab is incomplete, the
-precedence is (post-patch-53 P0-HYDRO-01, one coherent provenance per side
-state): an imported (MPI / same-level / coarse-fine) ghost takes the adjacent
-real owner cell's transverse increment as a one-sided, lower-order closure,
-counted in `ctu_transverse_boundary_proxy_states`; a physical open/reflective
-ghost keeps the normal-only predictor, counted in
-`ctu_transverse_degraded_states`. A complete slab always takes precedence over
-the proxy. Successful slab corrections are reported by
+only if the complete selected-order stencil exists.
+
+**Edge stencil ghosts (P1-HYDRO-02).** Production AMR with CTU builds, per
+patch, a stencil-only *edge ghost block*: for every face (axis `n`, side) and
+transverse axis `t` with extent > 1, the cells one layer beyond the face and
+`1..r` cells beyond the transverse patch face (`r` = stencil half-width =
+ghost layers; PCM 1, PLM 2, PPM 3), keyed by position
+(`HydroPatchGeometry::edgeGhostSlot`). They own no face and no flux register
+and are never advanced (read-only imported scratch). The tangential slab of a
+face ghost resolves `g + o e_t` to the standard shell inside the patch and to
+the edge block beyond it, so the slab is complete at every patch edge and
+corner (the corner region is covered by the two one-dimensional slabs; no
+three-axis corner cell is read). The AMR ghost filler resolves each edge
+ghost with any legal level relation (same level, coarse→fine with the
+temporal history, fine→coarse conservative average), local or sparse MPI,
+periodic wrap (including in-patch wraps), and applies the physical domain
+closure on every crossed non-periodic domain face (open: zero-gradient;
+reflective: mirror with reversed normal momentum). Missing source data fails
+closed. Local ghost sources include edge/corner-adjacent patches, and the
+directed MPI exchange widens the target's transverse intervals by `r` cells
+(`AmrInterfaceTopologyOptions::edge_stencil_layers`) so diagonal remote cells
+are delivered. Telemetry: `edge_stencil_ghosts_filled`,
+`edge_stencil_physical_closures`, `edge_stencil_degenerate_closures` (the only
+counted downgrade: a reflective mirror deeper than the patch extent).
+
+With the edge block present an incomplete slab is a geometry defect
+(`std::logic_error`), and the one-sided owner proxy is disabled. Geometries
+without the block (fixed-grid / custom, or a ghost-layer override below the
+stencil width) keep the counted closure: an imported ghost takes the adjacent
+real owner cell's transverse increment
+(`ctu_transverse_boundary_proxy_states`), a physical open/reflective ghost
+keeps the normal-only predictor (`ctu_transverse_degraded_states`). Successful slab corrections are reported by
 `ctu_transverse_ghost_corrected_states`; the slab and proxy counts are
 disjoint subsets of `ctu_transverse_corrected_states`, so the CTU order is
 full only where neither proxy nor degraded counts are non-zero. Periodic ghosts use their wrapped

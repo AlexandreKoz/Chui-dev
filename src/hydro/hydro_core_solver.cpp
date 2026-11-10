@@ -1152,9 +1152,11 @@ void setPositiveAxisNormal(HydroFace& face, std::size_t axis) {
 
 // Resolve a layer-1 boundary ghost in the same normal face slab as `ghost`,
 // displaced along a tangential axis. AMR geometry emits the standard shell in
-// deterministic X/Y/Z, lower/upper order before its deep normal layers. The
-// metadata checks make this fail closed for custom geometries that do not use
-// that layout; those faces retain the explicit normal-only CTU fallback.
+// deterministic X/Y/Z, lower/upper order before its deep normal layers. A
+// displacement that leaves the patch along the tangential axis resolves to
+// the edge stencil ghost block (P1-HYDRO-02) when the geometry provides it.
+// The metadata checks make this fail closed for custom geometries that do not
+// use that layout; those faces retain the explicit counted CTU fallback.
 [[nodiscard]] std::size_t tangentialGhostCell(
     const HydroPatchGeometry& geometry,
     const HydroGhostCell& ghost,
@@ -1169,7 +1171,36 @@ void setPositiveAxisNormal(HydroFace& face, std::size_t axis) {
   const std::size_t extent = axisCellCount(geometry, transverse_axis);
   const std::ptrdiff_t shifted = static_cast<std::ptrdiff_t>(ijk[transverse_axis]) + displacement;
   if (shifted < 0 || shifted >= static_cast<std::ptrdiff_t>(extent)) {
-    return k_invalid_cell_index;
+    // Edge stencil ghost: one normal layer beyond the face AND
+    // `depth` cells beyond the tangential patch face, keyed by position.
+    const std::size_t normal_axis = faceAxisIndex(ghost.axis);
+    const std::size_t third_axis = 3U - normal_axis - transverse_axis;
+    const std::size_t transverse_side = shifted < 0 ? 0U : 1U;
+    const std::size_t depth = shifted < 0
+        ? static_cast<std::size_t>(-shifted)
+        : static_cast<std::size_t>(shifted - static_cast<std::ptrdiff_t>(extent) + 1);
+    const std::size_t edge_slot = geometry.edgeGhostSlot(
+        normal_axis, ghost.side == HydroFaceSide::kLower ? 0U : 1U,
+        transverse_axis, transverse_side, depth, ijk[third_axis]);
+    if (edge_slot == k_invalid_ghost_cell_slot) {
+      return k_invalid_cell_index;
+    }
+    const HydroGhostCell& edge = geometry.ghost_cells[edge_slot];
+    const std::int8_t expected_offset = static_cast<std::int8_t>(
+        transverse_side == 0U ? -static_cast<int>(depth) : static_cast<int>(depth));
+    if (edge.axis != ghost.axis || edge.side != ghost.side ||
+        edge.transverse_axis != transverse_axis || edge.transverse_offset != expected_offset ||
+        edge.ghost_slot != edge_slot || edge.ghost_cell != real_cells + edge_slot ||
+        edge.owner_real_cell >= real_cells) {
+      return k_invalid_cell_index;
+    }
+    std::array<std::size_t, 3> edge_owner = geometry.cellIjk(edge.owner_real_cell);
+    std::array<std::size_t, 3> expected_owner = ijk;
+    expected_owner[transverse_axis] = transverse_side == 0U ? 0U : extent - 1U;
+    if (edge_owner != expected_owner) {
+      return k_invalid_cell_index;
+    }
+    return edge.ghost_cell;
   }
   ijk[transverse_axis] = static_cast<std::size_t>(shifted);
   const std::size_t shifted_owner = geometry.linearCellIndex(ijk[0], ijk[1], ijk[2]);
@@ -1553,6 +1584,15 @@ void HydroCoreSolver::advancePatchActiveSetBatchedWithScratch(
           slab_cells[static_cast<std::size_t>(static_cast<int>(k_center) + offset)] = cell;
         }
         if (!complete) {
+          // P1-HYDRO-02: with an edge stencil block at least as deep as the
+          // stencil, every ordinary interface slab is complete by
+          // construction (the ghost filler fails closed when its data is
+          // missing). An incomplete slab there is a geometry defect, never a
+          // reason to fall back to a lower-order closure.
+          if (geometry.edge_ghost_depth >= static_cast<std::uint8_t>(stencil_radius)) {
+            throw std::logic_error(
+                "CTU ghost slab is incomplete although the patch provides the edge stencil ghost block");
+          }
           continue;
         }
         std::array<HydroPrimitiveState, 7> slab_primitives{};
@@ -1681,7 +1721,12 @@ void HydroCoreSolver::advancePatchActiveSetBatchedWithScratch(
       provenance = CtuTransverseProvenance::kGhostSlab;
       return true;
     }
-    const std::size_t proxy_cell = boundaryProxySourceCell(geometry, cell, real_cell_count);
+    // The counted one-sided proxy exists only for geometries WITHOUT the edge
+    // stencil block (fixed-grid / custom geometries); with the block every
+    // interface ghost has a complete slab (enforced above).
+    const std::size_t proxy_cell = geometry.edge_ghost_depth == 0U
+        ? boundaryProxySourceCell(geometry, cell, real_cell_count)
+        : k_invalid_cell_index;
     if (proxy_cell != k_invalid_cell_index && sumRealCellTransverse(proxy_cell, face_axis, out)) {
       provenance = CtuTransverseProvenance::kBoundaryProxy;
       return true;

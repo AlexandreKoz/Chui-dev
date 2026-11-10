@@ -59,6 +59,12 @@ struct AmrHydroGeometryOptions {
   // for reflective boundaries) is omitted and the resulting order reduction
   // is counted by the solver's stencil-degradation counter.
   std::uint8_t ghost_layers = 1;
+  // P1-HYDRO-02: transverse depth of the edge stencil ghost block (0 = none).
+  // CTU sets it to the reconstruction stencil half-width so the tangential
+  // ghost slab of every face ghost is complete across patch edges and
+  // corners (same-level, coarse/fine, periodic and MPI). Edge ghosts are
+  // stencil-only: no face, no flux register, never advanced.
+  std::uint8_t edge_stencil_depth = 0;
 };
 
 struct AmrHydroCellDescriptor {
@@ -81,6 +87,11 @@ struct AmrHydroGhostDescriptor {
   // 1 = face-adjacent ghost; >1 = stencil-only deep layer at distance
   // ghost_layer cell widths from the owner cell along the outward normal.
   std::uint8_t ghost_layer = 1;
+  // P1-HYDRO-02: edge stencil ghost (see hydro::HydroGhostCell::
+  // transverse_axis). boundary_class is copied from the owner's face ghost;
+  // the filler resolves edge ghosts with any legal level relation and applies
+  // the physical domain closure on every axis that leaves the domain.
+  bool edge_stencil = false;
 };
 
 struct AmrHydroFaceDescriptor {
@@ -131,7 +142,7 @@ struct AmrHydroGeometryCapacity {
 // AmrHydroGeometryOptions::ghost_layers); the default keeps the historical
 // one-layer bound for existing callers.
 [[nodiscard]] AmrHydroGeometryCapacity amrHydroGeometryCapacity(
-    const PatchDescriptor& patch, std::uint8_t ghost_layers = 1);
+    const PatchDescriptor& patch, std::uint8_t ghost_layers = 1, std::uint8_t edge_stencil_depth = 0);
 
 [[nodiscard]] AmrHydroPatchGeometry buildAmrHydroPatchGeometry(
     const core::SimulationState& state,

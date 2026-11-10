@@ -2391,7 +2391,8 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
                 amr_options.physical_boundary_kind == hydro::HydroBoundaryKind::kPeriodic
                     ? amr_options.periodic_box_extent_comoving
                     : std::array<double, 3>{0.0, 0.0, 0.0},
-            .ghost_layers = amr::productionAmrHydroGhostLayers(amr_options)},
+            .ghost_layers = amr::productionAmrHydroGhostLayers(amr_options),
+            .edge_stencil_layers = amr::productionAmrHydroEdgeStencilDepth(amr_options)},
         m_memory_governor);
     directed_amr_diagnostics = directed_amr_exchange.diagnostics;
 
@@ -2975,7 +2976,11 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
             m_config.cosmology.box_size_x_mpc_comoving,
             m_config.cosmology.box_size_y_mpc_comoving,
             m_config.cosmology.box_size_z_mpc_comoving},
-        .thermodynamic_cache = amrThermodynamicCachePolicy(update.scale_factor, source_context.redshift)};
+        .thermodynamic_cache = amrThermodynamicCachePolicy(update.scale_factor, source_context.redshift),
+        // P1-HYDRO-02: CTU needs the edge stencil ghost block (same config
+        // authority as the solver's integration scheme, rank-uniform).
+        .ctu_edge_stencils = m_config.numerics.hydro_integration_scheme ==
+            core::HydroIntegrationMode::kCornerTransportUpwind};
     amr::ProductionAmrHydroDiagnostics amr_diagnostics;
     std::size_t remote_patch_count = 0;
     std::size_t remote_flux_register_count = 0;

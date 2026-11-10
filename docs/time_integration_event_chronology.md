@@ -61,13 +61,21 @@ chronology is explicit and auditable, not hidden.
   resolution fail closed; `event_lag_policy = physical_event_barrier`.
   Requires `ssp_max_event_publication_lag_years = 0` and stochastic Part 2 SN
   events. Cost: one coarse step per distinct global event time.
+* Legacy records (P1-TIME-01 follow-up): the forecast now covers stars
+  without a record (it builds the same deterministic legacy record the stage
+  builds from immutable birth data) and records without an absolute cursor
+  (cursor adopted at the next interval begin). Thresholds already crossed are
+  catch-up events (counted, exempt, physical time before the interval); every
+  TIMED event of every star is held to the enforced bound, so
+  `unforecast_timed_discrete_events` is always 0.
 * Residual gap (not source-complete): events are still deposited only at
-  coarse-step endpoints. Exact publication therefore shortens the GLOBAL
-  coarse step; there is no fine-level event barrier inside a recursive coarse
-  interval (that would need intra-interval discrete deposition on level
-  clocks with reflux and level-local rollback). Legacy-record events whose
-  cursor is adopted in the interval (`unforecast_timed_discrete_events`) are
-  counted and exempt, as in `coarse_endpoint`.
+  coarse-step endpoints. Exact publication is achieved by shortening the
+  GLOBAL coarse step (fidelity is the barrier resolution); there is no
+  level-local publication inside a recursive coarse interval. That would need
+  per-star contiguous cursors over level substeps, a level-restricted SSP
+  stage whose feedback stencil stays within cells of the publishing level or
+  finer, and deposition after the level's temporal-history end capture with
+  open flux registers — a restructuring of the SSP stage not done here.
 
 ## Exceptions, rollback and restart
 

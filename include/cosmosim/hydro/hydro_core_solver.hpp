@@ -197,7 +197,26 @@ struct HydroGhostCell {
   int origin_rank = -1;
   std::uint64_t hydro_sync_epoch = 0;
   std::uint64_t decomposition_epoch = 0;
+  // P1-HYDRO-02 edge stencil ghost (stencil-only, never owns a face, never a
+  // flux-register target): one normal layer beyond the (axis, side) face of
+  // owner_real_cell AND displaced by transverse_offset cells along
+  // transverse_axis beyond the patch extent. owner_real_cell lies on both the
+  // normal and the transverse boundary row. transverse_axis = 3 marks an
+  // ordinary face/deep ghost. Edge ghosts are read-only imported scratch
+  // filled by the AMR ghost filler; appended last so existing designated
+  // initializers keep their meaning.
+  std::uint8_t transverse_axis = 3U;
+  std::int8_t transverse_offset = 0;
 };
+
+// Number of edge stencil ghosts of an (nx, ny, nz) patch with `depth`
+// transverse layers. Ordering (also the slot formula of
+// HydroPatchGeometry::edgeGhostSlot): normal axis n = x,y,z; normal side
+// lower, upper; transverse axis t != n ascending (skipped when its extent is
+// 1: a suppressed dimension has no transverse divergence); transverse side
+// lower, upper; depth 1..depth; index along the third axis u.
+[[nodiscard]] std::size_t hydroEdgeGhostCount(
+    std::size_t nx, std::size_t ny, std::size_t nz, std::size_t depth);
 
 // One Cartesian face. Reconstruction stencil cells are ordered ALONG THE
 // FACE NORMAL n (owner -> neighbor is +n):
@@ -237,8 +256,21 @@ struct HydroPatchGeometry {
   std::vector<HydroFace> faces;
   std::vector<HydroGhostCell> ghost_cells;
   std::vector<HydroFluxRegisterFace> flux_register_faces;
+  // P1-HYDRO-02: first ghost slot of the edge stencil ghost block and its
+  // transverse depth (0 = no edge ghosts; such geometries keep the counted
+  // boundary-proxy / normal-only CTU closure at face edges).
+  std::size_t edge_ghost_slot_begin = k_invalid_ghost_cell_slot;
+  std::uint8_t edge_ghost_depth = 0U;
 
   [[nodiscard]] std::size_t cellCount() const;
+  // Slot of the edge stencil ghost beyond face (normal_axis, normal_side) and
+  // `depth` cells beyond the transverse face (transverse_axis,
+  // transverse_side), at index `third_index` along the remaining axis.
+  // k_invalid_ghost_cell_slot when the block is absent or the key invalid.
+  [[nodiscard]] std::size_t edgeGhostSlot(
+      std::size_t normal_axis, std::size_t normal_side,
+      std::size_t transverse_axis, std::size_t transverse_side,
+      std::size_t depth, std::size_t third_index) const;
   [[nodiscard]] std::size_t totalCellStorageCount() const;
   [[nodiscard]] std::size_t linearCellIndex(std::size_t i, std::size_t j, std::size_t k) const;
   [[nodiscard]] std::array<std::size_t, 3> cellIjk(std::size_t row) const;

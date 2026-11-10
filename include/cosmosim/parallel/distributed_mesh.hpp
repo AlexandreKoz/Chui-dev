@@ -332,6 +332,13 @@ void validateHydroConservativeFluxCorrectionRecord(const HydroConservativeFluxCo
 struct AmrInterfaceTopologyOptions {
   std::array<double, 3> periodic_box_extent_comoving{0.0, 0.0, 0.0};
   std::uint16_t ghost_layers = 1;
+  // P1-HYDRO-02: edge stencil ghost depth of the TARGET patches (CTU; 0 =
+  // face-only topology, the historical behaviour). When > 0 a source face
+  // facing a target face plane is requested whenever it overlaps the
+  // target's transverse intervals widened by this many target cells
+  // (periodic images included), so edge/corner-adjacent remote cells reach
+  // the edge stencil ghosts. Faces and flux registers are unaffected.
+  std::uint16_t edge_stencil_layers = 0;
 };
 
 [[nodiscard]] std::vector<AmrPatchBoundaryCellRequest>
