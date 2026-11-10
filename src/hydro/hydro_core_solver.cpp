@@ -734,8 +734,12 @@ struct HydroScratchCapacityPlan {
 [[nodiscard]] HydroScratchCapacityPlan planHydroScratch(
     std::size_t active_cells, std::size_t active_faces,
     std::size_t real_cells, std::size_t total_cells,
+    std::size_t face_ghost_slots,
     const HydroActiveBatchPolicy& policy) {
-  if (real_cells > total_cells || active_cells > real_cells) {
+  // face_ghost_slots is an independent per-geometry maximum (callers that
+  // plan one scratch for several geometries pass max over them), so it is
+  // bounded by the storage extent only, not by total - real of one shape.
+  if (real_cells > total_cells || active_cells > real_cells || face_ghost_slots > total_cells) {
     throw std::invalid_argument("hydro scratch extent is inconsistent with geometry");
   }
   // The solver appends raw face incidences before sorting/deduplicating.
@@ -751,7 +755,7 @@ struct HydroScratchCapacityPlan {
       std::min(total_cells, touched), face_batch, stencil,
       std::min(total_cells, stencil),
       policy.ctu_transverse_workspace ? touched_unique : 0U,
-      policy.ctu_transverse_workspace ? total_cells - real_cells : 0U,
+      policy.ctu_transverse_workspace ? face_ghost_slots : 0U,
       policy.dual_energy_workspace ? touched_unique : 0U};
 }
 
@@ -792,16 +796,40 @@ std::uint64_t HydroScratchBuffers::workspaceBytes(
     std::size_t active_cell_count, std::size_t active_face_count,
     std::size_t real_cell_count, std::size_t total_cell_count,
     const HydroActiveBatchPolicy& batch_policy) {
+  if (real_cell_count > total_cell_count) {
+    throw std::invalid_argument("hydro scratch extent is inconsistent with geometry");
+  }
+  return workspaceBytes(active_cell_count, active_face_count, real_cell_count, total_cell_count,
+                        total_cell_count - real_cell_count, batch_policy);
+}
+
+std::uint64_t HydroScratchBuffers::workspaceBytes(
+    std::size_t active_cell_count, std::size_t active_face_count,
+    std::size_t real_cell_count, std::size_t total_cell_count,
+    std::size_t face_ghost_slot_count,
+    const HydroActiveBatchPolicy& batch_policy) {
   return scratchPlanBytes(planHydroScratch(active_cell_count, active_face_count,
-      real_cell_count, total_cell_count, batch_policy));
+      real_cell_count, total_cell_count, face_ghost_slot_count, batch_policy));
 }
 
 std::uint64_t HydroScratchBuffers::prepareForActiveSet(
     std::size_t active_cell_count, std::size_t active_face_count,
     std::size_t real_cell_count, std::size_t total_cell_count,
     const HydroActiveBatchPolicy& batch_policy) {
+  if (real_cell_count > total_cell_count) {
+    throw std::invalid_argument("hydro scratch extent is inconsistent with geometry");
+  }
+  return prepareForActiveSet(active_cell_count, active_face_count, real_cell_count, total_cell_count,
+                             total_cell_count - real_cell_count, batch_policy);
+}
+
+std::uint64_t HydroScratchBuffers::prepareForActiveSet(
+    std::size_t active_cell_count, std::size_t active_face_count,
+    std::size_t real_cell_count, std::size_t total_cell_count,
+    std::size_t face_ghost_slot_count,
+    const HydroActiveBatchPolicy& batch_policy) {
   const auto plan = planHydroScratch(active_cell_count, active_face_count,
-      real_cell_count, total_cell_count, batch_policy);
+      real_cell_count, total_cell_count, face_ghost_slot_count, batch_policy);
   reserveHydroVector(cell_delta, plan.touched_unique);
   reserveHydroVector(left_states, plan.face_batch);
   reserveHydroVector(right_states, plan.face_batch);
@@ -1400,9 +1428,11 @@ void HydroCoreSolver::advancePatchActiveSetBatchedWithScratch(
   scratch.cell_delta.assign(scratch.touched_cells.size(), HydroConservedState{});
   if (use_ctu) {
     scratch.ctu_transverse_delta.assign(scratch.touched_cells.size(), std::array<HydroConservedState, 3>{});
-    scratch.ctu_ghost_transverse_delta.assign(
-        geometry.ghost_cells.size(), std::array<HydroConservedState, 3>{});
-    scratch.ctu_ghost_transverse_axis_mask.assign(geometry.ghost_cells.size(), 0U);
+    // P2-55-04: only face-adjacent ghost slots (the leading prefix) can be
+    // the ghost of a face and receive a CTU slab correction.
+    const std::size_t ctu_ghost_slots = geometry.faceGhostSlotExtent();
+    scratch.ctu_ghost_transverse_delta.assign(ctu_ghost_slots, std::array<HydroConservedState, 3>{});
+    scratch.ctu_ghost_transverse_axis_mask.assign(ctu_ghost_slots, 0U);
   }
   if (use_dual_energy) {
     scratch.aux_internal_energy_advection.assign(scratch.touched_cells.size(), 0.0);
@@ -1552,6 +1582,10 @@ void HydroCoreSolver::advancePatchActiveSetBatchedWithScratch(
         continue;
       }
       const std::size_t ghost_slot = interface_face.ghost_cell_slot;
+      if (ghost_slot >= scratch.ctu_ghost_transverse_axis_mask.size()) {
+        throw std::logic_error(
+            "CTU: a face references a ghost slot beyond HydroPatchGeometry::face_ghost_slot_count");
+      }
       const HydroGhostCell& ghost = geometry.ghost_cells[ghost_slot];
       if (ghost.boundary_kind == HydroBoundaryKind::kPeriodic) {
         continue;
@@ -1704,13 +1738,17 @@ void HydroCoreSolver::advancePatchActiveSetBatchedWithScratch(
     }
     const std::size_t ghost_slot = cell - real_cell_count;
     HydroConservedState slab_sum{};
+    // Stencil-only (deep/edge) ghost slots lie beyond the face prefix and
+    // have no slab entry (P2-55-04): identical outcome to an empty mask, so
+    // suppressed (1-cell) axes still count as complete exactly as before.
+    const bool has_slab_entry = ghost_slot < scratch.ctu_ghost_transverse_axis_mask.size();
     bool slab_complete = true;
     for (std::size_t axis = 0; axis < 3U; ++axis) {
       if (axis == face_axis || axisCellCount(geometry, axis) == 1U) {
         continue;
       }
       const std::uint8_t axis_bit = static_cast<std::uint8_t>(1U << axis);
-      if ((scratch.ctu_ghost_transverse_axis_mask[ghost_slot] & axis_bit) == 0U) {
+      if (!has_slab_entry || (scratch.ctu_ghost_transverse_axis_mask[ghost_slot] & axis_bit) == 0U) {
         slab_complete = false;
         break;
       }

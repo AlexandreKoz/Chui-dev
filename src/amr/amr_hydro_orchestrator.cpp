@@ -28,9 +28,22 @@ namespace cosmosim::amr {
 
 std::uint64_t amrPreparedGhostWorkspaceBytes(
     std::size_t patch_count, std::size_t prepared_ghost_count) {
+  return amrPreparedGhostWorkspaceBytes(patch_count, prepared_ghost_count, false);
+}
+
+std::uint64_t amrPreparedGhostWorkspaceBytes(
+    std::size_t patch_count, std::size_t prepared_ghost_count, bool dual_energy_auxiliary) {
   const std::size_t offset_count = core::checkedSizeAdd(
       patch_count, 1U, "AMR prepared ghost offsets");
-  return core::checkedMemoryBytesAdd(
+  // P1-55-01: with dual energy the snapshot also retains one auxiliary rho*e
+  // per prepared ghost, formed by the ghost filler with the conserved state.
+  const std::uint64_t auxiliary_bytes = dual_energy_auxiliary
+      ? core::checkedMemoryBytesAdd(
+            static_cast<std::uint64_t>(core::checkedSizeMultiply(
+                prepared_ghost_count, sizeof(double), "AMR prepared ghost auxiliary energy")),
+            64U, "AMR prepared ghost auxiliary alignment")
+      : 0U;
+  return core::checkedMemoryBytesAdd(auxiliary_bytes, core::checkedMemoryBytesAdd(
       static_cast<std::uint64_t>(core::checkedSizeMultiply(
           prepared_ghost_count, sizeof(hydro::HydroConservedState),
           "AMR prepared ghost states")),
@@ -38,7 +51,7 @@ std::uint64_t amrPreparedGhostWorkspaceBytes(
           static_cast<std::uint64_t>(core::checkedSizeMultiply(
               offset_count, sizeof(std::size_t), "AMR prepared ghost offsets")),
           256U, "AMR prepared ghost alignment"),
-      "AMR prepared ghost coexistence");
+      "AMR prepared ghost coexistence"), "AMR prepared ghost auxiliary coexistence");
 }
 
 namespace {
@@ -465,6 +478,33 @@ void validatePeriodicAmrPatchTopology(
       .metal_mass_code = density.metal_mass_density_comoving * volume};
 }
 
+
+// P1-55-01 / H02: real-cell auxiliary lane rho*e of an AMR patch SoA from the
+// canonical specific internal energy (the thermal authority used by
+// loadAmrHydroConservedStateInto). NaN marks an unknown e (<= 0 or
+// non-finite); ghost rows are reset to NaN until the ghost filler forms them.
+// No-op when the SoA has no auxiliary lane.
+void loadCanonicalAuxiliaryInternalEnergy(
+    const core::SimulationState& state,
+    const AmrHydroPatchGeometry& patch_geometry,
+    hydro::HydroConservedStateSoa& conserved) {
+  if (!conserved.auxiliaryInternalEnergyEnabled()) {
+    return;
+  }
+  std::span<double> auxiliary = conserved.auxiliaryInternalEnergyDensityComoving();
+  std::fill(auxiliary.begin(), auxiliary.end(), std::numeric_limits<double>::quiet_NaN());
+  const std::span<const double> rho = std::as_const(conserved).massDensityComoving();
+  if (patch_geometry.real_cells.size() > auxiliary.size()) {
+    throw std::logic_error("AMR auxiliary lane is smaller than the patch real-cell count");
+  }
+  for (std::size_t patch_cell = 0; patch_cell < patch_geometry.real_cells.size(); ++patch_cell) {
+    const std::uint32_t row = patch_geometry.real_cells[patch_cell].local_cell_row;
+    const double canonical_e = state.gas_cells.internal_energy_code[row];
+    if (std::isfinite(canonical_e) && canonical_e > 0.0) {
+      auxiliary[patch_cell] = rho[patch_cell] * canonical_e;
+    }
+  }
+}
 
 void refreshTraceableGhostSourceIds(
     std::vector<AmrHydroPatchGeometry>& geometries,
@@ -2385,10 +2425,13 @@ struct AmrSynchronizedSweepWorkspace {
     std::size_t max_real = 0U;
     std::size_t max_total = 0U;
     std::size_t max_faces = 0U;
+    // P2-55-04: CTU ghost-slab scratch is per face-adjacent ghost slot only.
+    std::size_t max_face_ghost_slots = 0U;
     for (const auto& geometry : geometries) {
       max_real = std::max(max_real, geometry.geometry.cellCount());
       max_total = std::max(max_total, geometry.geometry.totalCellStorageCount());
       max_faces = std::max(max_faces, geometry.geometry.faces.size());
+      max_face_ghost_slots = std::max(max_face_ghost_slots, geometry.geometry.faceGhostSlotExtent());
     }
     const auto bytes = [](std::size_t count, std::size_t width) {
       return static_cast<std::uint64_t>(core::checkedSizeMultiply(
@@ -2402,7 +2445,7 @@ struct AmrSynchronizedSweepWorkspace {
         bytes(max_faces, sizeof(std::size_t)), "AMR active faces");
     bound = core::checkedMemoryBytesAdd(bound,
         hydro::HydroScratchBuffers::workspaceBytes(max_real, max_faces,
-            max_real, max_total, options.active_batch_policy), "AMR solver scratch");
+            max_real, max_total, max_face_ghost_slots, options.active_batch_policy), "AMR solver scratch");
     if (options.regrid_memory_governor != nullptr) {
       reservation = options.regrid_memory_governor->reserve(
           core::MemoryClass::kPhaseResident, bound, "amr.synchronized_sweep.workspace");
@@ -2420,7 +2463,7 @@ struct AmrSynchronizedSweepWorkspace {
     if (active_cells.capacity() != max_real || active_faces.capacity() != max_faces) {
       throw std::length_error("AMR active index exceeded admitted capacity");
     }
-    (void)scratch.prepareForActiveSet(max_real, max_faces, max_real, max_total,
+    (void)scratch.prepareForActiveSet(max_real, max_faces, max_real, max_total, max_face_ghost_slots,
                                      options.active_batch_policy);
     actual_capacity_bytes = conserved.ownedCapacityBytes();
     for (const auto& field : source_fields) {
@@ -2612,19 +2655,10 @@ struct AmrSynchronizedSweepWorkspace {
   if (distributed_exchange != nullptr) {
     refreshRemoteTraceableGhostSourceIds(geometries, distributed_exchange->remote_patches, periodic_frame);
   }
-  // H02/G3.1: remote specific internal energies by stable gas_cell_id for the
-  // dual-energy auxiliary lane of remote-sourced ghosts (sorted lookup).
-  std::vector<std::pair<std::uint64_t, double>> remote_internal_energy;
-  if (distributed_exchange != nullptr) {
-    for (const DistributedAmrRemotePatch& remote : distributed_exchange->remote_patches) {
-      for (const AmrHydroSparseRemoteCell& cell : remote.boundary_cells) {
-        if (std::isfinite(cell.internal_energy_code) && cell.internal_energy_code > 0.0) {
-          remote_internal_energy.emplace_back(cell.gas_cell_id, cell.internal_energy_code);
-        }
-      }
-    }
-    std::sort(remote_internal_energy.begin(), remote_internal_energy.end());
-  }
+  // P1-55-01: remote specific internal energies are consumed by the ghost
+  // filler directly from the sparse remote cells (same selection as the
+  // conserved state); no separate gas_cell_id lookup is materialized.
+  const bool dual_energy_auxiliary = options.active_batch_policy.dual_energy_workspace;
 
   const auto patchRequiresGhostFill = [&](std::size_t patch_index) {
     return all_cells_active || std::any_of(
@@ -2658,6 +2692,11 @@ struct AmrSynchronizedSweepWorkspace {
     target.edge_stencil_ghosts_filled += source.edge_stencil_ghosts_filled;
     target.edge_stencil_physical_closures += source.edge_stencil_physical_closures;
     target.edge_stencil_degenerate_closures += source.edge_stencil_degenerate_closures;
+    target.in_domain_missing_source_rejections += source.in_domain_missing_source_rejections;
+    target.unsupported_closure_geometry_rejections += source.unsupported_closure_geometry_rejections;
+    target.physical_face_inside_domain_rejections += source.physical_face_inside_domain_rejections;
+    target.auxiliary_internal_energy_ghosts_transferred += source.auxiliary_internal_energy_ghosts_transferred;
+    target.auxiliary_internal_energy_ghosts_invalid += source.auxiliary_internal_energy_ghosts_invalid;
   };
 
   // Snapshot only the ghost shell needed by each active local patch while the
@@ -2678,12 +2717,15 @@ struct AmrSynchronizedSweepWorkspace {
   const std::size_t ghost_offset_count = core::checkedSizeAdd(
       geometries.size(), 1U, "AMR prepared ghost offsets");
   const std::uint64_t prepared_ghost_bytes = amrPreparedGhostWorkspaceBytes(
-      geometries.size(), prepared_ghost_count);
+      geometries.size(), prepared_ghost_count, dual_energy_auxiliary);
   core::GovernedScratchArena prepared_ghost_arena(
       options.regrid_memory_governor, core::MemoryClass::kPhaseResident,
       prepared_ghost_bytes, "amr.ghosts.step_start_snapshots");
   std::pmr::vector<std::size_t> prepared_ghost_offsets(prepared_ghost_arena.resource());
   std::pmr::vector<hydro::HydroConservedState> prepared_ghost_states(prepared_ghost_arena.resource());
+  // P1-55-01: auxiliary rho*e of each prepared ghost, formed by the ghost
+  // filler with the same source coverage/time as prepared_ghost_states.
+  std::pmr::vector<double> prepared_ghost_auxiliary(prepared_ghost_arena.resource());
   prepared_ghost_offsets.reserve(ghost_offset_count);
   prepared_ghost_offsets.push_back(0U);
   for (std::size_t patch_index = 0; patch_index < geometries.size(); ++patch_index) {
@@ -2696,10 +2738,17 @@ struct AmrSynchronizedSweepWorkspace {
     throw std::logic_error("AMR prepared ghost membership changed during preparation");
   }
   prepared_ghost_states.resize(prepared_ghost_count);
-  diagnostics.prepared_ghost_capacity_bytes = static_cast<std::uint64_t>(
-      core::checkedSizeMultiply(prepared_ghost_states.capacity(),
-                                sizeof(hydro::HydroConservedState),
-                                "AMR prepared ghost actual capacity"));
+  if (dual_energy_auxiliary) {
+    prepared_ghost_auxiliary.assign(prepared_ghost_count, std::numeric_limits<double>::quiet_NaN());
+  }
+  diagnostics.prepared_ghost_capacity_bytes = core::checkedMemoryBytesAdd(
+      static_cast<std::uint64_t>(core::checkedSizeMultiply(
+          prepared_ghost_states.capacity(), sizeof(hydro::HydroConservedState),
+          "AMR prepared ghost actual capacity")),
+      static_cast<std::uint64_t>(core::checkedSizeMultiply(
+          prepared_ghost_auxiliary.capacity(), sizeof(double),
+          "AMR prepared ghost auxiliary actual capacity")),
+      "AMR prepared ghost actual coexistence");
   for (std::size_t patch_index = 0; patch_index < geometries.size(); ++patch_index) {
     if (!patchRequiresGhostFill(patch_index)) {
       continue;
@@ -2743,9 +2792,12 @@ struct AmrSynchronizedSweepWorkspace {
       return static_cast<std::uint64_t>(core::checkedSizeMultiply(
           count, width, "AMR ghost preparation physical capacity"));
     };
+    // P1-55-01: with dual energy the target and every local source carry the
+    // auxiliary rho*e lane (7 doubles per stored cell instead of 6).
+    const std::size_t soa_lane_bytes = (dual_energy_auxiliary ? 7U : 6U) * sizeof(double);
     std::uint64_t ghost_preparation_bound = ghostBytes(
         core::checkedSizeAdd(target_cells, source_cells, "AMR ghost preparation cells"),
-        6U * sizeof(double));
+        soa_lane_bytes);
     ghost_preparation_bound = core::checkedMemoryBytesAdd(
         ghost_preparation_bound, ghostBytes(source_count, sizeof(std::size_t)),
         "AMR ghost source indices");
@@ -2770,10 +2822,12 @@ struct AmrSynchronizedSweepWorkspace {
     }
     hydro::HydroConservedStateSoa target_state = loadAmrHydroConservedState(
         state, geometries[patch_index], options.adiabatic_index);
+    target_state.enableAuxiliaryInternalEnergy(dual_energy_auxiliary);
+    loadCanonicalAuxiliaryInternalEnergy(state, geometries[patch_index], target_state);
     const std::uint64_t target_bytes = target_state.ownedCapacityBytes();
     diagnostics.max_patch_conserved_bytes = std::max(
         diagnostics.max_patch_conserved_bytes, target_bytes);
-    if (target_bytes > ghostBytes(target_cells, 6U * sizeof(double))) {
+    if (target_bytes > ghostBytes(target_cells, soa_lane_bytes)) {
       throw std::length_error("AMR ghost target exceeds admitted physical capacity");
     }
     std::vector<std::size_t> local_source_indices;
@@ -2794,9 +2848,11 @@ struct AmrSynchronizedSweepWorkspace {
     for (const std::size_t source_index : local_source_indices) {
       local_source_states.push_back(loadAmrHydroConservedState(
           state, geometries[source_index], options.adiabatic_index));
+      local_source_states.back().enableAuxiliaryInternalEnergy(dual_energy_auxiliary);
+      loadCanonicalAuxiliaryInternalEnergy(state, geometries[source_index], local_source_states.back());
       const std::uint64_t source_bytes = local_source_states.back().ownedCapacityBytes();
       if (source_bytes > ghostBytes(
-              geometries[source_index].geometry.totalCellStorageCount(), 6U * sizeof(double))) {
+              geometries[source_index].geometry.totalCellStorageCount(), soa_lane_bytes)) {
         throw std::length_error("AMR ghost source exceeds admitted physical capacity");
       }
       diagnostics.max_patch_conserved_bytes = std::max(
@@ -2824,7 +2880,9 @@ struct AmrSynchronizedSweepWorkspace {
         .requires_ghost_fill = true,
         .periodic_box_extent_comoving = periodic_box
             ? options.periodic_box_extent_comoving : std::array<double, 3>{0.0, 0.0, 0.0},
-        .physical_boundary_kind = options.physical_boundary_kind});
+        .physical_boundary_kind = options.physical_boundary_kind,
+        .domain_origin_comoving = options.domain_origin_comoving,
+        .domain_extent_comoving = options.domain_extent_comoving});
     for (std::size_t slot = 0; slot < local_source_indices.size(); ++slot) {
       ghost_views.push_back(AmrHydroGhostFillPatch{
           .geometry = &geometries[local_source_indices[slot]],
@@ -2849,6 +2907,10 @@ struct AmrSynchronizedSweepWorkspace {
     const std::size_t prepared_begin = prepared_ghost_offsets[patch_index];
     std::size_t ghost_slot = 0U;
     for (const hydro::HydroGhostCell& ghost : geometries[patch_index].geometry.ghost_cells) {
+      if (dual_energy_auxiliary) {
+        prepared_ghost_auxiliary[prepared_begin + ghost_slot] =
+            target_state.auxiliaryInternalEnergyDensityComoving()[ghost.ghost_cell];
+      }
       prepared_ghost_states[prepared_begin + ghost_slot++] =
           target_state.loadCell(ghost.ghost_cell);
     }
@@ -2928,40 +2990,22 @@ struct AmrSynchronizedSweepWorkspace {
           prepared_ghost_states[prepared_begin + ghost_slot]);
     }
     if (conserved_state.auxiliaryInternalEnergyEnabled()) {
-      // Dual energy: auxiliary thermal lane from the canonical e of real
-      // cells; physical ghosts copy their source; same-level / coarse-fine
-      // ghosts keep NaN and fall back to E - K (counted by the solver).
-      std::span<double> auxiliary = conserved_state.auxiliaryInternalEnergyDensityComoving();
-      std::fill(auxiliary.begin(), auxiliary.end(), std::numeric_limits<double>::quiet_NaN());
-      for (std::size_t patch_cell = 0; patch_cell < patch_geometry.real_cells.size(); ++patch_cell) {
-        const std::uint32_t row = patch_geometry.real_cells[patch_cell].local_cell_row;
-        const double canonical_e = state.gas_cells.internal_energy_code[row];
-        if (canonical_e > 0.0) {
-          auxiliary[patch_cell] = conserved_state.loadCell(patch_cell).mass_density_comoving * canonical_e;
-        }
+      // P1-55-01 / H02: real cells take rho*e from the canonical e; EVERY ghost
+      // row (physical, same-level, coarse/fine, temporal, MPI, deep and edge
+      // stencil) takes the auxiliary value the ghost filler formed with the
+      // same source coverage, weights and time as its conserved state. NaN
+      // rows are explicitly invalid (a contributing source had no rho*e);
+      // the solver then uses E - K there and counts the fallback.
+      if (!dual_energy_auxiliary || prepared_ghost_auxiliary.size() != prepared_ghost_states.size()) {
+        throw std::logic_error("AMR dual-energy sweep is missing its prepared auxiliary ghost snapshot");
       }
-      hydro::fillHydroBoundaryGhostAuxiliaryInternalEnergy(conserved_state, patch_geometry.geometry);
-      // Same-level / coarse-fine ghosts: rho_ghost * e_source from the
-      // canonical e of the local source cell, or (H02) the transported e of a
-      // remote source cell. Unknown sources stay NaN; their face states then
-      // use E - K and are counted, so degraded dual-energy protection is
-      // reported, not silent.
-      for (const AmrHydroGhostDescriptor& ghost : patch_geometry.ghosts) {
-        if (ghost.ghost_cell >= auxiliary.size() || std::isfinite(auxiliary[ghost.ghost_cell])) {
-          continue;
-        }
-        const auto source_row = ghost.source_gas_cell_id != 0U
-            ? state.rowForGasCellId(ghost.source_gas_cell_id)
-            : std::optional<std::uint32_t>{};
-        double source_e = source_row.has_value() ? state.gas_cells.internal_energy_code[*source_row] : 0.0;
-        if (!source_row.has_value() && ghost.source_gas_cell_id != 0U && !remote_internal_energy.empty()) {
-          const auto it = std::lower_bound(remote_internal_energy.begin(), remote_internal_energy.end(),
-                                           std::make_pair(ghost.source_gas_cell_id, -std::numeric_limits<double>::infinity()));
-          if (it != remote_internal_energy.end() && it->first == ghost.source_gas_cell_id) source_e = it->second;
-        }
-        if (source_e > 0.0) {
-          auxiliary[ghost.ghost_cell] = conserved_state.loadCell(ghost.ghost_cell).mass_density_comoving * source_e;
-        } else {
+      loadCanonicalAuxiliaryInternalEnergy(state, patch_geometry, conserved_state);
+      std::span<double> auxiliary = conserved_state.auxiliaryInternalEnergyDensityComoving();
+      for (std::size_t ghost_slot = 0; ghost_slot < patch_geometry.geometry.ghost_cells.size(); ++ghost_slot) {
+        const std::size_t ghost_cell = patch_geometry.geometry.ghost_cells[ghost_slot].ghost_cell;
+        const double value = prepared_ghost_auxiliary[prepared_begin + ghost_slot];
+        auxiliary[ghost_cell] = value;
+        if (!(std::isfinite(value) && value > 0.0)) {
           ++diagnostics.dual_energy_unresolved_ghosts;
         }
       }

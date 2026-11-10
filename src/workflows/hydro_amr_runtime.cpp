@@ -2348,16 +2348,29 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
                       0.0,
                       1.0)
                 : 0.0;
+            // P1-55-01: the owner's canonical specific internal energy is the
+            // thermal authority for the remote conserved state, exactly as in
+            // amr::loadAmrHydroConservedStateInto for local patches (same
+            // positive density and 1e-14 pressure floor); the pressure cache
+            // is only the legacy fallback for rows that never set e. Remote
+            // and local sources of one ghost therefore share one E, and
+            // rho_remote * e_remote is the auxiliary lane of that same state.
+            const double remote_rho = cell_record.density_code > 0.0
+                ? cell_record.density_code
+                : std::max(cell_record.mass_code, 1.0e-14);
+            const double remote_pressure = cell_record.internal_energy_code > 0.0
+                ? std::max((k_gamma_adiabatic - 1.0) * remote_rho * cell_record.internal_energy_code, 1.0e-14)
+                : std::max(cell_record.pressure_code, 1.0e-14);
             remote.boundary_cells.push_back(amr::AmrHydroSparseRemoteCell{
                 .patch_local_cell = cell_record.local_cell_offset,
                 .gas_cell_id = cell_record.gas_cell_id,
                 .conserved = hydro::HydroCoreSolver::conservedFromPrimitive(
                     hydro::HydroPrimitiveState{
-                        .rho_comoving = cell_record.density_code,
+                        .rho_comoving = remote_rho,
                         .vel_x_peculiar = cell_record.velocity_x_peculiar,
                         .vel_y_peculiar = cell_record.velocity_y_peculiar,
                         .vel_z_peculiar = cell_record.velocity_z_peculiar,
-                        .pressure_comoving = cell_record.pressure_code,
+                        .pressure_comoving = remote_pressure,
                         .metallicity_mass_fraction = metallicity_mass_fraction},
                     k_gamma_adiabatic),
                 .internal_energy_code = cell_record.internal_energy_code > 0.0
@@ -2754,9 +2767,18 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
         }
         amr::AmrHydroSparseRemoteCell cell = a;
         cell.conserved = (1.0 - alpha) * a.conserved + alpha * b.conserved;
-        // Specific internal energy interpolated with the same weights (NaN
-        // stays NaN: the dual-energy lane then falls back to E - K, counted).
-        cell.internal_energy_code = (1.0 - alpha) * a.internal_energy_code + alpha * b.internal_energy_code;
+        // P1-55-01: the auxiliary lane is a DENSITY, so it is interpolated as
+        // rho*e with the same alpha as the conserved state, then divided by
+        // the interpolated rho: the ghost filler's rho_interp * e_interp is
+        // then exactly (1-alpha)(rho e)_a + alpha (rho e)_b. Any unknown
+        // endpoint keeps NaN (explicitly invalid, counted E - K fallback).
+        const double rho_e_a = a.conserved.mass_density_comoving * a.internal_energy_code;
+        const double rho_e_b = b.conserved.mass_density_comoving * b.internal_energy_code;
+        cell.internal_energy_code = std::isfinite(rho_e_a) && rho_e_a > 0.0 &&
+                std::isfinite(rho_e_b) && rho_e_b > 0.0 &&
+                cell.conserved.mass_density_comoving > 0.0
+            ? ((1.0 - alpha) * rho_e_a + alpha * rho_e_b) / cell.conserved.mass_density_comoving
+            : std::numeric_limits<double>::quiet_NaN();
         if (!(cell.conserved.mass_density_comoving > 0.0) || !std::isfinite(cell.conserved.total_energy_density_comoving)) {
           throw std::runtime_error("distributed recursive AMR: interpolated remote coarse state is unphysical");
         }
@@ -2875,6 +2897,44 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
     m_mpi_context.rethrowCollectivePreparationFailure(failure, "recursive AMR accepted-step CFL guard");
   }
 
+  // P1-55-02: global AMR hierarchy domain = the collectively reduced bounding
+  // box of every populated patch on every rank (nested refinement never
+  // leaves the root tiling). Non-periodic deep/edge stencil closures are
+  // legal only beyond these walls, and a patch face without a neighbour that
+  // is NOT on them is rejected as missing interface data. A non-rectangular
+  // root tiling therefore fails closed instead of receiving a silent outflow
+  // or reflective closure inside the domain. Collective: every rank calls it
+  // from runProductionAmrHydroPath. Returns zero extents when no rank owns a
+  // populated patch (domain undeclared).
+  [[nodiscard]] std::pair<std::array<double, 3>, std::array<double, 3>> globalAmrHierarchyDomain(
+      const core::SimulationState& state) const {
+    const double inf = std::numeric_limits<double>::infinity();
+    std::array<double, 3> local_lower{inf, inf, inf};
+    std::array<double, 3> local_negative_upper{inf, inf, inf};
+    const auto& p = state.patches;
+    for (std::size_t patch = 0; patch < p.size(); ++patch) {
+      if (p.cell_count[patch] == 0U || p.level[patch] < 0) continue;
+      const std::array<double, 3> origin{p.origin_x_comoving[patch], p.origin_y_comoving[patch], p.origin_z_comoving[patch]};
+      const std::array<double, 3> extent{p.extent_x_comoving[patch], p.extent_y_comoving[patch], p.extent_z_comoving[patch]};
+      for (std::size_t axis = 0; axis < 3U; ++axis) {
+        if (!(extent[axis] > 0.0) || !std::isfinite(origin[axis]) || !std::isfinite(extent[axis])) continue;
+        local_lower[axis] = std::min(local_lower[axis], origin[axis]);
+        local_negative_upper[axis] = std::min(local_negative_upper[axis], -(origin[axis] + extent[axis]));
+      }
+    }
+    std::array<double, 3> origin{0.0, 0.0, 0.0};
+    std::array<double, 3> extent{0.0, 0.0, 0.0};
+    for (std::size_t axis = 0; axis < 3U; ++axis) {
+      const double lower = m_mpi_context.allreduceMinDouble(local_lower[axis]);
+      const double upper = -m_mpi_context.allreduceMinDouble(local_negative_upper[axis]);
+      if (std::isfinite(lower) && std::isfinite(upper) && upper > lower) {
+        origin[axis] = lower;
+        extent[axis] = upper - lower;
+      }
+    }
+    return {origin, extent};
+  }
+
   void runProductionAmrHydroPath(core::StepContext& context) {
     // Hydro transport/source terms own the full accepted interval. Evaluate
     // background terms at its midpoint; AMR fine substeps derive their own
@@ -2981,6 +3041,11 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
         // authority as the solver's integration scheme, rank-uniform).
         .ctu_edge_stencils = m_config.numerics.hydro_integration_scheme ==
             core::HydroIntegrationMode::kCornerTransportUpwind};
+    {
+      const auto [domain_origin, domain_extent] = globalAmrHierarchyDomain(context.state);
+      amr_options.domain_origin_comoving = domain_origin;
+      amr_options.domain_extent_comoving = domain_extent;
+    }
     amr::ProductionAmrHydroDiagnostics amr_diagnostics;
     std::size_t remote_patch_count = 0;
     std::size_t remote_flux_register_count = 0;
@@ -3077,6 +3142,14 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
       }
       std::vector<amr::FluxRegisterEntry> outbound_remote_entries;
       std::vector<amr::FluxRegisterEntry> deferred_local_entries;
+      // P1-55-02: the synchronized distributed advance contains no collective,
+      // so a rank-local rejection (in-domain missing ghost source, physical
+      // face inside the domain, stale/underdelivered remote payload, invalid
+      // temporal history) is voted here before the reflux exchange's first
+      // collective: every rank fails the step together instead of one rank
+      // throwing while its peers block in the exchange.
+      std::exception_ptr advance_failure;
+      try {
       if (amr::hasProductionAmrHydroCoverage(context.state)) {
         amr_diagnostics = amr::advanceDistributedProductionAmrHydro(
             context.state,
@@ -3098,6 +3171,10 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
         throw std::runtime_error(
             "distributed AMR hydro rank has partial local patch coverage; only an explicitly empty rank may skip advancement");
       }
+      } catch (...) {
+        advance_failure = std::current_exception();
+      }
+      m_mpi_context.rethrowCollectivePreparationFailure(advance_failure, "distributed AMR hydro advance");
       // Patch 53 (P0-52-01): packing is a guarded phase voted before the
       // exchange's first collective; the result is the governed variant.
       std::vector<parallel::AmrFluxRegisterPayloadRecord> local_flux_payloads;

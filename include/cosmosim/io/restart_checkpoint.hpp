@@ -18,6 +18,11 @@ namespace cosmosim::core { class MemoryGovernor; struct FrozenConfig; }
 namespace cosmosim::io {
 
 struct RestartSchema {
+  // v25 adds /state/amr_temporal_boundary_history/{start,end}_internal_energy_density_comoving
+  // (group schema_version 3): the dual-energy auxiliary rho*e endpoints of
+  // each coarse temporal-history cell, so a mid-subcycle restart forms the
+  // same temporally interpolated auxiliary ghost lane as the uninterrupted
+  // run (P1-55-01). Older checkpoints restore them as NaN (unknown).
   // v24 adds /gravity_force_cache/hierarchical_endpoint: the synchronized
   // hierarchical-KDK split force (Tree and PM components) and nearest-pair
   // encounter lane at the checkpoint, so a resumed run reuses the same
@@ -25,8 +30,8 @@ struct RestartSchema {
   // v23 adds canonical SHA-256 payload integrity while retaining the v22 legacy hash
   // only for backward compatibility and migration diagnostics.
   // v22 adds conserved gas metal mass and immutable star-birth identity.
-  std::string name = "cosmosim_restart_v24";
-  std::uint32_t version = 24;
+  std::string name = "cosmosim_restart_v25";
+  std::uint32_t version = 25;
 };
 
 [[nodiscard]] const RestartSchema& restartSchema();

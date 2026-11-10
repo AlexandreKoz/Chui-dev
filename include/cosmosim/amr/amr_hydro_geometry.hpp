@@ -35,8 +35,14 @@ enum class AmrHydroGhostFillStatus : std::uint8_t {
   kRejectedTemporalTimeOutOfRange,
   kRejectedTemporalFineToCoarseMismatch,
   kMissingSource,
+  // Deep stencil layer beyond a PROVEN non-periodic open domain wall
+  // (zero-gradient outflow closure; P1-55-02). Never used for in-domain data.
   kFilledDeepLayerExtrapolated,
   kFilledDeepLayerReflected,
+  // P1-55-02/P2-55-03: closure cannot be formed (domain narrower than the
+  // stencil beyond the supported reflection count, unsupported hierarchy
+  // boundary kind, probe range). Always accompanied by a thrown error.
+  kRejectedUnsupportedClosureGeometry,
 };
 
 struct AmrHydroGeometryOptions {
@@ -55,9 +61,10 @@ struct AmrHydroGeometryOptions {
   // give PLM (N = 2) and PPM (N = 3) full-order reconstruction across patch,
   // coarse/fine, rank and open/reflective boundaries. In-patch periodic wraps
   // never need deep layers (the stencil resolves to real wrapped cells).
-  // A deep layer that cannot be formed (patch narrower than the mirror depth
-  // for reflective boundaries) is omitted and the resulting order reduction
-  // is counted by the solver's stencil-degradation counter.
+  // P2-55-03: a reflective deep layer whose mirror depth exceeds the patch
+  // extent is still created (physical_closure_mapped) and is resolved by the
+  // AMR ghost filler from the data beyond the opposite face; it is no longer
+  // omitted as a silent order reduction.
   std::uint8_t ghost_layers = 1;
   // P1-HYDRO-02: transverse depth of the edge stencil ghost block (0 = none).
   // CTU sets it to the reconstruction stencil half-width so the tangential
@@ -92,6 +99,13 @@ struct AmrHydroGhostDescriptor {
   // the filler resolves edge ghosts with any legal level relation and applies
   // the physical domain closure on every axis that leaves the domain.
   bool edge_stencil = false;
+  // P2-55-03: deep reflective PHYSICAL layer of a patch thinner than the
+  // mirror depth along the normal. The mirror cell lies beyond the opposite
+  // patch face, so hydro::fillHydroBoundaryGhostCells only writes a
+  // provisional owner copy and the AMR ghost filler resolves the exact mirror
+  // (neighbour patch beyond the opposite face, or a second reflection when
+  // that face is a domain wall) with the reflected axis' momentum reversed.
+  bool physical_closure_mapped = false;
 };
 
 struct AmrHydroFaceDescriptor {

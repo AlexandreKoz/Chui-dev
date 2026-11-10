@@ -2,7 +2,7 @@
 
 20261012 adds source identity, source-manifest SHA-256 and dependency-provider
 text to existing build/derived-runtime provenance, without changing science
-snapshot v6, checkpoint v24 or provenance v7 field schemas. Source archives
+snapshot v6, checkpoint v25 or provenance v7 field schemas. Source archives
 retain unavailable Git identity; a manifest checksum is explicitly a source
 identity, never a fabricated commit. Normalized configuration includes five
 new conservative TreePM controls; verified predecessor migration uses the
@@ -99,7 +99,12 @@ See `docs/snapshot_hdf5_io.md` for the detailed contract.
 
 Current restart identity:
 
-- `name = cosmosim_restart_v24`
+- `name = cosmosim_restart_v25`
+
+Schema v25 adds `/state/amr_temporal_boundary_history/start_internal_energy_density_comoving`
+and `end_internal_energy_density_comoving` (float64, one row per history cell, group
+`schema_version = 3`): the dual-energy auxiliary `rho*e` endpoints used by temporal
+coarse-to-fine AMR ghosts (NaN = unknown; v24 and older restore NaN).
 - `version = 24`
 
 Schema v24 adds `/gravity_force_cache/hierarchical_endpoint` (attributes `valid`,
@@ -177,7 +182,7 @@ restart is execution-resume oriented.
 
 ## Stage 2 timestep-authority schema note (2026-05-11)
 
-Historical Stage 2 scheduler-authority documentation did not change snapshot/restart/provenance schemas. H2.4 historical material referenced `cosmosim_restart_v17`; v19 introduced authoritative gas-cell scheduling, v20 added checkpoint-authoritative gravity force caches, and the active schema is now `cosmosim_restart_v24` (v23 plus the hierarchical KDK synchronized split-force endpoint) with ordered code-time output events. The compatibility behavior is explicit: restart payloads retain `ParticleSoa::time_bin` and `CellSoa::time_bin` as mirrors for corruption detection, reject stale mirror conflicts against scheduler truth, and rebuild valid parent-backed mirrors from scheduler state on import. Gas-cell parent lineage is optional metadata; parentless cells keep cell-local hydro velocity and timestep mirror lanes without particle velocity access.
+Historical Stage 2 scheduler-authority documentation did not change snapshot/restart/provenance schemas. H2.4 historical material referenced `cosmosim_restart_v17`; v19 introduced authoritative gas-cell scheduling, v20 added checkpoint-authoritative gravity force caches, and the active schema is now `cosmosim_restart_v25` (v24 plus the temporal-history dual-energy auxiliary endpoints; v24 was v23 plus the hierarchical KDK synchronized split-force endpoint) with ordered code-time output events. The compatibility behavior is explicit: restart payloads retain `ParticleSoa::time_bin` and `CellSoa::time_bin` as mirrors for corruption detection, reject stale mirror conflicts against scheduler truth, and rebuild valid parent-backed mirrors from scheduler state on import. Gas-cell parent lineage is optional metadata; parentless cells keep cell-local hydro velocity and timestep mirror lanes without particle velocity access.
 
 ## H1 Hydro Restart Geometry Note
 
@@ -315,9 +320,9 @@ When changing snapshot/restart/provenance fields:
 - Historical snapshot schema v4 was introduced as `gadget_arepo_v4`; v5 added optional per-particle softening sidecars.
   The active science-output schema is now `chui_science_snapshot_v6` (`schema_version = 6`), which separates CHUÍ-native identity from explicit AREPO/GADGET export semantics and supports logical multifile snapshot sets.
 - No external `/PartType*` dataset names were changed.
-- Restart schema version/name are now `cosmosim_restart_v24`, version `24` (v24 adds `/gravity_force_cache/hierarchical_endpoint`; see below). It retains the v20 force cache and adds restart-authoritative code-time output cadence with an explicit v20 compatibility default of disabled.
+- Restart schema version/name are now `cosmosim_restart_v25`, version `25` (v25 adds the temporal-history auxiliary `rho*e` endpoints; v24 adds `/gravity_force_cache/hierarchical_endpoint`; see below). It retains the v20 force cache and adds restart-authoritative code-time output cadence with an explicit v20 compatibility default of disabled.
 - Restart contract enforcement was tightened: missing continuation-critical metadata, a missing or wrong root file kind, or missing output-cadence state now fails fast with explicit path-aware errors instead of producing weak checkpoints.
-- Restart schema is `cosmosim_restart_v24`; distributed TreePM state, the restart-authoritative gravity force cache, and ordered output-event state are persisted under restart-only data and covered by restart integrity hashing.
+- Restart schema is `cosmosim_restart_v25`; distributed TreePM state, the restart-authoritative gravity force cache, and ordered output-event state are persisted under restart-only data and covered by restart integrity hashing.
 - The reader accepts the documented legacy `cosmosim_restart_v14` particle-bound import path
   by materializing `/state/gas_cell_identity` from
   `/state/gas_cells/{gas_cell_id,parent_particle_id}` with
@@ -346,7 +351,7 @@ PatchSoa now persists restart-authoritative AMR patch geometry lanes: `parent_pa
 
 ## AMR temporal restart state (v18)
 
-`cosmosim_restart_v19` introduced `/state/amr_temporal_boundary_history` for active local AMR coarse temporal intervals. The current `cosmosim_restart_v24` retains it and the v20 `/gravity_force_cache`, then adds ordered code-time output events. None are part of analysis snapshots. v17 pending flux-register restart state remains supported as a legacy read path.
+`cosmosim_restart_v19` introduced `/state/amr_temporal_boundary_history` for active local AMR coarse temporal intervals. The current `cosmosim_restart_v25` retains it (group schema 3 adds the dual-energy auxiliary endpoints) and the v20 `/gravity_force_cache`, then adds ordered code-time output events. None are part of analysis snapshots. v17 pending flux-register restart state remains supported as a legacy read path.
 
 
 ## Initial-condition import report counters

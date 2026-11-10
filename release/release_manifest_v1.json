@@ -6,7 +6,7 @@
   "source_version": "0.1.0",
   "naming_rule_version": "lower_snake_v1",
   "snapshot_schema": "chui_science_snapshot_v6",
-  "restart_schema": "cosmosim_restart_v24",
+  "restart_schema": "cosmosim_restart_v25",
   "provenance_schema": "provenance_v7",
   "config_schema": "param_txt_v1",
   "supported_modes": [

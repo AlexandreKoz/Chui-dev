@@ -510,6 +510,9 @@ void appendTemporalHistoryCell(
   out.f64(cell.end_momentum_density_z_comoving);
   out.f64(cell.end_total_energy_density_comoving);
   out.f64(cell.end_metal_mass_density_comoving);
+  // v5 (P1-55-01): dual-energy auxiliary rho*e endpoints (NaN = unknown).
+  out.f64(cell.start_internal_energy_density_comoving);
+  out.f64(cell.end_internal_energy_density_comoving);
 }
 
 core::AmrTemporalBoundaryHistoryCellRecord readTemporalHistoryCell(WireReader& in) {
@@ -529,6 +532,8 @@ core::AmrTemporalBoundaryHistoryCellRecord readTemporalHistoryCell(WireReader& i
   cell.end_momentum_density_z_comoving = in.f64("temporal_history_end_momentum_z");
   cell.end_total_energy_density_comoving = in.f64("temporal_history_end_energy");
   cell.end_metal_mass_density_comoving = in.f64("temporal_history_end_metal");
+  cell.start_internal_energy_density_comoving = in.f64("temporal_history_start_internal_energy");
+  cell.end_internal_energy_density_comoving = in.f64("temporal_history_end_internal_energy");
   return cell;
 }
 
@@ -902,7 +907,8 @@ std::size_t estimateAmrPatchMigrationWireUpperBoundBytes(
   const std::uint64_t patch_id = state.patches.patch_id[local_patch_index];
   constexpr std::size_t k_pending_flux_wire_bytes = 219U;
   constexpr std::size_t k_temporal_history_fixed_wire_bytes = 50U;
-  constexpr std::size_t k_temporal_history_cell_wire_bytes = 112U;
+  // 2 identity u64 + 12 conserved endpoint f64 + 2 auxiliary rho*e f64 (v5).
+  constexpr std::size_t k_temporal_history_cell_wire_bytes = 128U;
   for (const core::PendingFluxRegisterRecord& pending : state.pending_flux_registers.records()) {
     if (pending.coarse_patch_id == patch_id) {
       bytes = core::checkedSizeAdd(

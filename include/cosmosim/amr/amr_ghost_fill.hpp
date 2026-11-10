@@ -50,16 +50,41 @@ struct AmrHydroGhostFillPatch {
   // continuation (the open/outflow closure). Appended last so existing
   // designated initializers keep their meaning; default preserves old callers.
   hydro::HydroBoundaryKind physical_boundary_kind = hydro::HydroBoundaryKind::kOpen;
+  // P1-55-02: declared global (hierarchy) domain [origin, origin + extent)
+  // in the patch coordinate frame, per axis. A deep or edge stencil ghost may
+  // use the physical closure on a NON-periodic axis only beyond a wall of
+  // this domain; any other unresolved stencil cell is an in-domain missing
+  // source and fails closed. A face classified kPhysical must lie on a
+  // declared wall (otherwise neighbour metadata is missing and the fill
+  // fails). Extent 0 on an axis = undeclared: only a target face that is
+  // itself kPhysical counts as a wall there (standalone/validation callers).
+  // Appended last; defaults preserve existing designated initializers.
+  std::array<double, 3> domain_origin_comoving{0.0, 0.0, 0.0};
+  std::array<double, 3> domain_extent_comoving{0.0, 0.0, 0.0};
 };
+
+// P1-55-01 / H02 dual-energy contract of fillAmrHydroGhostCells: when the
+// target SoA has its auxiliary internal-energy lane enabled, every ghost row
+// receives rho*e formed by exactly the operator that formed its conserved
+// state (single-source injection, equal-volume fine->coarse mean, temporal
+// (1-alpha)/alpha blend from the persistent history, sparse MPI owner rho*e,
+// physical/closure copy or mirror). Callers must initialize the target's and
+// every local source's REAL-cell auxiliary lane with rho*e from the canonical
+// specific internal energy (NaN = unknown). A ghost touching any unknown
+// source is stored as NaN (explicitly invalid; the solver uses E - K and
+// counts it). Without an enabled lane on the target nothing is written.
 
 struct AmrHydroSparseRemoteCell {
   std::uint32_t patch_local_cell = 0U;
   std::uint64_t gas_cell_id = 0U;
   hydro::HydroConservedState conserved{};
-  // H02/G3.1: the owner's canonical SPECIFIC internal energy (code units),
-  // transported so remote same-level/coarse-fine ghosts seed the dual-energy
-  // auxiliary lane (rho_ghost * e) instead of falling back to E - K. NaN =
-  // unknown (the solver then uses E - K and counts the fallback).
+  // H02/G3.1: the owner's canonical SPECIFIC internal energy (code units).
+  // The ghost filler forms this cell's auxiliary density as
+  // conserved.mass_density_comoving * internal_energy_code and averages /
+  // interpolates that density with the conserved state (P1-55-01). A
+  // temporally interpolated remote cell stores (interpolated rho*e) /
+  // (interpolated rho) so the product is the interpolated density. NaN =
+  // unknown (every ghost touching it is marked invalid, counted).
   double internal_energy_code = std::numeric_limits<double>::quiet_NaN();
 };
 
@@ -103,7 +128,22 @@ struct AmrHydroGhostFillDiagnostics {
   // only edge case that falls back to zero-gradient continuation).
   std::size_t edge_stencil_ghosts_filled = 0;
   std::size_t edge_stencil_physical_closures = 0;
+  // Retired by P2-55-03 (thin-patch reflective mirrors are now resolved
+  // through the neighbour patch beyond the opposite face, or rejected). Kept
+  // for telemetry/ABI compatibility; never incremented.
   std::size_t edge_stencil_degenerate_closures = 0;
+  // P1-55-02 distinct closure/rejection telemetry. Valid physical closures are
+  // deep_layer_extrapolated_ghosts (open wall), deep_layer_reflected_ghosts
+  // (reflective wall) and edge_stencil_physical_closures; stale remote data is
+  // stale_epoch_rejections. The rejections below always throw.
+  std::size_t in_domain_missing_source_rejections = 0;
+  std::size_t unsupported_closure_geometry_rejections = 0;
+  std::size_t physical_face_inside_domain_rejections = 0;
+  // P1-55-01: ghost rows whose auxiliary rho*e was transferred with the same
+  // operator as the conserved state, and rows explicitly marked invalid (NaN)
+  // because a contributing source had no auxiliary value.
+  std::size_t auxiliary_internal_energy_ghosts_transferred = 0;
+  std::size_t auxiliary_internal_energy_ghosts_invalid = 0;
 };
 
 [[nodiscard]] std::uint64_t amrPatchGeometryFingerprint(const PatchDescriptor& patch);

@@ -3,7 +3,7 @@
 ## Scope and schema
 
 CosmoSim restart checkpoints are **exact-continuation artifacts** and intentionally richer than analysis snapshots.
-The restart schema (`cosmosim_restart_v24`) persists:
+The restart schema (`cosmosim_restart_v25`) persists:
 
 - full `SimulationState` hot/cold SoA lanes (through a narrow `RestartPersistentStateView`),
 - `StateMetadata` blob,
@@ -17,6 +17,17 @@ The restart schema (`cosmosim_restart_v24`) persists:
 - module sidecars (`ModuleSidecarRegistry`) with per-module schema versions,
 - `IntegratorState`, including the `pm_refresh_enabled` policy bit,
 - restart-authoritative `/gravity_force_cache` acceleration triplets used by the next KDK pre-kick,
+- v25 `/state/amr_temporal_boundary_history/{start,end}_internal_energy_density_comoving`
+  (group `schema_version = 3`): the dual-energy auxiliary internal-energy density `rho*e`
+  of each coarse temporal-history cell at the interval endpoints, captured from the
+  canonical specific internal energy. Temporal coarse-to-fine ghosts interpolate it with
+  the same `alpha` as the conserved state (P1-55-01). `NaN` means unknown. A v24 or older
+  checkpoint restores both lanes as `NaN`: temporal ghosts formed from such a history are
+  explicitly invalid in the auxiliary lane (the solver's counted `E - K` fallback), so a
+  mid-subcycle resume from v24 is not bitwise identical in dual-energy runs. The lanes are
+  covered by the v25 canonical SHA-256 / legacy digests (NaN digested as one canonical
+  quiet-NaN pattern) and by post-write verification. The AMR migration wire record is v5
+  (the same two lanes per history cell).
 - v24 `/gravity_force_cache/hierarchical_endpoint`: at a closed hierarchical KDK block the
   Tree and PM split components and the nearest direct-pair separation squared for every
   particle, so the next block opens with the same force in uninterrupted and resumed runs,
@@ -142,7 +153,7 @@ Schema v15 retains the compact `/restart_diagnostics` group. It records the sche
 - Format: HDF5 (`writeRestartCheckpointHdf5`, `readRestartCheckpointHdf5`).
 - Root file-kind gate: restart readers require `cosmosim_file_kind=restart_checkpoint` and reject ordinary `science_snapshot` files before reading runtime truth.
 - Schema version gate: `isRestartSchemaCompatible(file_schema_version)`.
-- Current compatibility policy: write current v24; read v23 (no hierarchical endpoint: the resumed hierarchical segment bootstraps its first block), v22/v21 plus documented v20/v19/v18/v17/v16/v15/v14 paths. v20 has no code-time output-event fields and materializes that lane as disabled. v19 also has no serialized gravity force cache and therefore follows the explicit safe-bootstrap compatibility path rather than claiming bitwise workflow continuation.
+- Current compatibility policy: write current v25; read v24 (temporal-history auxiliary lanes restored as NaN), v23 (no hierarchical endpoint: the resumed hierarchical segment bootstraps its first block), v22/v21 plus documented v20/v19/v18/v17/v16/v15/v14 paths. v20 has no code-time output-event fields and materializes that lane as disabled. v19 also has no serialized gravity force cache and therefore follows the explicit safe-bootstrap compatibility path rather than claiming bitwise workflow continuation.
 - v14 compatibility materializes `/state/gas_cell_identity` from
   `/state/gas_cells/{gas_cell_id,parent_particle_id}` with `has_parent_particle=true`
   and requires `gas_cell_id == parent_particle_id != 0` for every cell. It does not
@@ -291,7 +302,7 @@ This proves local HDF5 AMR hydro restart equivalence for the exercised synchroni
 
 ---
 
-The narrow TreePM normalized-defaults compatibility projection accepts only an integrity-verified v23 or v24 checkpoint with matching historical provenance, an exact legacy-default projection, and a closed global KDK state. V24 is covered by the full canonical SHA-256 digest (including output-cadence state); this does not introduce open-ended configuration migration or change the restart schema.
+The narrow TreePM normalized-defaults compatibility projection accepts only an integrity-verified v23, v24 or v25 checkpoint with matching historical provenance, an exact legacy-default projection, and a closed global KDK state. V24 is covered by the full canonical SHA-256 digest (including output-cadence state); this does not introduce open-ended configuration migration or change the restart schema.
 
 ## AMR pending flux-register restart lanes (v17)
 

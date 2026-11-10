@@ -261,6 +261,16 @@ struct HydroPatchGeometry {
   // boundary-proxy / normal-only CTU closure at face edges).
   std::size_t edge_ghost_slot_begin = k_invalid_ghost_cell_slot;
   std::uint8_t edge_ghost_depth = 0U;
+  // P2-55-04: ghost slots [0, face_ghost_slot_count) are the only slots a
+  // HydroFace may reference (the face-adjacent shell); deep stencil layers
+  // and the edge block are appended after it and never carry a face. The CTU
+  // ghost-slab scratch is sized by this prefix, not by every ghost slot.
+  // k_invalid_ghost_cell_slot (default) = every ghost slot may carry a face
+  // (fixed-grid / custom geometries keep the historical sizing).
+  std::size_t face_ghost_slot_count = k_invalid_ghost_cell_slot;
+  [[nodiscard]] std::size_t faceGhostSlotExtent() const noexcept {
+    return face_ghost_slot_count < ghost_cells.size() ? face_ghost_slot_count : ghost_cells.size();
+  }
 
   [[nodiscard]] std::size_t cellCount() const;
   // Slot of the edge stencil ghost beyond face (normal_axis, normal_side) and
@@ -622,10 +632,13 @@ struct HydroScratchBuffers {
   // pass-1 fluxes of the faces normal to x, y and z (same ordering as
   // touched_cells). Transient, batch-scoped, never restart truth.
   std::vector<std::array<HydroConservedState, 3>> ctu_transverse_delta;
-  // CTU interface completion: per ghost slot, tangential flux-divergence
-  // increments reconstructed from the immutable face ghost slab. The mask
-  // has one bit per valid axis. Only complete stencils are admitted; patch
-  // edges/corners remain an explicit, counted normal-only fallback.
+  // CTU interface completion: per FACE-ADJACENT ghost slot (indices
+  // [0, HydroPatchGeometry::faceGhostSlotExtent()), identical to the ghost
+  // slot numbering, so producer and consumer index without a lookup table),
+  // tangential flux-divergence increments reconstructed from the immutable
+  // face ghost slab. The mask has one bit per valid axis. Deep/edge
+  // stencil-only slots never receive a correction and have no entry
+  // (P2-55-04). Only complete stencils are admitted.
   std::vector<std::array<HydroConservedState, 3>> ctu_ghost_transverse_delta;
   std::vector<std::uint8_t> ctu_ghost_transverse_axis_mask;
   // Dual energy only: per touched cell, the advective internal-energy flux
@@ -645,6 +658,20 @@ struct HydroScratchBuffers {
   [[nodiscard]] std::uint64_t prepareForActiveSet(
       std::size_t active_cell_count, std::size_t active_face_count,
       std::size_t real_cell_count, std::size_t total_cell_count,
+      const HydroActiveBatchPolicy& batch_policy);
+  // P2-55-04: as above with an explicit bound on face-adjacent ghost slots
+  // (max HydroPatchGeometry::faceGhostSlotExtent() over the geometries the
+  // scratch serves). The overloads above use every ghost slot
+  // (total_cell_count - real_cell_count), the historical worst case.
+  [[nodiscard]] static std::uint64_t workspaceBytes(
+      std::size_t active_cell_count, std::size_t active_face_count,
+      std::size_t real_cell_count, std::size_t total_cell_count,
+      std::size_t face_ghost_slot_count,
+      const HydroActiveBatchPolicy& batch_policy);
+  [[nodiscard]] std::uint64_t prepareForActiveSet(
+      std::size_t active_cell_count, std::size_t active_face_count,
+      std::size_t real_cell_count, std::size_t total_cell_count,
+      std::size_t face_ghost_slot_count,
       const HydroActiveBatchPolicy& batch_policy);
   void resizeFaceBatch(std::size_t active_cell_batch_count, std::size_t active_face_batch_count);
   [[nodiscard]] std::uint64_t ownedCapacityBytes() const;

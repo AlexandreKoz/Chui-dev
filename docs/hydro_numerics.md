@@ -96,16 +96,31 @@ box-spanning AMR patches) are full order everywhere. With the required shell:
 The production AMR/MPI planner requests `requiredStencilHalfWidth()` normal
 layers (one for PCM, two for PLM and three for PPM), and the ghost filler
 resolves each layer at the step-start/temporally interpolated level clock.
-Only a physically thin patch that cannot provide the required reflected/open
-continuation may reduce order; every such reduction is reported by
-`stencil_degradation_count` and `deep_layer_extrapolated_ghosts`. A deep
-stencil-only interface layer whose probe leaves every patch (domain edge
-behind a neighbour patch thinner than the stencil) is filled with the
-physical domain closure (post-patch-53 P1-HYDRO-02): for an open domain the
-zero-gradient continuation (`deep_layer_extrapolated_ghosts`); for a
-reflective domain the exact mirror image of the column across the wall with
-reversed normal momentum (`deep_layer_reflected_ghosts`). A reflective mirror
-source outside the target patch falls back to the counted continuation.
+**Domain versus missing data (P1-55-02, P2-55-03).** A stencil-only ghost
+(deep normal layer, edge stencil ghost, or deep reflective layer of a patch
+thinner than the mirror depth) is described by the target-relative index of
+the stencil cell it represents. On every non-periodic axis on which that
+index leaves the patch, the global boundary is classified from the declared
+hierarchy domain (`ProductionAmrHydroOptions::domain_{origin,extent}_comoving`,
+production: the collectively reduced bounding box of all patches) or, when no
+domain is declared, from a target face that is itself `kPhysical`. Only beyond
+such a wall is the physical closure applied: open -> zero-gradient onto the
+last in-domain row (`deep_layer_extrapolated_ghosts`); reflective -> mirror
+`i' = 2w - 1 - i` with that axis' momentum reversed, repeated for a domain
+narrower than the stencil (`deep_layer_reflected_ghosts`). The mapped
+in-domain cell is then resolved as a real target cell or through the
+ordinary local / coarse-fine (temporal) / fine-coarse / MPI selection, so a
+thin-patch mirror that lands beyond the opposite face is read from the
+neighbour patch there. A stencil cell that is (or is not provably out of)
+inside the domain and has no source fails closed
+(`in_domain_missing_source_rejections`); it is never continued from a
+shallower ghost. A face with no neighbour that is not on a declared domain wall
+is rejected as missing interface metadata
+(`physical_face_inside_domain_rejections`); closures that need more than eight
+reflections per axis or an unsupported hierarchy boundary kind are rejected
+(`unsupported_closure_geometry_rejections`). Reflective deep physical layers of
+thin patches are no longer omitted. `edge_stencil_degenerate_closures` is
+retired (always 0).
 
 ## 4. CTU (simplified Colella 1990 in 3D)
 
@@ -155,8 +170,11 @@ closed. Local ghost sources include edge/corner-adjacent patches, and the
 directed MPI exchange widens the target's transverse intervals by `r` cells
 (`AmrInterfaceTopologyOptions::edge_stencil_layers`) so diagonal remote cells
 are delivered. Telemetry: `edge_stencil_ghosts_filled`,
-`edge_stencil_physical_closures`, `edge_stencil_degenerate_closures` (the only
-counted downgrade: a reflective mirror deeper than the patch extent).
+`edge_stencil_physical_closures` (closures use the domain-versus-missing-data
+rule of section 3; `edge_stencil_degenerate_closures` is retired). The CTU
+ghost-slab scratch is sized by the face-adjacent ghost prefix only
+(`HydroPatchGeometry::face_ghost_slot_count`, P2-55-04); deep and edge slots
+never receive a slab correction and hold no entry.
 
 With the edge block present an incomplete slab is a geometry defect
 (`std::logic_error`), and the one-sided owner proxy is disabled. Geometries
@@ -298,13 +316,25 @@ Selectable: `hydro_dual_energy = off` (reference: thermal energy is always
   energy instead of the cancellation-dominated `E - K`; the thermal
   correction is ledgered in `RefluxDiagnostics::dual_energy_reflux_*` and
   reported in the `hydro.amr_production_stage` event.
-* **AMR ghosts.** Physical ghosts copy their source; same-level and
-  coarse/fine ghosts take `rho_ghost * e_source` from the local source cell's
-  canonical `e`. Ghosts whose source is remote (or unknown) keep `E - K` and
-  are counted (`dual_energy_unresolved_ghosts`): protection is degraded at
-  those faces and this is reported, not silent. Remote auxiliary exchange is a
-  Part 3 item. Per-step AMR thermal corrections are summed in
-  `dual_energy_thermal_correction_code`.
+* **AMR ghosts (P1-55-01).** The auxiliary lane of every AMR ghost is the
+  comoving density `rho e` formed by the ghost filler with *exactly* the
+  operator that forms the ghost's conserved state: single-source injection
+  (same level, coarse to fine), the equal-volume mean over the complete fine
+  stencil (fine to coarse), the temporal blend
+  `(1 - alpha) (rho e)_start + alpha (rho e)_end` with the same `alpha` from
+  the persistent temporal history (whose v25 records carry the `rho e`
+  endpoints), the owner's `rho e` of a sparse MPI cell (a remote recursive
+  interval is interpolated in `rho e` and divided by the interpolated `rho`),
+  and the copied/mirrored cell for physical, deep-layer and edge closures.
+  Local sources, the target's real cells and the step-start ghost snapshot
+  carry the lane (admitted as a seventh SoA lane and one double per prepared
+  ghost). A ghost touching any source with unknown `e` is stored as NaN
+  (explicitly invalid, never an unrelated finite value) and is counted in
+  `dual_energy_unresolved_ghosts`; the solver then uses `E - K` there.
+  `AmrHydroGhostFillDiagnostics::auxiliary_internal_energy_ghosts_{transferred,invalid}`
+  report the transfer. Remote conserved states use the owner's canonical `e`
+  as thermal authority (same as local patches). Per-step AMR thermal
+  corrections are summed in `dual_energy_thermal_correction_code`.
 * **Limits.** Weak shocks whose post-shock thermal fraction stays below `eta`
   are not heated by the auxiliary branch (same as Enzo-type schemes);
   `eta = 1e-3` is the default; the pdV face velocity is first-order accurate.

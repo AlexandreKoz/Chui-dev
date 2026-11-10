@@ -969,8 +969,12 @@ RungZeroTimeState initializeRungZeroTimeState(
     time_state.m_gas_cell_scheduler.importPersistentState(
         restart_state->gas_cell_scheduler_state);
     time_state.m_integrator_state = restart_state->integrator_state;
+    // Pre-v24 checkpoints carry no synchronized hierarchical endpoint force,
+    // so PM must be refreshed on resume. Pinned to v24 (not "current") so the
+    // v25 temporal-history auxiliary lane does not change v24 resumes.
+    constexpr std::uint32_t k_hierarchical_endpoint_restart_schema = 24U;
     if (restart_state->diagnostics.restart_schema_version <
-        io::restartSchema().version) {
+        k_hierarchical_endpoint_restart_schema) {
       time_state.m_integrator_state.pm_refresh_enabled = true;
     }
     if (time_state.m_particle_scheduler.elementCount() !=
