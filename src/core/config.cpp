@@ -711,6 +711,22 @@ parseInitialConditionMissingFieldPolicy(
   throw ConfigError("key 'physics.ssp_wind_model': invalid value '" + value + "' (expected none or table_v1)");
 }
 
+[[nodiscard]] SspYieldTableCoverageConfig parseSspYieldTableCoverageConfig(const std::string& value) {
+  const std::string lower = toLower(trim(value));
+  if (lower == "reject") return SspYieldTableCoverageConfig::kReject;
+  if (lower == "edge_clamp_research") return SspYieldTableCoverageConfig::kEdgeClampResearch;
+  throw ConfigError("key 'physics.ssp_yield_table_coverage': invalid value '" + value +
+                    "' (expected reject or edge_clamp_research)");
+}
+
+[[nodiscard]] SspWindTableCompatibilityConfig parseSspWindTableCompatibilityConfig(const std::string& value) {
+  const std::string lower = toLower(trim(value));
+  if (lower == "strict") return SspWindTableCompatibilityConfig::kStrict;
+  if (lower == "approximate_research") return SspWindTableCompatibilityConfig::kApproximateResearch;
+  throw ConfigError("key 'physics.ssp_wind_table_compatibility': invalid value '" + value +
+                    "' (expected strict or approximate_research)");
+}
+
 [[nodiscard]] SspEventPublicationModeConfig parseSspEventPublicationModeConfig(const std::string& value) {
   const std::string lower = toLower(trim(value));
   if (lower == "coarse_endpoint") return SspEventPublicationModeConfig::kCoarseEndpoint;
@@ -1722,6 +1738,8 @@ struct ConfigKeySpec {
       {"physics.ssp_wind_model", "none"},
       {"physics.ssp_wind_table_path", ""},
       {"physics.ssp_wind_table_sha256", ""},
+      {"physics.ssp_yield_table_coverage", "reject"},
+      {"physics.ssp_wind_table_compatibility", "strict"},
       {"output.run_name", "cosmosim_run"},
       {"output.output_directory", "outputs"},
       {"output.output_stem", "snapshot"},
@@ -2066,6 +2084,18 @@ void validatePart2BaryonicPhysics(const SimulationConfig& config) {
     }
   } else if (!p.ssp_wind_table_path.empty()) {
     throw ConfigError("physics.ssp_wind_table_path is set but ssp_wind_model = none (it would have no effect)");
+  }
+  // Patch 58: a research acknowledgement without the table it qualifies would
+  // be recorded in provenance while having no effect; refuse it.
+  if (p.ssp_yield_table_coverage != SspYieldTableCoverageConfig::kReject &&
+      p.stellar_population_model != StellarPopulationModelConfig::kChabrierYieldTableV1) {
+    throw ConfigError("physics.ssp_yield_table_coverage = edge_clamp_research acknowledges an approximation of the "
+                      "table yield mode; it requires stellar_population_model = chabrier_yield_table_v1");
+  }
+  if (p.ssp_wind_table_compatibility != SspWindTableCompatibilityConfig::kStrict &&
+      p.ssp_wind_model != SspWindModelConfig::kTableV1) {
+    throw ConfigError("physics.ssp_wind_table_compatibility = approximate_research acknowledges an approximation of "
+                      "the wind table channel; it requires ssp_wind_model = table_v1");
   }
   if (p.fb_supernova_model == SupernovaFeedbackModelConfig::kMechanicalResolvedUnresolved &&
       p.stellar_population_model == StellarPopulationModelConfig::kLegacyTable) {
@@ -3533,6 +3563,10 @@ class NormalizedConfigStream {
   stream << "ssp_wind_model = " << sspWindModelConfigToString(frozen.config.physics.ssp_wind_model) << '\n';
   stream << "ssp_wind_table_path = " << frozen.config.physics.ssp_wind_table_path << '\n';
   stream << "ssp_wind_table_sha256 = " << frozen.config.physics.ssp_wind_table_sha256 << '\n';
+  stream << "ssp_yield_table_coverage = "
+         << sspYieldTableCoverageConfigToString(frozen.config.physics.ssp_yield_table_coverage) << '\n';
+  stream << "ssp_wind_table_compatibility = "
+         << sspWindTableCompatibilityConfigToString(frozen.config.physics.ssp_wind_table_compatibility) << '\n';
   stream << "\n[output]\n";
   stream << "run_name = " << frozen.config.output.run_name << '\n';
   stream << "output_directory = " << frozen.config.output.output_directory << '\n';
@@ -4672,6 +4706,10 @@ class NormalizedConfigStream {
       requireString(entries, consumed, "physics.ssp_wind_table_path", "");
   frozen.config.physics.ssp_wind_table_sha256 =
       requireString(entries, consumed, "physics.ssp_wind_table_sha256", "");
+  frozen.config.physics.ssp_yield_table_coverage = parseSspYieldTableCoverageConfig(
+      requireString(entries, consumed, "physics.ssp_yield_table_coverage", "reject"));
+  frozen.config.physics.ssp_wind_table_compatibility = parseSspWindTableCompatibilityConfig(
+      requireString(entries, consumed, "physics.ssp_wind_table_compatibility", "strict"));
 
   frozen.config.output.run_name =
       requireString(entries, consumed, "output.run_name", frozen.config.output.run_name);
@@ -5283,6 +5321,22 @@ std::string sspWindModelConfigToString(SspWindModelConfig mode) {
     case SspWindModelConfig::kTableV1: return "table_v1";
   }
   throw ConfigError("unhandled SspWindModelConfig enum value during serialization");
+}
+
+std::string sspYieldTableCoverageConfigToString(SspYieldTableCoverageConfig mode) {
+  switch (mode) {
+    case SspYieldTableCoverageConfig::kReject: return "reject";
+    case SspYieldTableCoverageConfig::kEdgeClampResearch: return "edge_clamp_research";
+  }
+  throw ConfigError("unhandled SspYieldTableCoverageConfig enum value during serialization");
+}
+
+std::string sspWindTableCompatibilityConfigToString(SspWindTableCompatibilityConfig mode) {
+  switch (mode) {
+    case SspWindTableCompatibilityConfig::kStrict: return "strict";
+    case SspWindTableCompatibilityConfig::kApproximateResearch: return "approximate_research";
+  }
+  throw ConfigError("unhandled SspWindTableCompatibilityConfig enum value during serialization");
 }
 
 std::string sspEventPublicationModeConfigToString(SspEventPublicationModeConfig mode) {

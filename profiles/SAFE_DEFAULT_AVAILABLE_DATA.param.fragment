@@ -15,6 +15,12 @@
 # Scientific caveats that remain even here: SB99 winds assume a Kroupa IMF
 # (CHUI SSP: Chabrier) and a single metallicity Z = 0.014; NuGrid yields cover
 # 1-25 Msun and Z = 1e-4..0.02 (clamped and counted outside). Not qualified.
+# Patch 58: those caveats are now machine-enforced. The strict defaults
+# (ssp_yield_table_coverage = reject, ssp_wind_table_compatibility = strict)
+# REFUSE this data at construction, so the fragment carries the two named
+# RESEARCH acknowledgements below; they are recorded in the normalized
+# configuration/provenance and in sources.data_assumptions. They are the only
+# research opt-ins of this fragment; no qualified S02/F02 data exists yet.
 # Requires a mode deck with star formation and feedback enabled.
 [physics]
 
@@ -28,5 +34,7 @@ ssp_yield_table_sha256 = e2161646eadc4119e1b4976045fd6dad7876c7b4940a0c9174e94e1
 ssp_wind_model = table_v1
 ssp_wind_table_path = chui_data/sb99_z014_genevav00_chui_ssp_wind_table_v1.txt
 ssp_wind_table_sha256 = ba232a1cfe2c1996cadf55f14df2476280f8f56e81fe25e2e06c90464b655da5
+ssp_yield_table_coverage = edge_clamp_research
+ssp_wind_table_compatibility = approximate_research
 fb_supernova_model = mechanical_resolved_unresolved
 ssp_max_event_publication_lag_years = 0.0

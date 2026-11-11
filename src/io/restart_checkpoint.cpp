@@ -3466,7 +3466,9 @@ namespace {
       physics.ssp_association_time_window_years == defaults.ssp_association_time_window_years &&
       physics.ssp_wind_model == defaults.ssp_wind_model &&
       physics.ssp_wind_table_path == defaults.ssp_wind_table_path &&
-      physics.ssp_wind_table_sha256 == defaults.ssp_wind_table_sha256;
+      physics.ssp_wind_table_sha256 == defaults.ssp_wind_table_sha256 &&
+      physics.ssp_yield_table_coverage == defaults.ssp_yield_table_coverage &&
+      physics.ssp_wind_table_compatibility == defaults.ssp_wind_table_compatibility;
 }
 }  // namespace
 
@@ -3723,6 +3725,19 @@ std::string restartConfigurationCompatibilityRecord(
       fail("checkpoint predates physics.ssp_event_publication_mode; only its default coarse_endpoint is accepted");
     }
     removeKeyLines({"ssp_event_publication_mode"});
+  }
+  // Patch 58 keys (S02 yield-table coverage, F02 wind-table compatibility).
+  // A checkpoint written before them carries no value; only the strict
+  // defaults are accepted on resume (a checkpoint with table physics active
+  // never reaches this projection: part2/part3PhysicsKeysAtDefaults above).
+  if (projected.find("\nssp_yield_table_coverage = ") != std::string::npos &&
+      restart.normalized_config_text.find("\nssp_yield_table_coverage = ") == std::string::npos) {
+    if (current.config.physics.ssp_yield_table_coverage != core::SspYieldTableCoverageConfig::kReject ||
+        current.config.physics.ssp_wind_table_compatibility != core::SspWindTableCompatibilityConfig::kStrict) {
+      fail("checkpoint predates physics.ssp_yield_table_coverage / ssp_wind_table_compatibility; only their "
+           "strict defaults are accepted");
+    }
+    removeKeyLines({"ssp_yield_table_coverage", "ssp_wind_table_compatibility"});
   }
   const std::string after_part1_projection = projected;
   // Support exact predecessor groups, not arbitrary missing keys.

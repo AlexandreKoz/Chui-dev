@@ -1,3 +1,28 @@
+## Post-patch-58 final source closure — 2026-11-11 (static, NOT RUN)
+
+Implemented in source (uncommitted, unverified): P1-GEOMETRY exact AMR
+leaf-tiling proof (signed-corner coverage measure on the finest-cell lattice;
+supersedes the patch-56 volume sum), malformed-leaf rejection with patch /
+rank / level / axis diagnostics, periodic-box agreement, collective vote +
+bounded memory-admitted gather, fingerprint cache, wired before ghost fill,
+after automatic regrid and before the pre-hydro source half. P2-S02 explicit
+`physics.ssp_yield_table_coverage = reject | edge_clamp_research` (strict
+construction-time + at-use refusal inside the stellar-population
+transaction). P2-F02 `chui_ssp_wind_table_v2` machine-readable IMF /
+normalization / metallicity contract and `physics.ssp_wind_table_compatibility
+= strict | approximate_research`.
+
+Open: owner build/tests (incl. MPI/HDF5); OWNER SCIENCE DECISIONS: is CC
+edge-row clamping (25–40 M☉ from the 25 M☉ row) acceptable; is a
+single-metallicity Ia (W7) table acceptable under the strict policy; is the
+Kroupa SB99 wind table acceptable with the Chabrier SSP. External data still
+missing: full-range multi-Z yields, Chabrier-consistent multi-Z wind tables
+(v2), HM01-consistent UVB/cooling, verified C02 rates, grain-collision rates.
+Conditional/deferred (not mandatory gaps): D01 grain collisions, G01
+fine-level gravity correction, C04 shadow hydro, T02 level-local events,
+IMEX/SDC, X01 MHD/RT/new AGN. See
+[`repair/chui_post_patch58_final_source_closure.md`](repair/chui_post_patch58_final_source_closure.md).
+
 ## Post-patch-56 v10 final source closure — 2026-11-10 (static, NOT RUN)
 
 Repaired in source (uncommitted, unverified): restart v25 group-schema

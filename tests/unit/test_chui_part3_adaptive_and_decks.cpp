@@ -50,6 +50,11 @@ int main() {
     const auto& physics = frozen.config.physics;
     if (physics.stellar_population_model == co::StellarPopulationModelConfig::kChabrierYieldTableV1) {
       CHUI_REQUIRE(physics.ssp_yield_table_sha256.size() == 64U && physics.ssp_wind_table_sha256.size() == 64U);
+      // Patch 58: the staged NuGrid/W7 + SB99 v1 data are refused by the
+      // strict defaults; the research decks must carry the named opt-ins.
+      CHUI_REQUIRE(physics.ssp_yield_table_coverage == co::SspYieldTableCoverageConfig::kEdgeClampResearch);
+      CHUI_REQUIRE(physics.ssp_wind_table_compatibility ==
+                   co::SspWindTableCompatibilityConfig::kApproximateResearch);
     }
     CHUI_REQUIRE(physics.metal_cooling_accept_uv_background_mismatch ==
                  (std::string(deck_name) == "cosmo_cube_wss09_experimental_final"));

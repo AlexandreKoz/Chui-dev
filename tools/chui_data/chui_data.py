@@ -155,8 +155,10 @@ SAFE_DEFAULT_HEADER = """# SAFE_DEFAULT_AVAILABLE_DATA -- PARTIAL, DIAGNOSTIC fr
 #   * C02: declared unverified (research opt-in only).
 # Scientific caveats that remain even here: SB99 winds assume a Kroupa IMF
 # (CHUI SSP: Chabrier) and a single metallicity Z = 0.014; NuGrid yields cover
-# 1-25 Msun and Z = 1e-4..0.02 (clamped and counted outside). Not qualified.
-# Requires a mode deck with star formation and feedback enabled.
+            f"ssp_wind_table_sha256 = {f02['sha256']}",
+            "ssp_yield_table_coverage = edge_clamp_research",
+            "ssp_wind_table_compatibility = approximate_research",
+            "fb_supernova_model = mechanical_resolved_unresolved",# Requires a mode deck with star formation and feedback enabled.
 [physics]
 """
 
@@ -204,6 +206,8 @@ def cmd_emit_config(args) -> int:
             "ssp_wind_model = table_v1",
             f"ssp_wind_table_path = {data_dir}/{f02['file']}",
             f"ssp_wind_table_sha256 = {f02['sha256']}",
+            "ssp_yield_table_coverage = edge_clamp_research",
+            "ssp_wind_table_compatibility = approximate_research",
             "fb_supernova_model = mechanical_resolved_unresolved",
             "ssp_max_event_publication_lag_years = 0.0",
         ]

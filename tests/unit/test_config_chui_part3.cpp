@@ -103,9 +103,31 @@ void testPhysicsIndicatorKeys() {
   CHUI_REQUIRE(rejects("[mode]\nmode = cosmo_cube\n[numerics]\namr_predictive_event_lookahead_years = 1.0e7\n"));
 }
 
+// Patch 58 (S02/F02): explicit data-coverage / compatibility policies.
+// Strict defaults are dumped; a research acknowledgement without the table
+// it qualifies is refused; unknown values are refused. The accepted
+// (table-bound) round trip is covered by the final decks in
+// test_chui_part3_adaptive_and_decks.cpp.
+void testPatch58DataPolicyKeys() {
+  const auto frozen = co::loadFrozenConfigFromString("[mode]\nmode = cosmo_cube\n", "p58_defaults");
+  CHUI_REQUIRE(frozen.config.physics.ssp_yield_table_coverage == co::SspYieldTableCoverageConfig::kReject);
+  CHUI_REQUIRE(frozen.config.physics.ssp_wind_table_compatibility == co::SspWindTableCompatibilityConfig::kStrict);
+  CHUI_REQUIRE(frozen.normalized_text.find("\nssp_yield_table_coverage = reject\n") != std::string::npos);
+  CHUI_REQUIRE(frozen.normalized_text.find("\nssp_wind_table_compatibility = strict\n") != std::string::npos);
+  const auto reparsed = co::loadFrozenConfigFromString(frozen.normalized_text, "p58_defaults_reparse");
+  CHUI_REQUIRE(reparsed.normalized_text == frozen.normalized_text);
+  const std::string galaxy = "[mode]\nmode = isolated_galaxy\n[physics]\nuv_background_model = none\n";
+  CHUI_REQUIRE(rejects(galaxy + "ssp_yield_table_coverage = edge_clamp_research\n"));
+  CHUI_REQUIRE(rejects(galaxy + "ssp_wind_table_compatibility = approximate_research\n"));
+  CHUI_REQUIRE(rejects(galaxy + "ssp_yield_table_coverage = extrapolate\n"));
+  CHUI_REQUIRE(rejects(galaxy + "ssp_wind_table_compatibility = reweight\n"));
+  CHUI_REQUIRE(!rejects(galaxy + "ssp_yield_table_coverage = reject\nssp_wind_table_compatibility = strict\n"));
+}
+
 }  // namespace
 
 int main() {
+  testPatch58DataPolicyKeys();
   testPhysicsIndicatorKeys();
   testDefaultsKeepHistoricalBehaviour();
   testRegridRoundTrip();

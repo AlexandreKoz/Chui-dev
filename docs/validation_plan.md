@@ -904,3 +904,38 @@ Additional campaign checks to run on top of the unit tests:
   "runtime module construction 'sources'" with the same diagnostic.
 * Science (Layer B–D): C02 versus CHIANTI/ADAS where legitimate; C01 + UVB
   consistency once an HM01 photo-rate table exists; event-lag impact study.
+
+## Patch 58 validation targets (authored, NOT RUN) — 20261111
+
+* `unit_amr_geometry_coverage` (`tests/unit/test_amr_geometry_coverage.cpp`):
+  uniform rectangle, mixed-level dyadic refinement, rank-split slabs, the
+  audit counterexample (overlap compensating a hole with equal volume — must
+  reject), plain hole, pure overlap, NaN/inf/negative/zero/overflowing
+  extents and negative level (diagnostic names patch and rank), misaligned
+  face, empty rank, inactive parent, fingerprint cache reuse, ownership change
+  re-proof, corrupted geometry refusal, legacy all-zero descriptor
+  (strict/lenient), periodic sub-box refusal versus isolated sub-box
+  acceptance.
+* `unit_ssp_wind_data_contracts` (`tests/unit/test_ssp_wind_data_contracts.cpp`):
+  strict construction refusal of an uncovered CC range / single-Z channel,
+  research admission with split clamp counters, strict at-use refusal (AGB
+  turnoff below the tabulated minimum, out-of-grid metallicity for CC and Ia),
+  v2 wind metadata parsing and every malformed/contradictory declaration,
+  v1 loading unchanged with undeclared IMF, strict/research compatibility
+  verdicts.
+* `unit_config_chui_part3::testPatch58DataPolicyKeys` and the final-deck
+  assertions in `unit_chui_part3_adaptive_and_decks`.
+* MPI (owner): 2/3/4-rank production AMR runs with (a) a valid mixed-level
+  hierarchy split across ranks, (b) one rank holding a corrupted leaf
+  (NaN extent) and (c) two ranks holding overlapping leaves with a
+  compensating hole: (a) proceeds; (b)/(c) every rank fails with the same
+  diagnostic, no deadlock (TIMEOUT = failure). Repeat after a restart restore
+  and after an automatic regrid; check `geometry_proof_runs` stays constant
+  across steps with an unchanged hierarchy.
+* Runtime (owner, data staged): the SAFE_DEFAULT fragment without the two
+  research keys must refuse at "runtime module construction 'sources'" on
+  every rank; with them it must run and record
+  `ssp_yield_table_coverage = edge_clamp_research` and
+  `ssp_wind_table_accepted_approximations` in `sources.data_assumptions`.
+* Restart (owner, HDF5): a pre-patch-58 Part-2-disabled checkpoint resumes
+  with the defaults; one with table physics active is refused.

@@ -84,6 +84,13 @@ ssp_yield_table_sha256 = e2161646eadc4119e1b4976045fd6dad7876c7b4940a0c9174e94e1
 ssp_wind_model = table_v1
 ssp_wind_table_path = chui_data/sb99_z014_genevav00_chui_ssp_wind_table_v1.txt
 ssp_wind_table_sha256 = ba232a1cfe2c1996cadf55f14df2476280f8f56e81fe25e2e06c90464b655da5
+# Patch 58: explicit RESEARCH acknowledgements required by the staged data.
+# The strict defaults refuse these tables: the NuGrid CC grid (1-25 Msun)
+# does not cover the configured CC range 8-40 Msun, the W7 Ia table and the
+# SB99 wind table are single-metallicity, and the SB99 table is schema v1
+# (IMF undeclared; SB99 used a Kroupa IMF, the CHUI SSP is Chabrier).
+ssp_yield_table_coverage = edge_clamp_research
+ssp_wind_table_compatibility = approximate_research
 metal_species_mode = core_elements
 uv_background_model = none
 self_shielding_model = rahmati13_like

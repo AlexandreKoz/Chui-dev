@@ -1,5 +1,18 @@
 # Repair state recap (post-repair audit snapshot)
 
+## 2026-11-11 — post-patch-58 final source closure (static, NOT RUN)
+
+Exact AMR leaf-tiling proof (`include/cosmosim/amr/amr_geometry_coverage.hpp`,
+`src/workflows/internal/amr_geometry_assurance.*`) replaces the patch-56
+volume comparison in `globalAmrHierarchyDomain`; also run after automatic
+regrid and before the pre-hydro source half. New typed keys
+`physics.ssp_yield_table_coverage` (default `reject`) and
+`physics.ssp_wind_table_compatibility` (default `strict`); wind table schema
+`chui_ssp_wind_table_v2` (v1 still loads, IMF undeclared). Restart remains v25
+(pending flux group 2, temporal history group 3), AMR wire v5; the two keys
+are projected away for pre-patch-58 checkpoints only at their defaults.
+Ledger: `docs/repair/chui_post_patch58_final_source_closure.md`.
+
 ## 2026-11-10 — post-patch-56 v10 final source closure (static, NOT RUN)
 
 Restart v25 group identities repaired (`src/io/restart_checkpoint.cpp`);

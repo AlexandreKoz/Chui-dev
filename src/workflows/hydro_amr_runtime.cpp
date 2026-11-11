@@ -49,6 +49,7 @@
 #include "workflows/internal/cartesian_gas_cell_layout.hpp"
 #include "workflows/internal/gas_cell_ownership.hpp"
 #include "workflows/internal/amr_migration_payload.hpp"
+#include "workflows/internal/amr_geometry_assurance.hpp"
 #include "workflows/internal/particle_ghost_runtime.hpp"
 #include "workflows/internal/mpi_stage_collective_decision.hpp"
 #include "cosmosim/core/stage_transaction.hpp"
@@ -2897,80 +2898,44 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
     m_mpi_context.rethrowCollectivePreparationFailure(failure, "recursive AMR accepted-step CFL guard");
   }
 
-  // P1-55-02: global AMR hierarchy domain = the collectively reduced bounding
-  // box of every populated patch on every rank (nested refinement never
-  // leaves the root tiling). Non-periodic deep/edge stencil closures are
-  // legal only beyond these walls, and a patch face without a neighbour that
-  // is NOT on them is rejected as missing interface data. A non-rectangular
-  // root tiling therefore fails closed instead of receiving a silent outflow
-  // or reflective closure inside the domain. Collective: every rank calls it
-  // from runProductionAmrHydroPath. Returns zero extents when no rank owns a
-  // populated patch (domain undeclared).
+  // P1-55-02 / P1-GEOMETRY (patch 58): global AMR hierarchy domain.
+  // Non-periodic deep/edge stencil closures are legal only beyond the walls
+  // of this domain, and a patch face without a neighbour that is NOT on them
+  // is rejected as missing interface data, so the populated leaves of every
+  // rank must tile one rectangle exactly.
   //
   // Domain authority (v10 H01/A02 operating-mode contract): the hydro domain
   // is the root tiling materialized from the gas-cell layout
   // (materializeRootHydroPatchIfMissing / IC patch geometry), which is not
   // required to coincide with cosmology.box_size_* (the gravity/PM extent of
-  // isolated modes). Refinement replaces a parent by its leaf children, so the
-  // populated patches are disjoint leaves whose union must equal that tiling.
-  // The supported restriction is therefore stated and enforced explicitly
-  // here, collectively and before any ghost fill: the populated leaves must
-  // tile their bounding box completely (no holes, no overlaps). Internal holes
-  // are never reinterpreted as physical boundaries; a non-rectangular or
-  // perforated hierarchy is refused with the measured coverage. Every rank
-  // receives identical reduced values, so the refusal is collective.
+  // isolated modes); a periodic run, however, must tile the periodic box.
+  //
+  // Patch 56 compared summed leaf volume with the bounding-box volume, which
+  // accepts an overlap that cancels a hole and silently zeroed malformed
+  // extents. The proof is now exact (signed-corner coverage measure on the
+  // finest-cell lattice, amr/amr_geometry_coverage.hpp) and collective with a
+  // vote before every payload collective (internal/amr_geometry_assurance.*).
+  // It is cached on the populated-geometry fingerprint: unchanged hierarchies
+  // cost one scalar collective; any change on any rank (regrid, migration,
+  // restart restore, IC materialization) re-runs the full proof before the
+  // next ghost fill. Internal holes are never reinterpreted as physical
+  // boundaries. Returns zero extents when no rank owns a populated patch.
   [[nodiscard]] std::pair<std::array<double, 3>, std::array<double, 3>> globalAmrHierarchyDomain(
-      const core::SimulationState& state) const {
-    const double inf = std::numeric_limits<double>::infinity();
-    std::array<double, 3> local_lower{inf, inf, inf};
-    std::array<double, 3> local_negative_upper{inf, inf, inf};
-    double local_covered_volume = 0.0;
-    const auto& p = state.patches;
-    for (std::size_t patch = 0; patch < p.size(); ++patch) {
-      if (p.cell_count[patch] == 0U || p.level[patch] < 0) continue;
-      const std::array<double, 3> origin{p.origin_x_comoving[patch], p.origin_y_comoving[patch], p.origin_z_comoving[patch]};
-      const std::array<double, 3> extent{p.extent_x_comoving[patch], p.extent_y_comoving[patch], p.extent_z_comoving[patch]};
-      double patch_volume = 1.0;
-      for (std::size_t axis = 0; axis < 3U; ++axis) {
-        if (!(extent[axis] > 0.0) || !std::isfinite(origin[axis]) || !std::isfinite(extent[axis])) {
-          patch_volume = 0.0;
-          continue;
-        }
-        patch_volume *= extent[axis];
-        local_lower[axis] = std::min(local_lower[axis], origin[axis]);
-        local_negative_upper[axis] = std::min(local_negative_upper[axis], -(origin[axis] + extent[axis]));
-      }
-      local_covered_volume += patch_volume;
+      const core::SimulationState& state,
+      const amr::ProductionAmrHydroOptions& amr_options,
+      std::string_view phase) {
+    internal::AmrGeometryAssurancePolicy policy;
+    policy.require_explicit_geometry = true;
+    policy.periodic = amr_options.physical_boundary_kind == hydro::HydroBoundaryKind::kPeriodic;
+    policy.periodic_box_extent_comoving = amr_options.periodic_box_extent_comoving;
+    const internal::AmrGeometryAssuranceResult result =
+        m_geometry_assurance.assure(state, m_mpi_context, m_memory_governor, policy, phase);
+    if (result.revalidated) {
+      m_last_geometry_proof_patches = result.populated_patches;
+      m_last_geometry_proof_residual_points = result.gathered_residual_points;
+      ++m_geometry_proof_count;
     }
-    std::array<double, 3> origin{0.0, 0.0, 0.0};
-    std::array<double, 3> extent{0.0, 0.0, 0.0};
-    bool all_axes_declared = true;
-    for (std::size_t axis = 0; axis < 3U; ++axis) {
-      const double lower = m_mpi_context.allreduceMinDouble(local_lower[axis]);
-      const double upper = -m_mpi_context.allreduceMinDouble(local_negative_upper[axis]);
-      if (std::isfinite(lower) && std::isfinite(upper) && upper > lower) {
-        origin[axis] = lower;
-        extent[axis] = upper - lower;
-      } else {
-        all_axes_declared = false;
-      }
-    }
-    const double covered_volume = m_mpi_context.allreduceSumDouble(local_covered_volume);
-    if (all_axes_declared) {
-      const double box_volume = extent[0] * extent[1] * extent[2];
-      // Leaves are dyadic subdivisions of the root tiling; the tolerance only
-      // absorbs the summation rounding of many patch volumes.
-      constexpr double k_coverage_relative_tolerance = 1.0e-9;
-      if (!(box_volume > 0.0) ||
-          std::abs(covered_volume - box_volume) > k_coverage_relative_tolerance * box_volume) {
-        throw std::runtime_error(
-            "production AMR hydro requires the populated patch hierarchy to tile its bounding box "
-            "completely (supported domain contract: rectangular, hole-free root coverage); covered volume " +
-            std::to_string(covered_volume) + " vs bounding-box volume " + std::to_string(box_volume) +
-            " (comoving)");
-      }
-    }
-    return {origin, extent};
+    return {result.origin_comoving, result.extent_comoving};
   }
 
   void runProductionAmrHydroPath(core::StepContext& context) {
@@ -3080,7 +3045,8 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
         .ctu_edge_stencils = m_config.numerics.hydro_integration_scheme ==
             core::HydroIntegrationMode::kCornerTransportUpwind};
     {
-      const auto [domain_origin, domain_extent] = globalAmrHierarchyDomain(context.state);
+      const auto [domain_origin, domain_extent] = globalAmrHierarchyDomain(
+          context.state, amr_options, "production AMR hydro leaf-tiling proof (pre-ghost-fill)");
       amr_options.domain_origin_comoving = domain_origin;
       amr_options.domain_extent_comoving = domain_extent;
     }
@@ -3399,6 +3365,10 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
           .scale_factor = context.integrator_state.current_scale_factor,
           .message = "advanced production AMR hydro patches from SimulationState-authoritative gas rows",
           .payload = {{"patch_count", std::to_string(amr_diagnostics.patch_count)},
+                      {"geometry_proof_runs", std::to_string(m_geometry_proof_count)},
+                      {"geometry_proof_global_leaves", std::to_string(m_last_geometry_proof_patches)},
+                      {"geometry_proof_gathered_corner_points",
+                       std::to_string(m_last_geometry_proof_residual_points)},
                       {"advanced_patch_count", std::to_string(amr_diagnostics.advanced_patch_count)},
                       {"riemann_solve_count", std::to_string(amr_diagnostics.riemann_solve_count)},
                       {"positivity_fallback_count", std::to_string(amr_diagnostics.positivity_fallback_count)},
@@ -4382,6 +4352,13 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
     }
     m_mpi_context.rethrowCollectivePreparationFailure(
         failure, "automatic AMR regrid application");
+    // P1-GEOMETRY transactional boundary: the committed refine/derefine
+    // transaction must leave an exact leaf tiling. Collective (every rank
+    // reaches this point: patch_window/cell_window are global maxima); the
+    // proof is re-run because the regrid changed the populated geometry, and
+    // its cached result serves the next step's pre-ghost-fill check.
+    (void)globalAmrHierarchyDomain(
+        context.state, amr_options, "production AMR leaf-tiling proof (after automatic regrid)");
     failure = nullptr;
     try {
       persist_v02_regrid_state(context.state);
@@ -4719,6 +4696,11 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
   const core::ModePolicy& m_mode_policy;
   const parallel::MpiContext& m_mpi_context;
   core::MemoryGovernor* m_memory_governor = nullptr;
+  // P1-GEOMETRY: cached exact leaf-tiling proof (identical on every rank).
+  internal::AmrGeometryAssurance m_geometry_assurance;
+  std::uint64_t m_last_geometry_proof_patches = 0U;
+  std::uint64_t m_last_geometry_proof_residual_points = 0U;
+  std::uint64_t m_geometry_proof_count = 0U;
   core::UnitSystem m_units;
   std::uint32_t m_current_world_rank = 0;
   double m_temperature_k_per_internal_energy_code = 0.0;

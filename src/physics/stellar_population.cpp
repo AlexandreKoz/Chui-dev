@@ -218,8 +218,17 @@ SspYieldTable SspYieldTable::loadFromString(const std::string& text, const std::
 
 SspYieldTable::Row SspYieldTable::massive(std::size_t channel, double mass_msun, double metallicity,
                                           bool& clamped) const {
+  bool mass_clamped = false;
+  bool metallicity_clamped = false;
+  Row out = massive(channel, mass_msun, metallicity, mass_clamped, metallicity_clamped);
+  clamped = clamped || mass_clamped || metallicity_clamped;
+  return out;
+}
+
+SspYieldTable::Row SspYieldTable::massive(std::size_t channel, double mass_msun, double metallicity,
+                                          bool& mass_clamped, bool& metallicity_clamped) const {
   const Channel& ch = m_channels.at(channel);
-  const auto locate = [&clamped](const std::vector<double>& axis, double x, std::size_t& lo, double& w) {
+  const auto locate = [](const std::vector<double>& axis, double x, std::size_t& lo, double& w, bool& clamped) {
     // Part 2.5: a singleton axis covers only its one coordinate; any other
     // query uses that row and is REPORTED as clamped (never silent).
     if (axis.size() == 1U) {
@@ -228,7 +237,13 @@ SspYieldTable::Row SspYieldTable::massive(std::size_t channel, double mass_msun,
       clamped = clamped || std::abs(x - axis[0]) > 1.0e-8 * std::max(1.0, std::abs(axis[0]));
       return;
     }
-    if (x <= axis.front() || x >= axis.back()) clamped = clamped || x < axis.front() || x > axis.back();
+    // Patch 58: an edge query within round-off of the axis end (the fixed
+    // quadrature nodes are pow(10, log10 m), a few ulp off the configured
+    // channel limits) is ON the grid, not a clamp; the value is identical
+    // either way, only the classification (and the strict refusal) depends on it.
+    const double tol_lo = 1.0e-12 * std::max(1.0, std::abs(axis.front()));
+    const double tol_hi = 1.0e-12 * std::max(1.0, std::abs(axis.back()));
+    clamped = clamped || x < axis.front() - tol_lo || x > axis.back() + tol_hi;
     x = std::clamp(x, axis.front(), axis.back());
     const auto up = std::upper_bound(axis.begin(), axis.end(), x);
     std::size_t hi = std::clamp<std::size_t>(static_cast<std::size_t>(up - axis.begin()), 1U, axis.size() - 1U);
@@ -237,8 +252,8 @@ SspYieldTable::Row SspYieldTable::massive(std::size_t channel, double mass_msun,
   };
   std::size_t iz = 0, im = 0;
   double wz = 0.0, wm = 0.0;
-  locate(ch.metallicity, metallicity, iz, wz);
-  locate(ch.mass, mass_msun, im, wm);
+  locate(ch.metallicity, metallicity, iz, wz, metallicity_clamped);
+  locate(ch.mass, mass_msun, im, wm, mass_clamped);
   const std::size_t nm = ch.mass.size();
   Row out;
   for (int dz = 0; dz < 2; ++dz) {
@@ -255,6 +270,12 @@ SspYieldTable::Row SspYieldTable::massive(std::size_t channel, double mass_msun,
   }
   return out;
 }
+
+std::size_t SspYieldTable::metallicityCount(std::size_t channel) const {
+  return m_channels.at(channel).metallicity.size();
+}
+
+std::size_t SspYieldTable::massCount(std::size_t channel) const { return m_channels.at(channel).mass.size(); }
 
 SspYieldTable::Coverage SspYieldTable::channelCoverage(std::size_t channel) const {
   const Channel& ch = m_channels.at(channel);
@@ -279,7 +300,8 @@ SspYieldTable::Row SspYieldTable::snia(double metallicity, bool& clamped) const 
     return ch.rows[0];
   }
   const double z = std::clamp(metallicity, ch.metallicity.front(), ch.metallicity.back());
-  clamped = clamped || z != metallicity;
+  clamped = clamped || metallicity < ch.metallicity.front() - 1.0e-12 * std::max(1.0, std::abs(ch.metallicity.front())) ||
+      metallicity > ch.metallicity.back() + 1.0e-12 * std::max(1.0, std::abs(ch.metallicity.back()));
   const auto up = std::upper_bound(ch.metallicity.begin(), ch.metallicity.end(), z);
   const std::size_t hi = std::clamp<std::size_t>(static_cast<std::size_t>(up - ch.metallicity.begin()), 1U,
                                                  ch.metallicity.size() - 1U);
@@ -291,6 +313,66 @@ SspYieldTable::Row SspYieldTable::snia(double metallicity, bool& clamped) const 
     out.net_yield_msun[e] = (1.0 - w) * ch.rows[lo].net_yield_msun[e] + w * ch.rows[hi].net_yield_msun[e];
   }
   return out;
+}
+
+const char* sspYieldCoveragePolicyName(SspYieldCoveragePolicy policy) noexcept {
+  switch (policy) {
+    case SspYieldCoveragePolicy::kReject: return "reject";
+    case SspYieldCoveragePolicy::kEdgeClampResearch: return "edge_clamp_research";
+  }
+  return "unknown";
+}
+
+SspYieldCoverageAssessment assessSspYieldCoverage(const SspConfig& config, const SspYieldTable& table) {
+  SspYieldCoverageAssessment assessment;
+  const std::array<const char*, 3> names{"agb", "cc", "ia"};
+  const std::array<std::pair<double, double>, 2> configured{
+      std::pair{config.imf_mass_min_msun, std::min(config.imf_mass_max_msun, config.cc_mass_min_msun)},
+      std::pair{std::max(config.imf_mass_min_msun, config.cc_mass_min_msun),
+                std::min(config.imf_mass_max_msun, config.cc_mass_max_msun)}};
+  std::ostringstream refusal;
+  refusal.precision(6);
+  for (std::size_t channel = 0; channel < 3U; ++channel) {
+    SspYieldChannelCoverage& c = assessment.channels[channel];
+    const SspYieldTable::Coverage coverage = table.channelCoverage(channel);
+    c.name = names[channel];
+    c.tabulated_metallicity_min = coverage.metallicity_min;
+    c.tabulated_metallicity_max = coverage.metallicity_max;
+    c.tabulated_metallicity_count = table.metallicityCount(channel);
+    c.single_metallicity = c.tabulated_metallicity_count == 1U;
+    if (c.single_metallicity) {
+      refusal << " channel " << c.name << " tabulates a single metallicity Z=" << coverage.metallicity_min
+              << " (cannot cover a self-enriching population);";
+    }
+    if (channel == 2U) continue;  // Ia: per-event, metallicity-only schema
+    c.has_mass_axis = true;
+    c.configured_mass_min_msun = configured[channel].first;
+    c.configured_mass_max_msun = configured[channel].second;
+    c.tabulated_mass_min_msun = coverage.mass_min_msun;
+    c.tabulated_mass_max_msun = coverage.mass_max_msun;
+    if (!(c.configured_mass_max_msun > c.configured_mass_min_msun)) continue;  // empty channel
+    const bool single_mass = table.massCount(channel) == 1U;
+    if (channel == 0U) {
+      // The AGB upper end (cc_min, lifetime ~ 4e7 yr) is queried by every
+      // run that ages a population past it; its lower end only once the
+      // turnoff mass falls that far (age ~ lifetime(m_lo)), enforced at use.
+      c.configured_mass_range_uncovered = single_mass || c.configured_mass_max_msun > c.tabulated_mass_max_msun ||
+          c.configured_mass_max_msun < c.tabulated_mass_min_msun;
+      c.lower_mass_enforced_at_use = !c.configured_mass_range_uncovered &&
+          c.configured_mass_min_msun < c.tabulated_mass_min_msun;
+    } else {
+      // Every CC progenitor mass is queried within the CC horizon.
+      c.configured_mass_range_uncovered = single_mass || c.configured_mass_min_msun < c.tabulated_mass_min_msun ||
+          c.configured_mass_max_msun > c.tabulated_mass_max_msun;
+    }
+    if (c.configured_mass_range_uncovered) {
+      refusal << " channel " << c.name << " configured " << c.configured_mass_min_msun << ".."
+              << c.configured_mass_max_msun << " Msun exceeds the tabulated " << c.tabulated_mass_min_msun << ".."
+              << c.tabulated_mass_max_msun << " Msun;";
+    }
+  }
+  assessment.strict_refusal = refusal.str();
+  return assessment;
 }
 
 // ---------------------------------------------------------------------------
@@ -305,6 +387,19 @@ SspModel::SspModel(SspConfig config, const SspYieldTable* table) : m_config(conf
   }
   if (m_config.yield_mode == SspYieldMode::kTable && m_table == nullptr) {
     throw SourceModelUnavailableError("SspModel: table yield mode selected without a loaded yield table");
+  }
+  if (m_config.yield_mode == SspYieldMode::kTable && m_config.yield_coverage == SspYieldCoveragePolicy::kReject) {
+    // Patch 58 (S02) construction-time gate: refuse before any star evolves
+    // (SourceRuntime construction is agreed collectively across ranks).
+    const SspYieldCoverageAssessment assessment = assessSspYieldCoverage(m_config, *m_table);
+    if (!assessment.strict_refusal.empty()) {
+      throw SourceModelUnavailableError(
+          "SSP yield table " + m_table->sha256() + " does not cover the configured stellar population under "
+          "physics.ssp_yield_table_coverage = reject:" + assessment.strict_refusal +
+          " no extrapolation or substitute yields exist; supply a table covering the configured ranges, change the "
+          "configured IMF channel limits deliberately, or select ssp_yield_table_coverage = edge_clamp_research "
+          "(edge-row approximation, counted and recorded; RESEARCH ONLY)");
+    }
   }
   const double mass = simpson([](double x) { return std::pow(10.0, x) * chabrierXi(x); },
                               std::log10(m_config.imf_mass_min_msun), std::log10(m_config.imf_mass_max_msun), 512);
@@ -373,9 +468,29 @@ std::array<double, k_chemical_element_count> SspModel::ejectaElements(
     double& ejecta) const {
   std::array<double, k_chemical_element_count> out{};
   if (m_config.yield_mode == SspYieldMode::kTable) {
-    bool clamped = false;
-    const SspYieldTable::Row row = m_table->massive(channel, m, metallicity, clamped);
-    if (clamped) ++table_clamps;
+    bool mass_clamped = false;
+    bool metallicity_clamped = false;
+    const SspYieldTable::Row row = m_table->massive(channel, m, metallicity, mass_clamped, metallicity_clamped);
+    if (mass_clamped || metallicity_clamped) {
+      if (m_config.yield_coverage == SspYieldCoveragePolicy::kReject) {
+        // Patch 58 (S02) at-use gate. Thrown inside the stellar-population
+        // StageTransaction prepare(): the stage is rejected collectively and
+        // no return, event ordinal, cursor or ledger change commits.
+        const SspYieldTable::Coverage coverage = m_table->channelCoverage(channel);
+        std::ostringstream text;
+        text.precision(6);
+        text << "SSP yield query outside the tabulated grid under physics.ssp_yield_table_coverage = reject: channel "
+             << (channel == 0U ? "agb" : "cc") << " progenitor mass " << m << " Msun (tabulated "
+             << coverage.mass_min_msun << ".." << coverage.mass_max_msun << ") at birth metallicity " << metallicity
+             << " (tabulated " << coverage.metallicity_min << ".." << coverage.metallicity_max
+             << "); refusing instead of using the edge row (select edge_clamp_research only as an acknowledged "
+                "RESEARCH approximation)";
+        throw SourceModelUnavailableError(text.str());
+      }
+      ++table_clamps;
+      if (mass_clamped) ++table_mass_clamps;
+      if (metallicity_clamped) ++table_metallicity_clamps;
+    }
     // Gross ejecta per element = X_birth,e m_ej + p_e (net-yield convention).
     // No renormalization: the ejected mass is DEFINED as the sum of the
     // tracked element ejecta (element-conserving); its difference from the
@@ -525,8 +640,21 @@ SspModel::ChannelReturn SspModel::iaReturnPerEvent(const std::array<double, k_ch
   ChannelReturn result;
   if (m_config.yield_mode == SspYieldMode::kTable) {
     bool clamped = false;
-    const SspYieldTable::Row row = m_table->snia(metallicityOf(birth_x), clamped);
-    if (clamped) ++table_clamps;
+    const double metallicity = metallicityOf(birth_x);
+    const SspYieldTable::Row row = m_table->snia(metallicity, clamped);
+    if (clamped) {
+      if (m_config.yield_coverage == SspYieldCoveragePolicy::kReject) {
+        const SspYieldTable::Coverage coverage = m_table->channelCoverage(2U);
+        std::ostringstream text;
+        text.precision(6);
+        text << "SSP Ia yield query at birth metallicity " << metallicity << " outside the tabulated "
+             << coverage.metallicity_min << ".." << coverage.metallicity_max
+             << " under physics.ssp_yield_table_coverage = reject (refused; no edge-row substitution)";
+        throw SourceModelUnavailableError(text.str());
+      }
+      ++table_clamps;
+      ++table_metallicity_clamps;
+    }
     result.mass_fraction = row.ejecta_msun;
     result.element_fraction = row.net_yield_msun;  // absolute Ia ejecta per element
     return result;

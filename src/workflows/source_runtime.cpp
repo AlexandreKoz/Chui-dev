@@ -51,6 +51,7 @@
 #include "cosmosim/parallel/composition_exchange.hpp"
 #include "cosmosim/parallel/distributed_mesh.hpp"
 #include "workflows/internal/amr_migration_payload.hpp"
+#include "workflows/internal/amr_geometry_assurance.hpp"
 #include "cosmosim/physics/baryon_composition.hpp"
 #include "cosmosim/workflows/runtime_services.hpp"
 #include "workflows/internal/gas_cell_ownership.hpp"
@@ -1152,6 +1153,13 @@ class SourceRuntimeImpl final : public SourceRuntime {
       ssp.energy_per_sn_erg = config.physics.ssp_energy_per_sn_erg;
       ssp.reference_net_metal_yield = config.physics.ssp_reference_net_metal_yield;
       ssp.stochastic_events = config.physics.ssp_stochastic_sn_events;
+      // Patch 58 (S02): explicit coverage policy; kReject refuses an
+      // uncovered configured range inside the SspModel constructor (runtime
+      // construction is agreed collectively), and out-of-grid queries at use.
+      ssp.yield_coverage =
+          config.physics.ssp_yield_table_coverage == core::SspYieldTableCoverageConfig::kEdgeClampResearch
+          ? physics::SspYieldCoveragePolicy::kEdgeClampResearch
+          : physics::SspYieldCoveragePolicy::kReject;
       if (config.physics.stellar_population_model == core::StellarPopulationModelConfig::kChabrierYieldTableV1) {
         ssp.yield_mode = physics::SspYieldMode::kTable;
         m_ssp_yield_table = std::make_shared<const physics::SspYieldTable>(physics::SspYieldTable::loadFromFile(
@@ -1161,6 +1169,28 @@ class SourceRuntimeImpl final : public SourceRuntime {
       if (config.physics.ssp_wind_model == core::SspWindModelConfig::kTableV1) {
         m_wind_table = std::make_shared<const physics::StellarWindTable>(physics::StellarWindTable::loadFromFile(
             config.physics.ssp_wind_table_path, config.physics.ssp_wind_table_sha256));
+        // Patch 58 (F02): declared table assumptions versus the SSP actually
+        // selected. Strict refuses undeclared (v1) / mismatched IMF, IMF
+        // mass-limit mismatch and single-metallicity tables; the research
+        // policy admits them as named, recorded approximations (no IMF
+        // reweighting is performed). Wind ownership is unchanged: energy and
+        // momentum only, mass stays in the SSP CC return.
+        m_wind_policy =
+            config.physics.ssp_wind_table_compatibility == core::SspWindTableCompatibilityConfig::kApproximateResearch
+            ? physics::StellarWindCompatibilityPolicy::kApproximateResearch
+            : physics::StellarWindCompatibilityPolicy::kStrict;
+        m_wind_compatibility = physics::assessStellarWindCompatibility(
+            *m_wind_table, physics::k_chui_ssp_imf_identity, ssp.imf_mass_min_msun, ssp.imf_mass_max_msun,
+            m_wind_policy);
+        if (!m_wind_compatibility.admitted) {
+          throw physics::SourceModelUnavailableError(
+              "stellar wind table " + m_wind_table->sha256() +
+              " is not compatible with the CHUI SSP under physics.ssp_wind_table_compatibility = strict: " +
+              m_wind_compatibility.refusal +
+              ". No IMF reweighting or metallicity synthesis exists; supply a chui_ssp_wind_table_v2 declaring the "
+              "CHUI SSP IMF and limits with a metallicity grid, or select ssp_wind_table_compatibility = "
+              "approximate_research (named approximation, recorded; RESEARCH ONLY)");
+        }
       }
     }
     if (physics::part2ThermochemistrySelected(config.physics)) {
@@ -1222,10 +1252,13 @@ class SourceRuntimeImpl final : public SourceRuntime {
       payload.emplace("ssp_yield_table_sha256", m_ssp_yield_table->sha256());
       payload.emplace("ssp_yield_table_citation", m_ssp_yield_table->citation());
       payload.emplace("ssp_yield_table_license", m_ssp_yield_table->license());
-      // S02: configured IMF channel ranges versus the tabulated grid. Masses
-      // or metallicities outside the grid use the edge row and are counted in
-      // ssp_table_clamps; this records up front where that will happen. No
-      // extrapolation or substitute yields are introduced here.
+      // S02: configured IMF channel ranges versus the tabulated grid and the
+      // explicit coverage policy (patch 58). Under `reject` an uncovered
+      // configured range already refused construction; the remaining
+      // at-use bounds (AGB lower mass, metallicity) refuse the stage. Under
+      // `edge_clamp_research` the edge row is used and counted
+      // (yield_table_{mass,metallicity}_clamps). No extrapolation or
+      // substitute yields are introduced here.
       if (m_ssp_model != nullptr) {
         const physics::SspConfig& ssp = m_ssp_model->config();
         const auto range_text = [](double lo, double hi) {
@@ -1234,32 +1267,61 @@ class SourceRuntimeImpl final : public SourceRuntime {
           text << lo << ".." << hi;
           return text.str();
         };
-        const std::array<std::pair<double, double>, 2> configured{
-            std::pair{ssp.imf_mass_min_msun, std::min(ssp.imf_mass_max_msun, ssp.cc_mass_min_msun)},
-            std::pair{std::max(ssp.imf_mass_min_msun, ssp.cc_mass_min_msun),
-                      std::min(ssp.imf_mass_max_msun, ssp.cc_mass_max_msun)}};
-        const std::array<const char*, 2> names{"agb", "cc"};
-        for (std::size_t channel = 0; channel < 2U; ++channel) {
-          const physics::SspYieldTable::Coverage coverage = m_ssp_yield_table->channelCoverage(channel);
-          const auto [lo, hi] = configured[channel];
-          const std::string prefix = std::string("ssp_yield_") + names[channel];
-          payload.emplace(prefix + "_configured_mass_msun", range_text(lo, hi));
-          payload.emplace(prefix + "_tabulated_mass_msun",
-                          range_text(coverage.mass_min_msun, coverage.mass_max_msun));
+        const physics::SspYieldCoverageAssessment assessment =
+            physics::assessSspYieldCoverage(ssp, *m_ssp_yield_table);
+        payload.emplace("ssp_yield_table_coverage", physics::sspYieldCoveragePolicyName(ssp.yield_coverage));
+        payload.emplace("ssp_yield_table_coverage_research_approximation",
+                        ssp.yield_coverage == physics::SspYieldCoveragePolicy::kEdgeClampResearch ? "true" : "false");
+        payload.emplace("ssp_yield_strict_construction_refusal",
+                        assessment.strict_refusal.empty() ? "none" : assessment.strict_refusal);
+        for (const physics::SspYieldChannelCoverage& c : assessment.channels) {
+          const std::string prefix = std::string("ssp_yield_") + c.name;
           payload.emplace(prefix + "_tabulated_metallicity",
-                          range_text(coverage.metallicity_min, coverage.metallicity_max));
+                          range_text(c.tabulated_metallicity_min, c.tabulated_metallicity_max));
+          payload.emplace(prefix + "_single_metallicity", c.single_metallicity ? "true" : "false");
+          if (!c.has_mass_axis) continue;
+          payload.emplace(prefix + "_configured_mass_msun",
+                          range_text(c.configured_mass_min_msun, c.configured_mass_max_msun));
+          payload.emplace(prefix + "_tabulated_mass_msun",
+                          range_text(c.tabulated_mass_min_msun, c.tabulated_mass_max_msun));
           payload.emplace(prefix + "_mass_range_clamped",
-                          (hi > lo && (lo < coverage.mass_min_msun || hi > coverage.mass_max_msun)) ? "true"
-                                                                                                     : "false");
+                          (c.configured_mass_range_uncovered || c.lower_mass_enforced_at_use) ? "true" : "false");
+          payload.emplace(prefix + "_lower_mass_enforced_at_use", c.lower_mass_enforced_at_use ? "true" : "false");
         }
-        const physics::SspYieldTable::Coverage ia = m_ssp_yield_table->channelCoverage(2U);
-        payload.emplace("ssp_yield_ia_tabulated_metallicity", range_text(ia.metallicity_min, ia.metallicity_max));
       }
     }
     if (m_wind_table != nullptr) {
       payload.emplace("ssp_wind_table_source", m_wind_table->source());
       payload.emplace("ssp_wind_table_metallicities", std::to_string(m_wind_table->metallicityCount()));
       payload.emplace("ssp_wind_table_limitations", m_wind_table->limitations());
+      // Patch 58 (F02): machine-readable declarations and the policy decision.
+      const physics::StellarWindTableMetadata& meta = m_wind_table->metadata();
+      payload.emplace("ssp_wind_table_sha256", m_wind_table->sha256());
+      payload.emplace("ssp_wind_table_schema",
+                      meta.schema == physics::StellarWindTableSchema::kV2 ? "chui_ssp_wind_table_v2"
+                                                                         : "chui_ssp_wind_table_v1");
+      payload.emplace("ssp_wind_table_imf", meta.schema == physics::StellarWindTableSchema::kV2
+                                                ? meta.imf_identity
+                                                : std::string("undeclared"));
+      if (meta.schema == physics::StellarWindTableSchema::kV2) {
+        std::ostringstream limits;
+        limits.precision(9);
+        limits << meta.imf_mass_min_msun << ".." << meta.imf_mass_max_msun;
+        payload.emplace("ssp_wind_table_imf_mass_msun", limits.str());
+        payload.emplace("ssp_wind_table_normalization", meta.normalization);
+      }
+      {
+        std::ostringstream grid;
+        grid.precision(6);
+        grid << m_wind_table->metallicityMin() << ".." << m_wind_table->metallicityMax();
+        payload.emplace("ssp_wind_table_metallicity_range", grid.str());
+      }
+      payload.emplace("ssp_imf_identity", physics::k_chui_ssp_imf_identity);
+      payload.emplace("ssp_wind_table_compatibility", physics::stellarWindCompatibilityPolicyName(m_wind_policy));
+      payload.emplace("ssp_wind_table_imf_matches_ssp", m_wind_compatibility.imf_identity_matches ? "true" : "false");
+      payload.emplace("ssp_wind_table_imf_limits_match_ssp",
+                      m_wind_compatibility.imf_mass_limits_match ? "true" : "false");
+      payload.emplace("ssp_wind_table_accepted_approximations", m_wind_compatibility.approximations);
     }
     if (m_baryonic_data.uv_background != nullptr) {
       payload.emplace("uv_background_table_sha256", m_baryonic_data.uv_background->provenance().sha256_hex);
@@ -1395,6 +1457,8 @@ class SourceRuntimeImpl final : public SourceRuntime {
       checkpoint.ssp_negative_ejecta_clamps = m_ssp_model->negative_ejecta_clamps;
       checkpoint.ssp_untracked_mass_residual_msun = m_ssp_model->untracked_mass_residual_msun;
       checkpoint.ssp_nonmonotone_return_clamps = m_ssp_model->nonmonotone_return_clamps;
+      checkpoint.ssp_table_mass_clamps = m_ssp_model->table_mass_clamps;
+      checkpoint.ssp_table_metallicity_clamps = m_ssp_model->table_metallicity_clamps;
     }
     checkpoint.wind_metallicity_clamps = m_wind_metallicity_clamps;
     checkpoint.sf_gradient_unavailable_cells = m_sf_gradient_unavailable_cells;
@@ -1423,6 +1487,8 @@ class SourceRuntimeImpl final : public SourceRuntime {
       m_ssp_model->negative_ejecta_clamps = c.ssp_negative_ejecta_clamps;
       m_ssp_model->untracked_mass_residual_msun = c.ssp_untracked_mass_residual_msun;
       m_ssp_model->nonmonotone_return_clamps = c.ssp_nonmonotone_return_clamps;
+      m_ssp_model->table_mass_clamps = c.ssp_table_mass_clamps;
+      m_ssp_model->table_metallicity_clamps = c.ssp_table_metallicity_clamps;
     }
     m_wind_metallicity_clamps = c.wind_metallicity_clamps;
     m_sf_gradient_unavailable_cells = c.sf_gradient_unavailable_cells;
@@ -1975,6 +2041,25 @@ class SourceRuntimeImpl final : public SourceRuntime {
     // T01: one explicit plan per dispatch (see SourceStagePlan). Smooth
     // operators advance only this dispatch's half interval; discrete events
     // are owned by the post half (or the compatibility dispatch) alone.
+    // P1-GEOMETRY: the Strang pre-half (and the unsplit compatibility
+    // dispatch) runs before the hydro stage's pre-ghost-fill proof, so on the
+    // first step after IC materialization, restart restoration or migration
+    // the patch-topology consumers below (element diffusion, star-formation
+    // gradients, remote neighbour imports) would otherwise read an unproven
+    // hierarchy. Collective on every rank; cached on the populated-geometry
+    // fingerprint (one scalar collective when nothing changed). The post half
+    // follows the hydro stage, which proves the geometry before its ghost
+    // fill and again after any automatic regrid.
+    if (context.source_split_phase != core::SourceSplitPhase::kStrangPostHalf) {
+      internal::AmrGeometryAssurancePolicy geometry_policy;
+      geometry_policy.require_explicit_geometry = false;  // all-zero legacy rows are non-AMR here
+      geometry_policy.periodic = m_hydro_boundary == core::BoundaryCondition::kPeriodic;
+      geometry_policy.periodic_box_extent_comoving = geometry_policy.periodic
+          ? m_box_extent_comoving : std::array<double, 3>{0.0, 0.0, 0.0};
+      (void)m_geometry_assurance.assure(
+          context.state, m_mpi_context, m_memory_governor, geometry_policy,
+          "source-stage AMR leaf-tiling proof (pre-hydro)");
+    }
     const SourceStagePlan plan =
         makeSourceStagePlan(context, recursiveAmrLevelSourcesActive(context));
     if (plan.opens_interval) openSourceInterval(context, plan);
@@ -3673,6 +3758,9 @@ class SourceRuntimeImpl final : public SourceRuntime {
     const std::uint64_t negative_clamps_before = m_ssp_model->negative_ejecta_clamps;
     const double untracked_residual_before = m_ssp_model->untracked_mass_residual_msun;
     const std::uint64_t nonmonotone_before = m_ssp_model->nonmonotone_return_clamps;
+    const std::uint64_t mass_clamps_before = m_ssp_model->table_mass_clamps;
+    const std::uint64_t metallicity_clamps_before = m_ssp_model->table_metallicity_clamps;
+    const std::uint64_t wind_clamps_before = m_wind_metallicity_clamps;
     std::vector<physics::FeedbackSourceBudget> staged_budgets;
     std::vector<double> association_birth_years;
     DiscreteEventChronologyLedger event_chronology;
@@ -3835,7 +3923,19 @@ class SourceRuntimeImpl final : public SourceRuntime {
           budget.wind_energy_erg = wind.energy_erg_per_msun * birth_msun;
           budget.wind_momentum_code = wind.momentum_msun_kms_per_msun * birth_msun *
               (physics::k_solar_mass_g / bridge.mass_code_to_g) * (1.0e5 / bridge.velocity_code_to_cm_s);
-          if (wind.metallicity_clamped) ++m_wind_metallicity_clamps;
+          if (wind.metallicity_clamped) {
+            if (m_wind_policy == physics::StellarWindCompatibilityPolicy::kStrict) {
+              // Patch 58 (F02) at-use gate, inside this transaction's
+              // prepare(): the stage is rejected and nothing commits.
+              std::ostringstream text;
+              text.precision(6);
+              text << "stellar wind query at birth metallicity " << z << " outside the tabulated "
+                   << m_wind_table->metallicityMin() << ".." << m_wind_table->metallicityMax()
+                   << " under physics.ssp_wind_table_compatibility = strict (refused; no edge-column substitution)";
+              throw physics::SourceModelUnavailableError(text.str());
+            }
+            ++m_wind_metallicity_clamps;
+          }
         }
         staged_budgets.push_back(budget);
         StarUpdate update;
@@ -3920,6 +4020,9 @@ class SourceRuntimeImpl final : public SourceRuntime {
       m_ssp_model->negative_ejecta_clamps = negative_clamps_before;
       m_ssp_model->untracked_mass_residual_msun = untracked_residual_before;
       m_ssp_model->nonmonotone_return_clamps = nonmonotone_before;
+      m_ssp_model->table_mass_clamps = mass_clamps_before;
+      m_ssp_model->table_metallicity_clamps = metallicity_clamps_before;
+      m_wind_metallicity_clamps = wind_clamps_before;
       throw core::StageTransactionRejected(transaction.outcome().rejection,
           "stellar population stage rejected: " + transaction.outcome().reason);
     }
@@ -3991,6 +4094,9 @@ class SourceRuntimeImpl final : public SourceRuntime {
                       {"dust_injected_code", std::to_string(l.dust_injected_code)},
                       {"dust_destroyed_code", std::to_string(l.dust_destroyed_code)},
                       {"yield_table_clamps", std::to_string(m_ssp_model->table_clamps)},
+                      {"yield_table_mass_clamps", std::to_string(m_ssp_model->table_mass_clamps)},
+                      {"yield_table_metallicity_clamps", std::to_string(m_ssp_model->table_metallicity_clamps)},
+                      {"wind_table_metallicity_clamps", std::to_string(m_wind_metallicity_clamps)},
                       {"ssp_nonmonotone_return_clamps", std::to_string(m_ssp_model->nonmonotone_return_clamps)},
                       {"event_publication_time_code", std::to_string(m_last_event_chronology.interval_end_code)},
                       {"timed_discrete_events", std::to_string(m_last_event_chronology.timed_events)},
@@ -5198,6 +5304,8 @@ class SourceRuntimeImpl final : public SourceRuntime {
   physics::FeedbackLedger m_last_feedback_ledger{};
   DiscreteEventChronologyLedger m_last_event_chronology{};
   bool m_data_assumptions_reported = false;
+  // P1-GEOMETRY: cached exact leaf-tiling proof for the pre-hydro source half.
+  internal::AmrGeometryAssurance m_geometry_assurance;
   std::unique_ptr<internal::StarFormationNeighborIndex> m_sf_neighbor_index;
   std::array<double, 3> m_box_extent_comoving{};
   std::uint64_t m_sf_gradient_unavailable_cells = 0U;
@@ -5221,6 +5329,8 @@ class SourceRuntimeImpl final : public SourceRuntime {
     std::uint64_t ssp_negative_ejecta_clamps = 0U;
     double ssp_untracked_mass_residual_msun = 0.0;
     std::uint64_t ssp_nonmonotone_return_clamps = 0U;
+    std::uint64_t ssp_table_mass_clamps = 0U;
+    std::uint64_t ssp_table_metallicity_clamps = 0U;
     std::uint64_t wind_metallicity_clamps = 0U;
     std::uint64_t sf_gradient_unavailable_cells = 0U;
     std::uint64_t sf_gradient_coarse_fine_cells = 0U;
@@ -5282,6 +5392,10 @@ class SourceRuntimeImpl final : public SourceRuntime {
   std::vector<double> m_diffusion_rho_kappa_code;
   std::vector<physics::MetalDiffusionFace> m_diffusion_faces;
   std::shared_ptr<const physics::StellarWindTable> m_wind_table;
+  // Patch 58 (F02): selected compatibility policy and the construction-time
+  // assessment recorded in sources.data_assumptions.
+  physics::StellarWindCompatibilityPolicy m_wind_policy = physics::StellarWindCompatibilityPolicy::kStrict;
+  physics::StellarWindCompatibilityReport m_wind_compatibility{};
   std::uint64_t m_wind_metallicity_clamps = 0U;
   std::vector<double> m_element_diffusion_workspace;
   physics::ElementDiffusionReport m_last_element_diffusion{};
