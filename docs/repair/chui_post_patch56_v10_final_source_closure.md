@@ -1,5 +1,12 @@
 # CHUÍ — post-patch-56 v10 final source-implementation closure ledger
 
+> **Superseded in part (2026-11-11):** §2 (volume-based domain check), the
+> S02/F02 rows of §3–§4 and the "unsettled model decisions" of §6 are
+> superseded by
+> [`chui_post_patch58_final_source_closure.md`](chui_post_patch58_final_source_closure.md)
+> (exact leaf-tiling proof; explicit yield-coverage and wind-compatibility
+> policies). This record is kept unchanged below for history.
+
 Date: 2026-11-10. Baseline: `4775f35` (merge of PR #135, patch 56), branch
 `claude/gifted-cray-zjay8f`, clean working tree at start. This ledger extends,
 and does not delete, `chui_post_patch55_source_closure.md`.

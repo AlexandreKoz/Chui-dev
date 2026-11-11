@@ -566,7 +566,8 @@ add_library(cosmosim_amr STATIC
   src/amr/amr_hydro_geometry.cpp
   src/amr/amr_ghost_fill.cpp
   src/amr/amr_hydro_orchestrator.cpp
-  src/amr/amr_production_regrid.cpp)
+  src/amr/amr_production_regrid.cpp
+  src/amr/amr_geometry_coverage.cpp)
 add_library(cosmosim_physics STATIC
   src/physics/cooling_heating.cpp
   src/physics/effective_multiphase_ism.cpp
@@ -647,6 +648,7 @@ add_library(cosmosim_workflows STATIC
   src/workflows/internal/distributed_element_diffusion.cpp
   src/workflows/internal/gas_cell_ownership.cpp
   src/workflows/internal/migration_wire.cpp
+  src/workflows/internal/amr_geometry_assurance.cpp
   src/workflows/internal/gravity_force_endpoint.cpp
   src/workflows/migration_balance_runtime.cpp
   src/workflows/output_restart_runtime.cpp
@@ -1197,7 +1199,9 @@ if(COSMOSIM_ENABLE_TESTS)
       zoom_contamination
       chui_part3_adaptive_and_decks
       amr_recursive_subcycling
-      amr_history_atomicity)
+      amr_history_atomicity
+      amr_geometry_coverage
+      ssp_wind_data_contracts)
   foreach(chui_part3_test IN LISTS CHUI_PART3_UNIT_TESTS)
     add_executable(test_unit_${chui_part3_test} tests/unit/test_${chui_part3_test}.cpp)
     target_include_directories(test_unit_${chui_part3_test} PRIVATE ${PROJECT_SOURCE_DIR}/src)

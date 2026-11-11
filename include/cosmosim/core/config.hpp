@@ -63,6 +63,28 @@ enum class SspWindModelConfig {
   kTableV1,
 };
 
+// Patch 58 (S02): physics.ssp_yield_table_coverage. kReject (default) is the
+// strict/qualified use of a chui_ssp_yield_table_v1: configured IMF channel
+// ranges must lie inside the tabulated mass axes (construction-time refusal),
+// single-metallicity channels are refused, and any other out-of-grid query is
+// refused at use. kEdgeClampResearch keeps the historical edge-row clamp as
+// an explicitly acknowledged, counted RESEARCH approximation.
+enum class SspYieldTableCoverageConfig : std::uint8_t {
+  kReject = 0,
+  kEdgeClampResearch = 1,
+};
+
+// Patch 58 (F02): physics.ssp_wind_table_compatibility. kStrict (default)
+// requires a chui_ssp_wind_table_v2 whose machine-readable IMF identity and
+// IMF mass limits equal the CHUI SSP IMF, and a metallicity grid that covers
+// the queries (single-Z tables refused). kApproximateResearch admits an
+// undeclared (v1) or mismatched-IMF / single-Z table as a named, recorded
+// RESEARCH approximation (no IMF reweighting is performed).
+enum class SspWindTableCompatibilityConfig : std::uint8_t {
+  kStrict = 0,
+  kApproximateResearch = 1,
+};
+
 // P1-TIME-01 (post patch 53): publication-time contract of discrete
 // stochastic SN events. kCoarseEndpoint (default, the pre-existing semantics)
 // deposits every event at the synchronized coarse-interval end; its lag is
@@ -766,6 +788,9 @@ struct PhysicsConfig {
   SspWindModelConfig ssp_wind_model = SspWindModelConfig::kNone;
   std::string ssp_wind_table_path;
   std::string ssp_wind_table_sha256;
+  // Patch 58: explicit data-coverage / compatibility policies (see enums).
+  SspYieldTableCoverageConfig ssp_yield_table_coverage = SspYieldTableCoverageConfig::kReject;
+  SspWindTableCompatibilityConfig ssp_wind_table_compatibility = SspWindTableCompatibilityConfig::kStrict;
 };
 
 enum class ScienceSnapshotLayout : std::uint8_t {
@@ -1101,6 +1126,8 @@ void writeNormalizedConfigSnapshot(
 [[nodiscard]] std::string v02ControlModeToString(V02ControlMode mode);
 [[nodiscard]] std::string amrTimeSteppingConfigModeToString(AmrTimeSteppingConfigMode mode);
 [[nodiscard]] std::string sspWindModelConfigToString(SspWindModelConfig mode);
+[[nodiscard]] std::string sspYieldTableCoverageConfigToString(SspYieldTableCoverageConfig mode);
+[[nodiscard]] std::string sspWindTableCompatibilityConfigToString(SspWindTableCompatibilityConfig mode);
 [[nodiscard]] std::string sspEventPublicationModeConfigToString(SspEventPublicationModeConfig mode);
 [[nodiscard]] std::string nodeMemoryAdmissionModeToString(NodeMemoryAdmissionMode mode);
 [[nodiscard]] std::string coordinateFrameToString(CoordinateFrame frame);

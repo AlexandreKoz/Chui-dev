@@ -43,6 +43,29 @@ namespace cosmosim::physics {
 
 enum class SspYieldMode : std::uint8_t { kReference = 0, kTable = 1 };
 
+// Identity token of the IMF implemented by SspModel (Chabrier 2003,
+// individual-star form above). External SSP-integrated tables (e.g. the
+// chui_ssp_wind_table_v2 `imf` declaration) are compared against this token
+// and against the configured IMF mass limits; nothing else is inferred.
+inline constexpr const char* k_chui_ssp_imf_identity = "chabrier2003_individual";
+
+// Patch 58 (S02): how the table yield mode treats a query outside the
+// tabulated mass/metallicity grid (physics.ssp_yield_table_coverage).
+//  * kReject (default, strict/qualified use): the configured IMF channel
+//    ranges must lie inside the tabulated mass axes (checked at model
+//    construction, before any event), single-metallicity channels are
+//    refused (they cannot represent a self-enriching population), and every
+//    remaining out-of-grid query at use (AGB turnoff below the tabulated
+//    minimum mass, a birth metallicity outside the grid) throws
+//    SourceModelUnavailableError inside the stellar-population transaction,
+//    so no partial return/event/cursor can commit.
+//  * kEdgeClampResearch: the historical behaviour (edge row, no
+//    extrapolation), explicitly acknowledged as a RESEARCH approximation;
+//    every clamp is counted (mass and metallicity separately) and the policy
+//    is recorded in the normalized configuration and sources.data_assumptions.
+// No extrapolation law or substitute yield is ever introduced.
+enum class SspYieldCoveragePolicy : std::uint8_t { kReject = 0, kEdgeClampResearch = 1 };
+
 struct SspConfig {
   double imf_mass_min_msun = 0.1;
   double imf_mass_max_msun = 100.0;
@@ -55,6 +78,7 @@ struct SspConfig {
   double reference_net_metal_yield = 0.0;
   bool stochastic_events = true;
   SspYieldMode yield_mode = SspYieldMode::kReference;
+  SspYieldCoveragePolicy yield_coverage = SspYieldCoveragePolicy::kReject;
 };
 
 // Yield table, chui_ssp_yield_table_v1 (see docs/stellar_evolution.md).
@@ -70,7 +94,15 @@ class SspYieldTable {
     std::array<double, k_chemical_element_count> net_yield_msun{};
   };
   [[nodiscard]] Row massive(std::size_t channel, double mass_msun, double metallicity, bool& clamped) const;
+  // Patch 58: same interpolation, reporting the mass-axis and the
+  // metallicity-axis clamp separately (each flag is only ever set).
+  [[nodiscard]] Row massive(std::size_t channel, double mass_msun, double metallicity, bool& mass_clamped,
+                            bool& metallicity_clamped) const;
   [[nodiscard]] Row snia(double metallicity, bool& clamped) const;
+  // Number of tabulated metallicities / masses of a channel (Ia has no mass
+  // axis: 0).
+  [[nodiscard]] std::size_t metallicityCount(std::size_t channel) const;
+  [[nodiscard]] std::size_t massCount(std::size_t channel) const;
   // Tabulated axis coverage of a channel (0=AGB, 1=CC, 2=Ia; Ia has no mass
   // axis, reported as {0, 0}). Read-only: used to report, before any event,
   // where the configured IMF channel ranges exceed the tabulated grid so the
@@ -99,6 +131,40 @@ class SspYieldTable {
   std::array<Channel, 3> m_channels{};  // agb, cc, ia
   std::string m_citation, m_license, m_sha256;
 };
+
+// Patch 58 (S02): configured IMF channel ranges versus the tabulated grid.
+// Channel 0 = AGB [imf_min, min(imf_max, cc_min)], 1 = CC
+// [max(imf_min, cc_min), min(imf_max, cc_max)], 2 = Ia (metallicity only; no
+// mass-domain check is meaningful for a per-event table).
+struct SspYieldChannelCoverage {
+  const char* name = "";
+  bool has_mass_axis = false;
+  double configured_mass_min_msun = 0.0;
+  double configured_mass_max_msun = 0.0;
+  double tabulated_mass_min_msun = 0.0;
+  double tabulated_mass_max_msun = 0.0;
+  double tabulated_metallicity_min = 0.0;
+  double tabulated_metallicity_max = 0.0;
+  std::size_t tabulated_metallicity_count = 0U;
+  // Configured masses that the table cannot cover and that are certainly
+  // queried (AGB upper end, the whole CC range): refused at construction
+  // under kReject.
+  bool configured_mass_range_uncovered = false;
+  // Lower AGB masses below the tabulated minimum: queried only once the
+  // turnoff mass reaches them, so enforced at use under kReject.
+  bool lower_mass_enforced_at_use = false;
+  // A single tabulated metallicity cannot cover a self-enriching population:
+  // refused at construction under kReject; edge row under research policy.
+  bool single_metallicity = false;
+};
+struct SspYieldCoverageAssessment {
+  std::array<SspYieldChannelCoverage, 3> channels{};
+  // Construction-time refusal reasons under kReject (empty = admitted; any
+  // remaining out-of-grid query is still refused at use).
+  std::string strict_refusal;
+};
+[[nodiscard]] SspYieldCoverageAssessment assessSspYieldCoverage(const SspConfig& config, const SspYieldTable& table);
+[[nodiscard]] const char* sspYieldCoveragePolicyName(SspYieldCoveragePolicy policy) noexcept;
 
 class SspModel {
  public:
@@ -130,6 +196,11 @@ class SspModel {
   [[nodiscard]] ChannelReturn iaReturnPerEvent(const std::array<double, k_chemical_element_count>& birth_x) const;
   // Diagnostics (mutable counters; the runtime restores them on rejection).
   std::uint64_t mutable table_clamps = 0;
+  // Patch 58: the same clamps split by axis (a query clamped on both axes
+  // increments both; table_clamps counts queries). Only non-zero under
+  // SspYieldCoveragePolicy::kEdgeClampResearch (kReject throws instead).
+  std::uint64_t mutable table_mass_clamps = 0;
+  std::uint64_t mutable table_metallicity_clamps = 0;
   std::uint64_t mutable negative_ejecta_clamps = 0;
   double mutable untracked_mass_residual_msun = 0.0;
   // massiveReturn calls in which a quadrature difference was negative and

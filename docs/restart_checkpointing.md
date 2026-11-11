@@ -737,6 +737,18 @@ bitwise.
   the default `coarse_endpoint` (the key line is projected away); no
   checkpoint field changed (the barrier is re-derived from persisted
   population cursors and star ages each step).
+* Patch 58 (S02/F02): `physics.ssp_yield_table_coverage` and
+  `physics.ssp_wind_table_compatibility` join the normalized configuration
+  (and therefore the config hash and provenance). A checkpoint written before
+  them resumes only with the strict defaults (`reject` / `strict`; both key
+  lines are projected away). A pre-patch-58 checkpoint whose run used table
+  yields or a wind table is not eligible for that projection
+  (`part2PhysicsKeysAtDefaults` / `part3PhysicsKeysAtDefaults`), so it is
+  refused rather than silently resumed under a different coverage policy. No
+  checkpoint field, group version (restart v25; pending flux group 2,
+  temporal history group 3) or AMR migration wire version (v5) changed. The
+  AMR leaf-tiling proof (P1-GEOMETRY) reads only persisted patch geometry and
+  is re-run after every restore before the first ghost fill.
 * Reproducibility impact (T02): under `amr_time_stepping = recursive_subcycling`
   element diffusion and SGS shear now integrate on AMR level clocks instead of
   the coarse halves, so recursive runs are not bit-comparable with patch 49.

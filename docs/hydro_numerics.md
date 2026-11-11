@@ -107,12 +107,32 @@ patches) or, when no domain is declared, from a target face that is itself
 `kPhysical`. **Supported domain contract (patch 56 closure):** the hydro domain
 is the root tiling built from the gas-cell layout, not `cosmology.box_size_*`
 (the gravity/PM extent of isolated modes); production AMR therefore requires
-the populated leaves to tile their bounding box completely.
-`globalAmrHierarchyDomain` (`hydro_amr_runtime.cpp`) sums the leaf volumes
-collectively and refuses, before any ghost fill and identically on every
-rank, a hierarchy whose covered volume differs from the bounding-box volume
-(relative 1e-9): internal holes or non-rectangular tilings are never treated as
-physical walls. Only beyond
+the populated leaves to tile their bounding box completely. **Exact proof
+(patch 58, P1-GEOMETRY; supersedes the patch-56 volume sum, which accepted an
+overlap cancelling a hole):** every populated leaf is first validated (finite
+origin/extent/upper bound, positive extent and cell width, level >= 0,
+cell count = dims product; failure names patch, rank, level, axis and value),
+then mapped onto the integer lattice of the finest populated cell width
+(faces must lie on lattice planes within `1e-6 + 64 eps * span` lattice units
+and cell widths must be integer lattice multiples, so mixed-level geometry
+must be dyadically/index aligned; span <= 2^40 per axis). By
+inclusion-exclusion `1_P = sum_corners (-1)^{#upper} H(x - c)`; the summed
+signed corner measure equals the 8 signed corners of the bounding box **iff**
+the coverage multiplicity is exactly 1 on the box and 0 outside (the orthant
+functions of distinct lattice points are linearly independent), i.e. no hole
+and no overlap, exactly, in integer arithmetic (`amr/amr_geometry_coverage.hpp`).
+Collective protocol (`workflows/internal/amr_geometry_assurance.*`): vote on
+malformed leaves, scalar reductions of the box and finest width, vote on
+lattice representability, local corner aggregation (interior corners cancel),
+memory-admitted bounded gather of the residual corners to rank 0, broadcast of
+one verdict; every rank throws the same error. Periodic runs must tile the
+periodic box `[0, L)` on every periodic axis (a periodic sub-box is refused);
+non-periodic modes keep legitimate sub-box domains. The proof is cached on the
+populated-geometry fingerprint (one scalar collective per step when unchanged)
+and re-run before the next ghost fill whenever any rank's leaves changed
+(regrid, migration, restart restore, IC materialization), after every
+automatic regrid, and before the Strang pre-half source stage. Internal holes
+or non-rectangular tilings are never treated as physical walls. Only beyond
 such a wall is the physical closure applied: open -> zero-gradient onto the
 last in-domain row (`deep_layer_extrapolated_ghosts`); reflective -> mirror
 `i' = 2w - 1 - i` with that axis' momentum reversed, repeated for a domain

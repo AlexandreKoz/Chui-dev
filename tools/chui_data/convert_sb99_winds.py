@@ -28,6 +28,15 @@ Physics:
 Limitations recorded in the header: the SB99 IMF (from the input deck) may
 differ from the CHUI SSP IMF (Chabrier); one metallicity per run (CHUI reports
 metallicity extrapolation, see stellar_wind.cpp).
+
+Schema (patch 58): ``--schema v1`` (default) reproduces the historical
+``chui_ssp_wind_table_v1`` bytes and therefore the pinned SHA-256 of the staged
+F02 product. ``--schema v2`` writes ``chui_ssp_wind_table_v2`` with the
+machine-readable IMF declaration CHUI checks against its SSP. The IMF identity
+and mass limits are NOT inferred from the deck: the owner must state them
+(``--imf-identity``, ``--imf-mass-min-msun``, ``--imf-mass-max-msun``); the deck
+values are still copied into the free-text header for audit. Never declare
+the CHUI identity ``chabrier2003_individual`` for a Kroupa SB99 run.
 """
 from __future__ import annotations
 
@@ -67,7 +76,16 @@ def main() -> int:
     p.add_argument("--citation", required=True)
     p.add_argument("--license", required=True)
     p.add_argument("--output", required=True, type=Path)
+    p.add_argument("--schema", choices=("v1", "v2"), default="v1")
+    p.add_argument("--imf-identity", help="v2: IMF identity token [a-z0-9_]+ stated by the owner (e.g. kroupa2001)")
+    p.add_argument("--imf-mass-min-msun", type=float, help="v2: lower IMF mass limit of the SB99 run")
+    p.add_argument("--imf-mass-max-msun", type=float, help="v2: upper IMF mass limit of the SB99 run")
     a = p.parse_args()
+    if a.schema == "v2":
+        if not a.imf_identity or not re.fullmatch(r"[a-z0-9_]{1,64}", a.imf_identity):
+            raise SystemExit("convert_sb99_winds: --schema v2 requires --imf-identity matching [a-z0-9_]+")
+        if not (a.imf_mass_min_msun and a.imf_mass_max_msun and 0.0 < a.imf_mass_min_msun < a.imf_mass_max_msun):
+            raise SystemExit("convert_sb99_winds: --schema v2 requires 0 < --imf-mass-min-msun < --imf-mass-max-msun")
     deck = parse_input(a.input1)
     if float(deck.get("ISF", "0")) > 0:
         raise SystemExit("convert_sb99_winds: continuous star formation run; an instantaneous burst is required")
@@ -100,10 +118,18 @@ def main() -> int:
     quad = abs(e_trap[-1] - ew[-1]) / ew[-1]
     a.output.parent.mkdir(parents=True, exist_ok=True)
     with a.output.open("w", encoding="ascii") as out:
-        out.write("# chui_ssp_wind_table_v1\n")
+        out.write(f"# chui_ssp_wind_table_{a.schema}\n")
         out.write(f"# source = Starburst99 {a.power1.name} sha256={sha(a.power1)}; deck {a.input1.name} "
                   f"sha256={sha(a.input1)}; {a.citation}\n")
         out.write(f"# license = {a.license}\n")
+        if a.schema == "v2":
+            out.write(f"# imf = {a.imf_identity}\n")
+            out.write(f"# imf_mass_min_msun = {a.imf_mass_min_msun:.17g}\n")
+            out.write(f"# imf_mass_max_msun = {a.imf_mass_max_msun:.17g}\n")
+            out.write("# normalization = per_msun_initial_stellar_mass\n")
+            out.write("# energy_unit = erg_per_msun\n")
+            out.write("# momentum_unit = msun_km_s_per_msun\n")
+            out.write("# metallicity_definition = metal_mass_fraction\n")
         out.write("# converter = chui_sb99_wind_converter_v1\n")
         out.write(f"# sb99_total_mass_msun = {m_tot:g} (TOMA); IMF exponents {deck.get('XPONENT')} "
                   f"mass limits {deck.get('XMASLIM')}; SN cut {deck.get('SNCUT')}; BH cut {deck.get('BHCUT')}; "

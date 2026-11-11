@@ -45,7 +45,10 @@ are git-ignored.
 ## Configuration fragments
 
 * `profiles/SAFE_DEFAULT_AVAILABLE_DATA.param.fragment`: **partial,
-  diagnostic**. S02 + F02 with `analytic_reference`, no research opt-ins. The
+  diagnostic**. S02 + F02 with `analytic_reference`; since patch 58 it carries
+  exactly two research acknowledgements (`ssp_yield_table_coverage =
+  edge_clamp_research`, `ssp_wind_table_compatibility = approximate_research`)
+  because the strict defaults refuse the staged S02/F02 data. The
   FG20 UVB is excluded because every backend that consumes it is gated as
   unqualified; C01 is excluded because no HM01-consistent UVB exists; C02 is
   excluded because it is unverified.
@@ -70,12 +73,27 @@ Regenerate both with `chui_data.py emit-config --profile {safe_default,research_
   (`ssp_yield_{agb,cc}_{configured,tabulated}_mass_msun`,
   `ssp_yield_{agb,cc}_tabulated_metallicity`, `ssp_yield_{agb,cc}_mass_range_clamped`,
   `ssp_yield_ia_tabulated_metallicity`). With the default CC range 8–40 M☉ and
-  the 1–25 M☉ NuGrid grid, `ssp_yield_cc_mass_range_clamped = true`. Whether edge
-  clamping is scientifically acceptable or must be refused is an unsettled
-  model-contract decision; no refusal key is added.
-* The SB99 wind-table IMF is recorded only as a `# limitation =` header line
-  (surfaced as `ssp_wind_table_limitations`); the table schema has no
-  machine-readable IMF field, so no automatic Kroupa/Chabrier gate exists.
+  the 1–25 M☉ NuGrid grid, `ssp_yield_cc_mass_range_clamped = true`.
+  **Patch 58:** the policy is now explicit and enforced by
+  `physics.ssp_yield_table_coverage`. The default `reject` refuses this table at
+  runtime construction (CC range uncovered; single-Z W7 Ia) and refuses any
+  out-of-grid query at use; `edge_clamp_research` keeps the edge row as a named
+  RESEARCH approximation (counted separately as mass/metallicity clamps,
+  recorded in the normalized configuration and `sources.data_assumptions`).
+  Whether edge clamping is scientifically acceptable remains an OPEN owner
+  decision; no extrapolation law or substitute yield exists.
+* The staged SB99 wind table is `chui_ssp_wind_table_v1`: its IMF is
+  undeclared (the `# limitation =` text is surfaced as
+  `ssp_wind_table_limitations` but is never parsed as metadata). **Patch 58:**
+  `chui_ssp_wind_table_v2` adds machine-readable `imf`, IMF mass limits,
+  normalization, units and metallicity definition, and
+  `physics.ssp_wind_table_compatibility = strict` (default) refuses a v1,
+  mismatched-IMF/limits or single-Z table. The staged table therefore needs
+  `approximate_research`. `tools/chui_data/convert_sb99_winds.py --schema v2
+  --imf-identity <token> --imf-mass-min-msun <m> --imf-mass-max-msun <M>` writes
+  a v2 file (new SHA-256; the registry still pins the v1 bytes); the owner must
+  state the IMF (SB99 deck: Kroupa 0.1–0.5–100) — never declare
+  `chabrier2003_individual` for it.
 * C02: 10⁴–10⁸ K, optically thin, collisional; no metal photo-rates; no
   low-T dielectronic resonances; Voronov-rounded potentials. With
   `chemistry_adaptive_selection` an element table is required (demoted rows).
