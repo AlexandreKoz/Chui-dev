@@ -1,0 +1,175 @@
+\section{The SHAI-HULUD method}\label{sec:method}
+
+\subsection{Statement of the scheme}
+
+\paragraph{State.} A fixed reference mesh $\mathcal K$ of $\Xi=\T^d$ with nodes $\xi_i$; per node the Legendrian
+data \eqref{eq:state}; the Liouville class $c$ (a constant of the run, computed once from the initial data); in
+$d\ge2$ the potential $\varphi$ of the current label map $T=\id+\nabla\varphi$.
+
+\paragraph{Initialisation.} $q_i=\xi_i$; $(x_i,p_i,\Sigma_i)=(F_0,\Sigma_0)(q_i)$ from exactly Lagrangian initial
+data with known action (\cref{ex:ic}).
+
+\begin{algorithm}[h]
+\caption{SHAI-HULUD: one macro-step (evolution, monitor, optimal-transport remap)}\label{alg:sh}
+\begin{algorithmic}[1]
+\Require nodal state $Z^n=\{(q_i,x_i,p_i,\Sigma_i)\}$, Liouville class $c$, tolerance on equidistribution quality $\varrho_{\max}$
+\Statex \textbf{A. Hamiltonian step} (exact on the carrier, \cref{thm:carrier})
+\State obtain the potential $V_n$ (prescribed, or from the deposited density of the sheet, \cref{sec:cosmo})
+\State kick: $\Sigma_i\mathrel{-}=\kappa'V_n(x_i)$;\quad $p_i\mathrel{-}=\kappa'\nabla V_n(x_i)$ \Comment{$\nabla V_n$: exact gradient of one interpolated potential}
+\State drift: $x_i^{\rm new}=x_i+D\,\nabla K(p_i)$;\quad $\Sigma_i\mathrel{+}=p_i\cdot(x_i^{\rm new}-x_i)-D\,K(p_i)$ \Comment{round-off-consistent, \cref{rem:roundoff}}
+\State kick with $V_{n+1}$ and $\kappa''$ as in line 2
+\Statex \textbf{B. Monitor} (symplectic invariants of the carrier)
+\State edge defects $\eps_e=\Sigma_j-\Sigma_i-\tfrac12(p_i+p_j)\cdot(x_j-x_i)$ on mesh edges \Comment{\eqref{eq:edgedefect}; exact, no differencing}
+\State monitor $M(q)\propto(\abs{\eps}/h^3+\text{floor})^{d/(3+d)}$ (or $\norm{C}$ from the reconstruction), regularised and mollified at a fixed label scale (\cref{rem:monreg}); quality $\varrho=\max_K\nu_M(T(K))/\operatorname{mean}_K\nu_M(T(K))$
+\If{$\varrho>\varrho_{\max}$ (or on a fixed schedule)}
+\Statex \quad\textbf{C. Optimal transport of the sampling} (\cref{thm:ot})
+\State solve $M(\xi+\nabla\varphi')\det(I+D^2\varphi')=1$ for the new potential $\varphi'$; \ $q'_i=\xi_i+\nabla\varphi'(\xi_i)$
+\Statex \quad\textbf{D. Remap through the generating function} (\cref{thm:ac,thm:front})
+\State locate each $q'_i$ in the old carrier: $\xi_i^{\rm old}=T^{-1}(q'_i)$ \Comment{$d=1$: cell search on the old labels}
+\State build the action-consistent reconstruction $(G_h,W_h)$ of the old data \Comment{$d=1$: AC$(m,1)$; $d\ge2$: $C^1$ element for $W$ per chart}
+\State $(x'_i,p'_i,\Sigma'_i)=(G_h,\Sigma_h)(\xi_i^{\rm old})$; \ $Z^{n+1}=\{(q'_i,x'_i,p'_i,\Sigma'_i)\}$, $\varphi\leftarrow\varphi'$
+\EndIf
+\Statex \textbf{E. Mass} (\cref{prop:mass}): cell masses $m_K=\mu(q_h(K))$ are recomputed from the labels whenever needed (deposit, diagnostics)
+\end{algorithmic}
+\end{algorithm}
+
+\paragraph{What is guaranteed.} Combining \cref{thm:carrier,thm:ac,thm:front,prop:mass}:
+
+\begin{theorem}[structure preservation of the coupled scheme]\label{thm:scheme}\status{new derivation}
+Run \cref{alg:sh} with a common-potential force. Then, at every step and independently of the mesh size, the
+time step, the number and timing of remaps, and the monitor:
+\begin{enumerate}[label=(\roman*),leftmargin=2.2em,itemsep=1pt]
+\item \emph{(mass)} the total mass of the represented measure equals $\mu(\Q)$ exactly, and cell masses are positive as long as the reconstructed label map is orientation preserving;
+\item \emph{($d=1$)} with the AC$(m,1)$ remap the nodal data are, at all times, exact Legendrian samples of a continuous closed carrier whose Poincar\'e invariant is exactly $c$;
+\item \emph{($d\ge2$, while the sheet is covered by one chart)} with a $C^1$ generating-function element the nodal data are exact Legendrian samples of a continuous, exactly Lagrangian carrier with Liouville class $c$; all Kelvin/Poincar\'e circulations vanish identically on contractible loops;
+\item \emph{(in general)} between chart changes the statement of (iii) holds; the invariant defect created at a chart transition obeys \cref{thm:budget} with the interpolation error of the transition zone.
+\end{enumerate}
+The carrier is $h$-close to the exact sheet only to the extent quantified in \cref{sec:error}; exactness of the
+invariants does not depend on that.
+\end{theorem}
+\begin{proof}
+(i) \cref{prop:mass}. (ii) By \cref{thm:ac}(ii) the reconstruction is an exact carrier of the old data with period
+$c$, and the new data are samples of it; \cref{thm:carrier}(iii) propagates this to the next remap. (iii) Same with
+\cref{thm:front}(ii)--(iii). (iv) \cref{thm:budget}.
+\end{proof}
+
+\paragraph{What is \emph{not} guaranteed.} The distribution function is perturbed at each remap by the
+interpolation error (inevitably, \cref{sec:nogo}); energy is not exactly conserved (nor is it by the underlying
+splitting integrator); in $d\ge2$ exactness is chart-wise (\cref{prob:glue}); positivity of cell masses can fail
+if the label interpolation overshoots (the prototype in $d=1$ never encountered it; a monotone interpolation of
+the cumulative mass would enforce it).
+
+\paragraph{Cost and storage.} Per vertex the scheme stores $3d+1$ numbers ($q,x,p,\Sigma$) against $2d$ for a
+plain tessellation and against the $2d$ numbers \emph{per edge tracer} of a quadratic tessellation. The remap
+costs one Monge--Amp\`ere solve on the reference mesh (a few Newton steps, each a handful of FFT-preconditioned
+Krylov iterations, \cref{tab:ot}) plus one local reconstruction and evaluation per vertex.
+
+\subsection{Where the scheme differs from prior work}\label{sec:prior}
+
+\begin{table}[t]\centering\footnotesize
+\begin{tabular}{p{2.8cm}p{3.0cm}p{2.5cm}p{2.2cm}p{3.5cm}}\toprule
+method & representation & adaptivity & per-vertex data & Hamiltonian invariants under adaptation\\\midrule
+$N$-body & points & none & $x,p$ & n/a (no sheet)\\
+tetrahedral sheet \cite{AbelHahnKaehler2012,ShandarinHabibHeitmann2012,HahnAbelKaehler2013} & P1 simplices on fixed labels & none & $x,p$ & exact carrier (if common-potential force); P1 defect \eqref{eq:flux}\\
+Hahn--Angulo \cite{HahnAngulo2016} & higher-order Lagrangian elements & $h$-refinement & $x,p$ & not enforced\\
+ColDICE \cite{SousbieColombi2016} & simplices, quadratic via tracers & anisotropic bisection & $x,p$ (+ tracers) & \emph{measured} local Poincar\'e invariants constrain refinement\\
+waterbag / contour dynamics \cite{ColombiTouma2014,Dritschel1988} & polygons in 2D phase space & node insertion/removal & $x,p$ & area monitored\\
+CIP \cite{YabeAoki1991} & Eulerian field + its gradient & none (grid) & $f,\nabla f$ & n/a (Hermite semi-Lagrangian)\\
+wavefront construction \cite{VinjeEtAl1993,EngquistRunborg2003} & rays on a Lagrangian manifold & ray insertion & $x,p$, traveltime & traveltime (action) carried; interpolation not constrained\\
+OT mesh adaptation \cite{BuddWilliams2006,Delzanno2008,Weller2016} & PDE mesh in physical space & $r$-adaptation by Monge--Amp\`ere & --- & n/a\\
+MAK / semi-discrete OT \cite{FrischEtAl2002,BrenierEtAl2003,LevyEtAl2021} & mass in configuration space & --- & --- & single-stream only; OT \emph{is} the dynamics/reconstruction\\\midrule
+\textbf{SHAI-HULUD} & Legendrian samples; generating-function reconstruction & $r$-adaptation by OT on label space (+$h$) & $q,x,p,\Sigma$ & exact Liouville class and exact Lagrangian carrier ($d=1$; chart-wise $d\ge2$), by construction\\\bottomrule
+\end{tabular}
+\caption{Positioning. For ColDICE only the statements of its abstract were re-verified for this note (conforming
+simplicial tessellation; vertices follow the Lagrangian equations of motion; bisection refinement with a
+second-order local representation relying on tracers; anisotropic refinement constrained by measurements of local
+Poincar\'e invariants; FFT Poisson solver; four- and six-dimensional phase space); finer details are from our
+reading of the paper and should be checked against it.}\label{tab:prior}
+\end{table}
+
+\Cref{tab:prior} locates the scheme. The honest assessment of novelty is as follows.
+\begin{itemize}[leftmargin=1.6em,itemsep=2pt]
+\item \emph{Known ingredients.} Tessellating the sheet and moving vertices with the flow; monitoring Poincar\'e
+invariants (ColDICE); carrying the action along bicharacteristics on an adaptively refined Lagrangian manifold
+(wavefront construction in geometrical optics); Hermite interpolation of a function together with its transported
+gradient (CIP); Monge--Amp\`ere equidistribution; the generating-function identities of \cref{thm:action}.
+\item \emph{What we have not found in the cited literature and derive here.} (a) The use of the transported action
+as the \emph{primary reconstructed field} of a Vlasov sheet method, so that the Liouville form of the
+reconstruction is exact by construction (\cref{thm:ac,thm:front}); ColDICE uses the invariants as a refinement
+criterion and bounds their violation, it does not remove it, and its invariant is a closed-loop sum on a simplex
+which is blind to the exact part of the error (and is vacuous in two-dimensional phase space), whereas the edge
+defect \eqref{eq:edgedefect} sees the full cochain. (b) The carrier/budget analysis (\cref{thm:carrier,thm:budget})
+that localises all invariant violation in the projection step and the characterisation by exactness of the normal
+error form (\cref{prop:normalform}). (c) The rigidity theorem for P1 sheets (\cref{thm:rigidity}). (d) The
+symplectically invariant monitor from measured action defects and the complexity functional $\mathcal A$, $G$
+(\cref{sec:monitor}). (e) OT acting on the label space of a multi-stream sheet with the mass as a pulled-back passenger.
+\item \emph{Caveat.} Our literature check was limited (\cref{sec:ledger}); (a) in particular is close in spirit to
+Hermite traveltime interpolation in ray methods, and a specialist may know an equivalent construction. We
+therefore claim a derivation, not priority.
+\end{itemize}
+
+\subsection{Error analysis}\label{sec:error}
+
+Throughout this subsection the Hamiltonian is external, $H=K(p,t)+V(x,t)$ with bounded derivatives up to order
+$r+1$, and $F^{\Delta t}_n:=\Psi_n\circ\dots\circ\Psi_1\circ F_0$ denotes the exact discrete transport of the
+initial sheet (what the prototype calls the \emph{oracle}).
+
+\paragraph{Consistency.} A single remap of exact samples commits the error of the reconstruction:
+\cref{thm:ac}(iii) in $d=1$ (tangential $h^m$, normal $h^{m+1}$) and \cref{thm:front}(iv) in a chart. The time
+discretisation is the standard second-order splitting, $\norm{F^{\Delta t}_n-F_{t_n}}_\infty\le C_T\Delta t^2$
+\cite{HLW}; it is independent of the spatial questions studied here and cancels identically in all our
+measurements, which compare against $F^{\Delta t}_n$.
+
+\paragraph{Stability of one remap.}
+\begin{lemma}[Hermite front, frozen frame]\label{lem:lebesgue}\status{new derivation; elementary}
+Let $W\in W^{1,\infty}(0,1)$ and $W_H$ its cubic Hermite interpolant on $[0,1]$ built from $W(0),W(1),W'(0),W'(1)$. Then
+\begin{equation}\label{eq:lebesgue}
+W_H'(s)=W'(0)(1-s)(1-3s)+W'(1)\,s(3s-2)+6\big(W(1)-W(0)\big)s(1-s),\qquad\norm{W_H'}_\infty\le2\,\norm{W'}_\infty ,
+\end{equation}
+and the constant $2$ is attained at $s=\tfrac12$.
+\end{lemma}
+\begin{proof}
+$\abs{W(1)-W(0)}\le\norm{W'}_\infty$ and $\max_s\big(\abs{(1-s)(1-3s)}+\abs{s(3s-2)}+6s(1-s)\big)=2$.
+\end{proof}
+Note that the bound is in terms of $\norm{W'}_\infty=\norm{P}_\infty$ only: because the nodal actions are samples of
+an \emph{exact} carrier, differences of action errors are integrals of momentum errors and no factor $h^{-1}$
+appears. This is the analytic reason for insisting that the data be Legendrian samples of some carrier at all times.
+
+\begin{observation}[von Neumann analysis]\label{obs:vn}
+For the linearised remap in a frozen frame (uniform nodes, data $(W_j,P_j)$, shift by $\sigma h$) the $2\times2$
+amplification matrices of AC$(2,1)$, AC$(4,1)$, AC$(6,1)$ have spectral radius $\le1+\VNRadius$ over
+$\sigma\in[0,1]$, $\vartheta\in(0,\pi]$ ($101\times240$ sample points). This is a necessary condition for stability
+under unboundedly many remaps, not a proof of it.
+\end{observation}
+
+\begin{theorem}[convergence for a bounded number of remaps]\label{thm:conv}\status{new derivation, conditional on (R2)}
+Let $d=1$ (or a single chart). Assume: \textup{(R1)} the reconstruction has order $r$ on exact samples of a $C^r$
+carrier, $\norm{\mathcal R[G]-G}_\infty\le C_Ih^r\abs{G}_{r}$; \textup{(R2)} it is Lipschitz with respect to the carrier,
+$\norm{\mathcal R[G_1]-\mathcal R[G_2]}_\infty\le\Lambda\norm{G_1-G_2}_\infty$ for carriers in a fixed neighbourhood of the
+exact sheet in the extended (Legendrian) sense; \textup{(M)} the label maps $T_r$ used at the $N_r$ remaps are
+uniformly bounded in $C^{r}$ with $\det DT_r\ge\delta>0$. Then the carrier $G^n$ of \cref{alg:sh} satisfies
+\begin{equation}\label{eq:conv}
+\norm{G^n-F^{\Delta t}_n}_\infty\le\sum_{k=1}^{N_r}\Lambda^{N_r-k}\,e^{\ell(t_n-t_{(k)})}\,C_I\,h^{r}\,\abs{F^{\Delta t}_{(k)}\circ T_k}_{r},\qquad
+\ell=\sup_t\Lip(X_{H_t}),
+\end{equation}
+where $t_{(k)}$ are the remap times, while the invariants of \cref{thm:scheme} hold exactly for every $h$ and $N_r$.
+Hence the scheme converges at order $\min(r,2)$ in $(h,\Delta t)$ to the exact sheet for fixed $N_r$.
+\end{theorem}
+\begin{proof}
+Let $E=\norm{G-F^{\Delta t}}_\infty$ over $\Xi$ at matching labels. Between remaps both carriers are transported by the
+same maps $\Psi_n$, each Lipschitz with constant $e^{\ell\Delta t_n}$ up to $O(\Delta t^2)$, so $E$ grows by at most
+$e^{\ell(t-s)}$. At a remap,
+$\norm{\mathcal R[G]-F^{\Delta t}}\le\norm{\mathcal R[G]-\mathcal R[F^{\Delta t}]}+\norm{\mathcal R[F^{\Delta t}]-F^{\Delta t}}\le\Lambda E+C_Ih^r\abs{F^{\Delta t}\circ T}_r$
+by (R2), (R1). Iterate.
+\end{proof}
+
+\paragraph{What is proved, and what is missing.}
+(R1) is \cref{thm:ac}(iii)/\cref{thm:front}(iv). (R2) holds for plain Lagrange interpolation (Lebesgue constant) and
+for AC$(2,1)$ in a frozen frame with $\Lambda=2$ (\cref{lem:lebesgue}); for AC$(m,1)$ with moving chord frames we
+have not computed a constant and (R2) is an assumption, supported by \cref{obs:vn} and by the experiments. The bound
+\eqref{eq:conv} deteriorates like $\Lambda^{N_r}$, which is harmless for remaps triggered by $O(1)$ changes of the
+monitor (their number scales with the number of stretching e-folds, not with $h^{-1}$) but says nothing about
+continuous sliding; uniform power-boundedness is open. Measured behaviour is far better than \eqref{eq:conv}: errors
+are nearly independent of the number of remaps from 1 to 399 (\cref{tab:accum}). For the self-consistent problem no
+estimate is offered: it requires stability of the Poisson coupling with respect to perturbations of a sheet with
+caustics, which is open for every sheet method.

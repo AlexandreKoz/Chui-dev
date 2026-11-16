@@ -1,0 +1,353 @@
+\section{Discrete geometry of sheets}\label{sec:discrete}
+
+\subsection{Discrete sheets, carriers, and the discrete Liouville cochain}
+
+\begin{definition}[discrete Legendrian sheet]\label{def:discrete}
+Let $\mathcal K$ be a mesh of the reference torus $\Xi$ (simplicial or tensor-product) with node set $\{\xi_i\}$.
+A \emph{discrete Legendrian sheet} is the nodal data
+\begin{equation}\label{eq:state}
+Z=\{(q_i,\ x_i,\ p_i,\ \Sigma_i)\}_i\ \subset\ \Q\times T^*\X\times\R ,
+\end{equation}
+understood on the universal cover ($q$, $x$ and $\Sigma$ are quasi-periodic with periods $e_a$, $e_a$, $c_a$).
+A \emph{reconstruction} is an operator $\mathcal R:Z\mapsto(G_h,q_h)$ producing continuous piecewise-$C^1$ maps on
+$\Xi$ interpolating the nodal values. A \emph{carrier} of $Z$ is any continuous piecewise-$C^1$ extended sheet
+$(G,q,\Sigma):\Xi\to T^*\X\times\Q\times\R$ through the nodal data; it is an \emph{exact Lagrangian carrier} if
+$\dd\Sigma=G^*\theta$. The \emph{discrete Liouville cochain} of a reconstruction assigns to each mesh edge $e$ the
+number $\alpha_h(e)=\int_eG_h^*\theta$; the reconstruction is \emph{action consistent} if
+$\alpha_h(e)=\Sigma_j-\Sigma_i$ on every edge $e=(i,j)$.
+\end{definition}
+
+A finite point set lies on infinitely many Lagrangian manifolds, so ``the vertices lie on a Lagrangian manifold''
+has no content by itself. The notion of carrier becomes meaningful through \cref{thm:carrier}: the scheme
+\emph{determines} a specific carrier at all times, and statements about invariants are statements about it.
+Action consistency is a closedness statement: if $\alpha_h=\delta\Sigma$ then the flux of $G_h^*\om$ through every
+mesh 2-cell vanishes and every mesh-loop integral of $\theta$ takes its exact value.
+
+\subsection{Piecewise-linear and quadratic elements}
+
+\begin{proposition}[Lagrangian defect of P1 interpolation]\label{prop:flux}\status{new derivation; verified symbolically}
+Let $F$ be a $C^4$ Lagrangian immersion and $G_h$ its piecewise-linear interpolant on a label-space triangle
+$\tau$ with vertices $q_0,q_0+u,q_0+v$, $\abs u,\abs v\le h$. Then
+\begin{equation}\label{eq:flux}
+\int_\tau G_h^*\om=-\oint_{\partial\tau}G_h^*\theta=-\tfrac14\big[C(u,u,v)-C(u,v,v)\big]+O(h^4).
+\end{equation}
+Thus the P1 interpolant of a Lagrangian sheet is not Lagrangian; its defect per unit label area is $O(h)$ and is
+governed by the cubic form.
+\end{proposition}
+\begin{proof}
+On each straight edge $\int\theta$ is the trapezoid value, which by \cref{lem:edge} exceeds the exact edge action by
+$\tfrac1{12}C(e,e,e)+O(h^4)$. The exact actions sum to zero around $\partial\tau$ because $F^*\theta$ is closed, and
+$\tfrac1{12}[u^3+(v-u)^3+(-v)^3]=\tfrac14[u^2v-uv^2]$ in the symmetric algebra, the base-point dependence of $C$
+contributing $O(h^4)$.
+\end{proof}
+
+For the graph of $\phi=x_1^2x_2$ on the triangle $(0,0),(h,0),(0,h)$, \eqref{eq:flux} is exact:
+$\oint\theta_{PL}=h^3/2$. For quadratic elements with a mid-edge tracer at the parametric midpoint, the edge
+action is given by a Simpson-type formula and its error is $O(h^5)$ (measured orders $4.93,\,4.98,\,5.00$), so the
+flux defect per unit area is $O(h^3)$: smaller, still not zero.
+
+\subsection{Mass}\label{sec:mass}
+
+\begin{proposition}[total mass is a degree]\label{prop:mass}\status{new derivation; elementary}
+Let $q_h:\Xi\to\Q$ be continuous, piecewise $C^1$ and homotopic to the identity, and define cell masses
+$m_K=\int_K q_h^*\mu=\int_K\rho_0(q_h)\det Dq_h\,\dd\xi$. Then $\sum_Km_K=\mu(\Q)$ exactly, for \emph{every} such
+$q_h$; all $m_K$ are positive iff $q_h$ is orientation preserving on every cell. For P1 labels and uniform $\mu$,
+$m_K$ is the signed volume of the label simplex.
+\end{proposition}
+\begin{proof}
+$\int_\Xi q_h^*\mu=\deg(q_h)\int_\Q\mu$ and the degree of a map homotopic to the identity is one.
+\end{proof}
+
+Hence the total mass is conserved by any conforming interpolation of the labels, including across remaps, with no
+flux bookkeeping; the error of a remap in the mass \emph{distribution} is the tangential (label) interpolation
+error, and it does not interact with the symplectic structure (\cref{prop:normalform}(i)).
+
+\section{Structure preservation: theorems and obstructions}\label{sec:structure}
+
+\subsection{Between remaps everything is exact}
+
+\begin{theorem}[carrier transport]\label{thm:carrier}\status{new derivation}
+Suppose every time step applies to \emph{all} vertices one and the same map
+$\Psi_n=\Psi_{\kappa''}\circ\Psi_D\circ\Psi_{\kappa'}$ of $T^*\X$, built from drifts and kicks as in
+\cref{thm:action}(c) with potentials $V_n\in C^{2}(\X)$ \textup{(common-potential hypothesis)}, and updates
+$\Sigma_i$ by \eqref{eq:genfun}. Let $(G^n,q^n,\Sigma^n)$ be any carrier of the nodal data at step $n$. Then
+\begin{enumerate}[label=(\roman*),leftmargin=2.2em,itemsep=1pt]
+\item $(\Psi_n\circ G^n,\ q^n,\ \Sigma^n+A_{\Psi_n}\circ G^n)$ is a carrier of the data at step $n+1$, of the same regularity;
+\item $(G^{n+1})^*\om=(G^n)^*\om$ pointwise on $\Xi$, and $\oint_\gamma(G^{n+1})^*\theta=\oint_\gamma(G^n)^*\theta$ for every loop;
+\item if the carrier is exact Lagrangian at step $n$ it is exact Lagrangian at step $n+1$ with the same Liouville class and the same mass measure $q^{n*}\mu$.
+\end{enumerate}
+This holds for arbitrary time-dependent drift/kick coefficients and for self-consistent potentials, however they
+were computed, as long as the force applied to a vertex at $x$ is $-\kappa\nabla V_n(x)$ for a single function $V_n$.
+\end{theorem}
+\begin{proof}
+Each sub-map is a symplectic diffeomorphism of $T^*\X$ with generating function \eqref{eq:genfun}; apply
+\cref{thm:action}(b) and $\Psi^*\om=\om$. The labels are not touched.
+\end{proof}
+
+\begin{remark}[two notions of symplecticity; a real constraint on force evaluation]\label{rem:force}
+\Cref{thm:carrier} needs symplecticity in the \emph{one-particle} phase space, which is a different property from
+the $N$-body scheme being Hamiltonian. (a) If forces are obtained by differentiating a discrete potential energy
+of the tessellated sheet, the force on a vertex is an element-weighted average and is not $-\nabla V(x_i)$ for a
+common $V$: the $N$-vertex map is symplectic on $(T^*\X)^N$ but does not transport a carrier. (b) If a grid force is
+computed by finite differences and interpolated componentwise (the usual ``momentum-conserving'' particle-mesh
+choice \cite{HockneyEastwood}), the interpolated field is not a gradient in $d\ge2$: for a smooth test potential on an
+$n^2$ grid with centred differences and bilinear interpolation we measure
+$\max\abs{\partial_yg_x-\partial_xg_y}/\max\abs{\partial_xg_x}=\CurlRatios$ for $n=16,32,64$, i.e.\ a pointwise
+relative curl of $O(h)$. The kick is then not symplectic and creates circulation at every step. The hypothesis is
+met by $g=-\nabla\big(\sum_cW(x-x_c)\phi_c\big)$ with a $C^1$ kernel $W$ (quadratic or cubic B-spline), which is
+the force of ``energy-conserving'' schemes. This requirement is independent of remapping and applies to any
+sheet method that monitors Poincar\'e invariants.
+\end{remark}
+
+\begin{remark}[round-off-consistent action]\label{rem:roundoff}
+The edge defects \eqref{eq:edgedefect} are differences of numbers of size $\abs{p}\abs{\Delta x}$. If the drift
+updates $x$ in floating point and $\Sigma$ by the exact formula, the rounding of $x$ enters $\eps_e$ as
+$p\cdot\mathrm{ulp}(x)$, uncorrelated between neighbours; a reconstruction that honours $\eps_e$ converts this into a
+displacement $p\,\mathrm{ulp}(x)/\abs{\Delta z}$. In the prototype this produced a floor of $2\times10^{-9}$ that grew
+like $1/h$. The cure is to transport the action with the displacement actually applied,
+$\Sigma\mathrel{+}=p\cdot(x_{\rm new}-x_{\rm old})-\tfrac D2\abs p^2$ (identical in exact arithmetic), in extended
+precision; the floor dropped to $10^{-12}$ (\texttt{kdk\_step}).
+\end{remark}
+
+\subsection{All invariant violation happens at remaps: the budget}
+
+\begin{theorem}[invariant budget of an interpolatory remap]\label{thm:budget}\status{new derivation}
+Let $G$ be the carrier before a remap and $G'=\mathcal R[\text{nodal samples of }G]$ a continuous piecewise-$C^1$
+reconstruction, both parameterised over $\Xi$, and $e=G'-G$. For every piecewise-$C^1$ closed loop $\gamma\subset\Xi$,
+\begin{equation}\label{eq:budget}
+\oint_\gamma G'^*\theta-\oint_\gamma G^*\theta=\oint_\gamma\big(e_p\cdot\dd x-e_x\cdot\dd p\big)+\oint_\gamma e_p\cdot\dd e_x ,
+\end{equation}
+so that
+$\abs{\Delta I[\gamma]}\le\norm{e}_\infty\big(\len(x\circ\gamma)+\len(p\circ\gamma)+\len(e_x\circ\gamma)\big)$: no
+derivative of the interpolation error is lost. If the scheme satisfies the hypothesis of \cref{thm:carrier}, the
+Poincar\'e invariant of any loop at time $t_n$ differs from its initial value by exactly the sum of the terms
+\eqref{eq:budget} over the remaps performed. For an interpolation of order $r$ this is
+$\sum_{\rm remaps}O(h^{r})$: a drift proportional to the number of remaps.
+\end{theorem}
+\begin{proof}
+$\oint(p+e_p)\cdot\dd(x+e_x)-\oint p\cdot\dd x=\oint e_p\cdot\dd x+\oint p\cdot\dd e_x+\oint e_p\cdot\dd e_x$ and
+$\oint p\cdot\dd e_x=-\oint e_x\cdot\dd p$ on a closed loop. The second statement combines this with \cref{thm:carrier}(ii).
+\end{proof}
+
+The first term of \eqref{eq:budget} is $-\oint_\gamma\beta_e$ with the normal error one-form \eqref{eq:beta}: it
+vanishes for all loops iff $\beta_e$ is exact. This is the discrete face of \cref{prop:normalform} and the design
+criterion for \cref{sec:positive}.
+
+\subsection{Obstructions}\label{sec:nogo}
+
+\begin{counterexample}[sliding on a polygon dissipates action; a conservative remap that is not symplectic]\label{cex:polygon}
+\status{new derivation; elementary}
+Take $d=1$, the harmonic-oscillator orbit sampled by the regular $N$-gon $z_j=(\cos\vartheta_j,\sin\vartheta_j)$,
+$\vartheta_j=2\pi j/N$, with equal masses. Remap by half a cell with linear interpolation:
+$z'_j=\tfrac12(z_j+z_{j+1})$, $m'_j=\tfrac12(m_j+m_{j+1})$. This is the first-order conservative remap: $\sum m$,
+$\sum m\,x$, $\sum m\,p$ are conserved exactly. The enclosed action is multiplied by
+\begin{equation}\label{eq:cos2}
+\frac{A(P')}{A(P)}=\cos^2(\pi/N)<1 ,
+\end{equation}
+so $m$ remaps shrink the sheet by $\cos^{2m}(\pi/N)\simeq\exp(-m\pi^2/N^2)$: a secular, monotone loss of a
+Poincar\'e invariant. More generally, if $P$ is a strictly convex polygon and $P'$ has its vertices on $\partial P$
+and omits at least one vertex of $P$, then $A(P')<A(P)$, because $P'\subsetneq P$. Hence \emph{no} remap that places
+new vertices on the old piecewise-linear carrier can preserve the action of a convex orbit, whatever its mass
+bookkeeping. (Measured: \cref{tab:accum}, rows ``linear''.)
+\end{counterexample}
+
+\begin{theorem}[rigidity of exactly isotropic P1 complexes]\label{thm:rigidity}\status{new derivation; kernel dimension verified numerically}
+Let $\mathcal K_n$ be the Kuhn triangulation of $\T^2$ with vertices $\xi_i=i/n$, $i\in\Z_n^2$ (edges along
+$a_1=(1,0)$, $a_2=(0,1)$, $a_3=(1,1)$), and consider piecewise-linear sheets with $x_i=\xi_i$ and momenta
+$p_i\in\R^2$. Every triangle is isotropic ($\om$ vanishes on it) if and only if
+\begin{equation}\label{eq:rigid}
+p_i=\big(f(i_1),\,g(i_2)\big)+k(i_1-i_2)\,(1,-1)
+\end{equation}
+for functions $f,g,k:\Z_n\to\R$. The space of such fields has dimension $3n-1$, against $2n^2$ for all momentum
+fields. In particular the P1 interpolant of a Lagrangian graph $p=\nabla\phi$ sampled on the lattice is isotropic
+only if the samples of $\nabla\phi$ are of the form \eqref{eq:rigid}; for instance for
+$\phi=\cos(2\pi(\xi_1+\xi_2))$ and $n\ge3$ the $\ell^2$ distance from the nodal momenta to the isotropic subspace
+equals their full norm.
+\end{theorem}
+\begin{proof}
+All triangles are isotropic iff the trapezoid cochain is closed, iff there are $\Sigma_i$ and $c\in\R^2$ with
+$\tfrac12(p_i+p_{i+a_m})\cdot a_m/n=\Sigma_{i+a_m}-\Sigma_i+c\cdot a_m/n$ for $m=1,2,3$ (closed cochains on the torus
+are exact up to periods). The system is translation invariant; insert $p_i=\hat p\,e^{\mathrm i\vartheta\cdot i}$,
+$\Sigma_i=\hat\Sigma\,e^{\mathrm i\vartheta\cdot i}$ with $\vartheta\in(2\pi/n)\Z_n^2\setminus\{0\}$ and put
+$\vartheta_3=\vartheta_1+\vartheta_2$, $\tau_m=\tan(\vartheta_m/2)$. When no $\vartheta_m=\pi$, dividing the $m$-th
+equation by $\tfrac12(1+e^{\mathrm i\vartheta_m})$ gives
+\[
+\hat p_1=2\mathrm in\,\tau_1\hat\Sigma,\qquad\hat p_2=2\mathrm in\,\tau_2\hat\Sigma,\qquad\hat p_1+\hat p_2=2\mathrm in\,\tau_3\hat\Sigma ,
+\]
+so a non-trivial solution requires $\tau_1+\tau_2=\tau_3=(\tau_1+\tau_2)/(1-\tau_1\tau_2)$, i.e.
+\begin{equation}\label{eq:symbol}
+\tau_1\,\tau_2\,(\tau_1+\tau_2)=0\quad\Longleftrightarrow\quad\vartheta_1=0\ \text{ or }\ \vartheta_2=0\ \text{ or }\ \vartheta_1+\vartheta_2=0 .
+\end{equation}
+The cases with some $\vartheta_m=\pi$ are checked directly and give only modes on the same three lines. On each
+line the solution space is one-dimensional and is the Fourier transform of one of the three families in
+\eqref{eq:rigid}; the mode $\vartheta=0$ contributes the constants ($\hat p=c$). Counting, with the one linear
+relation among the three constant fields, gives $3n-1$. The isotropic subspace is a direct sum over wavevectors on the three lines; for
+$\phi=\cos(2\pi(\xi_1+\xi_2))$ the nodal momenta are supported on $\vartheta=\pm(2\pi/n,2\pi/n)$, which lies on none
+of them for $n\ge3$, hence they are orthogonal to the isotropic subspace.
+\end{proof}
+
+\begin{observation}[generic and three-dimensional rigidity]\label{obs:rigid}
+Computing the kernel of the edge system numerically (unknowns $(p_i,\Sigma_i,c)$, singular-value threshold
+$10^{-9}$) gives \cref{tab:rigidity}: $3n$ for the regular lattice in $d=2$ (the $3n-1$ fields of
+\cref{thm:rigidity} and the constant in $\Sigma$), $6n-2$ for the Kuhn-triangulated lattice in $d=3$, and for
+randomly perturbed vertex positions only the trivial solutions (constant momentum, constant $\Sigma$): dimension
+$3$ in $d=2$ and $4$ in $d=3$.
+\end{observation}
+
+\begin{table}[t]\centering\small
+\TableRigidity
+\caption{Dimension of the space of exactly isotropic P1 sheets over a fixed vertex set
+(\texttt{verify\_propositions.py}). ``Generic'' positions: lattice points displaced by independent uniform
+perturbations of $\pm0.15$ lattice spacings.}\label{tab:rigidity}
+\end{table}
+
+The meaning of \cref{thm:rigidity,obs:rigid} is that exact element-wise Lagrangian structure and freely chosen
+vertex positions are incompatible for P1 sheets: the isotropy equations determine the mesh instead of
+constraining a field on it. This does not contradict the existence of piecewise-linear isotropic
+\emph{approximations} of smooth isotropic tori \cite{JRT2019}, in which the vertices are unknowns and are not
+required to interpolate; it shows that such objects cannot serve as an adaptive interpolation space. For the
+linear-order tessellations used by sheet codes, Lagrangian structure is therefore necessarily approximate at the
+element level, with the defect \eqref{eq:flux}.
+
+\subsubsection*{Conservative is not symplectic: the de Rham degrees}\label{sec:derham}
+On the $d$-dimensional sheet the mass is a top-degree form, $\tilde\mu\in\Omega^d(\Xi)$, with potential the label
+map ($\tilde\mu=q^*\mu$, \cref{prop:mass}); the Liouville form is a closed one-form with potential the action,
+$G^*\theta=\dd\Sigma$. A finite-volume remap controls integrals of $d$-forms over cells and is blind to integrals
+of one-forms over loops; \cref{cex:polygon} is the simplest instance. In $d=1$ the two degrees coincide, which is
+why a single device, \emph{interpolating primitives}, serves both: interpolating the cumulative mass is the
+classical conservative remap, interpolating $\Sigma$ is its symplectic counterpart. In $d\ge2$ they separate, and
+the common formulation is that both structures are derived from \emph{nodal potentials} ($q$ and $\Sigma$), so that
+closedness is automatic.
+
+\subsubsection*{The distribution itself cannot be preserved}
+Any remap that changes the carrier as a set changes $f=G\pf\tilde\mu$; only weak closeness is available, e.g.\
+$W_1(f',f)\le\norm{G'\circ q'^{-1}-G\circ q^{-1}}_{L^1(\mu)}$. Exactness is attainable for integral invariants, not for $f$.
+
+\subsection{Positive results: remapping through the generating function}\label{sec:positive}
+
+By \cref{prop:normalform}, a remap is structure preserving iff its normal error is the differential of a scalar.
+The scalar is available: it is the error of a reconstruction of the action. We therefore reconstruct $\Sigma$
+and derive the momentum from it, instead of interpolating the momentum.
+
+\paragraph{One degree of freedom.}
+Let nodes $q_0<q_1<\dots<q_N=q_0+\abs\Q$ carry exact Legendrian samples $(z_j,\Sigma_j)$, $z=(x,p)$. On the cell
+$[q_j,q_{j+1}]$ let $z^L$ be the Lagrange interpolant of $z$ on the $m$ nodes $q_{j-m/2+1},\dots,q_{j+m/2}$
+($m$ even), $\pi_m(q)=\prod_k(q-q_k)$ the nodal polynomial of this stencil, $\Delta z=z_{j+1}-z_j$, and $n_j$ a
+vector with $\om(\Delta z,n_j)=1$. Define the \emph{action-corrected interpolant} AC$(m,1)$
+\begin{equation}\label{eq:ac}
+\tilde z(q)=z^L(q)+c_j\,\pi_m(q)\,n_j,\qquad
+c_j\int_{q_j}^{q_{j+1}}\pi_m\,\om(\partial_qz^L,n_j)\,\dd q=\Sigma_{j+1}-\Sigma_j-\int_{q_j}^{q_{j+1}}p^L\,\partial_qx^L\,\dd q ,
+\end{equation}
+and the new action $\tilde\Sigma(q)=\Sigma_j+\int_{q_j}^{q}\tilde p\,\partial_q\tilde x\,\dd q$ on the cell.
+
+\begin{theorem}[action-corrected interpolation]\label{thm:ac}\status{new derivation; orders verified numerically}
+Assume the data are samples of an exact sheet $(F,\Sigma)$ of class $C^{m+1}$ with $\abs{F'}\ge s_0>0$, on a mesh
+with bounded local ratio and $h=\max_j(q_{j+1}-q_j)$ so small that the integral multiplying $c_j$ in \eqref{eq:ac} is
+non-zero (it equals $\int\pi_m\dd q/\Delta q_j\cdot(1+O(h\norm{F''}/s_0))$, and $\pi_m$ has one sign on the cell). Then
+\begin{enumerate}[label=(\roman*),leftmargin=2.2em,itemsep=1pt]
+\item $\tilde z$ is continuous, piecewise polynomial of degree $m$, and interpolates the nodes;
+\item \emph{exact edge actions:} $\int_{q_j}^{q_{j+1}}\tilde p\,\partial_q\tilde x\,\dd q=\Sigma_{j+1}-\Sigma_j$ for every
+cell; hence $\oint\tilde p\,\dd\tilde x=c$ exactly, the signed area between old and new carrier over each cell is
+zero, and $(\tilde z,\tilde\Sigma)$ is an exact Lagrangian carrier of both the old nodal data and any re-sampling of itself;
+\item \emph{accuracy:} the tangential error is $O(h^m)$ and the normal error is $O(h^{m+1})$; to leading order
+\begin{equation}\label{eq:acerr}
+\abs{e_\perp}\le\norm{\pi_m}_\infty\,h\Big(\frac{2\norm{F''}_\infty\norm{F^{(m)}}_\infty}{m!\;s_0}+\frac{\norm{F^{(m+1)}}_\infty}{(m+1)!}\Big);
+\end{equation}
+\item for $m=2$ the arc is the parabola through $z_j,z_{j+1}$ enclosing with its chord the area
+$\eps_j$ of \eqref{eq:edgedefect}; in the oblique frame $z=z_j+s\Delta z+\eta\,n_j$ it is the graph $\eta=W'(s)$
+of the cubic Hermite interpolant $W(s)=\eps_j(3s^2-2s^3)$ of the generating function, and the action of the
+sub-arc $[0,s]$ exceeds that of its chord by $\eps_js^3$.
+\end{enumerate}
+\end{theorem}
+\begin{proof}
+(i) $\pi_m$ vanishes at the stencil nodes. (ii) For a curve $z$ on $[a,b]$, a constant vector $n$ and a function
+$\beta$ vanishing at $a,b$,
+\begin{equation}\label{eq:areavar}
+\int_a^b(p+\beta n_p)\,\partial_q(x+\beta n_x)\,\dd q-\int_a^bp\,\partial_qx\,\dd q=\int_a^b\beta\,\om(\partial_qz,n)\,\dd q ,
+\end{equation}
+because the quadratic term is $n_pn_x\int\beta\beta'=0$ and $\int p\,\beta'n_x=-\int\beta\,p'n_x$. With
+$\beta=c_j\pi_m$, \eqref{eq:ac} is exactly the condition that the cell action equals $\Sigma_{j+1}-\Sigma_j$; it is
+\emph{linear} in $c_j$. Summing over cells gives the period. (iii) Write $F-z^L=\pi_mg$ with $g$ the divided
+difference $F[q_{j-m/2+1},\dots,q_{j+m/2},q]$, $\norm g\le\norm{F^{(m)}}/m!$, $\norm{g'}\le\norm{F^{(m+1)}}/(m+1)!$.
+Applying \eqref{eq:areavar}-type expansion to $F=z^L+\pi_mg$ gives
+$\Sigma_{j+1}-\Sigma_j-\int p^L\partial_qx^L=\int\pi_m\om(\partial_qz^L,g)+O(h^{2m})$, hence
+$c_j=\langle a\rangle/\langle b\rangle+O(h^{2m})$ with $a=\om(\partial_qz^L,g)$, $b=\om(\partial_qz^L,n_j)$ and
+$\langle\cdot\rangle$ the $\pi_m$-weighted mean over the cell. The normal component of the error
+$F-\tilde z=\pi_m(g-c_jn_j)$ is $\pi_m(a-c_jb)/\abs{\partial_qz^L}$, and
+$\abs{a-b\langle a\rangle/\langle b\rangle}\le\mathrm{osc}(a)+\abs{\langle a\rangle/\langle b\rangle}\mathrm{osc}(b)$
+with oscillations over the cell bounded by $h$ times derivatives; using $b=\Delta q_j^{-1}(1+O(h))$ and
+$\abs{n_j}\abs{\Delta z}\simeq1$ yields \eqref{eq:acerr}. The tangential error is that of $z^L$ plus $c_j\pi_m$ times
+the tangential part of $n_j$, both $O(h^m)$. (iv) is a direct computation: for $m=2$,
+$\tilde z=z_j+s\Delta z+6\eps_js(1-s)n_j$ with $s=(q-q_j)/\Delta q_j$, and $W-\tfrac12sW'=\eps_js^3$.
+\end{proof}
+
+Three comments. First, the single scalar $\Sigma_{j+1}-\Sigma_j$ determines exactly the normal component of the
+leading error term of the base interpolant, which is why one order is gained (measured:
+\cref{tab:conv}, ``fixed'' rows: orders $4.00\to5.00$ for $m=4$). Second, the constant in \eqref{eq:acerr} contains the
+\emph{hairpin factor} $\norm{F''}/s_0$: at tight turns of the sheet in phase space (small $\abs{F'}$) the gain is
+reduced but the base accuracy is retained; a first implementation that represented the arc as a graph over its
+chord with a metric normal lost accuracy there, because that construction is not equivariant under affine
+symplectic maps, whereas \eqref{eq:ac} is up to a higher-order term (\cref{sec:num1d}). Third, using all $m-1$
+cell actions of the stencil with bubbles $\pi_m\{1,q,\dots,q^{m-2}\}$ (AC$(m,m-1)$) is possible and formally of
+normal order $2m-1$; in our tests it was more accurate at low resolution but irregular (the fixed direction $n_j$
+is a poor transversal in neighbouring cells at hairpins), and we do not build on it.
+
+\paragraph{Several degrees of freedom, one chart.}
+Let $M=\begin{psmallmatrix}A&B\\ C&D\end{psmallmatrix}\in Sp(2d)$ be a linear symplectic frame, $(X,P)=M(x,p)$.
+Then $P\cdot\dd X=p\cdot\dd x+\dd Q_M$ with
+\begin{equation}\label{eq:QM}
+Q_M(x,p)=\tfrac12x^{\!\top}A^{\!\top}Cx+\tfrac12p^{\!\top}B^{\!\top}Dp+x^{\!\top}C^{\!\top}Bp ,
+\end{equation}
+so that $W:=\Sigma+Q_M\circ G$ is the generating function of the sheet in the frame: $\dd W=G^*(P\cdot\dd X)$. A patch
+of the sheet is a \emph{chart} for $M$ if $\xi\mapsto X(\xi)$ is a local diffeomorphism there (by Arnold's theorem
+the $2^d$ coordinate frames suffice locally \cite{Arnold}). The vertex data provide, in a chart, \emph{Hermite data
+for the scalar $W$}: its values $W_i$ and its gradient $\nabla_XW(X_i)=P_i$.
+
+\begin{theorem}[generating-function elements]\label{thm:front}\status{new derivation; verified numerically in $d=2$}
+On a patch that is a chart for $M$, let $X_h:\Xi\to\R^d$ be a $C^1$ interpolant of the nodal $X_i$ with
+$\det DX_h\neq0$, and $W_h\in C^1(\Xi)$ any function with
+\begin{equation}\label{eq:hermitedata}
+W_h(\xi_i)=W_i,\qquad\nabla_\xi W_h(\xi_i)=DX_h(\xi_i)^{\!\top}P_i .
+\end{equation}
+Define $P_h:=(DX_h)^{-\top}\nabla_\xi W_h$ and $G_h=M^{-1}(X_h,P_h)$. Then
+\begin{enumerate}[label=(\roman*),leftmargin=2.2em,itemsep=1pt]
+\item $G_h$ is continuous and interpolates $(x_i,p_i)$; $W_h-Q_M\circ G_h$ interpolates $\Sigma_i$;
+\item $G_h^*(P\cdot\dd X)=\dd W_h$ identically: the reconstruction is \emph{exactly Lagrangian}, every loop integral
+of $\theta$ over a loop in the patch has its exact value, and the reconstruction is action consistent on every
+curve, not only on mesh edges;
+\item any re-sampling $(G_h(\xi'),W_h(\xi')-Q_M)$ is an exact Legendrian sample set of the carrier $G_h$;
+\item $\abs{P_h-P}\le\norm{(DX_h)^{-1}}\big(\abs{\nabla_\xi(W_h-W)}+\abs{DX_h-DX}\,\abs P\big)$, so the order in $P$ is
+the minimum of the gradient order of the $W$-element and the derivative order of the $X$-interpolant.
+\end{enumerate}
+\end{theorem}
+\begin{proof}
+(ii) $P_h\cdot\dd X_h=(DX_h^{\!\top}P_h)\cdot\dd\xi=\nabla_\xi W_h\cdot\dd\xi$. (i) follows from \eqref{eq:hermitedata} and
+continuity of $DX_h$, $\nabla W_h$. (iii) is (ii). (iv) subtract $DX^{\!\top}P=\nabla_\xi W$ for the exact sheet.
+\end{proof}
+
+$C^1$ elements with exactly the nodal data \eqref{eq:hermitedata} exist in every dimension: bicubic Hermite
+(Bogner--Fox--Schmit \cite{BFS1965}) and its higher-order relatives on tensor-product meshes, Clough--Tocher-type
+macro-elements on simplices \cite{WorseyFarin1987}; degrees of freedom beyond \eqref{eq:hermitedata} (twists, higher
+derivatives) are filled by differences of the exact gradient data and enter at higher order. The Lagrangian
+constraint, which is a rigid nonlinear condition on a parametric element (\cref{thm:rigidity}), has become
+$C^1$-conformity of a scalar potential, exactly as divergence-free fields are obtained from stream functions.
+In the prototype (\cref{sec:num2d}) the $C^1$ bicubic and $C^2$ biquintic elements give momentum errors of order
+$3$ and $\simeq5$--$6$ and circulation at quadrature round-off.
+
+\begin{remark}[relation to \cref{thm:ac}]
+In $d=1$ charts are needed only edge by edge, because continuity of a curve is a condition at points; taking the
+frame of each edge with $X$ along its chord, \cref{thm:front} with the cubic Hermite $W$ is \cref{thm:ac}(iv).
+The parametric form \eqref{eq:ac} is the same idea written without choosing a frame.
+\end{remark}
+
+\begin{problem}[global conforming Lagrangian carriers across caustics, $d\ge2$]\label{prob:glue}
+At a caustic of the frame $M$ ($\det DX=0$) the formula $P_h=(DX_h)^{-\top}\nabla W_h$ is singular and a different
+frame must be used on a neighbouring patch. Two exactly Lagrangian patch reconstructions in different frames agree
+only to the interpolation order on their overlap. Construct a \emph{globally continuous, exactly Lagrangian}
+piecewise-polynomial (or otherwise computable) carrier interpolating Legendrian data on a mesh that crosses
+caustics, with optimal-order error. The linearised problem is solvable (blend the generating functions of the two
+patches in one frame on the overlap, where both are graphs), which suggests existence; the obstruction is
+computational (the generating function of one patch in the frame of the other is not polynomial) and possibly
+topological over a full Maslov cycle. We have no construction and no proof. Without it, the method in $d\ge2$ is
+exact chart-wise and controlled by \cref{thm:budget} across chart transitions.
+\end{problem}

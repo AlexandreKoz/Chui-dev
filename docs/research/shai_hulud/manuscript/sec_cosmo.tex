@@ -1,0 +1,154 @@
+\section{Extension to comoving Vlasov--Poisson}\label{sec:cosmo}
+
+\subsection{The comoving Hamiltonian and what carries over verbatim}
+
+In comoving coordinates $x$ with canonical momentum $p=a^2\dot x$ (per unit mass) and cosmic time $t$,
+\begin{equation}\label{eq:comoving}
+H(x,p,t)=\frac{\abs p^2}{2a(t)^2}+\phi(x,t),\qquad\Delta_x\phi=\frac{3}{2}\,\Omega_mH_0^2\,\frac{\delta(x,t)}{a(t)},\qquad
+\delta=\frac{\rho}{\bar\rho}-1,\quad\rho=(x_t)\pf\mu ,
+\end{equation}
+on the periodic box $\X=\T^3$ (zero mode of $\phi$ removed). The Hamiltonian is explicitly time dependent and, for
+each $t$, separable. Everything in \cref{sec:continuum,sec:structure} was stated for time-dependent Hamiltonians:
+
+\begin{proposition}[comoving sheets]\label{prop:comoving}\status{new derivation; corollary of \cref{thm:action,thm:carrier}}
+For \eqref{eq:comoving} with $\phi_t\in C^2(\X)$ periodic: the sheet remains Lagrangian with constant Liouville class
+(\cref{prop:invariants}); the kick--drift--kick scheme with $D_n=\int_{t_n}^{t_{n+1}}a^{-2}\dd t$ and kick factors
+$\kappa=\int\dd t$ over the half steps \cite{QuinnEtAl1997} is a composition of exact symplectic maps of $T^*\X$ with
+generating functions
+\begin{equation}\label{eq:comovingaction}
+A_{\rm drift}=\tfrac12D_n\abs p^2,\qquad A_{\rm kick}=-\kappa\,\phi_n(x),
+\end{equation}
+so the action is transported exactly and \cref{thm:carrier,thm:scheme} hold, with $\phi_n$ the potential actually
+used for the force at the kick. Any other time variable (scale factor, superconformal time) only changes the
+coefficients $D_n,\kappa$.
+\end{proposition}
+
+The comoving test of \cref{sec:num1d} is exactly this situation with a prescribed $\phi$: the Liouville class is
+kept to within $5\times10^{-16}$ through $a\simeq11.7$ and 38 remaps, with $e_\perp^{\max}=2.8\times10^{-11}$ (\cref{tab:history}).
+Energy is not conserved for \eqref{eq:comoving}; the Layzer--Irvine relation is a diagnostic, not an invariant, and
+plays no role in the structure.
+
+\subsection{Requirements imposed by the self-consistent coupling}
+
+\begin{enumerate}[leftmargin=2em,itemsep=3pt]
+\item \emph{Common-potential, exact-gradient force.} By \cref{rem:force} the force must be
+$-\nabla\big(\sum_cW(x-x_c)\phi_c\big)$ with $W$ at least $C^1$, and the \emph{same} interpolated potential enters
+$A_{\rm kick}$. Finite-difference-then-interpolate forces and forces derived variationally from the tessellated
+potential energy both violate the hypothesis of \cref{thm:carrier}; with the former the pointwise relative curl of
+the force is $O(h_{\rm grid})$.
+\item \emph{Density deposit.} $\rho_h=(x_h)\pf(q_h^*\mu)$: each reference cell deposits its mass
+$m_K=\mu(q_h(K))$ over the image $x_h(K)$ (exact polyhedral projection for P1 elements as in ColDICE; sub-sampling or
+quadrature for curved carriers). Total deposited mass is exact by \cref{prop:mass} if the deposit is a partition of
+unity. The deposit is \emph{not} required to be adjoint to the force interpolation; the price is that total
+momentum and the $N$-vertex energy are conserved only to truncation order, the usual trade of energy-conserving
+particle-mesh schemes \cite{HockneyEastwood}. Which of the two structures (one-particle symplecticity, needed for the
+sheet; or exact momentum conservation) should be given up is a modelling decision; the sheet structure requires the former.
+\item \emph{Initial data.} Zel'dovich data are exactly Lagrangian with the action \eqref{eq:zeldovich} and $c=0$;
+second-order data are not (\cref{ex:ic}, \eqref{eq:2lpt}) and would freeze a third-order Lagrangian defect into the
+carrier (\cref{thm:carrier}(ii)); they should be replaced by symplectically generated higher-order data.
+\item \emph{Charts across caustics.} After shell crossing the identity frame fails on caustics. In $d=1$ the
+edge-wise construction of \cref{thm:ac} handles any number of streams (all 1D tests above are multi-stream). In
+$d=3$ a per-patch choice among the $2^3$ coordinate frames (or a rotation adapted to the patch) is needed, and
+exactness across frame changes is \cref{prob:glue}.
+\item \emph{Monitor.} The edge defects \eqref{eq:edgedefect} are available at no cost and are invariant under the
+time-dependent canonical rescalings of \eqref{eq:comoving}. By \cref{rem:monreg} the monitor must be mollified at a
+fixed comoving label scale.
+\end{enumerate}
+
+\subsection{What should be expected, and what should not}
+
+\emph{Complexity.} The sheet volume and its affine complexity grow without bound inside collapsed structures;
+in the externally driven chaotic test $\mathcal A$ grows by a factor $26$ and $G$ by $10^{9}$ over twelve dynamical
+times (\cref{tab:complexity}). Optimal transport redistributes a fixed budget of vertices optimally with respect to
+the monitor; it does not reduce $\mathcal A$. A production method needs $h$-refinement on top of the
+$r$-adaptation (a finer reference mesh at a remap; \cref{thm:scheme} is indifferent to the number of nodes) and,
+realistically, a fall-back to particles in regions of rapid mixing, as adopted by the sheet/release hybrid of
+\cite{Stuecker2020}. Nothing in this note changes that assessment.
+
+\emph{Regularity.} With singular caustic densities the tidal field is unbounded and the flow map is not $C^2$; the
+error analysis of \cref{sec:error} then does not apply as stated, and the carrier's derivatives are controlled only
+at the scale of the force-softening or mesh kernel. The structural statements (\cref{thm:carrier,thm:scheme}) are
+unaffected, since they use only that each step is a $C^1$ symplectic map generated by a $C^2$ interpolated potential.
+
+\emph{Stability of the coupling.} Whether exact preservation of the sheet invariants improves the long-time
+fidelity of self-gravitating runs is an empirical question that the present prototype does not address.
+
+\section{Proof ledger}\label{sec:ledger}
+
+\begin{table}[h]\centering\footnotesize
+\begin{tabular}{p{4.4cm}p{2.6cm}p{7.9cm}}\toprule
+statement & status & basis / caveat\\\midrule
+\cref{prop:vlasov,prop:invariants} sheet solves Vlasov; invariants & established & textbook (Cartan formula); self-consistent case under \cref{ass:regular}\\
+\cref{thm:action} action transport, generating functions of kick/drift & established mathematics, new use & three-line proof; verified to round-off in all runs\\
+\cref{ex:ic} Zel'dovich action; 2LPT defect \eqref{eq:2lpt} & new derivation & direct computation; consistent with known third-order transverse displacements\\
+\cref{thm:gauge} relabelling invariance, ALE form & new derivation (elementary) & proved\\
+\cref{thm:momentum} Lagrangian condition as momentum map & established \cite{Donaldson1999} & short verification given\\
+\cref{prop:normalform} exact normal one-forms & new derivation (linear); nonlinear version \cite{Weinstein1971} & proved to first order\\
+\cref{prop:cubic} cubic form & new derivation & proved; classical object\\
+\cref{thm:ot,prop:ot1d} OT on the torus & established & cited; not re-proved\\
+\cref{prop:sampling} sampling vs mass & new derivation (elementary) & proved\\
+\cref{lem:edge,prop:flux} edge defect, P1 flux & new derivation & proved; symbolic check\\
+\cref{prop:mass} mass as a degree & new derivation (elementary) & proved; $0$ / $10^{-16}$ in all runs\\
+\cref{thm:carrier} carrier transport & new derivation & proved; requires common-potential force\\
+\cref{thm:budget} invariant budget & new derivation & proved; drift with remap count observed\\
+\cref{cex:polygon} polygon action loss & new derivation (elementary) & proved; numeric check\\
+\cref{thm:rigidity} P1 rigidity on the lattice, $d=2$ & new derivation & proved (Fourier); kernel dimension $3n$ confirmed for $n=5,6,8$\\
+\cref{obs:rigid} generic and $d=3$ rigidity & numerical observation & SVD ranks only; no proof\\
+\cref{thm:ac} action-corrected interpolation & new derivation & (i),(ii),(iv) proved; (iii) proved to leading order, order confirmed for $m=4$ ($5.00$)\\
+\cref{thm:front} generating-function elements & new derivation & proved (chart-wise); confirmed in $d=2$\\
+\cref{thm:scheme} structure preservation of the scheme & new derivation & proved from the above\\
+\cref{lem:lebesgue} Hermite constant 2 & new derivation (elementary) & proved\\
+\cref{obs:vn} spectral radius $\le1$ & numerical observation & sampled grid; not a stability proof\\
+\cref{thm:conv} convergence & new derivation, conditional & (R2) proved only for Lagrange and frozen-frame AC$(2,1)$\\
+\cref{prop:comoving} comoving extension & corollary & proved for prescribed $\phi\in C^2$; external-potential test only\\
+\cref{prob:glue} global Lagrangian carrier across caustics & open & no construction\\
+uniform stability for unboundedly many remaps & open & evidence: \cref{obs:vn}, \cref{tab:accum}\\
+self-consistent Vlasov--Poisson stability/convergence & open & not attempted\\
+novelty of the action-based remap & unverified & limited literature check; ColDICE details beyond its abstract not re-verified\\\bottomrule
+\end{tabular}
+\caption{Ledger. ``New derivation'' means proved in this note; it is not a priority claim.}\label{tab:ledger}
+\end{table}
+
+\section{Verdict}\label{sec:verdict}
+
+\paragraph{Feasibility.} Coupling Hamiltonian evolution to optimal-transport-guided remapping without
+uncontrolled violation of invariants is \emph{feasible, with a precisely delimited scope}:
+\begin{itemize}[leftmargin=1.6em,itemsep=2pt]
+\item Mass: exact, in any dimension, by carrying labels (\cref{prop:mass}).
+\item Hamiltonian structure between remaps: exact, in any dimension, given a common-potential exact-gradient
+force (\cref{thm:carrier}); this is a constraint on force evaluation that existing particle-mesh practice does not
+automatically meet.
+\item Remaps, $d=1$: exact Liouville class and exact carrier for arbitrarily many remaps, any number of streams,
+with a \emph{gain} of one order of accuracy (\cref{thm:ac}); demonstrated.
+\item Remaps, $d\ge2$: exact chart-wise (\cref{thm:front}); demonstrated in $d=2$ before shell crossing, at the cost
+of one order of momentum accuracy relative to unconstrained splines of equal degree. Across caustics exactness is
+open (\cref{prob:glue}) and the fallback is the controlled budget of \cref{thm:budget}.
+\end{itemize}
+
+\paragraph{Fundamental obstructions.} (1) Exact preservation of $f$ is impossible for any projection. (2) Exact
+element-wise Lagrangian structure is impossible for freely placed piecewise-linear elements
+(\cref{thm:rigidity}); linear-order tessellations are Lagrangian only up to the cubic-form defect \eqref{eq:flux}.
+(3) Conservative remapping and symplectic remapping constrain forms of different degree; neither implies the
+other. (4) The structure-preserving perturbations of a sheet are exactly the graphs of exact one-forms
+(\cref{prop:normalform}): one scalar degree of freedom out of $d$. The strongest viable alternative is therefore to
+make the scalar the primary unknown, which is what the action-augmented representation does.
+
+\paragraph{The role of optimal transport.} Modest and well defined: it is the canonical, tangle-free,
+memoryless choice of the sampling map on label space. It contributes nothing to structure preservation (any
+diffeomorphism would do), nothing in $d=1$ beyond equidistribution, and it cannot resolve anisotropy. Its
+regularity requirement on the monitor is real and was observed.
+
+\paragraph{Scientific novelty.} The combination of known algorithms is not the claim. What appears to be new, to
+the limited extent we could check, is the structural analysis (carrier/budget, exact-normal-form
+characterisation, P1 rigidity) and the remap that reconstructs the generating function from an exactly transported
+action, with its invariant monitor. The closest antecedents are ColDICE's Poincar\'e-invariant refinement
+criterion, Hermite (CIP-type) semi-Lagrangian interpolation, and traveltime interpolation in wavefront
+construction; a proper literature review by specialists of geometric optics and of geometric integration is
+required before any priority statement.
+
+\paragraph{Recommended next steps.} (1) \Cref{prob:glue} in $d=2$: a two-frame construction across a fold caustic,
+with a four-dimensional multi-stream test (the ColDICE two-sine-wave collapse is the natural benchmark). (2) A
+proof of (R2) for AC$(m,1)$ and of power-boundedness. (3) Simplicial $C^1$ generating-function elements with
+anisotropic $h$-refinement, to combine with ColDICE-type refinement. (4) A self-consistent 1D comoving test with an
+exact-gradient particle-mesh force against the Zel'dovich solution, to quantify whether exact sheet invariants
+matter in practice.

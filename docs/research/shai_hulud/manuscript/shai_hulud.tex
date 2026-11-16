@@ -1,0 +1,202 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage[margin=2.4cm]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{amsmath,amssymb,amsthm,mathtools}
+\usepackage{booktabs,graphicx,enumitem,microtype}
+\usepackage{algorithm,algpseudocode}
+\usepackage{xcolor}
+\usepackage[colorlinks=true,linkcolor=blue!50!black,citecolor=blue!50!black,urlcolor=blue!50!black]{hyperref}
+\usepackage[nameinlink,capitalise]{cleveref}
+
+\numberwithin{equation}{section}
+\newtheorem{theorem}{Theorem}[section]
+\newtheorem{proposition}[theorem]{Proposition}
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{corollary}[theorem]{Corollary}
+\newtheorem{conjecture}[theorem]{Conjecture}
+\theoremstyle{definition}
+\newtheorem{definition}[theorem]{Definition}
+\newtheorem{assumption}[theorem]{Assumption}
+\newtheorem{counterexample}[theorem]{Counterexample}
+\newtheorem{example}[theorem]{Example}
+\newtheorem{problem}[theorem]{Open problem}
+\newtheorem{observation}[theorem]{Numerical observation}
+\theoremstyle{remark}
+\newtheorem{remark}[theorem]{Remark}
+
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\T}{\mathbb{T}}
+\newcommand{\Z}{\mathbb{Z}}
+\newcommand{\X}{\mathcal{X}}
+\newcommand{\Q}{\mathcal{Q}}
+\newcommand{\Lie}{\mathcal{L}}
+\newcommand{\dd}{\mathrm{d}}
+\newcommand{\id}{\mathrm{id}}
+\newcommand{\pf}{{}_{\#}}
+\newcommand{\om}{\omega}
+\newcommand{\eps}{\epsilon}
+\newcommand{\abs}[1]{\lvert #1\rvert}
+\newcommand{\norm}[1]{\lVert #1\rVert}
+\newcommand{\status}[1]{\textnormal{\small[#1]}}
+\DeclareMathOperator{\tr}{tr}
+\DeclareMathOperator{\Lip}{Lip}
+\DeclareMathOperator{\Diff}{Diff}
+\DeclareMathOperator{\len}{len}
+
+\input{tables_generated}
+
+\title{\textbf{SHAI-HULUD}\\[2pt]
+\large Structure-preserving adaptive remapping of cold phase-space sheets:\\
+action-augmented (Legendrian) sheets, optimal-transport sampling,\\
+and the limits of discrete Lagrangian structure}
+\author{CHUI project --- mathematical research note\\
+\small (working manuscript; status of every statement is tracked in \cref{sec:ledger})}
+\date{16 November 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+A cold collisionless medium is a Lagrangian submanifold of phase space carrying a mass measure, transported by a
+Hamiltonian flow. Any discrete representation of this sheet must be re-sampled as it stretches and folds. We ask
+whether Hamiltonian evolution can be coupled to an optimal-transport-guided adaptive reparameterisation without
+uncontrolled violation of the physical measure and of the Hamiltonian invariants (the Lagrangian property, the
+Poincar\'e--Cartan loop invariants, the Liouville class).
+
+The continuum answer is yes for trivial reasons: reparameterisation is a gauge symmetry (relabelling), and the
+Lagrangian property is the zero level of its momentum map. The discrete answer is subtler, and we establish the
+following. (i)~Between remaps, a vertex method with a splitting integrator and a \emph{common-potential} force
+transports an exact carrier manifold; all invariants are exactly conserved and the classical action can be
+transported exactly, vertex by vertex, by the generating functions of the sub-steps (\cref{thm:action,thm:carrier}).
+(ii)~All invariant violation is therefore created at remaps, with an explicit budget (\cref{thm:budget}).
+(iii)~Exact element-wise preservation is impossible for piecewise-linear sheets: sliding vertices on a convex
+polygon strictly loses action (\cref{cex:polygon}), and exactly isotropic P1 complexes over a lattice are rigid
+(\cref{thm:rigidity}); a mass-conservative remap is not symplectic because mass and the Liouville form live in
+different degrees of the de~Rham complex of the sheet (\cref{sec:derham}). (iv)~A remap is structure preserving
+if and only if its normal error one-form is exact (\cref{prop:normalform}); this is achieved constructively by
+reconstructing the \emph{generating function} from the transported action: in one degree of freedom by an
+\emph{action-corrected interpolation} that reproduces every edge action exactly and gains one order of accuracy
+in the normal direction (\cref{thm:ac}); in $d\ge 2$, chart-wise, by $C^1$ Hermite elements for the generating
+function (\cref{thm:front}). (v)~Optimal transport enters only as the canonical (curl-free) choice of the label
+reparameterisation that equidistributes a symplectically invariant monitor built from the cubic form of the
+sheet; it never moves mass (\cref{sec:ot}).
+
+A reference prototype with external Hamiltonians confirms the statements: in two-dimensional phase space the
+action-corrected remap keeps the Poincar\'e invariant at round-off over 1--399 remaps while interpolation
+remaps drift, and in chaotic and collapse tests it retains normal accuracy $10^{-6}$ where a fixed Lagrangian
+mesh of the same size has $O(1)$ error; in four-dimensional phase space (single-stream regime) the
+generating-function element gives circulation at quadrature round-off after Monge--Amp\`ere remaps. What is
+\emph{not} established is a globally conforming exactly Lagrangian discrete carrier across caustics in $d\ge2$,
+and any stability result for the self-consistent Vlasov--Poisson coupling. Individual ingredients have clear
+antecedents (ColDICE, CIP schemes, wavefront construction, Monge--Amp\`ere mesh adaptation); the contribution
+defended here is the structural analysis and the action-based remap, not the combination as such.
+\end{abstract}
+
+\tableofcontents
+
+\section{Introduction and summary}\label{sec:intro}
+
+\paragraph{Problem.} Let $\X=\T^d=\R^d/\Z^d$ be configuration space, $T^*\X=\T^d\times\R^d$ phase space with
+canonical one-form $\theta=p\cdot\dd x$ and symplectic form
+\begin{equation}\label{eq:omega}
+\om=\dd x\wedge \dd p=-\dd\theta,\qquad \om(a,b)=a_x\cdot b_p-a_p\cdot b_x .
+\end{equation}
+A cold distribution is the push-forward $f_t=(F_t)\pf\mu$ of a mass measure $\mu$ on a $d$-dimensional label
+manifold $\Q$ by a map $F_t:\Q\to T^*\X$, $F_t(q)=(x(q,t),p(q,t))$, which is a Lagrangian immersion. Numerical
+methods that tessellate $\Q$ and move the vertices with the flow
+\cite{AbelHahnKaehler2012,ShandarinHabibHeitmann2012,HahnAbelKaehler2013,HahnAngulo2016,SousbieColombi2016}
+must adapt the tessellation because $F_t$ stretches without bound. The mission of this note is to decide whether
+adaptation by a time-dependent reparameterisation $q=T_t(\xi)$, possibly constructed by optimal transport (OT),
+can be made compatible with (a) the physical measure, (b) the Lagrangian structure, (c) selected
+Poincar\'e invariants, and to derive the strongest scheme that can be defended mathematically.
+
+\paragraph{Three distinctions that organise the paper.}
+\begin{enumerate}[leftmargin=2em,itemsep=2pt]
+\item \emph{Coordinate change versus projection.} A smooth reparameterisation changes nothing
+(\cref{thm:gauge}). A discrete remap is a reparameterisation \emph{followed by a projection onto a
+finite-dimensional family of sheets}; only the projection can violate invariants.
+\item \emph{Sampling density versus mass.} OT is used on label space to choose where the degrees of freedom sit.
+The mass measure is a passenger that is pulled back; no mass is transported in phase space
+(\cref{prop:sampling}).
+\item \emph{Conservative versus symplectic.} Mass is a top-degree form on the sheet, the Liouville form is a
+closed one-form. A remap that conserves cell integrals of the former knows nothing about loop integrals of the
+latter (\cref{sec:derham}).
+\end{enumerate}
+
+\paragraph{The construction in one paragraph.} Each vertex carries its label $q_i$, its phase-space position
+$(x_i,p_i)$ and the \emph{action} $\Sigma_i$, a primitive of the Liouville form along the sheet,
+$\dd\Sigma=F^*\theta$. The quadruple is a sample of the \emph{Legendrian lift} of the sheet to
+$T^*\X\times\R$. A drift--kick integrator transports $\Sigma$ exactly. At a remap, new labels are chosen by an
+OT map that equidistributes a monitor built from the measured \emph{edge action defects}
+$\eps_e=\Sigma_j-\Sigma_i-\tfrac12(p_i+p_j)\cdot(x_j-x_i)$ (the symplectic area between the sheet and its chord,
+a symplectic invariant that requires no finite-difference curvature estimate), and the new vertex data are read
+off a reconstruction whose Liouville form is \emph{exactly} the differential of a reconstructed generating
+function interpolating the $\Sigma_i$. Mass is recovered from the labels and is exact by a degree argument.
+
+\paragraph{Conventions and standing assumptions.} Throughout, ``smooth'' means $C^\infty$ unless a finite class
+is stated; $\lambda$ is Lebesgue measure on the reference torus $\Xi=\T^d$; $\Q=\T^d$ with $\mu=\rho_0\,\dd q$,
+$\rho_0>0$ smooth. Maps between tori are understood through their lifts; a map ``isotopic to the identity''
+lifts to $\xi\mapsto\xi+(\text{periodic})$. Results are labelled \status{established} (known; reference given),
+\status{new derivation} (proved here; we do not claim that no equivalent statement exists in the literature),
+\status{verified numerically}, or \status{conjecture/open}. The self-consistent Vlasov--Poisson problem for
+cold data is \emph{assumed} to have a sheet solution with a $C^{1,1}$ potential on the time interval considered
+(\cref{ass:regular}); this is known in $d=1$ in a weak sense \cite{ZhengMajda1994} and open in general.
+
+\input{sec_continuum}
+\input{sec_ot}
+\input{sec_discrete}
+\input{sec_method}
+\input{sec_numerics}
+\input{sec_cosmo}
+
+\begin{thebibliography}{99}\small
+\bibitem{AbelHahnKaehler2012} T.~Abel, O.~Hahn, R.~Kaehler, Tracing the dark matter sheet in phase space, \emph{MNRAS} 427 (2012) 61.
+\bibitem{ShandarinHabibHeitmann2012} S.~Shandarin, S.~Habib, K.~Heitmann, Cosmic web, multistream flows, and tessellations, \emph{Phys.\ Rev.\ D} 85 (2012) 083005.
+\bibitem{HahnAbelKaehler2013} O.~Hahn, T.~Abel, R.~Kaehler, A new approach to simulating collisionless dark matter fluids, \emph{MNRAS} 434 (2013) 1171.
+\bibitem{HahnAngulo2016} O.~Hahn, R.~E.~Angulo, An adaptively refined phase-space element method for cosmological simulations and collisionless dynamics, \emph{MNRAS} 455 (2016) 1115 (arXiv:1501.01959).
+\bibitem{SousbieColombi2016} T.~Sousbie, S.~Colombi, ColDICE: a parallel Vlasov--Poisson solver using moving adaptive simplicial tessellation, \emph{J.\ Comput.\ Phys.} 321 (2016) 644 (arXiv:1509.07720).
+\bibitem{ColombiTouma2014} S.~Colombi, J.~Touma, Vlasov--Poisson in 1D: waterbags, \emph{MNRAS} 441 (2014) 2414.
+\bibitem{Stuecker2020} J.~St\"ucker, O.~Hahn, R.~E.~Angulo, S.~D.~M.~White, Simulating the complexity of the dark matter sheet I: numerical algorithms, \emph{MNRAS} 495 (2020) 4943.
+\bibitem{VogelsbergerWhite2011} M.~Vogelsberger, S.~D.~M.~White, Streams and caustics: the fine-grained structure of $\Lambda$CDM haloes, \emph{MNRAS} 413 (2011) 1419.
+\bibitem{ZhengMajda1994} Y.~Zheng, A.~Majda, Existence of global weak solutions to one-component Vlasov--Poisson and Fokker--Planck--Poisson systems in one space dimension with measures as initial data, \emph{Comm.\ Pure Appl.\ Math.} 47 (1994) 1365.
+\bibitem{Arnold} V.~I.~Arnold, \emph{Mathematical Methods of Classical Mechanics}, 2nd ed., Springer, 1989.
+\bibitem{Weinstein1971} A.~Weinstein, Symplectic manifolds and their Lagrangian submanifolds, \emph{Adv.\ Math.} 6 (1971) 329.
+\bibitem{Donaldson1999} S.~K.~Donaldson, Moment maps and diffeomorphisms, \emph{Asian J.\ Math.} 3 (1999) 1.
+\bibitem{Salmon1988} R.~Salmon, Hamiltonian fluid mechanics, \emph{Annu.\ Rev.\ Fluid Mech.} 20 (1988) 225.
+\bibitem{FrischVillone2014} U.~Frisch, B.~Villone, Cauchy's almost forgotten Lagrangian formulation of the Euler equation for 3D incompressible flow, \emph{Eur.\ Phys.\ J.\ H} 39 (2014) 325.
+\bibitem{ZheligovskyFrisch2014} V.~Zheligovsky, U.~Frisch, Time-analyticity of Lagrangian particle trajectories in ideal fluid flow, \emph{J.\ Fluid Mech.} 749 (2014) 404.
+\bibitem{RampfVilloneFrisch2015} C.~Rampf, B.~Villone, U.~Frisch, How smooth are particle trajectories in a $\Lambda$CDM Universe?, \emph{MNRAS} 452 (2015) 1421.
+\bibitem{Buchert1994} T.~Buchert, Lagrangian theory of gravitational instability of Friedman--Lema\^itre cosmologies: a generic third-order model for nonlinear clustering, \emph{MNRAS} 267 (1994) 811.
+\bibitem{HLW} E.~Hairer, C.~Lubich, G.~Wanner, \emph{Geometric Numerical Integration}, 2nd ed., Springer, 2006.
+\bibitem{MarsdenWest2001} J.~E.~Marsden, M.~West, Discrete mechanics and variational integrators, \emph{Acta Numer.} 10 (2001) 357.
+\bibitem{QuinnEtAl1997} T.~Quinn, N.~Katz, J.~Stadel, G.~Lake, Time stepping N-body simulations, arXiv:astro-ph/9710043 (1997).
+\bibitem{HockneyEastwood} R.~W.~Hockney, J.~W.~Eastwood, \emph{Computer Simulation Using Particles}, Adam Hilger, 1988.
+\bibitem{Kraus2017} M.~Kraus, K.~Kormann, P.~J.~Morrison, E.~Sonnendr\"ucker, GEMPIC: geometric electromagnetic particle-in-cell methods, \emph{J.\ Plasma Phys.} 83 (2017) 905830401.
+\bibitem{Brenier1991} Y.~Brenier, Polar factorization and monotone rearrangement of vector-valued functions, \emph{Comm.\ Pure Appl.\ Math.} 44 (1991) 375.
+\bibitem{McCann2001} R.~J.~McCann, Polar factorization of maps on Riemannian manifolds, \emph{Geom.\ Funct.\ Anal.} 11 (2001) 589.
+\bibitem{Cordero1999} D.~Cordero-Erausquin, Sur le transport de mesures p\'eriodiques, \emph{C.\ R.\ Acad.\ Sci.\ Paris S\'er.\ I} 329 (1999) 199.
+\bibitem{Caffarelli1992} L.~A.~Caffarelli, The regularity of mappings with a convex potential, \emph{J.\ Amer.\ Math.\ Soc.} 5 (1992) 99.
+\bibitem{Otto2001} F.~Otto, The geometry of dissipative evolution equations: the porous medium equation, \emph{Comm.\ Partial Differential Equations} 26 (2001) 101.
+\bibitem{Villani2003} C.~Villani, \emph{Topics in Optimal Transportation}, AMS, 2003.
+\bibitem{DelonSalomonSobolevski2010} J.~Delon, J.~Salomon, A.~Sobolevski, Fast transport optimization for Monge costs on the circle, \emph{SIAM J.\ Appl.\ Math.} 70 (2010) 2239.
+\bibitem{BuddWilliams2006} C.~J.~Budd, J.~F.~Williams, Parabolic Monge--Amp\`ere methods for blow-up problems in several spatial dimensions, \emph{J.\ Phys.\ A} 39 (2006) 5425.
+\bibitem{BuddHuangRussell2009} C.~J.~Budd, W.~Huang, R.~D.~Russell, Adaptivity with moving grids, \emph{Acta Numer.} 18 (2009) 111.
+\bibitem{Delzanno2008} G.~L.~Delzanno, L.~Chac\'on, J.~M.~Finn, Y.~Chung, G.~Lapenta, An optimal robust equidistribution method for two-dimensional grid adaptation based on Monge--Kantorovich optimization, \emph{J.\ Comput.\ Phys.} 227 (2008) 9841.
+\bibitem{Weller2016} H.~Weller, P.~Browne, C.~Budd, M.~Cullen, Mesh adaptation on the sphere using optimal transport and the numerical solution of a Monge--Amp\`ere type equation, \emph{J.\ Comput.\ Phys.} 308 (2016) 102.
+\bibitem{HuangRussell2011} W.~Huang, R.~D.~Russell, \emph{Adaptive Moving Mesh Methods}, Springer, 2011.
+\bibitem{FrischEtAl2002} U.~Frisch, S.~Matarrese, R.~Mohayaee, A.~Sobolevski, A reconstruction of the initial conditions of the Universe by optimal mass transportation, \emph{Nature} 417 (2002) 260.
+\bibitem{BrenierEtAl2003} Y.~Brenier, U.~Frisch, M.~H\'enon, G.~Loeper, S.~Matarrese, R.~Mohayaee, A.~Sobolevski, Reconstruction of the early Universe as a convex optimization problem, \emph{MNRAS} 346 (2003) 501.
+\bibitem{LevyEtAl2021} B.~L\'evy, R.~Mohayaee, S.~von~Hausegger, A fast semidiscrete optimal transport algorithm for a unique reconstruction of the early Universe, \emph{MNRAS} 506 (2021) 1165.
+\bibitem{McClureVitale1975} D.~E.~McClure, R.~A.~Vitale, Polygonal approximation of plane convex bodies, \emph{J.\ Math.\ Anal.\ Appl.} 51 (1975) 326.
+\bibitem{YabeAoki1991} T.~Yabe, T.~Aoki, A universal solver for hyperbolic equations by cubic-polynomial interpolation I. One-dimensional solver, \emph{Comput.\ Phys.\ Commun.} 66 (1991) 219.
+\bibitem{VinjeEtAl1993} V.~Vinje, E.~Iversen, H.~Gj{\o}ystdal, Traveltime and amplitude estimation using wavefront construction, \emph{Geophysics} 58 (1993) 1157.
+\bibitem{EngquistRunborg2003} B.~Engquist, O.~Runborg, Computational high frequency wave propagation, \emph{Acta Numer.} 12 (2003) 181.
+\bibitem{Dritschel1988} D.~G.~Dritschel, Contour surgery: a topological reconnection scheme for extended integrations using contour dynamics, \emph{J.\ Comput.\ Phys.} 77 (1988) 240.
+\bibitem{JRT2019} F.~Jauberteau, Y.~Rollin, S.~Tapie, Discrete geometry and isotropic surfaces, \emph{M\'em.\ Soc.\ Math.\ Fr.} 161 (2019) (arXiv:1802.08712).
+\bibitem{WorseyFarin1987} A.~J.~Worsey, G.~Farin, An $n$-dimensional Clough--Tocher interpolant, \emph{Constr.\ Approx.} 3 (1987) 99.
+\bibitem{BFS1965} F.~K.~Bogner, R.~L.~Fox, L.~A.~Schmit, The generation of interelement compatible stiffness and mass matrices by the use of interpolation formulas, \emph{Proc.\ Conf.\ Matrix Methods in Structural Mechanics}, Wright--Patterson AFB, 1965.
+\bibitem{MyersColella2017} A.~Myers, P.~Colella, B.~Van~Straalen, A 4th-order particle-in-cell method with phase-space remapping for the Vlasov--Poisson equation, \emph{SIAM J.\ Sci.\ Comput.} 39 (2017) B467.
+\end{thebibliography}
+
+\end{document}

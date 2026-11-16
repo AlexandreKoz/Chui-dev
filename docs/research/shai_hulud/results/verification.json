@@ -1,0 +1,121 @@
+{
+ "edge_defect_p1_leading_term": {
+  "pass": true,
+  "formula": "omega(z',z'') h^3/12"
+ },
+ "triangle_flux_p1_cubic_form": {
+  "pass": true,
+  "formula": "(1/4)[C(u,u,v)-C(u,v,v)] h^3"
+ },
+ "triangle_flux_example_x1sq_x2": {
+  "pass": true,
+  "value": "h**3/2"
+ },
+ "rigidity_symbol_factorisation": {
+  "pass": true,
+  "symbol": "-tau1*tau2*(tau1 + tau2)"
+ },
+ "rigidity_kernel_dimension_d2_equals_3n": {
+  "pass": true,
+  "d2_n5_regular": [
+   15,
+   77,
+   75
+  ],
+  "d2_n5_jittered": [
+   3,
+   77,
+   75
+  ],
+  "d2_n6_regular": [
+   18,
+   110,
+   108
+  ],
+  "d2_n6_jittered": [
+   3,
+   110,
+   108
+  ],
+  "d2_n8_regular": [
+   24,
+   194,
+   192
+  ],
+  "d2_n8_jittered": [
+   3,
+   194,
+   192
+  ],
+  "d3_n4_regular": [
+   22,
+   259,
+   448
+  ],
+  "d3_n4_jittered": [
+   4,
+   259,
+   448
+  ],
+  "d3_n5_regular": [
+   28,
+   503,
+   875
+  ],
+  "d3_n5_jittered": [
+   4,
+   503,
+   875
+  ]
+ },
+ "polygon_midpoint_area_factor_cos2": {
+  "pass": true,
+  "N8": 0.8535533905932738,
+  "N64": 0.9975923633360987,
+  "N512": 0.9999623509195719
+ },
+ "hermite_front_lebesgue_constant": {
+  "pass": true,
+  "value": 2.0
+ },
+ "parabola_subarc_area_s_cubed": {
+  "pass": true,
+  "value": "eps*s**3"
+ },
+ "p2_edge_action_superconvergence": {
+  "pass": true,
+  "orders": [
+   4.93,
+   4.98,
+   5.0
+  ]
+ },
+ "cic_fd_force_is_not_a_gradient": {
+  "pass": true,
+  "orders": [
+   0.9488270600474487,
+   1.0110068037395605
+  ],
+  "n16_cic_fd_curl_over_grad": 0.42689347613547957,
+  "n32_cic_fd_curl_over_grad": 0.22115365030367115,
+  "n64_cic_fd_curl_over_grad": 0.10973640750221222
+ },
+ "von_neumann_spectral_radius": {
+  "pass": true,
+  "ac21_max_spectral_radius": 1.0000000000000004,
+  "ac21_argmax_sigma_theta": [
+   1.0,
+   2.458283791720884
+  ],
+  "ac41_max_spectral_radius": 1.0000000000000009,
+  "ac41_argmax_sigma_theta": [
+   0.47000000000000003,
+   0.001
+  ],
+  "ac61_max_spectral_radius": 1.0000000000000009,
+  "ac61_argmax_sigma_theta": [
+   0.01,
+   0.04042166510782168
+  ]
+ }
+}

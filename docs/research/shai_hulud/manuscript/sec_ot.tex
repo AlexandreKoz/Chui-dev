@@ -1,0 +1,163 @@
+\section{Optimal transport of the sampling}\label{sec:ot}
+
+\subsection{Equidistribution and its indeterminacy}
+
+Fix a reference torus $\Xi=\T^d$ carrying a fixed mesh (uniform, or a fixed hierarchy). A discrete sheet is
+parameterised over $\Xi$ through a \emph{label map} $T:\Xi\to\Q$. Let $M:\Q\to(0,\infty)$ be a \emph{monitor
+density}, $\int_\Q M\,\dd q=1$, expressing where resolution is wanted (\cref{sec:monitor}). The
+\emph{equidistribution principle} asks that reference cells of equal volume carry equal monitor mass:
+\begin{equation}\label{eq:equi}
+T\pf\lambda=\nu_M:=M\,\dd q\qquad\Longleftrightarrow\qquad M(T(\xi))\,\det DT(\xi)=1 .
+\end{equation}
+For $d\ge2$ this is one scalar equation for $d$ unknown functions: if $T$ solves \eqref{eq:equi} so does
+$s\circ T$ for every $\nu_M$-preserving diffeomorphism $s$. The indeterminacy is exactly the fibre $\Diff_{\nu_M}$
+of \cref{rem:noether}; its elements shear and rotate cells without changing their monitor mass, and they are
+harmful (they degrade mesh quality and enlarge the constants of every interpolation estimate) but invisible to \eqref{eq:equi}.
+
+\subsection{The transport problem and its well-posedness}
+
+\begin{definition}[sampling transport problem]\label{def:ot}
+Given $M$, find
+\begin{equation}\label{eq:monge}
+T=\arg\min\Big\{\int_\Xi d_{\T^d}(\xi,T(\xi))^2\,\dd\xi\ :\ T\pf\lambda=\nu_M\Big\},
+\end{equation}
+where $d_{\T^d}$ is the flat distance on the torus (we identify $\Xi$ and $\Q$ as flat tori).
+\end{definition}
+
+\begin{theorem}[existence, uniqueness, structure, regularity]\label{thm:ot}\status{established
+\cite{Brenier1991,Cordero1999,McCann2001,Caffarelli1992}}
+Let $M\in C^{k,\alpha}(\Q)$, $k\ge0$, $0<\alpha<1$, with $0<m_-\le M\le m_+$. Then \eqref{eq:monge} has a unique
+minimiser. It has the form
+\begin{equation}\label{eq:brenier}
+T(\xi)=\xi+\nabla\varphi(\xi)\pmod{\Z^d},\qquad \varphi\ \text{periodic},\qquad \tfrac12\abs{\xi}^2+\varphi\ \text{convex},
+\end{equation}
+$\varphi\in C^{k+2,\alpha}$ solves the Monge--Amp\`ere equation
+\begin{equation}\label{eq:ma}
+M\big(\xi+\nabla\varphi(\xi)\big)\,\det\big(I+D^2\varphi(\xi)\big)=1 ,
+\end{equation}
+and $T$ is a $C^{k+1,\alpha}$ diffeomorphism isotopic to the identity. Conversely a periodic $\varphi$ with
+$I+D^2\varphi>0$ solving \eqref{eq:ma} gives the minimiser.
+\end{theorem}
+
+The selection made by \eqref{eq:monge} has three properties that matter here. \emph{(a) Canonical gauge.} Among all
+equidistributing maps the optimal one is the unique gradient map (Brenier's polar factorisation: every
+equidistributing map is $T\circ s$ with $s$ measure preserving); its displacement is curl free, which removes the
+harmful fibre directions. \emph{(b) No tangling.} $I+D^2\varphi>0$ makes $T$ a diffeomorphism; in computations the
+smallest eigenvalue of $I+D^2\varphi$ is a certificate. \emph{(c) Memorylessness.} $T$ depends only on the current
+monitor, not on the history of the mesh; composing increments would not have this property (a composition of
+gradient maps is not a gradient map) and would accumulate shear. Optimal-transport mesh adaptation with these
+properties is well established for PDE meshes in physical space
+\cite{BuddWilliams2006,BuddHuangRussell2009,Delzanno2008,Weller2016}; the present use differs only in \emph{where}
+it acts (label space of a Lagrangian sheet) and in what it is allowed to touch (\cref{prop:sampling}).
+
+\begin{proposition}[$d=1$: monotone rearrangement]\label{prop:ot1d}\status{established}
+For $d=1$ the equidistributing orientation-preserving maps of the circle form a one-parameter family
+$T_\tau=C^{-1}(\cdot+\tau)$, $C(q)=\int_{0}^{q}M$, and \eqref{eq:monge} selects the offset $\tau$ by a
+one-dimensional minimisation \cite{DelonSalomonSobolevski2010}. Optimal transport therefore adds nothing to
+equidistribution in $d=1$ beyond fixing a rotation; the prototype pins the label $q=0$ instead.
+\end{proposition}
+
+\paragraph{Linearisation and solution.} With $F(\varphi)=\log\det(I+D^2\varphi)+\log M(\xi+\nabla\varphi)$,
+\begin{equation}\label{eq:malin}
+F'(\varphi)[\psi]=\tr\big((I+D^2\varphi)^{-1}D^2\psi\big)+\nabla\log M(T)\cdot\nabla\psi ,
+\end{equation}
+a uniformly elliptic operator on admissible $\varphi$, equal to the Laplacian at $\varphi=0$, $M=1$; for
+$M=1+\varepsilon m$ one has $\Delta\varphi=-\varepsilon m+O(\varepsilon^2)$. The prototype solves \eqref{eq:ma} by a
+damped Newton iteration with \eqref{eq:malin} inverted by GMRES preconditioned with the FFT inverse Laplacian and
+a backtracking line search that maintains $I+D^2\varphi>0$ (\texttt{solve\_ot} in \texttt{prototype/sheet2d.py}).
+Measured behaviour is reported in \cref{sec:num2d}.
+
+\subsection{Sampling is not mass}
+
+\begin{proposition}[the physical measure is a passenger]\label{prop:sampling}\status{new derivation; elementary}
+Let $T_0,T_1:\Xi\to\Q$ be two label maps and $F$ a sheet with mass measure $\mu$.
+\begin{enumerate}[label=(\roman*),leftmargin=2.2em,itemsep=1pt]
+\item If the reference density is updated as a pull-back, $\tilde\mu_i=T_i^*\mu$, both discretisations represent the
+same measure $F\pf\mu$, for arbitrary monitors. The reference density is $\tilde\rho=(\rho_0\circ T)\det DT=(\rho_0/M)\circ T$:
+cell masses necessarily vary by the factor $\max(M/\rho_0)/\min(M/\rho_0)$.
+\item If instead the masses stay attached to the moved sample points (the reference density is kept,
+$\tilde\mu_1:=\tilde\mu_0$), the represented measure becomes $F\pf(R\pf\mu)$ with $R=T_1\circ T_0^{-1}$, and
+\begin{equation}\label{eq:w2}
+W_2\big(F\pf R\pf\mu,\,F\pf\mu\big)\le\Lip(F)\,\norm{R-\id}_{L^2(\mu)},
+\end{equation}
+with equality to leading order for small displacements along a single stream. This is an $O(1)$ modification of the
+distribution function unless $R\pf\mu=\mu$.
+\item Equal-mass sampling and adaptive sampling are incompatible: $\tilde\rho$ constant forces $T\pf\lambda\propto\mu$,
+leaving only the gauge freedom $\Diff_\mu$.
+\end{enumerate}
+\end{proposition}
+\begin{proof}
+(i) is \cref{thm:gauge}(i). (ii) $(F\circ T_1)\pf(T_0^{-1})\pf\mu=F\pf R\pf\mu$; the coupling $(F\circ R,F)\pf\mu$ gives
+the bound. (iii) is \eqref{eq:equi} with $M=\rho_0/\mu(\Q)$.
+\end{proof}
+
+This is the precise sense in which the optimal transport of \cref{def:ot} must be distinguished from the uses of
+optimal transport that \emph{do} move mass in cosmology: Monge--Amp\`ere--Kantorovich reconstruction and its
+semi-discrete descendants \cite{FrischEtAl2002,BrenierEtAl2003,LevyEtAl2021} transport the mass density in
+\emph{configuration space} between initial and final times and are restricted to single-stream (convex-potential)
+maps. Here the transported measure is Lebesgue measure on a reference torus, the target is a sampling density on
+label space, and the phase-space measure is invariant by construction, in any number of streams.
+
+\subsection{A symplectically invariant monitor}\label{sec:monitor}
+
+What should be equidistributed? Phase space has no canonical metric ($x$ and $p$ have different units), so
+curvature-based monitors depend on an arbitrary scaling. The action supplies an invariant alternative.
+
+\begin{lemma}[edge action defect]\label{lem:edge}\status{new derivation; verified symbolically}
+Let $(F,\Sigma)$ be an exact $C^4$ sheet, $q_0\in\Q$, $e\in\R^d$ a label-space edge vector of length $h$, and
+$z_0=F(q_0)$, $z_1=F(q_0+e)$. The \emph{edge action defect}
+\begin{equation}\label{eq:edgedefect}
+\eps_e:=\Sigma(q_0+e)-\Sigma(q_0)-\tfrac12(p_0+p_1)\cdot(x_1-x_0)
+\end{equation}
+is the signed symplectic area between the sheet arc over the edge and its chord, and
+\begin{equation}\label{eq:edgeexp}
+\eps_e=-\tfrac1{12}\,C(e,e,e)+O(h^4),
+\end{equation}
+with $C$ the cubic form \eqref{eq:cubic} at $q_0$.
+\end{lemma}
+\begin{proof}
+$\Sigma(q_0+e)-\Sigma(q_0)=\int_0^1p\cdot\partial_sx\,\dd s$ along $s\mapsto F(q_0+se)$, and the trapezoid term is the
+integral of $\theta$ along the chord, so $\eps_e=\oint\theta$ over the closed curve arc--minus--chord, which is the
+signed area by Stokes. Expanding $x,p$ to third order in $s$,
+$\tfrac12(p_0+p_1)\cdot(x_1-x_0)-\int_0^1p\cdot x'\,\dd s=\tfrac1{12}(x'\cdot p''-p'\cdot x'')+O(h^4)$ with
+derivatives along $e$ at $s=0$, which is $\tfrac1{12}\om(\partial_eF,\partial_e^2F)$.
+\end{proof}
+
+$\eps_e$ is computable from vertex data alone, exactly (no finite differences), and is invariant under affine
+symplectic maps of phase space (it is an area); it is the local quantity a piecewise-linear
+representation gets wrong. Requiring $\abs{\eps_e}$ to be equidistributed for edges of local length $h(q)$, with
+node density $h^{-d}$ and $N$ nodes, the standard variational argument (minimise $\int\norm{C}h^{3-d}\dd q$ subject
+to $\int h^{-d}\dd q=N$) gives
+\begin{equation}\label{eq:monitor}
+M\ \propto\ \norm{C}^{\,d/(3+d)}\quad(L^1\text{-optimal}),\qquad M\ \propto\ \norm{C}^{\,d/3}\quad(\text{max-optimal}).
+\end{equation}
+
+\paragraph{The case $d=1$: equi-affine sampling and a complexity functional.} Here $C=\kappa\,\dd q^3$ and the
+max-optimal monitor is $M\propto\abs{\kappa}^{1/3}$, i.e.\ \emph{uniform sampling in equi-affine arclength}, the
+arclength that is invariant under area-preserving affine maps of the phase plane. This connects to the classical
+theory of best polygonal approximation of convex curves in the area metric \cite{McClureVitale1975}. Writing
+\begin{equation}\label{eq:complexity}
+\begin{gathered}
+\mathcal A(t):=\int_\Q\abs{\kappa(q,t)}^{1/3}\dd q,\qquad
+\eps_{\rm equi}=\frac{\mathcal A^3}{12N^3},\qquad
+\eps_{\rm unif}=\frac{\abs{\Q}^3\max\abs\kappa}{12N^3},\\
+G(t):=\frac{\eps_{\rm unif}}{\eps_{\rm equi}}=\frac{\abs{\Q}^3\max_q\abs\kappa}{\mathcal A(t)^3}\ \ge1 ,
+\end{gathered}
+\end{equation}
+$\mathcal A$ is a symplectic invariant measuring the intrinsic cost of representing the sheet by chords, and $G$ is
+the gain of adaptive over fixed (uniform-in-label) sampling at equal $N$ ($G\ge1$ by H\"older). Adaptivity cannot
+reduce $\mathcal A$; it can only remove $G$. The measured growth of $\mathcal A$ and $G$ is reported in
+\cref{tab:complexity}: in the collapse and chaotic tests $\mathcal A$ grows roughly linearly while $G$ grows
+exponentially.
+
+\begin{remark}[regularisation and regularity of the monitor]\label{rem:monreg}
+\eqref{eq:monitor} degenerates where $C=0$ and ignores higher-order error terms; practical monitors add a floor and
+arclength/turning-angle terms (prototype: \texttt{monitor\_density}). More importantly, \emph{the remap error
+inherits the regularity of $T$}: an interpolation estimate of order $r$ in the reference coordinates involves
+$\norm{F\circ T}_{W^{r,\infty}}$, hence $r$ derivatives of $T$, hence $r-1$ derivatives of $M$ by \cref{thm:ot}. In
+the $d=2$ prototype a monitor with a kink ($\norm{C}$ at a zero of $C$) smoothed only at the mesh scale reduced
+the observed remap order to about one; a monitor mollified at a fixed label-space scale restored the design
+order (\cref{sec:num2d}). In $d=1$ the prototype interpolates directly on the non-uniform label nodes, so the
+regularity of $T$ does not enter. Finally, optimal transport controls a scalar density only: it cannot align cells
+with the anisotropy of the tensor $C$; anisotropic (metric-based) refinement as in ColDICE addresses a complementary need.
+\end{remark}

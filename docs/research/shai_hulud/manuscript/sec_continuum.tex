@@ -1,0 +1,250 @@
+\section{Continuum theory}\label{sec:continuum}
+
+\subsection{From Hamiltonian/Vlasov dynamics to the sheet}
+
+Let $H:T^*\X\times[0,T]\to\R$ be a (possibly time-dependent) Hamiltonian, $X_H$ its vector field,
+$\iota_{X_H}\om=\dd H$, i.e.\ $\dot x=\partial_pH$, $\dot p=-\partial_xH$, and $\Phi_{t,s}$ its flow. The Vlasov
+equation for a measure $f_t$ on $T^*\X$ is, in weak form,
+\begin{equation}\label{eq:vlasov}
+\frac{\dd}{\dd t}\int\varphi\,\dd f_t=\int\{\varphi,H_t\}\,\dd f_t\qquad\forall\varphi\in C_c^\infty(T^*\X),\qquad
+\{\varphi,H\}=\dd\varphi(X_H)=\partial_x\varphi\cdot\partial_pH-\partial_p\varphi\cdot\partial_xH .
+\end{equation}
+
+\begin{definition}[cold sheet]\label{def:sheet}
+A \emph{cold sheet} is a pair $(F,\mu)$ with $F:\Q\to T^*\X$ a $C^1$ immersion and $\mu=\rho_0\,\dd q$ a positive
+measure on $\Q$. It represents the measure $f=F\pf\mu$. The sheet is \emph{Lagrangian} if $F^*\om=0$ and
+\emph{exact with Liouville class $c\in\R^d$} if there is a function $\Sigma$ on the universal cover $\R^d$ of $\Q$ with
+\begin{equation}\label{eq:exact}
+\dd\Sigma=F^*\theta,\qquad \Sigma(q+e_a)=\Sigma(q)+c_a\quad(a=1,\dots,d).
+\end{equation}
+We call $\Sigma$ the \emph{action} (generating function) of the sheet and $(F,\Sigma):\Q\to T^*\X\times\R$ its
+\emph{Legendrian lift}; the periods $c_a=\oint_{\gamma_a}p\cdot\dd x$ along the basic cycles are its Liouville class.
+\end{definition}
+
+Since $H^1(\T^d;\R)=\R^d$, every Lagrangian sheet over $\Q=\T^d$ is exact for a unique $c$, and $\Sigma$ is unique
+up to a constant.
+
+\begin{proposition}[the sheet solves Vlasov]\label{prop:vlasov}\status{established}
+Let $H_t\in C^{1,1}$ in $(x,p)$ uniformly in $t$, and $F_t=\Phi_{t,0}\circ F_0$. Then $f_t=(F_t)\pf\mu$ satisfies
+\eqref{eq:vlasov}. In the self-consistent case $H_t=K(p,t)+\phi_t(x)$ with $\phi_t$ determined by the density
+$\rho_t=(x_t)\pf\mu$, the same holds provided $\phi_t\in C^{1,1}(\X)$.
+\end{proposition}
+\begin{proof}
+$\frac{\dd}{\dd t}\int\varphi\,\dd f_t=\frac{\dd}{\dd t}\int_\Q\varphi(F_t(q))\,\dd\mu(q)
+=\int_\Q\dd\varphi(X_{H_t})(F_t(q))\,\dd\mu(q)=\int\{\varphi,H_t\}\,\dd f_t$. The Lipschitz hypothesis gives
+existence and uniqueness of the flow. In the self-consistent case the potential is a given function of $(x,t)$
+once the solution is fixed, so the same computation applies.
+\end{proof}
+
+\begin{assumption}[regular sheet solution]\label{ass:regular}
+For self-consistent problems we assume that a sheet solution exists on $[0,T]$ with $\phi_t\in C^{1,1}(\X)$
+uniformly in $t$. For cold data this is \emph{not} a theorem in $d\ge2$ after shell crossing (densities are
+singular on caustics); in $d=1$ weak measure solutions exist \cite{ZhengMajda1994}. All structural statements below
+use only that each time step applies a diffeomorphism of $T^*\X$; all error estimates are proved for externally
+prescribed smooth Hamiltonians.
+\end{assumption}
+
+The configuration-space density is $\rho_t=(x_t)\pf\mu$, i.e.\ $\rho_t(x)=\sum_{q:\,x(q,t)=x}\rho_0(q)/\abs{\det D_qx(q,t)}$
+away from caustics $\{\det D_qx=0\}$; the number of terms is the number of streams.
+
+\subsection{Lagrangian structure and Poincar\'e--Cartan invariants}
+
+\begin{proposition}[invariants of the sheet]\label{prop:invariants}\status{established}
+Let $F_t=\Phi_{t,0}\circ F_0$ with $H_t$ a $C^2$ function on $T^*\X$ (single valued on the torus). Then
+\begin{enumerate}[label=(\roman*),leftmargin=2.2em,itemsep=1pt]
+\item $F_t^*\om=F_0^*\om$; in particular a Lagrangian sheet stays Lagrangian;
+\item for every closed loop $\gamma\subset\Q$ the Poincar\'e invariant $I_t[\gamma]=\oint_{F_t\circ\gamma}\theta$ is constant in time;
+\item an exact sheet stays exact with the same Liouville class $c$.
+\end{enumerate}
+In label coordinates $F^*\om=0$ reads
+\begin{equation}\label{eq:cauchy}
+\partial_ax\cdot\partial_bp-\partial_bx\cdot\partial_ap=0\qquad(1\le a<b\le d).
+\end{equation}
+\end{proposition}
+\begin{proof}
+By Cartan's formula $\Lie_{X_H}\theta=\iota_{X_H}\dd\theta+\dd\iota_{X_H}\theta=\dd(\theta(X_H)-H)$, hence
+\begin{equation}\label{eq:dtheta}
+\frac{\dd}{\dd t}F_t^*\theta=F_t^*\Lie_{X_{H_t}}\theta=\dd\big(\mathcal{L}_t\circ F_t\big),\qquad
+\mathcal{L}_t:=p\cdot\partial_pH_t-H_t .
+\end{equation}
+The right-hand side is exact with a single-valued primitive because $H_t$ is a function on $T^*\T^d$. Taking
+$\dd$ gives (i); integrating over a closed loop gives (ii); (iii) follows from (ii) applied to the basic cycles
+together with (i).
+\end{proof}
+
+\begin{remark}[Cauchy invariants and Kelvin's theorem]\label{rem:cauchy}
+With $p=a^2\dot x$, \eqref{eq:cauchy} are the Cauchy invariants of Lagrangian perturbation theory
+\cite{FrischVillone2014,ZheligovskyFrisch2014,RampfVilloneFrisch2015}; in a single-stream region the sheet is the
+graph of the velocity field and (ii) is Kelvin's circulation theorem. The sheet formulation extends both through
+shell crossing, where the Eulerian velocity is multivalued but \eqref{eq:cauchy} persists.
+\end{remark}
+
+\begin{theorem}[action transport; Legendrian lift]\label{thm:action}\status{established mathematics; new use}
+\begin{enumerate}[label=(\alph*),leftmargin=2.2em,itemsep=1pt]
+\item \emph{(continuous time)} If $(F_0,\Sigma_0)$ is an exact sheet, then
+$\Sigma_t(q)=\Sigma_0(q)+\int_0^t\mathcal{L}_s(F_s(q))\,\dd s$ satisfies $\dd\Sigma_t=F_t^*\theta$ for all $t$, with unchanged periods.
+\item \emph{(one step of a symplectic map)} Let $\Psi$ be a diffeomorphism of $T^*\X$ with
+$\Psi^*\theta-\theta=\dd A_\Psi$ for a single-valued function $A_\Psi$. If $(F,\Sigma)$ is an exact sheet then so is
+$(\Psi\circ F,\ \Sigma+A_\Psi\circ F)$, with the same Liouville class.
+\item \emph{(splitting integrators)} For the drift $\Psi_D(x,p)=(x+D\,\nabla K(p),\,p)$ and the kick
+$\Psi_\kappa(x,p)=(x,\,p-\kappa\nabla V(x))$, with $K\in C^2(\R^d)$, $V\in C^2(\X)$ and constants $D,\kappa$,
+\begin{equation}\label{eq:genfun}
+A_{\Psi_D}=D\,\big(p\cdot\nabla K(p)-K(p)\big),\qquad A_{\Psi_\kappa}=-\kappa\,V(x).
+\end{equation}
+\end{enumerate}
+Consequently a kick--drift--kick scheme with arbitrary time-dependent coefficients admits an \emph{exact}
+per-vertex action update: $\Sigma\mathrel{+}=D(p\cdot\nabla K-K)$ at drifts, $\Sigma\mathrel{-}=\kappa V(x)$ at kicks.
+\end{theorem}
+\begin{proof}
+(a) is \eqref{eq:dtheta} integrated in time. (b): $(\Psi\circ F)^*\theta=F^*\Psi^*\theta=F^*\theta+\dd(A_\Psi\circ F)$.
+(c): for the drift, $p\cdot\dd(x+D\nabla K(p))-p\cdot\dd x=D\,p\cdot\dd(\nabla K(p))=D\,\dd(p\cdot\nabla K-K)$; for the
+kick, $(p-\kappa\nabla V)\cdot\dd x-p\cdot\dd x=-\kappa\,\dd V$. Single-valuedness of $A_{\Psi_\kappa}$ on the torus
+is the periodicity of $V$.
+\end{proof}
+
+\begin{remark}
+(b) is the statement that the discrete action of a symplectic map is its generating function
+\cite{MarsdenWest2001,HLW}. If $V$ were not periodic (a uniform force), $A_{\Psi_\kappa}$ would be multivalued and the
+Liouville class would change by $-\kappa\oint\dd V$: the periods $c_a$ record the net impulse around the box. In
+periodic cosmology the mean force vanishes and $c$ is conserved.
+\end{remark}
+
+\begin{example}[initial conditions]\label{ex:ic}
+Zel'dovich data $x=q+D\nabla\chi(q)$, $p=a^2\dot D\,\nabla\chi(q)$ are exactly Lagrangian with $c=0$ and
+\begin{equation}\label{eq:zeldovich}
+\Sigma_0=a^2\dot D\,\big(\chi+\tfrac{D}{2}\abs{\nabla\chi}^2\big),
+\end{equation}
+since $p\cdot\dd x=a^2\dot D\,\nabla\chi\cdot(\dd q+D\,\dd\nabla\chi)$. Second-order data
+$x=q+D_1\nabla\chi_1+D_2\nabla\chi_2$, $p=a^2(\dot D_1\nabla\chi_1+\dot D_2\nabla\chi_2)$ are \emph{not}: a direct computation gives
+\begin{equation}\label{eq:2lpt}
+(F^*\om)_{ab}=a^2\,(D_1\dot D_2-D_2\dot D_1)\,\big[\nabla\nabla\chi_1,\nabla\nabla\chi_2\big]_{ab},
+\end{equation}
+the commutator of the two Hessians, a third-order quantity in the perturbation amplitude. This is the phase-space
+form of the known fact that the Cauchy invariants force a transverse displacement at third order
+\cite{Buchert1994,RampfVilloneFrisch2015}. Exactly Lagrangian higher-order data with a known action can be produced
+by applying exact symplectic maps (e.g.\ kick--drift steps with perturbative potentials) to Zel'dovich data and
+using \cref{thm:action}(b).
+\end{example}
+
+\subsection{Reparameterisation as a gauge symmetry}
+
+\begin{theorem}[relabelling invariance]\label{thm:gauge}\status{new derivation; elementary}
+Let $(F,\Sigma,\mu)$ be an exact cold sheet and $T:\Xi\to\Q$ a $C^1$ diffeomorphism isotopic to the identity. Put
+$G=F\circ T$, $\tilde\Sigma=\Sigma\circ T$, $\tilde\mu=T^*\mu:=(T^{-1})\pf\mu$, i.e.\ $\tilde\rho=(\rho_0\circ T)\det DT$. Then
+\begin{enumerate}[label=(\roman*),leftmargin=2.2em,itemsep=1pt]
+\item $G\pf\tilde\mu=F\pf\mu$ (the physical distribution is unchanged);
+\item $G^*\om=T^*(F^*\om)=0$ and $\dd\tilde\Sigma=G^*\theta$ with the same periods $c$;
+\item if $F_t$ solves Hamilton's equations and $T_t$ is any $C^1$ family of such diffeomorphisms, then
+$G_t=F_t\circ T_t$, $q_t=T_t$, $\tilde\Sigma_t=\Sigma_t\circ T_t$, $\tilde\rho_t$ satisfy the arbitrary
+Lagrangian--Eulerian system on $\Xi$
+\begin{equation}\label{eq:ale}
+\begin{aligned}
+\partial_tG&=X_{H_t}(G)+(w\cdot\nabla_\xi)G,&\qquad \partial_tq&=(w\cdot\nabla_\xi)q,\\
+\partial_t\tilde\Sigma&=\mathcal{L}_t(G)+(w\cdot\nabla_\xi)\tilde\Sigma,&\qquad \partial_t\tilde\rho&=\nabla_\xi\cdot(\tilde\rho\,w),
+\end{aligned}
+\end{equation}
+with mesh velocity $w=(DT_t)^{-1}\partial_tT_t$, and conversely.
+\end{enumerate}
+The conclusions (i)--(ii) fail if $T$ is not injective (mass is counted with multiplicity) or does not preserve
+the homology classes of the basic cycles (the periods are permuted).
+\end{theorem}
+\begin{proof}
+(i) $G\pf T^{-1}\pf\mu=(F\circ T\circ T^{-1})\pf\mu$. (ii) Pull-back commutes with $\dd$; a map isotopic to the
+identity acts trivially on $H_1$. (iii) Differentiate $G_t(\xi)=F_t(T_t(\xi))$:
+$\partial_tG=X_H(G)+D_qF\,\partial_tT=X_H(G)+D_\xi G\,(DT)^{-1}\partial_tT$; the other equations are the same
+computation, and the last is the continuity equation for the push-forward by $T_t^{-1}$, whose velocity is $-w$.
+\end{proof}
+
+Equation \eqref{eq:ale} shows what a remap \emph{is}: an advection in the reference coordinates of the four
+fields $(G,q,\tilde\Sigma,\tilde\rho)$ by the mesh velocity. The advection is where a discretisation can damage
+structure; the Hamiltonian part cannot (\cref{thm:carrier}).
+
+\begin{theorem}[the Lagrangian condition is a momentum map]\label{thm:momentum}\status{established \cite{Donaldson1999}}
+On the space $\mathcal M$ of maps $F:\Q\to T^*\X$ consider the symplectic form
+$\Omega_F(\delta_1F,\delta_2F)=\int_\Q\om(\delta_1F,\delta_2F)\,\dd\mu$. The group $\Diff_\mu(\Q)$ of
+$\mu$-preserving diffeomorphisms acts by $F\mapsto F\circ\eta^{-1}$, preserving $\Omega$ and every Hamiltonian of
+the form $\mathcal H(F)=\int_\Q H\circ F\,\dd\mu+\tfrac12\iint\mathcal G(x(q)-x(q'))\,\dd\mu\,\dd\mu$. For a
+$\mu$-divergence-free vector field $v$ on $\Q$ the function
+\begin{equation}\label{eq:momentum}
+J_v(F)=\int_\Q (F^*\theta)(v)\,\dd\mu
+\end{equation}
+generates the infinitesimal action $F\mapsto DF\cdot v$: $\dd J_v=\iota_{DF\cdot v}\Omega$. Hence $J_v$ is conserved by
+the dynamics for every such $v$, and $J_v(F)=0$ for all $\mu$-divergence-free $v$ with zero mean flux if and only
+if $F^*\theta$ is closed, i.e.\ $F$ is Lagrangian; the values on the harmonic (constant-flux) fields are the periods
+$c_a$.
+\end{theorem}
+\begin{proof}
+For a variation $Y$ of $F$ (a vector field along $F$), $\delta(F^*\theta)=F^*(\iota_Y\dd\theta)+\dd(\theta(Y))$, so
+$\delta J_v=\int_\Q\dd\theta(Y,DF\,v)\,\dd\mu+\int_\Q\Lie_v(\theta(Y))\,\dd\mu
+=\int_\Q\om(DF\,v,Y)\,\dd\mu$, the last integral vanishing because $\Lie_v\mu=0$. The characterisation of the zero
+level is the Hodge--Helmholtz statement that the annihilator of the $\mu$-divergence-free fields is the space of exact one-forms.
+\end{proof}
+
+\begin{remark}[what a discretisation loses]\label{rem:noether}
+\Cref{thm:momentum} is the Noether explanation of \cref{prop:invariants}: the Lagrangian property is conserved
+\emph{because} the cold sheet has the relabelling symmetry of a fluid \cite{Salmon1988}. A vertex discretisation
+$\mathcal M_h=(T^*\X)^N$ retains at most the permutation subgroup, so no discrete Noether theorem can deliver exact
+Lagrangian structure of an interpolant. Exactness must come from a different mechanism (\cref{thm:carrier}).
+The full relabelling group $\Diff(\Q)$ fibres over the space of densities with fibre $\Diff_\mu$; the
+structure-relevant information of a reparameterisation is entirely in the base (the sampling density), which is
+why optimal transport, the horizontal lift of this fibration \cite{Otto2001}, is the natural selector (\cref{sec:ot}).
+\end{remark}
+
+\subsection{Which perturbations of a sheet preserve the structure?}
+
+A remap replaces the sheet by a nearby one. The following elementary statement identifies exactly which
+perturbations are harmless.
+
+\begin{proposition}[normal form of structure-preserving perturbations]\label{prop:normalform}\status{new derivation; the nonlinear version is \cite{Weinstein1971}}
+Let $(F,\Sigma)$ be an exact Lagrangian immersion and $F^\varepsilon=F+\varepsilon e+O(\varepsilon^2)$ a smooth family
+of immersions. Define the \emph{normal error one-form} $\beta_e\in\Omega^1(\Q)$,
+\begin{equation}\label{eq:beta}
+\beta_e(v):=\om(e,DF\,v)=e_x\cdot\partial_vp-e_p\cdot\partial_vx .
+\end{equation}
+Then
+\begin{equation}\label{eq:varliouville}
+\frac{\dd}{\dd\varepsilon}\Big|_{0}(F^\varepsilon)^*\theta=-\beta_e+\dd\big(\theta(e)\big),\qquad
+\frac{\dd}{\dd\varepsilon}\Big|_{0}(F^\varepsilon)^*\om=\dd\beta_e .
+\end{equation}
+Consequently: (i) $\beta_e$ vanishes for tangential perturbations $e=DF\,v$ (relabelling) and
+$e_\perp\mapsto\beta_e$ is an isomorphism from normal fields to one-forms; (ii) to first order the perturbed sheet is
+Lagrangian iff $\dd\beta_e=0$, and it keeps the Liouville class iff $\beta_e$ is exact, $\beta_e=\dd\sigma$, in which case
+its action is $\Sigma+\varepsilon(\theta(e)-\sigma)$; (iii) of the $d$ independent normal components of a generic
+error field, structure preservation leaves exactly one scalar function $\sigma$ free. In $d=1$ every $\beta_e$ is
+closed and the only obstruction is the single number $\oint_\Q\beta_e$ (the change of enclosed action).
+\end{proposition}
+\begin{proof}
+For a family of maps with variation field $e$, $\frac{\dd}{\dd\varepsilon}F_\varepsilon^*\theta=F^*(\iota_e\dd\theta)+\dd(F^*\iota_e\theta)$
+and $(\iota_e\dd\theta)(DF\,v)=-\om(e,DF\,v)$. Tangential fields give zero because $F$ is Lagrangian. Since $DF(T_q\Q)$
+is a Lagrangian subspace, $\om$ identifies the quotient $T(T^*\X)/DF(T\Q)$ with $T^*\Q$, which is (i). (ii) and (iii)
+are read off \eqref{eq:varliouville}.
+\end{proof}
+
+The nonlinear version is Weinstein's theorem: a neighbourhood of an embedded Lagrangian $\Lambda$ is
+symplectomorphic to a neighbourhood of the zero section of $T^*\Lambda$, nearby Lagrangians are graphs of closed
+one-forms, and those with the same Liouville class are graphs of $\dd\sigma$. Equivalently they are the images of
+$\Lambda$ under Hamiltonian diffeomorphisms: an exact remap is indistinguishable from a small symplectic kick.
+In the same spirit, every tangential (sliding) vector field on $\Lambda$ is the restriction of the Hamiltonian
+vector field of a function vanishing on $\Lambda$, because $X_K$ is tangent to a Lagrangian $\Lambda$ iff
+$\dd K|_{T\Lambda}=0$; reparameterisation is therefore not merely compatible with, but internal to, the symplectic category.
+
+\begin{proposition}[cubic form]\label{prop:cubic}\status{new derivation; classical object in affine/Lagrangian geometry}
+For a Lagrangian immersion $F$ define
+\begin{equation}\label{eq:cubic}
+C_{abc}:=\om(\partial_aF,\partial_b\partial_cF)=\partial_ax\cdot\partial_{bc}p-\partial_ap\cdot\partial_{bc}x .
+\end{equation}
+Then $C$ is a totally symmetric $(0,3)$ tensor field on $\Q$ (it transforms tensorially under relabelling), and it
+is invariant under affine symplectic maps of phase space. For a graph $p=\nabla\phi(x)$ parameterised by $x$,
+$C=D^3\phi$. In $d=1$, $C=\kappa\,\dd q^3$ with $\kappa=\om(F',F'')$, and $\abs{\kappa}^{1/3}\dd q$ is the
+equi-affine arclength element of the curve.
+\end{proposition}
+\begin{proof}
+Differentiating $\om(\partial_aF,\partial_cF)=0$ with respect to $q^b$ gives
+$\om(\partial_{ab}F,\partial_cF)+\om(\partial_aF,\partial_{bc}F)=0$, i.e.\ $C_{abc}=C_{cab}$; with the obvious symmetry in
+$(b,c)$ this is total symmetry. Under a change of labels the second derivatives acquire terms
+$\Gamma^e_{bc}\partial_eF$, which are annihilated by $\om(\partial_aF,\cdot)$. An affine symplectic map commutes with
+differentiation and preserves $\om$. The graph case is immediate.
+\end{proof}
+
+The cubic form is the lowest-order symplectic invariant of the \emph{shape} of the sheet; it will control both the
+Lagrangian defect of piecewise-linear interpolation (\cref{prop:flux}) and the natural monitor function (\cref{sec:monitor}).
