@@ -115,7 +115,7 @@ cell count = dims product; failure names patch, rank, level, axis and value),
 then mapped onto the integer lattice of the finest populated cell width
 (faces must lie on lattice planes within `1e-6 + 64 eps * span` lattice units
 and cell widths must be integer lattice multiples, so mixed-level geometry
-must be dyadically/index aligned; span <= 2^40 per axis). By
+must be dyadically/index aligned; span <= 2^35 per axis). By
 inclusion-exclusion `1_P = sum_corners (-1)^{#upper} H(x - c)`; the summed
 signed corner measure equals the 8 signed corners of the bounding box **iff**
 the coverage multiplicity is exactly 1 on the box and 0 outside (the orthant
@@ -417,3 +417,27 @@ event.
 * Reconstruction counters are per-instance and not thread-safe; the solver is
   serial per patch (OpenMP parallelism, if added, must use thread-owned
   reconstruction/Riemann instances).
+
+### C04/v10 geometry assurance tightening (2026-11)
+
+The source pre-half collectively refuses any mixture of populated legacy
+(all-zero geometry) patch rows and populated explicitly geometric AMR leaves,
+including mixtures split across MPI ranks; purely legacy non-AMR layouts remain
+supported. The geometric tiling proof admits at most `2^35` finest cells per
+axis. Its snap tolerance `1e-6 + 64 ε span` is therefore bounded by about
+`4.9e-4` cell widths (under the `1e-3` stated limit), instead of the
+previous `2^40` span whose tolerance reached approximately `0.0156`. Larger
+spans are rejected before converting to the integer signed-corner lattice.
+
+### Independent sampled CTU/PPM shadow (C04; 2026-11)
+
+`hydro.shadow_reference` is an optional, off-by-default profiler event. It
+advances private patch-local state through CTU/PPM (one full step when
+production uses MUSCL, or two half steps when production is CTU) and compares
+only owned real cells whose stencil domain of dependence does not touch
+held-fixed ghost values. The diagnostic does not alter conservation registers,
+source events, accepted CFL values or physical evolution. It is bounded by
+per-rank sample and memory policies and may emit `no_samples`, never fabricated
+zero errors. Source terms, effective EOS, evolving cosmological background,
+partial active sets, or small patches without a safe interior are explicitly
+ineligible. See the C04 source note for physics and numerical limitations.

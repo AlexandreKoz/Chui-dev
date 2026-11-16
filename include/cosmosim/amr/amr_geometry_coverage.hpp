@@ -74,10 +74,10 @@ struct AmrPatchGeometryRecord {
 // positive cell width.
 [[nodiscard]] std::string diagnoseAmrPatchGeometry(const AmrPatchGeometryRecord& record);
 
-// Largest lattice span per axis admitted by the proof (2^40 finest cells). It
+// Largest lattice span per axis admitted by the proof (2^35 finest cells). It
 // keeps every lattice coordinate exactly representable in double and int64
 // and keeps the snap tolerance below 1e-3 lattice units.
-inline constexpr std::int64_t k_amr_coverage_max_lattice_cells_per_axis = std::int64_t{1} << 40;
+inline constexpr std::int64_t k_amr_coverage_max_lattice_cells_per_axis = std::int64_t{1} << 35;
 
 struct AmrCoverageLattice {
   std::array<double, 3> lower_comoving{0.0, 0.0, 0.0};
@@ -95,7 +95,7 @@ struct AmrCoverageLattice {
 
 // Snap tolerance in lattice units for a coordinate of magnitude
 // `span_lattice_units`: 1e-6 + 64 * eps * span (absorbs the roundoff of
-// origin + k * width arithmetic; always << 0.5).
+// origin + k * width arithmetic; at admitted spans it is below 0.001).
 [[nodiscard]] double amrCoverageSnapTolerance(double span_lattice_units) noexcept;
 
 struct AmrSignedLatticeCorner {

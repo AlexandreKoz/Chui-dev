@@ -223,6 +223,25 @@ void caseEmptyRankAndAssuranceCache() {
   lenient.require_explicit_geometry = false;
   wi::AmrGeometryAssurance relaxed;
   assert(!relaxed.assure(legacy, serial, nullptr, lenient, "test legacy lenient").declared);
+  // Mixed populated legacy and explicit patch geometry must be refused even
+  // under the pre-source lenient policy (previously the legacy row was skipped).
+  cosmosim::core::SimulationState mixed = stateFromRecords({
+      box(90, 0, 0, {0.0, 0.0, 0.0}, {1.0, 1.0, 1.0}),
+      box(91, 0, 0, {0.0, 0.0, 0.0}, {0.0, 0.0, 0.0}, {0U, 0U, 0U})});
+  mixed.patches.cell_count[1] = 1U;
+  wi::AmrGeometryAssurance mixed_assurance;
+  threw = false;
+  try {
+    (void)mixed_assurance.assure(mixed, serial, nullptr, lenient, "mixed geometry pre-source");
+  } catch (const std::runtime_error& error) {
+    threw = std::string(error.what()).find("mixed populated AMR geometry") != std::string::npos;
+  }
+  assert(threw);
+  // Precise snap contract at the largest accepted (2^35) lattice span.
+  constexpr double largest = static_cast<double>(cosmosim::amr::k_amr_coverage_max_lattice_cells_per_axis);
+  assert(cosmosim::amr::amrCoverageSnapTolerance(largest) < 1.0e-3);
+  assert(cosmosim::amr::amrCoverageSnapTolerance(largest) > 0.0);
+
 }
 
 void casePeriodicAndNonPeriodic() {

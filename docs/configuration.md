@@ -919,3 +919,22 @@ Metal diffusion (`physics.enable_metal_diffusion`) is supported on several
 ranks for the element-resolved composition operator (unique-owner interface
 fluxes); the legacy total-Z scalar operator without the composition sidecar
 remains single-rank and is refused explicitly on several ranks.
+
+### C04 sampled shadow hydrodynamics (experimental; source unverified)
+
+The existing `[numerics]` parameter-file section now accepts:
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `hydro_shadow_enabled` | `false` | Enable independent CTU/PPM diagnostic on eligible sampled hydro patches |
+| `hydro_shadow_cadence_steps` | `16` | Positive coordinator-step interval for sampling |
+| `hydro_shadow_seed` | `0` | Deterministic patch/epoch selection seed |
+| `hydro_shadow_max_patches_per_rank` | `2` | Per-rank number of sampled patches (0 disables sampling) |
+| `hydro_shadow_max_storage_cells_per_rank` | `8192` | Per-rank cap including sampled ghost slots |
+| `hydro_shadow_max_workspace_bytes_per_rank` | `67108864` | Per-rank bound on private state and scratch reservations |
+
+All fields enter the normalized configuration/provenance record. Shadow samples
+never update accepted physical state. Source-free, stationary-background
+ideal-gas transport and complete owned-patch active sets are currently
+eligible. Unsupported geometries/physics and resource refusals are counted
+without substituting physics. See `docs/repair/chui_c04_shadow_hydro_source_20261116.md`.

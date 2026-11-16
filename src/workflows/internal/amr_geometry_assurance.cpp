@@ -105,6 +105,7 @@ AmrGeometryAssuranceResult AmrGeometryAssurance::assure(
   core::MemoryReservation gather_reservation;
   std::vector<amr::AmrPatchGeometryRecord> records;
   std::vector<amr::AmrSignedLatticeCorner> corners;
+  std::uint64_t local_legacy_populated = 0U;
 
   // V1: local geometry admission.
   std::exception_ptr failure;
@@ -136,7 +137,8 @@ AmrGeometryAssuranceResult AmrGeometryAssurance::assure(
               ") is populated but declares no geometry (legacy all-zero descriptor); production AMR hydro "
               "requires explicit geometry on every populated leaf");
         }
-        continue;  // non-AMR legacy row: not part of any geometric tiling
+        ++local_legacy_populated;
+        continue;  // all-legacy non-AMR is allowed, but never a mixed tiling
       }
       const std::string issue = amr::diagnoseAmrPatchGeometry(record);
       if (!issue.empty()) throw std::runtime_error(issue);
@@ -154,9 +156,19 @@ AmrGeometryAssuranceResult AmrGeometryAssurance::assure(
   }
   mpi_context.rethrowCollectivePreparationFailure(failure, phaseLabel(phase, "AMR patch geometry admission"));
 
-  // C2: populated geometric leaves anywhere?
+  // C2: all-legacy is a valid non-AMR layout. Mixing legacy populated rows
+  // with geometric leaves is NOT: skipping the former would let a purported
+  // complete tiling omit physical state, including across different ranks.
+  // This vote is collective even for empty ranks and cannot deadlock a peer.
+  const std::uint64_t global_legacy = mpi_context.allreduceSumUint64(local_legacy_populated);
   const std::uint64_t global_populated =
       mpi_context.allreduceSumUint64(static_cast<std::uint64_t>(records.size()));
+  if (global_legacy != 0U && global_populated != 0U) {
+    throw std::runtime_error(
+        phaseLabel(phase, "mixed populated AMR geometry") +
+        ": populated legacy all-zero patch descriptors coexist with geometric leaves "
+        "across ranks; neither can be omitted from the collective tiling proof");
+  }
   if (global_populated == 0U) {
     m_result = AmrGeometryAssuranceResult{};
     m_result.revalidated = true;

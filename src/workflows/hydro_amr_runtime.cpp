@@ -43,6 +43,7 @@
 #include "cosmosim/hydro/hydro_cartesian_patch.hpp"
 #include "cosmosim/hydro/hydro_reconstruction.hpp"
 #include "cosmosim/hydro/hydro_riemann.hpp"
+#include "cosmosim/hydro/hydro_shadow_reference.hpp"
 #include "cosmosim/workflows/runtime_services.hpp"
 #include "cosmosim/workflows/source_runtime.hpp"
 #include "workflows/internal/runtime_stage_resource_access.hpp"
@@ -235,6 +236,20 @@ static_assert(std::is_trivially_copyable_v<PredictiveRefinementPoint>);
           : hydro::HydroDualEnergyMode::kOff;
   policy.dual_energy.thermal_fraction_switch = config.numerics.hydro_dual_energy_eta;
   return policy;
+}
+
+[[nodiscard]] hydro::HydroShadowOptions hydroShadowOptionsFromConfig(
+    const core::SimulationConfig& config) {
+  return hydro::HydroShadowOptions{
+      .enabled = config.numerics.hydro_shadow_enabled,
+      .cadence = config.numerics.hydro_shadow_cadence_steps,
+      .seed = config.numerics.hydro_shadow_seed,
+      .max_patches_per_rank = static_cast<std::size_t>(
+          config.numerics.hydro_shadow_max_patches_per_rank),
+      .max_storage_cells_per_rank = static_cast<std::size_t>(
+          config.numerics.hydro_shadow_max_storage_cells_per_rank),
+      .max_workspace_bytes_per_rank =
+          config.numerics.hydro_shadow_max_workspace_bytes_per_rank};
 }
 
 [[nodiscard]] hydro::HydroSlopeLimiter hydroSlopeLimiterFromConfig(const core::SimulationConfig& config) {
@@ -766,6 +781,7 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
             config.units.length_unit, config.units.mass_unit, config.units.velocity_unit)),
         m_temperature_k_per_internal_energy_code(temperatureKelvinPerInternalEnergyCode(m_units)),
         m_solver(k_gamma_adiabatic, hydroNumericsPolicyFromConfig(config)),
+        m_shadow(hydroShadowOptionsFromConfig(config), services.memory_governor),
         m_reconstruction(makeConfiguredReconstruction(config, {0.0, 0.0, 0.0})),
         m_riemann_solver(hydro::makeHydroRiemannSolver(hydroRiemannSolverKindFromConfig(config))) {
     // CHUI Part 2: one owner per physical source. A Part 2 thermochemistry
@@ -1047,6 +1063,7 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
     const bool all_ranks_have_hydro_cells =
         !m_mpi_context.isEnabled() ||
         hydro_cell_rank_count == static_cast<std::uint64_t>(m_mpi_context.worldSize());
+    m_shadow.beginEpoch(context.integrator_state.step_index);
     m_last_hydro_profile = {};
     m_last_amr_hydro_diagnostics = {};
     m_last_floor_diagnostics = auditConfiguredHydroFloors(context.state);
@@ -1065,6 +1082,7 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
       // mutations without an O(N) source fingerprint.
       context.state.bumpGravitySourceGeneration();
       recordHydroFloorDiagnostics(context);
+      publishHydroShadow(context);
       return;
     }
     if (context.state.cells.size() == 0U) {
@@ -1072,6 +1090,7 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
       if (hydro_cell_rank_count > 0U) {
         context.state.bumpGravitySourceGeneration();
       }
+      publishHydroShadow(context);
       return;
     }
 
@@ -1266,6 +1285,10 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
     // throws StageNumericalRetryRequest from inside the solver. The solver
     // only writes the staging copy m_conserved, so the failure is converted
     // into a transaction rejection below; SimulationState stays untouched.
+    auto shadow_sample = m_shadow.capture(
+        0U, 0, m_conserved, m_geometry, active_view, update,
+        m_solver.numericsPolicy(), hydroReconstructionSchemeFromConfig(m_config), sources.size(),
+        source_context.thermodynamic_closure != nullptr);
     std::string source_retry_failure;
     try {
       m_solver.advancePatchActiveSetBatchedWithScratch(
@@ -1286,6 +1309,13 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
     }
     if (composition_flux != nullptr) {
       composition_flux->endAdvance();
+    }
+    if (source_retry_failure.empty() && shadow_sample) {
+      m_shadow.compare(std::move(shadow_sample), m_conserved, m_geometry,
+                       active_view, update, m_solver.numericsPolicy(),
+                       hydroReconstructionSchemeFromConfig(m_config), k_gamma_adiabatic,
+                       m_config.numerics.hydro_density_floor_code,
+                       m_config.numerics.hydro_pressure_floor_code);
     }
     if (context.profiler_session != nullptr) {
       const hydro::HydroConservationReport& conservation = m_last_hydro_profile.conservation;
@@ -1528,9 +1558,84 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
     persistEffectiveIsmDiagnostics(context.state);
     context.state.bumpGravitySourceGeneration();
     recordHydroFloorDiagnostics(context);
+    publishHydroShadow(context);
   }
 
  private:
+  // Called at a legal, rank-uniform hydro stage completion point; there are
+  // no observer-side MPI operations in conditional patch loops. Diagnostic
+  // aggregates are ephemeral: an aborted stage never publishes them.
+  void publishHydroShadow(const core::StepContext& context) {
+    if (!m_config.numerics.hydro_shadow_enabled) return;
+    const auto& local = m_shadow.report();
+    const auto sum_u64 = [&](std::uint64_t value) { return m_mpi_context.allreduceSumUint64(value); };
+    const auto sum_double = [&](double value) { return m_mpi_context.allreduceSumDouble(value); };
+    const auto max_double = [&](double value) {
+      return -m_mpi_context.allreduceMinDouble(-value);
+    };
+    const std::uint64_t completed = sum_u64(local.completed);
+    const std::uint64_t compared_cells = sum_u64(local.compared_cells);
+    const std::uint64_t auxiliary_cells = sum_u64(local.compared_auxiliary_cells);
+    const double compared_volume = sum_double(local.compared_volume);
+    std::unordered_map<std::string, std::string> payload{
+        {"eligible_patches", std::to_string(sum_u64(local.eligible))},
+        {"selected_patches", std::to_string(sum_u64(local.selected))},
+        {"completed_patches", std::to_string(completed)},
+        {"compared_owned_cells", std::to_string(compared_cells)},
+        {"compared_auxiliary_owned_cells", std::to_string(auxiliary_cells)},
+        {"compared_volume_comoving", std::to_string(compared_volume)},
+        {"skipped_cadence", std::to_string(sum_u64(local.skipped_cadence))},
+        {"skipped_selection", std::to_string(sum_u64(local.skipped_selection))},
+        {"skipped_geometry", std::to_string(sum_u64(local.skipped_geometry))},
+        {"skipped_sources_or_time", std::to_string(sum_u64(local.skipped_sources_or_time))},
+        {"skipped_resource", std::to_string(sum_u64(local.skipped_resource))},
+        {"skipped_numerical", std::to_string(sum_u64(local.skipped_numerical))},
+        {"reference_substeps", std::to_string(sum_u64(local.reference_substeps))},
+        {"reference_fallbacks", std::to_string(sum_u64(local.fallback_count))},
+        {"max_rank_reserved_workspace_bytes", std::to_string(
+            m_mpi_context.allreduceMaxUint64(local.workspace_high_water_bytes))},
+        {"max_rank_observed_capacity_bytes", std::to_string(
+            m_mpi_context.allreduceMaxUint64(local.observed_capacity_high_water_bytes))},
+        {"reference_method", "ctu_ppm_hllc_hlle_fallback"},
+        {"production_method", core::hydroIntegrationModeToString(
+            m_config.numerics.hydro_integration_scheme)},
+        {"sampling_budget_semantics", "per_rank_bounded"},
+        {"diagnostic_scope", "interior_transport_only_not_a_global_error_bar"}};
+    const std::array<const char*, 7> labels{"rho", "momentum_x", "momentum_y",
+        "momentum_z", "total_energy", "metal_density", "aux_thermal_density"};
+    for (std::size_t field = 0; field < labels.size(); ++field) {
+      const auto& lane = local.components[field];
+      const double l1_volume = sum_double(lane.weighted_abs_difference);
+      const double reference_magnitude = sum_double(lane.weighted_reference_magnitude);
+      const double linf = max_double(lane.linf_difference);
+      const std::string prefix = std::string("disagreement_") + labels[field];
+      const bool has_samples = completed != 0U && (field != 6U || auxiliary_cells != 0U);
+      payload.emplace(prefix + "_l1_volume_weighted", has_samples && compared_volume > 0.0
+          ? std::to_string(l1_volume / compared_volume) : "no_samples");
+      payload.emplace(prefix + "_linf", has_samples ? std::to_string(linf) : "no_samples");
+      payload.emplace(prefix + "_normalized_l1", has_samples
+          ? std::to_string(l1_volume / std::max(reference_magnitude, 1.0e-12 * compared_volume))
+          : "no_samples");
+      if (field < 6U) {
+        payload.emplace(std::string("reference_region_delta_") + labels[field],
+                             std::to_string(sum_double(local.reference_delta[field])));
+        payload.emplace(std::string("production_region_delta_") + labels[field],
+                             std::to_string(sum_double(local.production_delta[field])));
+      }
+    }
+    if (context.profiler_session != nullptr) {
+      context.profiler_session->recordEvent(core::RuntimeEvent{
+          .event_kind = "hydro.shadow_reference",
+          .severity = core::RuntimeEventSeverity::kInfo,
+          .subsystem = "hydro.godunov",
+          .step_index = context.integrator_state.step_index,
+          .simulation_time_code = context.integrator_state.current_time_code,
+          .scale_factor = context.integrator_state.current_scale_factor,
+          .message = "bounded independent CTU/PPM hydro reference; interior transport disagreement only",
+          .payload = std::move(payload)});
+    }
+  }
+
   [[nodiscard]] amr::AmrThermodynamicCachePolicy amrThermodynamicCachePolicy(
       double scale_factor, double redshift) const {
     return amr::AmrThermodynamicCachePolicy{
@@ -3043,7 +3148,8 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
         // P1-HYDRO-02: CTU needs the edge stencil ghost block (same config
         // authority as the solver's integration scheme, rank-uniform).
         .ctu_edge_stencils = m_config.numerics.hydro_integration_scheme ==
-            core::HydroIntegrationMode::kCornerTransportUpwind};
+            core::HydroIntegrationMode::kCornerTransportUpwind,
+        .hydro_shadow_reference = m_config.numerics.hydro_shadow_enabled ? &m_shadow : nullptr};
     {
       const auto [domain_origin, domain_extent] = globalAmrHierarchyDomain(
           context.state, amr_options, "production AMR hydro leaf-tiling proof (pre-ghost-fill)");
@@ -4705,6 +4811,7 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
   std::uint32_t m_current_world_rank = 0;
   double m_temperature_k_per_internal_energy_code = 0.0;
   hydro::HydroCoreSolver m_solver;
+  hydro::HydroShadowReference m_shadow;
   std::unique_ptr<hydro::HydroReconstruction> m_reconstruction;
   std::unique_ptr<hydro::HydroRiemannSolver> m_riemann_solver;
   std::unique_ptr<physics::CoolingHeatingSource> m_cooling_source;

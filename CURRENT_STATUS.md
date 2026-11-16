@@ -515,3 +515,13 @@ Several stale distributed fixtures were also corrected: distributed-IC logical c
 Repository hygiene, the full CPU Debug build, focused `unit_config_parser`, `unit_parallel_distributed_memory`, and `integration_pm_periodic_mode` tests pass. The attempted full CPU CTest inventory exposed pre-existing/current-tree failures outside this bounded closure (including uniform rung-zero append fixtures, stage-6 memory-report expectations, unique-ID fixture semantics, and governed analysis-memory expectations) before the command window expired; those failures are not reported as passes. Dependency-complete MPI/HDF5/FFTW qualification remains BLOCKED on this host because CMake cannot find `MPI_CXX` / `mpi-cxx`.
 
 This pass does **not** close the periodic-seam compact top-domain geometry design, restart digest divergence diagnosis, MPI restart artifact qualification, P3 MPI+OpenMP force-equivalence matrix, event-by-event P2 telemetry sequence, or the HDF5 provider-family matrix. Repository readiness therefore remains **NOT READY** under the P5-Q2/M48-Q campaign acceptance criteria until those gates are closed and the MPI dependency-complete suite is executed.
+
+### 2026-11-16 experimental source work (not qualified)
+
+C04 now has an off-by-default, per-rank memory-governed independent CTU/PPM
+shadow-hydro reference wired into fixed-grid and production AMR patch advances.
+The exact AMR assurance collectively rejects mixed populated legacy/geometric
+patches, and the snap span is limited to `2^35`. The supplied source and test
+fixtures have **not been compiled or run**. The shadow remains restricted to
+source-free stationary-background interior transport; full-physics coupled
+shadow and narrow-patch multi-patch AMR references are not complete.

@@ -1500,6 +1500,12 @@ struct ConfigKeySpec {
       {"numerics.hydro_density_floor_code", "1.0e-10"},
       {"numerics.hydro_pressure_floor_code", "1.0e-10"},
       {"numerics.hydro_active_batch_max_cells", "0"},
+      {"numerics.hydro_shadow_enabled", "false"},
+      {"numerics.hydro_shadow_cadence_steps", "16"},
+      {"numerics.hydro_shadow_seed", "0"},
+      {"numerics.hydro_shadow_max_patches_per_rank", "2"},
+      {"numerics.hydro_shadow_max_storage_cells_per_rank", "8192"},
+      {"numerics.hydro_shadow_max_workspace_bytes_per_rank", "67108864"},
       {"numerics.hydro_reconstruction", "piecewise_linear"},
       {"numerics.hydro_slope_limiter", "mc"},
       {"numerics.hydro_integration_scheme", "muscl_hancock"},
@@ -2276,6 +2282,14 @@ void validateConfig(const SimulationConfig& config) {
   if (config.numerics.hydro_density_floor_code < 0.0 ||
       config.numerics.hydro_pressure_floor_code < 0.0) {
     throw ConfigError("numerics hydro floors must be finite and non-negative code-unit values");
+  }
+  if (config.numerics.hydro_shadow_cadence_steps == 0U) {
+    throw ConfigError("numerics.hydro_shadow_cadence_steps must be >= 1");
+  }
+  if (config.numerics.hydro_shadow_max_patches_per_rank > 1024U ||
+      config.numerics.hydro_shadow_max_storage_cells_per_rank > 1000000U ||
+      config.numerics.hydro_shadow_max_workspace_bytes_per_rank > (1ULL << 34U)) {
+    throw ConfigError("hydro shadow budgets exceed the allowed bounded diagnostic envelope");
   }
   if (!std::isfinite(config.numerics.hydro_dual_energy_eta) ||
       config.numerics.hydro_dual_energy_eta <= 0.0 ||
@@ -3240,6 +3254,12 @@ class NormalizedConfigStream {
   stream << "hydro_density_floor_code = " << frozen.config.numerics.hydro_density_floor_code << '\n';
   stream << "hydro_pressure_floor_code = " << frozen.config.numerics.hydro_pressure_floor_code << '\n';
   stream << "hydro_active_batch_max_cells = " << frozen.config.numerics.hydro_active_batch_max_cells << '\n';
+  stream << "hydro_shadow_enabled = " << (frozen.config.numerics.hydro_shadow_enabled ? "true" : "false") << '\n';
+  stream << "hydro_shadow_cadence_steps = " << frozen.config.numerics.hydro_shadow_cadence_steps << '\n';
+  stream << "hydro_shadow_seed = " << frozen.config.numerics.hydro_shadow_seed << '\n';
+  stream << "hydro_shadow_max_patches_per_rank = " << frozen.config.numerics.hydro_shadow_max_patches_per_rank << '\n';
+  stream << "hydro_shadow_max_storage_cells_per_rank = " << frozen.config.numerics.hydro_shadow_max_storage_cells_per_rank << '\n';
+  stream << "hydro_shadow_max_workspace_bytes_per_rank = " << frozen.config.numerics.hydro_shadow_max_workspace_bytes_per_rank << '\n';
   stream << "hydro_reconstruction = "
          << hydroReconstructionModeToString(frozen.config.numerics.hydro_reconstruction) << '\n';
   stream << "hydro_slope_limiter = "
@@ -4025,6 +4045,27 @@ class NormalizedConfigStream {
           "numerics.hydro_active_batch_max_cells",
           defaultFor("numerics.hydro_active_batch_max_cells")),
       "numerics.hydro_active_batch_max_cells");
+  frozen.config.numerics.hydro_shadow_enabled = parseBool(requireString(
+      entries, consumed, "numerics.hydro_shadow_enabled", defaultFor("numerics.hydro_shadow_enabled")),
+      "numerics.hydro_shadow_enabled");
+  frozen.config.numerics.hydro_shadow_cadence_steps = parseNumber<std::uint64_t>(requireString(
+      entries, consumed, "numerics.hydro_shadow_cadence_steps", defaultFor("numerics.hydro_shadow_cadence_steps")),
+      "numerics.hydro_shadow_cadence_steps");
+  frozen.config.numerics.hydro_shadow_seed = parseNumber<std::uint64_t>(requireString(
+      entries, consumed, "numerics.hydro_shadow_seed", defaultFor("numerics.hydro_shadow_seed")),
+      "numerics.hydro_shadow_seed");
+  frozen.config.numerics.hydro_shadow_max_patches_per_rank = parseNumber<std::uint64_t>(requireString(
+      entries, consumed, "numerics.hydro_shadow_max_patches_per_rank",
+      defaultFor("numerics.hydro_shadow_max_patches_per_rank")),
+      "numerics.hydro_shadow_max_patches_per_rank");
+  frozen.config.numerics.hydro_shadow_max_storage_cells_per_rank = parseNumber<std::uint64_t>(requireString(
+      entries, consumed, "numerics.hydro_shadow_max_storage_cells_per_rank",
+      defaultFor("numerics.hydro_shadow_max_storage_cells_per_rank")),
+      "numerics.hydro_shadow_max_storage_cells_per_rank");
+  frozen.config.numerics.hydro_shadow_max_workspace_bytes_per_rank = parseNumber<std::uint64_t>(requireString(
+      entries, consumed, "numerics.hydro_shadow_max_workspace_bytes_per_rank",
+      defaultFor("numerics.hydro_shadow_max_workspace_bytes_per_rank")),
+      "numerics.hydro_shadow_max_workspace_bytes_per_rank");
   frozen.config.numerics.hydro_reconstruction = parseHydroReconstructionMode(requireString(
       entries, consumed, "numerics.hydro_reconstruction", defaultFor("numerics.hydro_reconstruction")));
   frozen.config.numerics.hydro_slope_limiter = parseHydroSlopeLimiterMode(requireString(

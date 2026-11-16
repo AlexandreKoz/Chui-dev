@@ -137,7 +137,7 @@ AmrCoverageLattice makeAmrCoverageLattice(
     const double span = (upper - lower) / unit;
     if (!std::isfinite(span) || span > static_cast<double>(k_amr_coverage_max_lattice_cells_per_axis)) {
       throw std::runtime_error(where + "bounding box spans " + formatDouble(span) +
-                               " finest cells, above the admitted 2^40 lattice span");
+                               " finest cells, above the admitted 2^35 lattice span");
     }
     std::int64_t cells = 0;
     if (!snapToLattice(span, span, cells) || cells < 1) {

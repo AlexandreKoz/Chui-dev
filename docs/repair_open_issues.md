@@ -1030,3 +1030,13 @@ Still open (external or validation, not source):
    edge/corner ghost provenance for full-order CTU at multi-interface
    edges, and P1-TIME-01 fine-level event barriers inside a recursive coarse
    interval. See `docs/repair/chui_post_patch53_source_closure.md`.
+
+**2026-11-16 C04 source implementation note:** bounded independent CTU/PPM
+shadow reference and AMR geometry guards have been added to the source tree
+(see `docs/repair/chui_c04_shadow_hydro_source_20261116.md`). This source has
+NOT been compiled or tested. Outstanding C04 full-physics scope includes
+independent time-centred AMR multi-patch ghost histories for narrow patches,
+consistent stiff-source/effective-ISM/cosmological references, and the planned
+MPI/convergence/resource qualification. Earlier references to shadow hydro as
+entirely absent are superseded only within the now-implemented eligibility
+contract; do not claim unconditional v10 source/science completion.

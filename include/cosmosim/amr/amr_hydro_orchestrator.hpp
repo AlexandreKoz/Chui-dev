@@ -14,6 +14,7 @@
 #include "cosmosim/core/memory_governor.hpp"
 #include "cosmosim/core/simulation_state.hpp"
 #include "cosmosim/hydro/hydro_core_solver.hpp"
+#include "cosmosim/hydro/hydro_shadow_reference.hpp"
 #include "cosmosim/hydro/hydro_reconstruction.hpp"
 #include "cosmosim/hydro/hydro_riemann.hpp"
 
@@ -159,6 +160,10 @@ struct ProductionAmrHydroOptions {
   // AmrInterfaceTopologyOptions::edge_stencil_layers so the diagonal remote
   // cells are delivered. Must agree with the HydroCoreSolver scheme.
   bool ctu_edge_stencils = false;
+  // Optional C04 read-only diagnostic. Not a flux register/source/AMR owner.
+  // The runtime owns its lifetime; the library never makes MPI calls through
+  // this pointer and the disabled path does not allocate shadow storage.
+  hydro::HydroShadowReference* hydro_shadow_reference = nullptr;
   // P1-55-02: global hierarchy domain [origin, origin + extent) in the patch
   // frame, forwarded to every ghost-fill target view. On non-periodic axes a
   // deep/edge stencil ghost may use the physical closure only beyond these

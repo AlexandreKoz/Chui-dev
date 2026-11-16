@@ -3167,6 +3167,15 @@ struct AmrSynchronizedSweepWorkspace {
       hydro::HydroFaceMassFluxSink* sink;
       ~CompositionSinkScope() { if (sink != nullptr) sink->endAdvance(); }
     } composition_sink_scope{global_source_context.face_mass_flux_sink};
+    const hydro::HydroActiveSetView patch_active_set{
+        .active_cells = active_patch_cells, .active_faces = active_faces};
+    auto shadow_sample = options.hydro_shadow_reference != nullptr
+        ? options.hydro_shadow_reference->capture(
+              patch_geometry.patch.patch_id, patch_geometry.patch.level,
+              conserved_state, patch_geometry.geometry, patch_active_set,
+              update, solver.numericsPolicy(), options.reconstruction_scheme, source_terms.size(),
+              patch_source_context.thermodynamic_closure != nullptr)
+        : hydro::HydroShadowReference::Sample{};
     solver.advancePatchActiveSetBatchedWithScratch(
         conserved_state,
         patch_geometry.geometry,
@@ -3181,6 +3190,12 @@ struct AmrSynchronizedSweepWorkspace {
         options.active_batch_policy,
         &profile,
         &flux_registers);
+    if (options.hydro_shadow_reference != nullptr && shadow_sample) {
+      options.hydro_shadow_reference->compare(
+          std::move(shadow_sample), conserved_state, patch_geometry.geometry,
+          patch_active_set, update, solver.numericsPolicy(),
+          options.reconstruction_scheme, options.adiabatic_index, options.density_floor, options.pressure_floor);
+    }
     if (scratch.ownedCapacityBytes() != scratch_capacity_before) {
       throw std::logic_error("AMR solver scratch grew after physical admission: before=" +
           std::to_string(scratch_capacity_before) + " after=" +

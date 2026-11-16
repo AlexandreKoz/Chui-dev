@@ -558,6 +558,7 @@ add_library(cosmosim_hydro STATIC
   src/hydro/hydro_boundary_conditions.cpp
   src/hydro/hydro_cartesian_patch.cpp
   src/hydro/hydro_core_solver.cpp
+  src/hydro/hydro_shadow_reference.cpp
   src/hydro/hydro_reconstruction.cpp
   src/hydro/hydro_riemann.cpp
   src/hydro/gas_thermodynamic_refresh.cpp)
@@ -1551,6 +1552,10 @@ if(COSMOSIM_ENABLE_TESTS)
   add_executable(test_unit_m2d_gate5_restart tests/unit/test_m2d_gate5_restart.cpp)
   target_link_libraries(test_unit_m2d_gate5_restart PRIVATE cosmosim_io cosmosim_core)
   add_test(NAME unit_m2d_gate5_restart COMMAND test_unit_m2d_gate5_restart)
+
+  add_executable(test_unit_hydro_shadow_reference tests/unit/test_hydro_shadow_reference.cpp)
+  target_link_libraries(test_unit_hydro_shadow_reference PRIVATE cosmosim_hydro cosmosim_core)
+  add_test(NAME unit_hydro_shadow_reference COMMAND test_unit_hydro_shadow_reference)
 
   add_executable(test_unit_hydro_core_solver tests/unit/test_hydro_core_solver.cpp)
   target_link_libraries(test_unit_hydro_core_solver PRIVATE cosmosim_hydro)

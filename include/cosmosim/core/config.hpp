@@ -466,6 +466,14 @@ struct NumericsConfig {
   // scratch batch. 0 selects the deterministic runtime automatic maximum,
   // further bounded by current MemoryGovernor headroom.
   std::uint64_t hydro_active_batch_max_cells = 0;
+  // C04 sampled, non-authoritative hydro reference. Budgets are per MPI rank;
+  // no all-cell shadow is permitted and the disabled path allocates nothing.
+  bool hydro_shadow_enabled = false;
+  std::uint64_t hydro_shadow_cadence_steps = 16U;
+  std::uint64_t hydro_shadow_seed = 0U;
+  std::uint64_t hydro_shadow_max_patches_per_rank = 2U;
+  std::uint64_t hydro_shadow_max_storage_cells_per_rank = 8192U;
+  std::uint64_t hydro_shadow_max_workspace_bytes_per_rank = 67108864U;
   HydroReconstructionMode hydro_reconstruction = HydroReconstructionMode::kPiecewiseLinear;
   HydroSlopeLimiterMode hydro_slope_limiter = HydroSlopeLimiterMode::kMonotonizedCentral;
   HydroIntegrationMode hydro_integration_scheme = HydroIntegrationMode::kMusclHancock;
