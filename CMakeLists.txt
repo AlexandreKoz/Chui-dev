@@ -1061,6 +1061,11 @@ if(COSMOSIM_ENABLE_TESTS)
   add_executable(test_unit_memory_governor tests/unit/test_memory_governor.cpp)
   target_link_libraries(test_unit_memory_governor PRIVATE cosmosim_core Threads::Threads)
   add_test(NAME unit_memory_governor COMMAND test_unit_memory_governor)
+
+  # C04-05 / M01: best-effort admission band and optional-work reclaim.
+  add_executable(test_unit_memory_governor_best_effort tests/unit/test_memory_governor_best_effort.cpp)
+  target_link_libraries(test_unit_memory_governor_best_effort PRIVATE cosmosim_core Threads::Threads)
+  add_test(NAME unit_memory_governor_best_effort COMMAND test_unit_memory_governor_best_effort)
   add_executable(test_unit_retained_capacity_transaction tests/unit/test_retained_capacity_transaction.cpp)
   target_link_libraries(test_unit_retained_capacity_transaction PRIVATE cosmosim_core)
   add_test(NAME unit_retained_capacity_transaction COMMAND test_unit_retained_capacity_transaction)
@@ -1439,6 +1444,17 @@ if(COSMOSIM_ENABLE_TESTS)
   add_executable(test_unit_ism_dust_sgs_adaptive tests/unit/test_ism_dust_sgs_adaptive.cpp)
   target_link_libraries(test_unit_ism_dust_sgs_adaptive PRIVATE cosmosim_all)
   add_test(NAME unit_ism_dust_sgs_adaptive COMMAND test_unit_ism_dust_sgs_adaptive)
+
+  # I01: one ISM-regime authority for solver closure, relaxation and refresh.
+  add_executable(test_unit_ism_regime_gate tests/unit/test_ism_regime_gate.cpp)
+  target_link_libraries(test_unit_ism_regime_gate PRIVATE cosmosim_all)
+  add_test(NAME unit_ism_regime_gate COMMAND test_unit_ism_regime_gate)
+
+  # C03/C04: order/decomposition-independent chemistry shadow sampling.
+  add_executable(test_unit_chemistry_shadow_sampling tests/unit/test_chemistry_shadow_sampling.cpp)
+  target_link_libraries(test_unit_chemistry_shadow_sampling PRIVATE cosmosim_all)
+  add_test(NAME unit_chemistry_shadow_sampling COMMAND test_unit_chemistry_shadow_sampling)
+  set_tests_properties(unit_chemistry_shadow_sampling PROPERTIES SKIP_RETURN_CODE 77)
   add_executable(test_unit_stellar_population_feedback tests/unit/test_stellar_population_feedback.cpp)
   target_link_libraries(test_unit_stellar_population_feedback PRIVATE cosmosim_all)
   add_test(NAME unit_stellar_population_feedback COMMAND test_unit_stellar_population_feedback)
@@ -1586,6 +1602,12 @@ if(COSMOSIM_ENABLE_TESTS)
   add_executable(test_unit_hydro_shadow_c04_chronology tests/unit/test_hydro_shadow_c04_chronology.cpp)
   target_link_libraries(test_unit_hydro_shadow_c04_chronology PRIVATE cosmosim_hydro cosmosim_physics cosmosim_core)
   add_test(NAME unit_hydro_shadow_c04_chronology COMMAND test_unit_hydro_shadow_c04_chronology)
+
+  # C04 final closure: noexcept containment, remote donor hold/resolution,
+  # private composition reconciliation, rejected-attempt accounting.
+  add_executable(test_unit_hydro_shadow_c04_final tests/unit/test_hydro_shadow_c04_final.cpp)
+  target_link_libraries(test_unit_hydro_shadow_c04_final PRIVATE cosmosim_hydro cosmosim_physics cosmosim_core)
+  add_test(NAME unit_hydro_shadow_c04_final COMMAND test_unit_hydro_shadow_c04_final)
 
   add_executable(test_unit_hydro_core_solver tests/unit/test_hydro_core_solver.cpp)
   target_link_libraries(test_unit_hydro_core_solver PRIVATE cosmosim_hydro)

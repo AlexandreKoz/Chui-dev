@@ -2834,6 +2834,8 @@ class SourceRuntimeImpl final : public SourceRuntime {
     total.max_relative_energy_difference = std::max(
         total.max_relative_energy_difference, shadow.max_relative_energy_difference);
     add(total.ion_samples, shadow.ion_samples);
+    add(total.cap_truncated, shadow.cap_truncated);
+    add(total.reference_failures, shadow.reference_failures);
     total.max_ion_stage_fraction_difference = std::max(
         total.max_ion_stage_fraction_difference, shadow.max_ion_stage_fraction_difference);
     total.max_relative_ion_electron_difference = std::max(
@@ -3189,6 +3191,8 @@ class SourceRuntimeImpl final : public SourceRuntime {
                       {"sgs_resolved_stress_work_code",
                        std::to_string(m_last_sgs_ledger.resolved_stress_work_code)},
                       {"shadow_samples", std::to_string(m_last_shadow_report.samples)},
+                      {"shadow_cap_truncated", std::to_string(m_last_shadow_report.cap_truncated)},
+                      {"shadow_reference_failures", std::to_string(m_last_shadow_report.reference_failures)},
                       {"physical_seconds", std::to_string(interval.physical_seconds)},
                       {"recursive_level", std::to_string(recursive_level)},
                       {"radiative_loss_erg", std::to_string(l.radiative_loss_erg)},
@@ -3290,7 +3294,15 @@ class SourceRuntimeImpl final : public SourceRuntime {
     const double global_max = std::max(global_species_max, global_ion_max);
     const std::uint64_t global_samples = m_mpi_context.allreduceSumUint64(current_shadow.samples);
     const std::uint64_t global_ion_samples = m_mpi_context.allreduceSumUint64(current_shadow.ion_samples);
-    const double bias = physics::nextChemistryPromotionBias(committed_bias, global_max, global_samples);
+    // C03/C04: learn only from complete, decomposition-independent evidence.
+    // A cost-cap truncation (order-dependent subset) or a failed reference
+    // (unknown disagreement) anywhere holds the committed bias for this
+    // interval instead of steering production from partial evidence.
+    const std::uint64_t global_incomplete = m_mpi_context.allreduceSumUint64(
+        current_shadow.cap_truncated + current_shadow.reference_failures);
+    const double bias = global_incomplete != 0U
+        ? committed_bias
+        : physics::nextChemistryPromotionBias(committed_bias, global_max, global_samples);
     m_thermochemistry->setGlobalPromotionBias(bias);
     if (joint) {
       std::uint64_t local_detailed = 0U;

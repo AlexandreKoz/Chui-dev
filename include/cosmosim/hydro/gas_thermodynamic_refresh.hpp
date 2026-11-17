@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <span>
+#include <vector>
 
 #include "cosmosim/core/simulation_state.hpp"
 #include "cosmosim/hydro/hydro_core_solver.hpp"
@@ -52,6 +53,33 @@ namespace cosmosim::hydro {
 // supply a composition/ionization-dependent mu through the thermodynamic
 // closure; callers must not assume 0.59 elsewhere.
 inline constexpr double k_part1_reference_mean_molecular_weight = 0.59;
+
+// I01 ISM regime authority (single rule for refresh, solver fluxes and the
+// effective-ISM relaxation source). With an enabled composition sidecar the
+// per-row ISM regime tag owns the effective/resolved decision: only rows
+// tagged effective may receive the effective multiphase closure (EOS
+// pressure, signal speed, relaxation). Without a sidecar there is no tag and
+// the closure decides from density/temperature alone (legacy behaviour).
+[[nodiscard]] bool ismRegimeGateActive(const core::SimulationState& state) noexcept;
+// 1 when the effective closure may be applied to dense gas row `row`
+// (always 1 without an active gate; 0 for an out-of-range row).
+[[nodiscard]] std::uint8_t ismRegimeAllowsEffectiveClosure(const core::SimulationState& state,
+                                                           std::size_t row) noexcept;
+// Gate value for a row whose regime tag is not locally known (e.g. a ghost
+// imported from a remote MPI owner): the closure keeps its own
+// density/temperature decision there (counted by callers).
+inline constexpr std::uint8_t k_ism_regime_gate_unknown_origin = 1U;
+// Per-SOLVER-row gate of `geometry` (size totalCellStorageCount()):
+//  * real row r: ismRegimeAllowsEffectiveClosure(state, dense_row_by_real_cell[r]);
+//  * physical/self ghost (writable physical-boundary scratch, incl. in-patch
+//    periodic wrap): the value of its in-patch source (or owner) cell;
+//  * every other ghost row: k_ism_regime_gate_unknown_origin (callers that
+//    know the origin cell of an imported ghost overwrite it).
+// Returns false (gate cleared) when no gate is active for `state`.
+[[nodiscard]] bool buildIsmRegimeGate(const core::SimulationState& state,
+                                      const HydroPatchGeometry& geometry,
+                                      std::span<const std::uint32_t> dense_row_by_real_cell,
+                                      std::vector<std::uint8_t>& gate);
 [[nodiscard]] double temperatureKelvinPerInternalEnergyCode(
     double adiabatic_index,
     double velocity_si_per_code,

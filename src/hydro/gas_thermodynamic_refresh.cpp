@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <stdexcept>
+#include <vector>
 
 namespace cosmosim::hydro {
 namespace {
@@ -43,9 +44,7 @@ struct RefreshedCell {
   double c_squared = policy.adiabatic_index * result.pressure / rho;
   // CHUI Part 2: with an enabled composition sidecar the ISM regime tag owns
   // the decision; resolved-regime rows never receive the effective closure.
-  const bool regime_allows_closure = !state.gas_composition.enabled() ||
-      (row < state.gas_composition.rowCount() &&
-       state.gas_composition.ism_regime_tag[row] == core::k_gas_ism_regime_effective);
+  const bool regime_allows_closure = ismRegimeAllowsEffectiveClosure(state, row) != 0U;
   if (policy.closure != nullptr && regime_allows_closure) {
     HydroPrimitiveState ideal;
     ideal.rho_comoving = rho;
@@ -99,6 +98,41 @@ void accumulate(GasThermodynamicRefreshReport& report, const RefreshedCell& cell
 }
 
 }  // namespace
+
+bool ismRegimeGateActive(const core::SimulationState& state) noexcept {
+  return state.gas_composition.enabled();
+}
+
+std::uint8_t ismRegimeAllowsEffectiveClosure(const core::SimulationState& state, std::size_t row) noexcept {
+  if (!ismRegimeGateActive(state)) return 1U;
+  if (row >= state.gas_composition.rowCount() || row >= state.gas_composition.ism_regime_tag.size()) return 0U;
+  return state.gas_composition.ism_regime_tag[row] == core::k_gas_ism_regime_effective ? 1U : 0U;
+}
+
+bool buildIsmRegimeGate(const core::SimulationState& state, const HydroPatchGeometry& geometry,
+                        std::span<const std::uint32_t> dense_row_by_real_cell, std::vector<std::uint8_t>& gate) {
+  if (!ismRegimeGateActive(state)) {
+    gate.clear();
+    return false;
+  }
+  const std::size_t real_count = geometry.cellCount();
+  gate.assign(geometry.totalCellStorageCount(), k_ism_regime_gate_unknown_origin);
+  for (std::size_t row = 0; row < real_count && row < gate.size(); ++row) {
+    gate[row] = row < dense_row_by_real_cell.size()
+        ? ismRegimeAllowsEffectiveClosure(state, dense_row_by_real_cell[row])
+        : 0U;
+  }
+  for (const HydroGhostCell& ghost : geometry.ghost_cells) {
+    const bool self_ghost = ghost.mutation_rights == HydroGhostMutationRights::kWritablePhysicalBoundaryScratch &&
+        ghost.boundary_kind != HydroBoundaryKind::kImportedMpi &&
+        ghost.boundary_kind != HydroBoundaryKind::kInterior;
+    const std::size_t source = ghost.source_real_cell < real_count ? ghost.source_real_cell : ghost.owner_real_cell;
+    if (self_ghost && ghost.ghost_cell < gate.size() && source < real_count) {
+      gate[ghost.ghost_cell] = gate[source];
+    }
+  }
+  return true;
+}
 
 double temperatureKelvinPerInternalEnergyCode(
     double adiabatic_index, double velocity_si_per_code, double mean_molecular_weight) {

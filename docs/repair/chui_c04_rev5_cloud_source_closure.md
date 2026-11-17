@@ -1,5 +1,13 @@
 # C04 sampled shadow hydrodynamics — revision-6 source closure (cloud session, 2026-11-17)
 
+> **Superseding note (2026-11-17, final C04 source campaign):** see
+> `chui_c04_final_precompile_handoff.md`. It fixes four residual source
+> defects of this revision (exception containment, production-rule private
+> composition clamp/reconciliation, synchronized-MPI remote composition
+> donors from the production donor table — superseding §5 item 5 for
+> synchronized stepping — and rejected-attempt accounting). The rest of this
+> note remains valid.
+
 **Status: C04 SOURCE IMPLEMENTED — UNVERIFIED.** Every mandatory C04 source
 contract listed by the revision-5 audit now has an integrated source path, with
 the approximation scopes declared below. **Nothing in this campaign was

@@ -3,10 +3,12 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <mutex>
 #include <span>
 #include <stdexcept>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 namespace cosmosim::core {
@@ -219,6 +221,30 @@ class MemoryGovernor final {
       std::uint64_t requested_bytes,
       std::string_view owner);
 
+  // Best-effort admission for OPTIONAL work (sampled diagnostics such as the
+  // C04 shadow). Identical to reserve() except that it is refused
+  // (MemoryAdmissionError) unless the prospective safety-adjusted total stays
+  // strictly inside the GREEN band (below the amber threshold) of a finite
+  // hard limit, so optional work never consumes the headroom band that
+  // mandatory physics may still need in the same stage (v10 §5.1/§5.2).
+  // Unlimited policies behave like reserve(). The node pool still applies.
+  [[nodiscard]] MemoryReservation reserveBestEffort(
+      MemoryClass memory_class,
+      std::uint64_t requested_bytes,
+      std::string_view owner);
+
+  // Optional-work reclaimer (at most one per governor). When reserve() of any
+  // class other than kDiagnostic would be refused, the governor calls the
+  // reclaimer OUTSIDE its lock (only on the thread that registered it, never
+  // re-entrantly) and retries the reservation once if it released anything.
+  // The reclaimer must only drop best-effort reservations, must not reserve
+  // and must not communicate; it returns the bytes it released. Rejections
+  // that trigger a successful reclaim are still counted.
+  using BestEffortReclaimer = std::function<std::uint64_t()>;
+  void setBestEffortReclaimer(BestEffortReclaimer reclaimer, std::thread::id owner_thread);
+  void clearBestEffortReclaimer() noexcept;
+  [[nodiscard]] std::uint64_t bestEffortReclaimCount() const;
+
   // Reconciles physical memory already owned outside governor-managed
   // commitments. Callers must exclude MemoryEntry ranges flagged as governed
   // commitments, otherwise the same byte range would be double-counted.
@@ -253,6 +279,8 @@ class MemoryGovernor final {
     bool used = false;
   };
 
+  [[nodiscard]] MemoryReservation reserveImpl(
+      MemoryClass memory_class, std::uint64_t requested_bytes, std::string_view owner, bool best_effort);
   [[nodiscard]] std::uint16_t ownerSlotLocked(std::string_view owner) noexcept;
   void releaseOwnerBytesLocked(std::uint16_t owner_slot, std::uint64_t bytes) noexcept;
   void releaseNodePoolBytesLocked(std::uint64_t bytes) noexcept;
@@ -291,6 +319,10 @@ class MemoryGovernor final {
   std::array<OwnerSlot, k_memory_owner_telemetry_slots> m_owner_slots{};
   NodeMemoryPool* m_node_pool = nullptr;
   std::uint64_t m_node_pool_held_bytes = 0U;
+  BestEffortReclaimer m_reclaimer;
+  std::thread::id m_reclaimer_thread{};
+  bool m_reclaiming = false;
+  std::uint64_t m_reclaim_count = 0U;
 };
 
 }  // namespace cosmosim::core
