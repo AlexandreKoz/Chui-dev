@@ -21,6 +21,14 @@ Indicators (one value per leaf block; all in units of PM cells):
          kick).  It measures the truncation error the CURRENT mesh would
          have at time t + tau if the current strain rate and tidal field
          persisted, and therefore fires before the under-resolution exists.
+  "ms"   Eulerian multi-stream proximity (alternative investigated after the
+         truncation monitors failed to find the accuracy-limiting blocks after
+         shell crossing): the PM cells that contain folded mass (det Dx < 0 at
+         a cell centre of the sheet), dilated by `ms_dilate` cells, form a
+         mask; a block is flagged if any of its cell centres is inside the
+         mask now or after a ballistic lead of up to `ms_lead`.  Value 0 or 1;
+         use tol = 0.5.  It marks every stream that is, or is about to be,
+         inside a multi-stream region -- not only the folded labels.
   strain diagnostics (logged, and used for the trigger gates): det Dx and the
          ballistic time-to-caustic tau_c (smallest positive root of
          det(Dx + tau Dp) = 0) at the cell centres of every block.
@@ -46,8 +54,8 @@ KAPPA = {3: 1.0 / 384.0, 5: 1.0 / 15360.0}
 class Controller:
     def __init__(self, indicator="pred", tol=1e-3, hyst=0.1, interval=5, cooldown=10, max_nodes=None,
                  tau=0.3, tau_p=0.3, floor_cells=0.5, t_enable=0.0, enable_on="always", tau_lead=0.3,
-                 buffer=0, coarsen=False, max_splits_per_event=None, auto_rebase=True):
-        if indicator not in ("d6", "pred", "max"):
+                 buffer=0, coarsen=False, max_splits_per_event=None, auto_rebase=True, ms_dilate=2, ms_lead=None):
+        if indicator not in ("d6", "pred", "max", "ms"):
             raise ValueError(indicator)
         self.indicator, self.tol, self.hyst = indicator, float(tol), float(hyst)
         self.interval, self.cooldown, self.max_nodes = int(interval), int(cooldown), max_nodes
@@ -59,6 +67,11 @@ class Controller:
         # exact, and it returns the carrier to the cost of a uniform sheet
         self.auto_rebase = bool(auto_rebase)
         self.n_rebase = 0
+        # "ms" (Eulerian multi-stream proximity): PM cells that contain folded (det Dx < 0) mass,
+        # dilated by `ms_dilate` cells; a block is flagged (value 1 > tol) if any of its cell
+        # centres lies in that mask now or after a ballistic lead `ms_lead` (default tau)
+        self.ms_dilate = int(ms_dilate)
+        self.ms_lead = float(tau if ms_lead is None else ms_lead)
         self.latched = False            # gate latch for "precaustic" / "crossing"
         self.latch_step = None
         self.merged_at = {}             # (l, I, J) -> step of last merge
@@ -70,7 +83,8 @@ class Controller:
         return dict(indicator=self.indicator, tol=self.tol, hyst=self.hyst, interval=self.interval, cooldown=self.cooldown,
                     max_nodes=self.max_nodes, tau=self.tau, tau_p=self.tau_p, floor_cells=self.floor_cells,
                     t_enable=self.t_enable, enable_on=self.enable_on, tau_lead=self.tau_lead, buffer=self.buffer,
-                    coarsen=self.coarsen, max_splits_per_event=self.max_splits_per_event, auto_rebase=self.auto_rebase)
+                    coarsen=self.coarsen, max_splits_per_event=self.max_splits_per_event, auto_rebase=self.auto_rebase,
+                    ms_dilate=self.ms_dilate, ms_lead=self.ms_lead)
 
     def state_dict(self):
         return dict(params=self.params(), latched=self.latched, latch_step=self.latch_step,
@@ -101,7 +115,10 @@ class Controller:
         a = car.update(zs, tag="ind")
         nl = len(car.leafL)
         out = dict(eta_x=np.zeros(nl), eta_p=np.zeros(nl), eta_pred=np.zeros(nl), det_min=np.full(nl, np.inf),
-                   tau_c=np.full(nl, np.inf), extent=np.zeros(nl))
+                   tau_c=np.full(nl, np.inf), extent=np.zeros(nl), eta_ms=np.zeros(nl))
+        want_ms = self.indicator == "ms"
+        ms_store = []
+        fold_grid = np.zeros((pm.ng, pm.ng), dtype=bool)
         tau = self.tau
         B = car.B
         for (L, d), (ids, idx) in car.groups.items():
@@ -141,12 +158,37 @@ class Controller:
             hL = 1.0 / sh.f.ncell(L)
             ext = np.maximum(np.maximum(np.abs(x11), np.abs(x21)), np.maximum(np.abs(x12), np.abs(x22))).max(axis=(1, 2))
             out["extent"][ids] = ext * hL * pm.ng                # largest cell edge in PM cells
+            if want_ms:
+                # cell-centre positions and momenta (state only), and the folded ones marked on the PM grid
+                v = np.tensordot(np.tensordot(A[..., 0:4], W, axes=([1], [1])), W, axes=([1], [1]))   # (nblk, 4, B, B)
+                x1, x2 = run._block_xi(L, ids, B, B)
+                X = np.stack([v[:, 0] + x1[:, :, None], v[:, 1] + x2[:, None, :]], axis=-1)           # (nblk, B, B, 2)
+                P = np.stack([v[:, 2], v[:, 3]], axis=-1)
+                fx = X[c0 < 0]
+                if len(fx):
+                    ci = np.floor(fx * pm.ng).astype(np.int64) % pm.ng
+                    fold_grid[ci[:, 0], ci[:, 1]] = True
+                ms_store.append((ids, X, P))
+        if want_ms:
+            mask = fold_grid
+            for _ in range(self.ms_dilate):
+                m = mask
+                for ax in (0, 1):
+                    m = m | np.roll(m, 1, ax) | np.roll(m, -1, ax)
+                mask = m
+            out["multistream_cell_fraction"] = float(mask.mean())
+            for ids, X, P in ms_store:
+                hit = np.zeros(len(ids), dtype=bool)
+                for lead in (0.0, 0.5 * self.ms_lead, self.ms_lead):
+                    ci = np.floor((X + lead * P) * pm.ng).astype(np.int64) % pm.ng
+                    hit |= mask[ci[..., 0], ci[..., 1]].any(axis=(1, 2))
+                out["eta_ms"][ids] = hit.astype(float)
         out["eta_d6"] = np.maximum(out["eta_x"], out["eta_p"])
         out["eta_max"] = np.maximum(out["eta_d6"], out["eta_pred"])
         return out
 
     def select(self, ind):
-        return {"d6": ind["eta_d6"], "pred": ind["eta_pred"], "max": ind["eta_max"]}[self.indicator]
+        return {"d6": ind["eta_d6"], "pred": ind["eta_pred"], "max": ind["eta_max"], "ms": ind["eta_ms"]}[self.indicator]
 
     # ------------------------------------------------------------------ decisions
     def due(self, step_count):

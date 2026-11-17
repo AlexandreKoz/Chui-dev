@@ -144,3 +144,32 @@ def test_resolution_floor_blocks_refinement_below_the_pm_scale():
     assert sh.top <= 1
     assert sum(h["n_denied_floor"] for h in ctrl.history) > 0
     assert isinstance(HierarchicalCarrier(f, k=5).memory_floats(2)["coefficients"], float)
+
+
+def test_multistream_proximity_indicator_is_state_only_and_marks_the_fold():
+    """Before any fold the mask is empty and nothing is flagged; after the
+    first crossing the folded blocks -- and blocks about to enter the
+    multi-stream region -- are flagged, the rest is not."""
+    def run_to(nsteps):
+        sh = AdaptiveSheet.from_ic(GrowingModeIC(eps=(0.3, 0.21, 0.09)), 32, B=8, lmax=1, k=5)
+        run = AdaptiveVP(sh, 64, Quadrature("lattice", 8))
+        for _ in range(nsteps):
+            run.step(0.02)
+        run.sync()
+        ctrl = Controller(indicator="ms", tol=0.5, tau=0.2, ms_dilate=1)
+        return ctrl.indicators(run), run
+    early, _ = run_to(20)
+    assert early["det_min"].min() > 0 and early["eta_ms"].max() == 0.0 and early["multistream_cell_fraction"] == 0.0
+    late, run = run_to(60)
+    folded = late["det_min"] < 0
+    assert folded.any() and np.all(late["eta_ms"][folded] == 1.0)        # every folded block is inside the mask
+    assert late["eta_ms"].sum() > folded.sum()                           # ... plus blocks near / approaching it
+    assert late["eta_ms"].min() == 0.0                                   # but not everything
+    # as a trigger it refines only flagged blocks
+    sh = AdaptiveSheet.from_ic(GrowingModeIC(eps=(0.3, 0.21, 0.09)), 32, B=8, lmax=1, k=5)
+    ctrl = Controller(indicator="ms", tol=0.5, tau=0.2, ms_dilate=1, interval=5, cooldown=5, floor_cells=0.0, auto_rebase=False)
+    r2 = AdaptiveVP(sh, 64, Quadrature("lattice", 8), ctrl)
+    for _ in range(60):
+        r2.step(0.02)
+    ev = [e for e in sh.f.events if e["kind"] == "split" and e["reason"] == "indicator:ms"]
+    assert ev and all(e["value"] == 1.0 for e in ev) and 0 < len(sh.f.exists[1]) < sh.f.nbl(1) ** 2
