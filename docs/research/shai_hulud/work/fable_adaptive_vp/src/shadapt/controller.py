@@ -112,7 +112,7 @@ class Controller:
             out["eta_pred"][ids] = sc * jump(A[..., 0:2] + tau * A[..., 2:4] + 0.5 * tau * tau * A[..., 4:6])
             # strain at cell centres: Dx = 1 + grad d, Dp = grad p
             W, Dw = run._weights(d, B), run._weights(d, B, True)
-            scale = float(1 << (L + d))
+            scale = float(sh.f.ncell(L + d))                     # d/dxi = N_{L+d} d/du
             t1 = np.tensordot(A[..., 0:4], Dw, axes=([1], [1]))  # (nblk, mw, 4, B) d/dxi1
             g1 = scale * np.tensordot(t1, W, axes=([1], [1]))    # (nblk, 4, B, B)
             t2 = np.tensordot(A[..., 0:4], W, axes=([1], [1]))
@@ -144,9 +144,13 @@ class Controller:
         return {"d6": ind["eta_d6"], "pred": ind["eta_pred"], "max": ind["eta_max"]}[self.indicator]
 
     # ------------------------------------------------------------------ decisions
+    def due(self, step_count):
+        return self.interval > 0 and step_count % self.interval == 0
+
     def maybe_adapt(self, run, dt):
-        if self.interval <= 0 or run.step_count % self.interval != 0:
+        if not self.due(run.step_count):
             return False
+        run.sync()
         sh, car, f = run.sh, run.sh.car, run.sh.f
         ind = self.indicators(run)
         eta = self.select(ind)

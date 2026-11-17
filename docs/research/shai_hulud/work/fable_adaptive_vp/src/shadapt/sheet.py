@@ -20,7 +20,7 @@ from .hcarrier import HierarchicalCarrier
 
 
 class AdaptiveSheet:
-    def __init__(self, forest, k=5, periods=(0.0, 0.0), halo_tiles=1, solver="adi", sweeps=2):
+    def __init__(self, forest, k=5, periods=(0.0, 0.0), halo_tiles=1, solver="adi", sweeps=1):
         self.f = forest
         self.k = k
         self.periods = np.asarray(periods, dtype=float)

@@ -226,6 +226,101 @@ def gather_pcs_hess(phi, x, H):
         H[m, 2] = hyy * ng * ng
 
 
+@numba.njit(cache=True, fastmath=False)
+def deposit_pcs_blocks(rho, V, mass):
+    """Deposit the tensor sample lattices of a group of blocks without copies:
+    V[nblk, 2, n1, n2] holds x (component 0) and y (component 1)."""
+    ng = rho.shape[0]
+    wa = np.empty(4)
+    wb = np.empty(4)
+    ia = np.empty(4, dtype=np.int64)
+    ib = np.empty(4, dtype=np.int64)
+    for q in range(V.shape[0]):
+        for r in range(V.shape[2]):
+            for c in range(V.shape[3]):
+                u = V[q, 0, r, c] * ng
+                v = V[q, 1, r, c] * ng
+                fu = np.floor(u)
+                fv = np.floor(v)
+                _pcs_w(u - fu, wa)
+                _pcs_w(v - fv, wb)
+                i0 = int(fu) - 1
+                j0 = int(fv) - 1
+                for a in range(4):
+                    ia[a] = (i0 + a) % ng
+                    ib[a] = (j0 + a) % ng
+                for a in range(4):
+                    wm = wa[a] * mass
+                    for b in range(4):
+                        rho[ia[a], ib[b]] += wm * wb[b]
+
+
+@numba.njit(cache=True, fastmath=False)
+def block_spacing(V, out):
+    """out[q, 0/1] = largest max-norm distance between neighbouring samples of
+    block q along the first / second lattice direction."""
+    for q in range(V.shape[0]):
+        m1 = 0.0
+        m2 = 0.0
+        for r in range(V.shape[2]):
+            for c in range(V.shape[3]):
+                if r + 1 < V.shape[2]:
+                    d = max(abs(V[q, 0, r + 1, c] - V[q, 0, r, c]), abs(V[q, 1, r + 1, c] - V[q, 1, r, c]))
+                    if d > m1:
+                        m1 = d
+                if c + 1 < V.shape[3]:
+                    d = max(abs(V[q, 0, r, c + 1] - V[q, 0, r, c]), abs(V[q, 1, r, c + 1] - V[q, 1, r, c]))
+                    if d > m2:
+                        m2 = d
+        out[q, 0] = m1
+        out[q, 1] = m2
+
+
+@numba.njit(cache=True, fastmath=False)
+def kick_pcs(phi, x, p, kappa):
+    """In-place kick  p += kappa * (-grad V)(x)  with the exact gradient of
+    the PCS-interpolated potential (same force as gather_pcs_grad; the
+    potential value itself is not accumulated)."""
+    ng = phi.shape[0]
+    wa = np.empty(4)
+    wb = np.empty(4)
+    da = np.empty(4)
+    db = np.empty(4)
+    ia = np.empty(4, dtype=np.int64)
+    ib = np.empty(4, dtype=np.int64)
+    kn = kappa * ng
+    for m in range(x.shape[0]):
+        u = x[m, 0] * ng
+        v = x[m, 1] * ng
+        fu = np.floor(u)
+        fv = np.floor(v)
+        _pcs_w(u - fu, wa)
+        _pcs_w(v - fv, wb)
+        _pcs_dw(u - fu, da)
+        _pcs_dw(v - fv, db)
+        i0 = int(fu) - 1
+        j0 = int(fv) - 1
+        for a in range(4):
+            ia[a] = (i0 + a) % ng
+            ib[a] = (j0 + a) % ng
+        g0 = 0.0
+        g1 = 0.0
+        for a in range(4):
+            for b in range(4):
+                f = phi[ia[a], ib[b]]
+                g0 += da[a] * wb[b] * f
+                g1 += wa[a] * db[b] * f
+        p[m, 0] -= kn * g0
+        p[m, 1] -= kn * g1
+
+
+@numba.njit(cache=True, fastmath=False)
+def drift_inplace(x, p, dt):
+    for m in range(x.shape[0]):
+        x[m, 0] += dt * p[m, 0]
+        x[m, 1] += dt * p[m, 1]
+
+
 class PMGrid:
     """2D periodic PM field with the baseline conventions (box 1, total mass 1,
     4 pi G = 1:  lap(phi) = rho - 1), PCS assignment, exact-gradient force.

@@ -62,16 +62,16 @@ def _coarsen(mask):
 class _Level:
     """Topology-dependent data of one level m >= 1."""
     __slots__ = ("m", "N", "nb", "dkeys", "nD", "tsel", "nT", "P", "M", "Mn", "node_rows", "node_keys",
-                 "perm", "chol", "crow", "lam", "lu")
+                 "perm", "chol", "crow", "lam", "lu", "tmap", "full", "dense_of_T")
 
 
 class HierarchicalCarrier:
-    def __init__(self, forest, k=5, halo_tiles=1, solver="adi", sweeps=2, tol=1e-13, max_iter=60):
+    def __init__(self, forest, k=5, halo_tiles=1, solver="adi", sweeps=1, tol=1e-13, max_iter=60):
         if k not in (3, 5):
             raise ValueError("degree must be 3 or 5")
         self.f, self.k, self.ht = forest, k, int(halo_tiles)
         # solver: "adi"   fixed number of alternating line sweeps from a zero guess
-        #                   (a deterministic LINEAR operator; default, 2 sweeps)
+        #                   (a deterministic LINEAR operator; default, 1 sweep)
         #         "adi-tol" line sweeps to relative residual `tol` (verification)
         #         "splu"  sparse LU (verification)
         self.solver, self.sweeps, self.tol, self.max_iter = solver, int(sweeps), tol, max_iter
@@ -95,11 +95,9 @@ class HierarchicalCarrier:
         B = self.B
         i = i % lv.N
         j = j % lv.N
-        key = (i // B) * lv.nb + (j // B)
-        pos = np.searchsorted(lv.dkeys, key)
-        pos = np.minimum(pos, len(lv.dkeys) - 1)
-        valid = lv.dkeys[pos] == key
-        return pos * (B * B) + (i % B) * B + (j % B), valid
+        pos = lv.tmap[i // B, j // B]                      # tile slot, -1 if the tile is not stored
+        valid = pos >= 0
+        return np.where(valid, pos, 0) * (B * B) + (i % B) * B + (j % B), valid
 
     def build_layout(self):
         t0 = time.perf_counter()
@@ -149,6 +147,8 @@ class HierarchicalCarrier:
             dI, dJ = np.nonzero(D[m])
             lv.dkeys = dI.astype(np.int64) * lv.nb + dJ          # sorted (row-major nonzero)
             lv.nD = len(lv.dkeys) * B * B
+            lv.tmap = np.full((lv.nb, lv.nb), -1, dtype=np.int64)  # block-resolution lookup (not a fine-grid array)
+            lv.tmap[dI, dJ] = np.arange(len(dI))
             self.lev[m] = lv
         r = np.arange(B, dtype=np.int64)
         for m in range(1, top + 1):
@@ -158,35 +158,34 @@ class HierarchicalCarrier:
             gi = (tI[:, None, None] * B + r[None, :, None]) + 0 * r[None, None, :]
             gj = (tJ[:, None, None] * B + r[None, None, :]) + 0 * r[None, :, None]
             gi, gj = gi.ravel(), gj.ravel()                       # global indices of all D points
-            # subdivision P_m : a_{m-1} -> level-m coefficients on D_m
+            # subdivision P_m : a_{m-1} -> level-m coefficients on D_m (CSR assembled row by row)
             mask = two_scale_mask(k)
             hw = (k + 1) // 2
-            rows, cols, vals = [], [], []
-            rowid = np.arange(lv.nD, dtype=np.int64)
-            w1 = {}
+            nst = hw + 1 if k == 5 else hw + 1                    # max coarse taps per dimension (4 for k=5, 3 for k=3)
+            offs = np.zeros((2, nst), dtype=np.int64)
+            wts = np.zeros((2, nst))
             for par in (0, 1):
-                offs, ws = [], []
+                q = 0
                 for o in range(-hw, hw + 1):                      # o = j - 2 i
                     if (o - par) % 2 == 0:
-                        offs.append((par - o) // 2)               # coarse index = (j - o) / 2 = q + (par - o)/2
-                        ws.append(mask[o + hw])
-                w1[par] = (np.array(offs), np.array(ws))
-            for pa in (0, 1):
-                for pb in (0, 1):
-                    sel = ((gi & 1) == pa) & ((gj & 1) == pb)
-                    if not sel.any():
-                        continue
-                    qi, qj, rid = gi[sel] >> 1, gj[sel] >> 1, rowid[sel]
-                    for oa, wa in zip(*w1[pa]):
-                        for ob, wb in zip(*w1[pb]):
-                            fl, ok = self._flat(m - 1, qi + oa, qj + ob)
-                            if not ok.all():
-                                raise RuntimeError("layout error: coarse support missing for subdivision")
-                            rows.append(rid)
-                            cols.append(fl)
-                            vals.append(np.full(len(rid), wa * wb))
+                        offs[par, q] = (par - o) // 2             # coarse index = q + (par - o)/2
+                        wts[par, q] = mask[o + hw]
+                        q += 1
+            pi, pj = gi & 1, gj & 1
+            ci = (gi >> 1)[:, None] + offs[pi]                    # (nD, nst)
+            cj = (gj >> 1)[:, None] + offs[pj]
+            wi, wj = wts[pi], wts[pj]
+            cols = np.empty((lv.nD, nst, nst), dtype=np.int64)
+            for qa in range(nst):
+                fl, ok = self._flat(m - 1, np.broadcast_to(ci[:, qa, None], (lv.nD, nst)), cj)
+                if not ok.all():
+                    raise RuntimeError("layout error: coarse support missing for subdivision")
+                cols[:, qa, :] = fl
+            vals = wi[:, :, None] * wj[:, None, :]
+            keep = vals != 0.0
             ncoarse = f.n0 * f.n0 if m == 1 else self.lev[m - 1].nD
-            lv.P = sp.csr_matrix((np.concatenate(vals), (np.concatenate(rows), np.concatenate(cols))), shape=(lv.nD, ncoarse))
+            indptr = np.concatenate([[0], np.cumsum(keep.reshape(lv.nD, -1).sum(axis=1))])
+            lv.P = sp.csr_matrix((vals[keep], cols[keep], indptr), shape=(lv.nD, ncoarse))
             # solve region T_m (subset of D_m points, in D flat order)
             inT = T[m][tI, tJ]
             tsel = np.nonzero(np.repeat(inT, B * B))[0]
@@ -195,17 +194,18 @@ class HierarchicalCarrier:
             tindex[tsel] = np.arange(lv.nT)
             ti, tj = gi[tsel], gj[tsel]
             taps = COLLOC[k]
-            rows, cols, vals = [], [], []
-            tid = np.arange(lv.nT, dtype=np.int64)
-            for a in range(-h, h + 1):
-                for b in range(-h, h + 1):
-                    fl, ok = self._flat(m, ti + a, tj + b)
-                    cidx = np.where(ok, tindex[np.where(ok, fl, 0)], -1)
-                    good = cidx >= 0
-                    rows.append(tid[good])
-                    cols.append(cidx[good])
-                    vals.append(np.full(int(good.sum()), taps[a + h] * taps[b + h]))
-            lv.M = sp.csr_matrix((np.concatenate(vals), (np.concatenate(rows), np.concatenate(cols))), shape=(lv.nT, lv.nT))
+            w = np.arange(-h, h + 1, dtype=np.int64)
+            cols = np.empty((lv.nT, k, k), dtype=np.int64)
+            for a in range(k):
+                fl, ok = self._flat(m, np.broadcast_to((ti + w[a])[:, None], (lv.nT, k)), tj[:, None] + w[None, :])
+                cols[:, a, :] = np.where(ok, tindex[fl], -1)
+            keep = cols >= 0
+            vals = np.broadcast_to(taps[:, None] * taps[None, :], (lv.nT, k, k))
+            indptr = np.concatenate([[0], np.cumsum(keep.reshape(lv.nT, -1).sum(axis=1))])
+            lv.M = sp.csr_matrix((vals[keep], cols[keep], indptr), shape=(lv.nT, lv.nT))
+            # full-torus level: the solve is the periodic prefilter (2D FFT)
+            lv.full = lv.nT == N * N
+            lv.dense_of_T = (ti % N) * N + (tj % N) if lv.full else None
             # active nodes of this level -> rows of the solve region
             keys = f.node_keys(m)
             lv.node_keys = keys
@@ -256,7 +256,7 @@ class HierarchicalCarrier:
                                 np.broadcast_to(wj[:, None, :], (len(ids), len(w), len(w))))
             if not np.all(ok):
                 raise RuntimeError("layout error: evaluation window outside coefficient tiles")
-            self.groups[(L, d)] = (ids, fl.astype(np.int64))
+            self.groups[(L, d)] = (ids, fl.astype(np.int32))
         # -- sorted block tables for point location ------------------------------------
         self._exist_keys = []
         self._leaf_tab = []
@@ -325,13 +325,19 @@ class HierarchicalCarrier:
         differs from it only through couplings across re-entrant corners of
         T_m, which lie >= halo_tiles*B points away from every non-zero of r,
         where c has already decayed by lambda^(halo_tiles*B).  "adi" applies a
-        fixed number of alternating sweeps (default 2: residual at the nodes
-        ~1e-9 of the surplus, measured in tests); "adi-tol" iterates to
-        `tol` with a CG fallback."""
+        fixed number of alternating sweeps (default 1: the interpolation defect
+        at the nodes stays at the skirt-leak level, measured in tests);
+        "adi-tol" iterates to `tol` with a CG fallback.  A level whose solve
+        region is the whole torus uses the periodic FFT prefilter (exact)."""
         if self.solver == "splu":
             if lv.lu is None:
                 lv.lu = spla.splu(lv.M.tocsc(), permc_spec="MMD_AT_PLUS_A")
             return lv.lu.solve(r)
+        if lv.full and self.solver != "splu":
+            N = lv.N
+            dense = np.empty((N * N, r.shape[1]))
+            dense[lv.dense_of_T] = r
+            return prefilter_periodic(dense.reshape(N, N, -1), self.k).reshape(N * N, -1)[lv.dense_of_T]
         if self.solver == "adi":
             c = self._line_solve(lv, 1, self._line_solve(lv, 0, r))
             for it in range(1, self.sweeps):
@@ -435,6 +441,16 @@ class HierarchicalCarrier:
         t1 = np.tensordot(A, W1, axes=([1], [1]))                  # (nblk, mw, nc, n1)
         t2 = np.tensordot(t1, W2, axes=([1], [1]))                 # (nblk, nc, n1, n2)
         return ids, np.moveaxis(t2, 1, 3)
+
+    def block_values_cf(self, a, L, d, W1, W2, sel=None, ncomp=None):
+        """As block_values but components-first and C-contiguous:
+        V[nblk, ncomp, n1, n2] (the layout consumed by the deposit kernel)."""
+        ids, idx = self.groups[(L, d)]
+        if sel is not None:
+            ids, idx = ids[sel], idx[sel]
+        A = a[L + d][idx] if ncomp is None else a[L + d][idx, :ncomp]
+        t1 = np.tensordot(A, W1, axes=([1], [1]))                  # (nblk, mw, nc, n1)
+        return ids, np.tensordot(t1, W2, axes=([1], [1]))          # (nblk, nc, n1, n2)
 
     def locate(self, xi):
         """Leaf block level and its evaluation level for points xi (M, 2)."""
