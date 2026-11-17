@@ -161,7 +161,9 @@ the whole torus uses the 2D FFT prefilter. MEASURED on random forests
 (`test_fixed_sweep_solver_matches_exact_solves`): coefficients within `3e-3·surplus` of a sparse-LU
 solve, and the node interpolation defect is unchanged (it is the skirt leak of P3 either way).
 Verification solvers `adi-tol` (sweeps to `1e-14`, CG fallback never triggered) and `splu` agree to
-`1e-12`. Sparse LU is not used in production runs: its fill is ~20 MB per 10⁴ unknowns here.
+`1e-12`. Sparse LU is kept for verification only (factorisation time and fill were not competitive
+in the exploratory timings; no fill number is claimed). Two or three sweeps and a two-ring halo
+change no result of the benchmark (`exp04`: 2.85e-8 / 2.85e-8 / 2.87e-8).
 
 ## 3. Mass measure and quadrature
 
@@ -229,6 +231,13 @@ error is `κ_k h^{k+1} f^{(k+1)}·b_k(t)` with `max|b_k| = 1`, `κ₃ = 1/384`, 
 * strain diagnostics: `det Dx` and the ballistic time-to-caustic `τ_c` (smallest positive root of
   `det(Dx + τ Dp) = c₀ + c₁τ + c₂τ²`) at the cell centres; used for the gates `precaustic`
   (`τ_c ≤ τ_lead`) and `crossing` (`det Dx ≤ 0`).
+* `eta_ms` (Eulerian multi-stream proximity; added after the truncation monitors failed at
+  PM 512²): the PM cells containing a folded cell centre of the sheet, dilated by `ms_dilate`
+  cells, form a mask; a block has value 1 if any of its cell centres is in the mask now or after a
+  ballistic lead of up to `ms_lead`, else 0 (use `tol = 0.5`). It flags every stream that is in or
+  about to enter a multi-stream region, not only folded labels. MEASURED (`exp08`): it reproduces
+  the uniform `n = 2ng` sheet at PM 512² (6.18e-9 vs 6.20e-9) with 84 % of the nodes and 37 % of
+  the node-steps; it cannot fire before the first fold (empty mask).
 
 Controller contract (`controller.Controller`): threshold `tol`; hysteresis (`merge` only if
 `2^{k+1}·eta_children < hyst·tol`); hard node budget (never exceeded; each denied request is
@@ -263,12 +272,21 @@ ring; every split carries `reason ∈ {indicator:<name>, balance, buffer}` and t
    that fires by `t ≈ 1.5` (`exp04`); refinement cannot repair error already committed.
 3. **Truncation indicators under-estimate accumulated error** (~25×): the tolerance has to be set
    well below the target accuracy (`tol ≈ 1e-6` PM cells for a `3e-8` position error at PM 256²).
-4. **Refinement above the PM-cell scale does not converge at the formal order.** After shell
-   crossing the sheet has structure at the PM cell scale; errors collapse only once the node
-   spacing reaches about one PM cell (quintic `n = ng/2 → ng`: >200× at PM 256²).
+4. **After shell crossing the formal order is not what limits the sheet.** The error is the same
+   for cubic and quintic carriers (5.71e-8 vs 5.74e-8 at PM 512², `n = ng`) and falls only when
+   the node spacing approaches the particle spacing of the N-body run of the same deposit lattice:
+   `n ≈ N_p/2` per dimension (PM 512², 2048² lattice: n256 1.69e-7, n512 5.74e-8, n1024 6.20e-9,
+   N-body 5.16e-9). Before crossing the same sheets are over-resolved by a factor 4–8 per dimension.
 5. **On the gate problem the refined region ends up being (almost) the whole sheet**, so local
-   refinement brings no accuracy-per-cost advantage over a uniform sheet with `n = ng`
-   (`reports/decision.md`).
+   refinement brings no accuracy-per-cost advantage over a uniform sheet (`reports/decision.md`).
+5a. **Truncation monitors are blind to the limiting blocks once `h ≈ Δ_pm`** (`exp06`): the worst
+   errors sit at the edge of the folded region, where the sheet is still smooth; budget-limited
+   refinement driven by them leaves the error unchanged with 1.5× and 2× the nodes (`exp07`).
+5b. **A hard node budget fails ungracefully** (`exp04`: 3.5e-6 with the budget at 0.6·ng² against
+   2.85e-8 without): the budget is spent before the late-time needs appear.
+5c. **`ms` trigger: non-monotone in the lead** (6.2e-9 / 7.9e-9 / 1.5e-8 for lead 0.3 / 0.6 / 1.0
+   at PM 512²; halo and sweeps ruled out). OPEN; conjecture: nodes created near a forming caustic
+   freeze the coarse carrier's momentum error.
 6. Prototype overheads: regridding rebuilds the operators of the changed levels from scratch
    (`O(tiles)`), and scipy sparse matrices cost 12 bytes per non-zero; peak RSS of locally refined
    arms is 3–5× that of the uniform sheet although the evolving state is smaller.

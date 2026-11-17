@@ -5,7 +5,8 @@ the CHUÍ build, configuration, schema or runtime, and no production source file
 The original Fable breakthrough sources are vendored **verbatim** under `vendor/` (checksums in
 `vendor/VENDOR_SHA256.txt`); all new code is in `src/shadapt/`.
 
-Read first: `reports/decision.md` (verdict and every arm), then
+Read first: **`FINAL_REPORT.md`** (algorithms, results, verdict, next steps) and **`RESUME.md`** (how to
+continue without repeating anything); then `reports/decision.md` (verdict and every arm),
 `research/local_refinement_contract.md` (definitions, proofs, invariants, known failures, 3D needs),
 `reports/CHECKPOINT_FOR_CALL_2.md` (API map and exact next experiment), `RELEASE_NOTES.md`.
 Every number quoted anywhere is in `results/SUMMARY.md`, which is generated from `results/*.json`.
