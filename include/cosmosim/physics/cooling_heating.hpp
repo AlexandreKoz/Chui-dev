@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <span>
 #include <string>
@@ -119,6 +120,11 @@ class CoolingSourceIntegrator {
 class CoolingHeatingSource final : public hydro::HydroSourceTerm {
  public:
   CoolingHeatingSource(CoolingRateProvider provider, CoolingSourceIntegrator integrator);
+
+  // The cooling kernel has no mutable ledger or runtime cursors. The shadow
+  // proxy holds a const read-only view of the same qualified rate tables;
+  // copying the provider would duplicate unbudgeted table storage.
+  [[nodiscard]] std::unique_ptr<hydro::HydroSourceTerm> cloneForShadow() const override;
 
   [[nodiscard]] hydro::HydroConservedState sourceForCell(
       std::size_t cell_index,

@@ -48,10 +48,13 @@ void checkShadowOneStep(h::HydroIntegrationScheme production_mode) {
       .max_patches_per_rank = 1, .max_storage_cells_per_rank = 1024,
       .max_workspace_bytes_per_rank = 16U * 1024U * 1024U});
   monitor.beginEpoch(0);
-  auto sample = monitor.capture(0U, 0, state, geometry, active, update, numerics,
-      production_mode == h::HydroIntegrationScheme::kCornerTransportUpwind
+  const auto reference_scheme = production_mode == h::HydroIntegrationScheme::kCornerTransportUpwind
           ? h::HydroReconstructionScheme::kPiecewiseParabolic
-          : h::HydroReconstructionScheme::kPiecewiseLinear, 0U, false);
+          : h::HydroReconstructionScheme::kPiecewiseLinear;
+  monitor.setGlobalCandidates({{0U, 0}});
+  const h::HydroReconstructionPolicy reference_input_policy{.adiabatic_index = gamma};
+  auto sample = monitor.capture(0U, 0, state, geometry, active, update, numerics,
+      reference_scheme, reference_input_policy, h::HydroRiemannSolverKind::kHllc, {}, h::HydroSourceContext{});
   assert(sample);
   h::HydroCoreSolver solver(gamma, numerics);
   const auto cfl = h::hydroTransportCourantFactors(update.dt_code, 1.0,
@@ -75,7 +78,7 @@ void checkShadowOneStep(h::HydroIntegrationScheme production_mode) {
   monitor.compare(std::move(sample), state, geometry, active, update, numerics,
       production_mode == h::HydroIntegrationScheme::kCornerTransportUpwind
           ? h::HydroReconstructionScheme::kPiecewiseParabolic
-          : h::HydroReconstructionScheme::kPiecewiseLinear, gamma, 1.0e-12, 1.0e-12);
+          : h::HydroReconstructionScheme::kPiecewiseLinear);
   assert(monitor.report().selected == 1U);
   assert(monitor.report().completed == 1U);
   assert(monitor.report().compared_cells > 0U);
@@ -105,10 +108,12 @@ void checkSamplingBudgetsAndCadence() {
       .max_patches_per_rank = 1, .max_storage_cells_per_rank = 16,
       .max_workspace_bytes_per_rank = 1024});
   limited.beginEpoch(1);
-  assert(!limited.capture(0, 0, state, geometry, active, update, numerics, h::HydroReconstructionScheme::kPiecewiseLinear, 0U, false));
+  limited.setGlobalCandidates({{0U, 0}});
+  assert(!limited.capture(0, 0, state, geometry, active, update, numerics, h::HydroReconstructionScheme::kPiecewiseLinear, {}, h::HydroRiemannSolverKind::kHllc, {}, h::HydroSourceContext{}));
   assert(limited.report().skipped_cadence == 1U);
   limited.beginEpoch(0);
-  assert(!limited.capture(0, 0, state, geometry, active, update, numerics, h::HydroReconstructionScheme::kPiecewiseLinear, 0U, false));
+  limited.setGlobalCandidates({{0U, 0}});
+  assert(!limited.capture(0, 0, state, geometry, active, update, numerics, h::HydroReconstructionScheme::kPiecewiseLinear, {}, h::HydroRiemannSolverKind::kHllc, {}, h::HydroSourceContext{}));
   assert(limited.report().skipped_resource == 1U);
   // Budget refusal and zero candidates leave production input untouched.
   assert(state.size() == geometry.totalCellStorageCount());
@@ -126,15 +131,16 @@ void checkSkippedWithoutStateMutation() {
   const h::HydroActiveSetView active{.active_cells = cells, .active_faces = faces};
   h::HydroShadowReference monitor({.enabled = true, .cadence = 1});
   monitor.beginEpoch(0);
+  monitor.setGlobalCandidates({{0U, 0}});
   auto sample = monitor.capture(0U, 0, state, geometry, active,
                                 h::HydroUpdateContext{}, h::HydroNumericsPolicy{},
-                                h::HydroReconstructionScheme::kPiecewiseLinear, 0U, false);
+                                h::HydroReconstructionScheme::kPiecewiseLinear, {}, h::HydroRiemannSolverKind::kHllc, {}, h::HydroSourceContext{});
   assert(!sample && monitor.report().skipped_geometry == 1U);
   h::HydroShadowReference disabled({.enabled = false});
   disabled.beginEpoch(0);
   assert(!disabled.capture(0U, 0, state, geometry, active,
                            h::HydroUpdateContext{}, h::HydroNumericsPolicy{},
-                           h::HydroReconstructionScheme::kPiecewiseLinear, 0U, false));
+                           h::HydroReconstructionScheme::kPiecewiseLinear, {}, h::HydroRiemannSolverKind::kHllc, {}, h::HydroSourceContext{}));
   assert(disabled.report().eligible == 0U);
 }
 }  // namespace

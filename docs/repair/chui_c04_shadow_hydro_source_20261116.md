@@ -1,32 +1,124 @@
-# CHUÍ — C04 shadow hydrodynamics source implementation (2026-11-16)
+# CHUÍ — C04 sampled shadow hydrodynamics: revision-4 source handoff (2026-11-17)
 
-**Status:** source implementation supplied for owner compilation and qualification. No CMake configure, compilation, CTest, MPI, HDF5 round trip, numerical test or scientific validation was executed in this campaign. **C04 is not yet scientifically qualified or unconditionally source-complete.**
+**Status: mandatory v10, PARTIAL source implementation, UNCOMPILED and UNVERIFIED.**
+This addendum supersedes the 2026-11-16 source eligibility narrative, not the
+pre-existing AMR geometry proof. Input is the user-selected
+`Chui-dev-main(4)(2).zip`; the attached instruction pack still names archive
+`Chui-dev-main(3).zip`, which was not used as the implementation baseline.
+No compilation, tests, simulations, benchmark, static analysis or scientific
+validation occurred during this code handoff.
 
-## Ownership and numerical scheme
+## P1-C04-01 — Production numerical policy (source implemented)
 
-- `include/cosmosim/hydro/hydro_shadow_reference.hpp` and `src/hydro/hydro_shadow_reference.cpp` own the optional diagnostic and private sample state. There is no additional physical conserved state, feedback event, AMR patch, flux register or authoritative history. A memory lease is obtained before copying state or allocating reference scratch.
-- The fixed-grid workflow captures a private pre-update patch before the Godunov call. `ProductionAmrHydroOptions::hydro_shadow_reference` provides the equivalent non-owning hook at each AMR patch advance (synchronized and recursively subcycled). The observer is called after the production solver's own update but before any permanent scatter; its failure does not change the production state or accepted timestep.
-- The reference uses the existing CTU/PPM reconstruction and HLLC/HLLE Riemann fluxes on an **independently advanced copy**, not an extra evaluation of the produced output.
-  - MUSCL–Hancock production: one independent CTU/PPM reference advance over the identical transport interval. Disagreement conflates reconstruction and integration errors.
-  - CTU+PPM production: two CTU/PPM reference half-steps over that interval, measuring **temporal self-consistency**, not an independent spatial truncation reference. CTU+PLM production: one CTU/PPM reference full-step, measuring a different spatial reconstruction instead.
-- Every ghost carries the *captured* step-start value; the reference therefore only compares owned real cells outside a conservative domain-of-dependence guard (4 cells for a full step and 7 for two half steps, ignoring suppressed dimensions). If there are no interior cells it records `skipped_geometry`, **not zero error**. There is no diagonal face/flux register creation.
-- Only complete active patches are eligible. Partially active faces/cells, too-narrow patches and budgets that cannot contain the patch are skipped. The current reference is valid for source-free, ideal-gas transport with a stationary scale-factor frame. It is **not a general coupled baryonic error estimate**: effective-ISM thermodynamics, in-solver source terms or evolving cosmological background cause `skipped_sources_or_time` until a fully coupled time-centred reference is added.
-- Hydro shadow does not advance the external stellar, dust, chemistry, gravity, event or RNG state. It cannot claim to measure the effect of those source terms; the source-free eligibility gate makes this limitation explicit. T02 level-local event publication is unchanged.
+Fixed-grid (`HydroAmrRuntimeImpl`) and AMR (`ProductionAmrHydroOptions`/
+`advanceProductionAmrHydro`) pass the actual `HydroReconstructionPolicy`,
+`HydroNumericsPolicy`, integration/reconstruction choice and Riemann solver kind.
+The private reference uses CTU+PPM, with identical limiter, adiabatic gamma,
+density/pressure floors, MUSCL predictor contract, dual-energy controls,
+HLLC/HLLE choice and fallback machinery. Its CTU+PPM versus CTU+PPM path
+advances two halfsteps, recomputing `dt/(a dx)` and a/H at substep midpoints.
+CTU/PLM and MUSCL/PLM versus reference CTU/PPM are **mixed spatial/temporal**
+comparisons and must not be interpreted as pure Richardson error estimates.
+The seven reported channels include the conservative metal lane and optional
+auxiliary internal-energy lane. Comparison is of local volume-integrated
+*disagreement*, not a global conservation residual or external error bound.
 
-## Cost, MPI and chronology
+## P1-C04-02 — Coupled sources/cosmology (partial)
 
-- Configuration is typed under `[numerics]`: `hydro_shadow_enabled` (off), `hydro_shadow_cadence_steps` (16), `hydro_shadow_seed` (0), `hydro_shadow_max_patches_per_rank` (2), `hydro_shadow_max_storage_cells_per_rank` (8192) and `hydro_shadow_max_workspace_bytes_per_rank` (67108864). Values are parsed, validated and included in the normalized parameter dump. Inactive or zero-budget paths produce no samples. Per-rank budgets are explicit; selection is seeded by stable patch ID, level and accepted coordinator step. An invariant sample set across rank redistribution is **not yet guaranteed** under per-rank truncation.
-- `HydroShadowReference::capture` reserves private state, reference scratch and baseline storage against the existing governor (and therefore its attached node pool, if enabled). It is not permitted to silently modify the requested production model because the reservation fails. The comparison uses no collectives inside patch-conditional code. `HydroAmrRuntimeImpl::publishHydroShadow` reduces diagnostics on a rank-uniform stage-completion surface, including empty ranks, and writes `hydro.shadow_reference` in the existing profiler's event stream.
-- Metric lanes: conserved rho, rho*v_x/y/z, E, rho*Z, and auxiliary rho*e when enabled. For each lane the report carries a compared-cell-volume-weighted L1, L∞ and L1 normalized to the reference magnitude with a nonzero denominator floor. No-sample statuses are explicit. The reference and production volume-integrated *interior-region deltas* are reported separately; neither should be called a globally conservative residual.
-- Diagnostics are ephemeral and reset at the start of the hydro stage. An aborted stage has no corresponding publication. No new restart or MPI-wire fields are introduced. Existing config-hash rules include the new normalized keys; older checkpoint compatibility should be checked during the user's validation campaign.
+`HydroSourceTerm::cloneForShadow()` is a restricted private replay protocol.
+Cooling/heating uses a read-only adapter over the production's immutable,
+qualified lookup source; effective-ISM energy relaxation gets a private source
+object and ledger. Nonclonable sources return null, with
+`skipped_unsupported_source`. The sampled source context reuses the selected
+thermodynamic closure read-only and snapshots the resolved/effective gate.
+A private `HydroCellSourcePropertyProvider` derives changing mass/hydrogen
+physical densities, thermal energy/temperature and metallicity from the
+reference conservative state and sampled initial conversion, including
+cosmological a⁻³ dilution. This is an **approximation** where the production
+microphysical source uses nonlocal chemical/ion histories or temperature
+conversion dependent on evolving molecular weights; those contexts must NOT
+be advertised as fully source-equivalent. Substep redshifts are determined by
+the independently advanced scale-factor midpoint, not the production endpoint.
 
-## Remaining limitations and qualification
+**OPEN:** external Strang halfsteps, independently evolving element/ion
+composition, discrete/stochastic star/feedback events, global gravity coupling (including `ComovingGravityExpansionSource`,
+which is refused until private gravity acceleration histories exist),
+and stiff source-driven event/barrier chronology do not have a clone/replay
+contract. The existing composition face-mass-flux sink explicitly refuses the
+sample (`skipped_external_passives`). An operator without a private clone
+refuses a sample instead of mutating its live state. External stage effects
+are *outside the hydro interval* and are not separately replayed. The
+currently implemented reference must not be claimed to cover full baryonic
+stage-level source fidelity.
 
-1. **Reference history:** complete time-centred remote AMR ghosts and edge/corner temporal interpolation are not independently reconstructed within a shadow substep. Instead, the finite dependence guard excludes boundary-influenced cells. On small AMR patches the observer cannot form a sample. Extending C04 to small patches requires a bounded multi-patch sampled reference with temporal ghost history, not merely relaxing the guard.
-2. **Physics:** active in-solver cooling or effective-ISM closure and varying comoving background are intentionally not compared to a transport-only reference. A source-consistent independent reference trajectory is needed before labelling C04 full-physics capable.
-3. **Scalability:** sampling is per rank, with deterministic hash and capped count, rather than a strict global top-k independent of MPI decomposition.
-4. **Tests (source supplied, NOT RUN):** `tests/unit/test_hydro_shadow_reference.cpp` exercises both numerical branches, zero-sample geometry and absence of production state writes. Expanded 3D CTU, coarse/fine, diagonal MPI, restart, memory-rejection and convergence tests remain to be written and run by the owner.
-5. **Physical accuracy:** a small shadow difference is **not** evidence of accurate galaxy formation, convergence or an external physical error bar.
+## P1-C04-03 — Small AMR patches and ghosts (partial)
+
+For self-contained periodic/open/reflective Cartesian patches, all ghosts
+have local real-cell source/owner indices and writable-physical status; the
+reference refreshes conserved and auxiliary-energy ghosts from private
+state at **every reference substep**. This provides an 8³ sampled path
+without falsely relaxing the stencil guard or making artificial diagonal
+flux-register faces. All other patches continue with the existing 4/7-cell
+interior guard. An 8³ patch whose exterior is imported through same-level
+MPI/diagonals or coarse/fine AMR is **not supported** without an independent
+midpoint temporal history. If no interior remains, report
+`skipped_temporal_ghost`, not a zero error or low-order substitute.
+`AmrTemporalBoundaryHistoryRecord` from the live hierarchy is not reused
+as an evolving private-neighborhood authority.
+
+**OPEN:** bounded multi-patch neighborhood and/or independently reconstructed
+midpoint coarse/fine and diagonal MPI ghost histories and their conservative
+auxiliary/face bookkeeping. This is mandatory to close C04 for ordinary
+multi-patch 8³ AMR hierarchies; the current source does NOT satisfy that scope.
+
+## P2-C04-04 — Distributed sampling (partial)
+
+At a rank-uniform hydro boundary, each rank holds at most K candidates,
+ranked by a stable 64-bit score of (patch ID, level, step, seed), with a
+stable ID/level tie-breaker. Only these bounded candidates are exchanged,
+then globally top-K ranked; empty ranks join every collective. A selected
+identity is advanced at most once per epoch; local byte/cell limits can
+produce `skipped_resource` rather than substitute a different patch.
+`hydro_shadow_max_patches_per_rank` retains its old key name but now means
+global AMR K; per-rank memory/cell caps retain their old scope. Fixed-grid
+sampling still uses local region ID 0 on all ranks, so it is **not** invariant
+to an alternative fixed-grid decomposition. Patch geometry/migration identity
+uniqueness still requires owner MPI tests.
+
+## P2-C04-05 — Memory and non-invasiveness (source implemented; unverified)
+
+Scratch/clone/candidate capacity is computed with checked 64-bit products and
+sums before governor leases. The global selection's byte cap, rank-wide
+resource refusal vote, and bounded candidate wire prevent a hidden full
+patch-inventory allgather. Local shadow failures are recorded; all MPI
+reductions/publish remain at rank-uniform stage boundaries, not in
+conditional per-patch reference advances. Reference copies and scratch are
+phase-local and discarded; no authoritative gas, flux register, scheduler,
+AMR history, stochastic source, restart or SHAI-HULUD research file is edited.
+When shadow is disabled, the path returns before candidate allocation.
+`observed_capacity_high_water_bytes` and `workspace_high_water_bytes` have
+different meanings (observed local reference capacity vs admitted reservation).
+Budget/fallback behavior requires the owner's eventual MPI/memory execution.
+
+## P2-C04-06 — Test sources, provenance and verification (partial)
+
+`tests/unit/test_hydro_shadow_reference.cpp` covers MUSCL/CTU paths, cadence,
+budget and disabled/no-sample cases. The new
+`tests/unit/test_hydro_shadow_c04_coupled.cpp` adds 3D 8³ periodic/reflective
+coverage, non-default limiter and floor, smooth source/closure, evolving
+comoving background, dual-energy ghost lanes, decomposed top-K identity
+simulation and imported-ghost refusal. CMake registers the new source-only
+test. These have **not been compiled or run**. True MPI diagonal and
+coarse/fine ghost fixtures, external Strang/discrete-event, restart and
+scientific convergence studies remain unimplemented/unrun and must not be
+listed as passed.
+
+No new restart or migration fields, HDF5 datasets, user-facing configuration
+keys, flux-register owner or physical model were added. The
+`hydro.shadow_reference` event documents selected schemes, limiter, floors,
+Riemann solver, global K/seed, comparison axis, completion and separate skip
+reasons; `no_samples` remains explicit. Source-level status remains PARTIAL
+until the missing C04 interfaces, fixtures and owner verification are closed.
 
 ## AMR source-contract closure
 

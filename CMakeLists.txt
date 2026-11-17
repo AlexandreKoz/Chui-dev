@@ -1557,6 +1557,10 @@ if(COSMOSIM_ENABLE_TESTS)
   target_link_libraries(test_unit_hydro_shadow_reference PRIVATE cosmosim_hydro cosmosim_core)
   add_test(NAME unit_hydro_shadow_reference COMMAND test_unit_hydro_shadow_reference)
 
+  add_executable(test_unit_hydro_shadow_c04_coupled tests/unit/test_hydro_shadow_c04_coupled.cpp)
+  target_link_libraries(test_unit_hydro_shadow_c04_coupled PRIVATE cosmosim_hydro cosmosim_physics cosmosim_core)
+  add_test(NAME unit_hydro_shadow_c04_coupled COMMAND test_unit_hydro_shadow_c04_coupled)
+
   add_executable(test_unit_hydro_core_solver tests/unit/test_hydro_core_solver.cpp)
   target_link_libraries(test_unit_hydro_core_solver PRIVATE cosmosim_hydro)
   add_test(NAME unit_hydro_core_solver COMMAND test_unit_hydro_core_solver)

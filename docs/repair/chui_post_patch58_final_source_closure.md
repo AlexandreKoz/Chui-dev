@@ -309,7 +309,7 @@ grain-collision rates.
 | C01 | `ThermochemistrySolver`, `MetalCoolingTable` | composition + gas sidecar | source transaction | blocked_external_data | none | HM01-consistent UVB/table | equilibrium/transient histories |
 | C02 | `metal_ion_network.cpp` | chemistry sidecar | same | blocked_external_data | none | verified rates | solver accuracy |
 | C03 | adaptive selection | regime tag + history | restart/migration | implemented_static_unverified | none | qualification | matched-error comparisons |
-| C04 | chemistry shadow | diagnostic | V02 publication | implemented_static_unverified; shadow hydro optional_research_deferred | none mandatory | shadow-hydro contract | disagreement qualification |
+| C04 | chemistry shadow + sampled shadow hydrodynamics | diagnostic, sampled private hydro SoA | V02 publication; no new persistent restart lane | **MANDATORY v10; partial_source_implemented_unverified** (policy, coupled local sources/cosmology, physical 8³ boundaries, AMR top-K, memory guards) | OPEN: private time-consistent imported same-level/diagonal/coarse-fine ghost history; discrete/external Strang/sidecar replay; fixed-grid decomposition-invariant sample identity | owner physical/event replay and boundary-history contracts | build, MPI, restart, convergence, refusal tests NOT RUN |
 | I01 | `effective_multiphase_ism.cpp` | ISM config | closure/CFL refresh | implemented_static_unverified | none | calibration | no double cooling |
 | I02 | `ism_dust_sgs.cpp` | SGS lane | regrid/restart | implemented_static_unverified | none | coefficients | energy transfer |
 | S01 | `star_formation.cpp`, gradients | star sidecar | pre-half source stage now runs on a proven hierarchy | implemented_static_unverified | none | — | patch/rank independence |
@@ -360,13 +360,17 @@ grain-collision rates.
 
 ## 7. Remaining obligations
 
-* **Mandatory source gaps:** none identified for H01–V02 after this patch
-  (static evidence only).
+* **Mandatory source gaps:** C04 shadow hydrodynamics is mandatory under the owner's 2026-11-17 v10 decision and is **PARTIAL**: imported AMR temporal
+  histories, external/discrete Strang/sidecar source replay, and fixed-grid
+  decomposition-invariant sampling remain OPEN. Historical H01–V02 static
+  conclusions are unchanged (not build-verified).
 * **Owner science decisions (OPEN):** §2 (a)–(c), §3.
 * **External data:** §4.
 * **Conditional / deferred research (not failed mandatory fixes):** D01 grain
-  shattering/coagulation; G01 multilevel gravity correction; C04 shadow hydro;
+  shattering/coagulation; G01 multilevel gravity correction;
   T02 independent fine-level events, IMEX/SDC; X01 MHD, general RT, new AGN.
+  C04 is **not deferred**: see the mandatory open-item entry above and
+  `chui_c04_shadow_hydro_source_20261116.md`.
 * **Known limitation (documented, not a gap):** non-rectangular root hydro
   domains have no boundary model and are refused; the strict yield gate may
   fire one quadrature node early at the AGB lower bound.

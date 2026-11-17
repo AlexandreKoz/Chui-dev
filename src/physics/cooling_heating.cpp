@@ -344,6 +344,27 @@ CoolingIntegrationResult CoolingSourceIntegrator::integrateSpecificInternalEnerg
 CoolingHeatingSource::CoolingHeatingSource(CoolingRateProvider provider, CoolingSourceIntegrator integrator)
     : m_rate_provider(std::move(provider)), m_integrator(std::move(integrator)) {}
 
+namespace {
+class ReadOnlyCoolingShadowSource final : public hydro::HydroSourceTerm {
+ public:
+  explicit ReadOnlyCoolingShadowSource(const CoolingHeatingSource& source) : m_source(source) {}
+  [[nodiscard]] hydro::HydroConservedState sourceForCell(
+      std::size_t cell_index, const hydro::HydroConservedState& conserved,
+      const hydro::HydroPrimitiveState& primitive,
+      const hydro::HydroSourceContext& context) const override {
+    // CoolingHeatingSource::sourceForCell is a pure evaluation over immutable
+    // rate tables and a private state/context: it owns no mutable ledger.
+    return m_source.sourceForCell(cell_index, conserved, primitive, context);
+  }
+ private:
+  const CoolingHeatingSource& m_source;
+};
+}  // namespace
+
+std::unique_ptr<hydro::HydroSourceTerm> CoolingHeatingSource::cloneForShadow() const {
+  return std::make_unique<ReadOnlyCoolingShadowSource>(*this);
+}
+
 hydro::HydroConservedState CoolingHeatingSource::sourceForCell(
     std::size_t cell_index,
     const hydro::HydroConservedState& conserved,

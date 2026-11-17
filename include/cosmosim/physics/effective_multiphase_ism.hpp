@@ -139,6 +139,11 @@ class EffectiveIsmEnergyRelaxationSource final : public hydro::HydroSourceTerm {
  public:
   explicit EffectiveIsmEnergyRelaxationSource(const EffectiveIsmThermodynamicClosure& closure);
 
+  [[nodiscard]] std::unique_ptr<hydro::HydroSourceTerm> cloneForShadow() const override {
+    // Fresh ledger: the authoritative source object is never called.
+    return std::make_unique<EffectiveIsmEnergyRelaxationSource>(m_closure);
+  }
+
   [[nodiscard]] hydro::HydroConservedState sourceForCell(
       std::size_t cell_index,
       const hydro::HydroConservedState& conserved,

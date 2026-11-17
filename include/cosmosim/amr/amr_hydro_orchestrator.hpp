@@ -139,6 +139,7 @@ struct ProductionAmrHydroOptions {
   // across patch edges/corners (P1-HYDRO-02).
   hydro::HydroReconstructionScheme reconstruction_scheme = hydro::HydroReconstructionScheme::kPiecewiseLinear;
   hydro::HydroSlopeLimiter slope_limiter = hydro::HydroSlopeLimiter::kMonotonizedCentral;
+  hydro::HydroRiemannSolverKind riemann_solver_kind = hydro::HydroRiemannSolverKind::kHllc;
   // Periodic box extent in the patch coordinate frame (comoving), required
   // when physical_boundary_kind == kPeriodic (box [0, L) per axis). CHUI
   // Part 3: a patch spanning the box along an axis wraps in-patch; any other

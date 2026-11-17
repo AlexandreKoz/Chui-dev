@@ -3173,8 +3173,9 @@ struct AmrSynchronizedSweepWorkspace {
         ? options.hydro_shadow_reference->capture(
               patch_geometry.patch.patch_id, patch_geometry.patch.level,
               conserved_state, patch_geometry.geometry, patch_active_set,
-              update, solver.numericsPolicy(), options.reconstruction_scheme, source_terms.size(),
-              patch_source_context.thermodynamic_closure != nullptr)
+              update, solver.numericsPolicy(), options.reconstruction_scheme,
+              reconstruction_policy, options.riemann_solver_kind,
+              source_terms, patch_source_context)
         : hydro::HydroShadowReference::Sample{};
     solver.advancePatchActiveSetBatchedWithScratch(
         conserved_state,
@@ -3194,7 +3195,7 @@ struct AmrSynchronizedSweepWorkspace {
       options.hydro_shadow_reference->compare(
           std::move(shadow_sample), conserved_state, patch_geometry.geometry,
           patch_active_set, update, solver.numericsPolicy(),
-          options.reconstruction_scheme, options.adiabatic_index, options.density_floor, options.pressure_floor);
+          options.reconstruction_scheme);
     }
     if (scratch.ownedCapacityBytes() != scratch_capacity_before) {
       throw std::logic_error("AMR solver scratch grew after physical admission: before=" +

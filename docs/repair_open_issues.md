@@ -1040,3 +1040,18 @@ consistent stiff-source/effective-ISM/cosmological references, and the planned
 MPI/convergence/resource qualification. Earlier references to shadow hydro as
 entirely absent are superseded only within the now-implemented eligibility
 contract; do not claim unconditional v10 source/science completion.
+
+## 2026-11-17 — Mandatory C04 revision-4 source campaign (PARTIAL, unverified)
+
+The owner designated C04 **mandatory** for v10; earlier descriptions of it as
+optional/deferred are superseded. Source now passes production numerical
+settings, privately replays supported smooth local hydro sources and midpoint
+comoving coefficients, refreshes self-contained periodic/reflective/open 8³
+patch ghosts, chooses globally ranked top-K AMR patch IDs via bounded MPI,
+and reports source/ghost/memory ineligibility separately. This is **not full
+source completion**: independent temporal histories across imported diagonal
+MPI, same-level and coarse/fine AMR interfaces; external Strang/discrete
+events, element/ion sidecars and variable thermochemical conversions; and
+fixed-grid decomposition-independent spatial identity remain OPEN. Source-only
+fixtures added, not compiled or executed. See
+`docs/repair/chui_c04_shadow_hydro_source_20261116.md` for exact boundaries.

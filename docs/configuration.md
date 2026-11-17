@@ -920,7 +920,7 @@ ranks for the element-resolved composition operator (unique-owner interface
 fluxes); the legacy total-Z scalar operator without the composition sidecar
 remains single-rank and is refused explicitly on several ranks.
 
-### C04 sampled shadow hydrodynamics (experimental; source unverified)
+### C04 sampled shadow hydrodynamics (mandatory v10 source requirement; experimental/unverified)
 
 The existing `[numerics]` parameter-file section now accepts:
 
@@ -929,12 +929,26 @@ The existing `[numerics]` parameter-file section now accepts:
 | `hydro_shadow_enabled` | `false` | Enable independent CTU/PPM diagnostic on eligible sampled hydro patches |
 | `hydro_shadow_cadence_steps` | `16` | Positive coordinator-step interval for sampling |
 | `hydro_shadow_seed` | `0` | Deterministic patch/epoch selection seed |
-| `hydro_shadow_max_patches_per_rank` | `2` | Per-rank number of sampled patches (0 disables sampling) |
+| `hydro_shadow_max_patches_per_rank` | `2` | **Legacy key now interpreted as a global top-K patch budget** in AMR, not a per-rank sample count (0 disables sampling) |
 | `hydro_shadow_max_storage_cells_per_rank` | `8192` | Per-rank cap including sampled ghost slots |
 | `hydro_shadow_max_workspace_bytes_per_rank` | `67108864` | Per-rank bound on private state and scratch reservations |
 
 All fields enter the normalized configuration/provenance record. Shadow samples
-never update accepted physical state. Source-free, stationary-background
-ideal-gas transport and complete owned-patch active sets are currently
-eligible. Unsupported geometries/physics and resource refusals are counted
-without substituting physics. See `docs/repair/chui_c04_shadow_hydro_source_20261116.md`.
+never update accepted physical state. AMR selection is global top-K by hash of
+stable physical patch ID, level, coordinator step and seed, with stable ID/level
+tie-breaks. The fixed-grid adapter still uses rank-local region ID zero, so
+fixed-grid sampling is **not** decomposition-invariant. Remaining per-rank
+storage/byte caps can refuse selected patches without replacing them.
+
+The reference reuses production limiter, floors, gamma, dual-energy mode and
+Riemann selection. CTU/PPM uses two private halfsteps, while other production
+schemes use a mixed spatial-and-temporal CTU/PPM comparison. Smooth
+hydro-owned sources (including read-only cooling and isolated effective-ISM
+relaxation) and evolving comoving a/H may be sampled; external Strang/event
+operators and ion/element passive flux sinks are not independently replayed.
+Self-contained 8³ periodic/open/reflective patch ghosts are refreshed from
+private state for each reference halfstep. Imported MPI/same-level/coarse-fine
+ghosts lack an admitted midpoint shadow history; where the interior guard is
+empty they produce named `skipped_temporal_ghost`, not false zero errors.
+This contract is uncompiled/unverified; see
+`docs/repair/chui_c04_shadow_hydro_source_20261116.md`.

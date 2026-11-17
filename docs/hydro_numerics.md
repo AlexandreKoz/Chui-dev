@@ -431,13 +431,23 @@ spans are rejected before converting to the integer signed-corner lattice.
 
 ### Independent sampled CTU/PPM shadow (C04; 2026-11)
 
-`hydro.shadow_reference` is an optional, off-by-default profiler event. It
-advances private patch-local state through CTU/PPM (one full step when
-production uses MUSCL, or two half steps when production is CTU) and compares
-only owned real cells whose stencil domain of dependence does not touch
-held-fixed ghost values. The diagnostic does not alter conservation registers,
-source events, accepted CFL values or physical evolution. It is bounded by
-per-rank sample and memory policies and may emit `no_samples`, never fabricated
-zero errors. Source terms, effective EOS, evolving cosmological background,
-partial active sets, or small patches without a safe interior are explicitly
-ineligible. See the C04 source note for physics and numerical limitations.
+`hydro.shadow_reference` is an off-by-default **v10-mandatory diagnostic source
+feature** (not yet compiled or scientifically qualified). It advances a private
+CTU/PPM copy of selected complete active patches. For CTU/PPM production,
+two reference halfsteps retain its limiter, EOS, floors, fallback/Riemann and
+source operators; only the temporal subdivision changes. MUSCL/PLM or CTU/PLM
+production is explicitly a mixed spatial-and-temporal comparison. Smooth
+hydro-owned sources and evolving comoving expansion are replayed at substep
+midpoints, with private source properties reconstructed from the sampled state.
+External Strang/event physics and detached composition sidecars are outside
+this reference.
+
+Within a wholly self-contained periodic/open/reflective Cartesian patch, the
+private boundary and auxiliary-energy ghosts are recomputed after each halfstep:
+an 8³ patch is therefore eligible. Imported MPI, same-level and coarse/fine AMR
+ghosts do **not** yet have private temporal history; only guarded interior cells
+are compared, otherwise a named ghost-history skip is recorded. Full active
+patches and memory admission are required. AMR selection uses deterministic
+global top-K; fixed-grid rank-local sampling is not decomposition-invariant.
+No compared cell means `no_samples`, never fabricated zero disagreement.
+See the C04 source note for remaining mandatory gaps.

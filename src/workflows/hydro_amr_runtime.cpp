@@ -1064,6 +1064,7 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
         !m_mpi_context.isEnabled() ||
         hydro_cell_rank_count == static_cast<std::uint64_t>(m_mpi_context.worldSize());
     m_shadow.beginEpoch(context.integrator_state.step_index);
+    prepareGlobalHydroShadowSelection(context, production_amr_rank_count > 0U);
     m_last_hydro_profile = {};
     m_last_amr_hydro_diagnostics = {};
     m_last_floor_diagnostics = auditConfiguredHydroFloors(context.state);
@@ -1285,10 +1286,23 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
     // throws StageNumericalRetryRequest from inside the solver. The solver
     // only writes the staging copy m_conserved, so the failure is converted
     // into a transaction rejection below; SimulationState stays untouched.
+    const hydro::HydroReconstructionPolicy production_reconstruction_policy{
+        .limiter = hydroSlopeLimiterFromConfig(m_config),
+        .dt_over_dx_code = hydro::hydroTransportCourantFactors(
+            update.dt_code, update.scale_factor, m_geometry.cell_width_x_comoving,
+            m_geometry.cell_width_y_comoving, m_geometry.cell_width_z_comoving)[0],
+        .dt_over_cell_width_code = hydro::hydroTransportCourantFactors(
+            update.dt_code, update.scale_factor, m_geometry.cell_width_x_comoving,
+            m_geometry.cell_width_y_comoving, m_geometry.cell_width_z_comoving),
+        .rho_floor = std::max(m_config.numerics.hydro_density_floor_code, 1.0e-30),
+        .pressure_floor = std::max(m_config.numerics.hydro_pressure_floor_code, 1.0e-30),
+        .enable_muscl_hancock_predictor = true,
+        .adiabatic_index = k_gamma_adiabatic};
     auto shadow_sample = m_shadow.capture(
         0U, 0, m_conserved, m_geometry, active_view, update,
-        m_solver.numericsPolicy(), hydroReconstructionSchemeFromConfig(m_config), sources.size(),
-        source_context.thermodynamic_closure != nullptr);
+        m_solver.numericsPolicy(), hydroReconstructionSchemeFromConfig(m_config),
+        production_reconstruction_policy, hydroRiemannSolverKindFromConfig(m_config),
+        sources, source_context);
     std::string source_retry_failure;
     try {
       m_solver.advancePatchActiveSetBatchedWithScratch(
@@ -1313,9 +1327,7 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
     if (source_retry_failure.empty() && shadow_sample) {
       m_shadow.compare(std::move(shadow_sample), m_conserved, m_geometry,
                        active_view, update, m_solver.numericsPolicy(),
-                       hydroReconstructionSchemeFromConfig(m_config), k_gamma_adiabatic,
-                       m_config.numerics.hydro_density_floor_code,
-                       m_config.numerics.hydro_pressure_floor_code);
+                       hydroReconstructionSchemeFromConfig(m_config));
     }
     if (context.profiler_session != nullptr) {
       const hydro::HydroConservationReport& conservation = m_last_hydro_profile.conservation;
@@ -1562,6 +1574,125 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
   }
 
  private:
+  // Deterministic global top-K without an all-patch gather. Each rank keeps
+  // only its top K physical patch IDs; the union contains the true global
+  // top K. Collective preparation failures disable the optional diagnostic
+  // uniformly, before the bounded allgather. Never call this inside a patch.
+  void prepareGlobalHydroShadowSelection(const core::StepContext& context, bool use_amr) {
+    if (!m_config.numerics.hydro_shadow_enabled) return;
+    const std::size_t k = m_shadow.options().max_patches_per_rank;
+    if (k == 0U || context.integrator_state.step_index % m_shadow.options().cadence != 0U) return;
+    using Candidate = hydro::HydroShadowCandidate;
+    std::vector<Candidate> local;
+    std::vector<std::uint8_t> wire;
+    core::MemoryReservation admission;
+    bool local_refusal = false;
+    try {
+      // Include the process's local maximum plus the allgathered wire and
+      // global ranking. Bounded by K, rank count, and checked byte arithmetic.
+      const std::uint64_t world_size = static_cast<std::uint64_t>(std::max(1, m_mpi_context.worldSize()));
+      const auto checked_mul = [](std::uint64_t lhs, std::uint64_t rhs) {
+        if (lhs != 0U && rhs > std::numeric_limits<std::uint64_t>::max() / lhs) {
+          throw std::overflow_error("hydro shadow collective buffer size overflow");
+        }
+        return lhs * rhs;
+      };
+      const std::uint64_t local_bytes = core::checkedMemoryBytesAdd(
+          checked_mul(k, 16U), checked_mul(k, sizeof(Candidate)),
+          "shadow candidate local byte budget");
+      const std::uint64_t workspace_bytes = core::checkedMemoryBytesAdd(
+          checked_mul(local_bytes, world_size), local_bytes, "shadow global candidate budget");
+      if (workspace_bytes > m_shadow.options().max_workspace_bytes_per_rank) {
+        throw std::runtime_error("shadow global selection exceeds diagnostic workspace cap");
+      }
+      if (m_memory_governor != nullptr) {
+        admission = m_memory_governor->reserve(core::MemoryClass::kDiagnostic,
+                   workspace_bytes, "hydro.shadow_reference.global_candidate_ranking");
+        admission.commit();
+      }
+      local.reserve(k);
+      const auto admit_candidate = [&](Candidate candidate) {
+        if (std::any_of(local.begin(), local.end(), [&](const auto& other) {
+              return other.patch_id == candidate.patch_id && other.level == candidate.level;
+            })) return;
+        if (local.size() < k) {
+          local.push_back(candidate);
+          return;
+        }
+        const auto worst = std::max_element(local.begin(), local.end(), [&](const auto& a, const auto& b) {
+          return hydro::hydroShadowCandidateLess(a, b, context.integrator_state.step_index,
+                                                 m_shadow.options().seed);
+        });
+        if (hydro::hydroShadowCandidateLess(candidate, *worst,
+                                           context.integrator_state.step_index,
+                                           m_shadow.options().seed)) *worst = candidate;
+      };
+      if (use_amr) {
+        const auto& patches = context.state.patches;
+        for (std::size_t i = 0U; i < patches.size(); ++i) {
+          if (patches.cell_count[i] != 0U && patches.level[i] >= 0 &&
+              patches.owning_rank[i] == m_mpi_context.worldRank()) {
+            admit_candidate(Candidate{patches.patch_id[i], patches.level[i]});
+          }
+        }
+      } else if (context.state.cells.size() != 0U) {
+        // The fixed-grid adapter's region ID is 0. Its cross-rank layout
+        // independence is not guaranteed (see C04 documentation).
+        admit_candidate(Candidate{0U, 0});
+      }
+      local = hydro::rankHydroShadowCandidates(local, k,
+                 context.integrator_state.step_index, m_shadow.options().seed);
+      wire.reserve(local.size() * 16U);
+      const auto append_u64 = [&](std::uint64_t value) {
+        for (std::size_t byte = 0; byte < 8U; ++byte) {
+          wire.push_back(static_cast<std::uint8_t>(value >> (8U * byte)));
+        }
+      };
+      for (const auto& candidate : local) {
+        append_u64(candidate.patch_id);
+        append_u64(static_cast<std::uint64_t>(static_cast<std::int64_t>(candidate.level)));
+      }
+    } catch (const std::exception&) {
+      local_refusal = true;
+    }
+    // All ranks execute this vote even if they contain no gas or patches.
+    if (m_mpi_context.allreduceMaxUint64(local_refusal ? 1U : 0U) != 0U) {
+      m_shadow.noteGlobalSelectionResourceRefusal();
+      return;
+    }
+    const auto global_wire = m_mpi_context.allgatherBytesBounded(wire);
+    local_refusal = false;
+    std::vector<Candidate> global_candidates;
+    try {
+      if (global_wire.size() % 16U != 0U) throw std::runtime_error("partial shadow identity wire");
+      global_candidates.reserve(global_wire.size() / 16U);
+      const auto read_u64 = [&](std::size_t offset) {
+        std::uint64_t value = 0U;
+        for (std::size_t byte = 0U; byte < 8U; ++byte) {
+          value |= static_cast<std::uint64_t>(global_wire[offset + byte]) << (8U * byte);
+        }
+        return value;
+      };
+      for (std::size_t offset = 0; offset < global_wire.size(); offset += 16U) {
+        const std::uint64_t id = read_u64(offset);
+        const std::int64_t level = static_cast<std::int64_t>(read_u64(offset + 8U));
+        if (level < 0 || level > std::numeric_limits<int>::max()) {
+          throw std::runtime_error("invalid shadow physical level in candidate wire");
+        }
+        global_candidates.push_back(Candidate{id, static_cast<int>(level)});
+      }
+      global_candidates = hydro::rankHydroShadowCandidates(global_candidates, k,
+          context.integrator_state.step_index, m_shadow.options().seed);
+    } catch (const std::exception&) {
+      local_refusal = true;
+    }
+    if (m_mpi_context.allreduceMaxUint64(local_refusal ? 1U : 0U) != 0U) {
+      m_shadow.noteGlobalSelectionResourceRefusal();
+      return;
+    }
+    m_shadow.setGlobalCandidates(std::move(global_candidates));
+  }
+
   // Called at a legal, rank-uniform hydro stage completion point; there are
   // no observer-side MPI operations in conditional patch loops. Diagnostic
   // aggregates are ephemeral: an aborted stage never publishes them.
@@ -1581,6 +1712,9 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
         {"eligible_patches", std::to_string(sum_u64(local.eligible))},
         {"selected_patches", std::to_string(sum_u64(local.selected))},
         {"completed_patches", std::to_string(completed)},
+        {"completed_closed_boundary_patches", std::to_string(sum_u64(local.completed_closed_boundary_patches))},
+        {"completed_hydro_source_active_patches", std::to_string(sum_u64(local.completed_source_active_patches))},
+        {"completed_evolving_comoving_patches", std::to_string(sum_u64(local.completed_evolving_comoving_patches))},
         {"compared_owned_cells", std::to_string(compared_cells)},
         {"compared_auxiliary_owned_cells", std::to_string(auxiliary_cells)},
         {"compared_volume_comoving", std::to_string(compared_volume)},
@@ -1590,17 +1724,47 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
         {"skipped_sources_or_time", std::to_string(sum_u64(local.skipped_sources_or_time))},
         {"skipped_resource", std::to_string(sum_u64(local.skipped_resource))},
         {"skipped_numerical", std::to_string(sum_u64(local.skipped_numerical))},
+        {"skipped_unsupported_source", std::to_string(sum_u64(local.skipped_unsupported_source))},
+        {"skipped_external_passives", std::to_string(sum_u64(local.skipped_external_passives))},
+        {"skipped_temporal_ghost", std::to_string(sum_u64(local.skipped_temporal_ghost))},
         {"reference_substeps", std::to_string(sum_u64(local.reference_substeps))},
         {"reference_fallbacks", std::to_string(sum_u64(local.fallback_count))},
         {"max_rank_reserved_workspace_bytes", std::to_string(
             m_mpi_context.allreduceMaxUint64(local.workspace_high_water_bytes))},
         {"max_rank_observed_capacity_bytes", std::to_string(
             m_mpi_context.allreduceMaxUint64(local.observed_capacity_high_water_bytes))},
-        {"reference_method", "ctu_ppm_hllc_hlle_fallback"},
+        {"reference_method", "ctu_ppm"},
+        {"reference_riemann", std::string(hydro::hydroRiemannSolverKindToString(
+            hydroRiemannSolverKindFromConfig(m_config)))},
+        {"reference_limiter", std::string(hydro::hydroSlopeLimiterToString(
+            hydroSlopeLimiterFromConfig(m_config)))},
+        {"reference_gamma", std::to_string(k_gamma_adiabatic)},
+        {"reference_density_floor", std::to_string(std::max(1.0e-30,
+            m_config.numerics.hydro_density_floor_code))},
+        {"reference_pressure_floor", std::to_string(std::max(1.0e-30,
+            m_config.numerics.hydro_pressure_floor_code))},
+        {"reference_dual_energy", std::string(hydro::hydroDualEnergyModeToString(
+            m_solver.numericsPolicy().dual_energy.mode))},
+        {"reference_dual_energy_eta", std::to_string(
+            m_solver.numericsPolicy().dual_energy.thermal_fraction_switch)},
+        {"production_reconstruction", std::string(hydro::hydroReconstructionSchemeToString(
+            hydroReconstructionSchemeFromConfig(m_config)))},
+        {"production_limiter", std::string(hydro::hydroSlopeLimiterToString(
+            hydroSlopeLimiterFromConfig(m_config)))},
+        {"production_riemann", std::string(hydro::hydroRiemannSolverKindToString(
+            hydroRiemannSolverKindFromConfig(m_config)))},
+        {"comparison_axis", m_solver.numericsPolicy().integration_scheme ==
+             hydro::HydroIntegrationScheme::kCornerTransportUpwind &&
+             hydroReconstructionSchemeFromConfig(m_config) ==
+             hydro::HydroReconstructionScheme::kPiecewiseParabolic
+                 ? "temporal_subdivision_only" : "mixed_spatial_temporal_scheme"},
+        {"boundary_reference", "self_contained_physical_ghost_refresh_or_interior_guard"},
+        {"hydro_owned_sources", "private_cloned_smooth_source_calls;external_strang_not_replayed"},
         {"production_method", core::hydroIntegrationModeToString(
             m_config.numerics.hydro_integration_scheme)},
-        {"sampling_budget_semantics", "per_rank_bounded"},
-        {"diagnostic_scope", "interior_transport_only_not_a_global_error_bar"}};
+        {"sampling_budget_semantics", "global_amr_top_k;rank_local_bytes_and_cells"},
+        {"sampling_global_k", std::to_string(m_shadow.options().max_patches_per_rank)},
+        {"diagnostic_scope", "sampled_hydro_interval_disagreement_not_a_global_error_bar"}};
     const std::array<const char*, 7> labels{"rho", "momentum_x", "momentum_y",
         "momentum_z", "total_energy", "metal_density", "aux_thermal_density"};
     for (std::size_t field = 0; field < labels.size(); ++field) {
@@ -1631,7 +1795,7 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
           .step_index = context.integrator_state.step_index,
           .simulation_time_code = context.integrator_state.current_time_code,
           .scale_factor = context.integrator_state.current_scale_factor,
-          .message = "bounded independent CTU/PPM hydro reference; interior transport disagreement only",
+          .message = "bounded private CTU/PPM hydro trajectory; sampled numerical disagreement, not a physical error bar",
           .payload = std::move(payload)});
     }
   }
@@ -3138,6 +3302,7 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
             : nullptr,
         .reconstruction_scheme = hydroReconstructionSchemeFromConfig(m_config),
         .slope_limiter = hydroSlopeLimiterFromConfig(m_config),
+        .riemann_solver_kind = hydroRiemannSolverKindFromConfig(m_config),
         // Patch coordinates share the comoving coordinate frame of the
         // configured box (same convention as the fixed-grid layout).
         .periodic_box_extent_comoving = {

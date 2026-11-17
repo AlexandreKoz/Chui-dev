@@ -3,6 +3,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <span>
 #include <string_view>
 #include <vector>
@@ -483,6 +484,13 @@ class HydroSourceTerm {
  public:
   virtual ~HydroSourceTerm() = default;
 
+  // C04: a private scratch-owned copy for a sampled comparison. The default
+  // refuses shadow replay: an unknown/discrete source must never be invoked
+  // on its live runtime object or publish a second event/ledger entry.
+  [[nodiscard]] virtual std::unique_ptr<HydroSourceTerm> cloneForShadow() const {
+    return nullptr;
+  }
+
   [[nodiscard]] virtual HydroConservedState sourceForCell(
       std::size_t cell_index,
       const HydroConservedState& conserved,
@@ -492,6 +500,9 @@ class HydroSourceTerm {
 
 class ComovingGravityExpansionSource final : public HydroSourceTerm {
  public:
+  // Gravity acceleration histories are not carried by the C04 private
+  // trajectory. Until they are sampled with a time-centred gravity contract,
+  // the base cloneForShadow() refuses this source, rather than dropping A/a^2.
   [[nodiscard]] HydroConservedState sourceForCell(
       std::size_t cell_index,
       const HydroConservedState& conserved,
