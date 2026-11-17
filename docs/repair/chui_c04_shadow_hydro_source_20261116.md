@@ -1,5 +1,14 @@
 # CHUÍ — C04 sampled shadow hydrodynamics: revision-4 source handoff (2026-11-17)
 
+> **Superseded in scope by revision 6 (2026-11-17, cloud session):**
+> `docs/repair/chui_c04_rev5_cloud_source_closure.md`. The OPEN items below
+> (imported AMR temporal ghost histories for same-level/diagonal/coarse-fine/MPI
+> 8³ patches, external Strang/thermochemistry/composition/event chronology,
+> fixed-grid decomposition-invariant identity) now have integrated source
+> implementations with declared approximation scopes. Status:
+> **C04 SOURCE IMPLEMENTED — UNVERIFIED** (nothing compiled or run). The
+> revision-4 text is kept as the historical record.
+
 **Status: mandatory v10, PARTIAL source implementation, UNCOMPILED and UNVERIFIED.**
 This addendum supersedes the 2026-11-16 source eligibility narrative, not the
 pre-existing AMR geometry proof. Input is the user-selected

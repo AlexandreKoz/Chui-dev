@@ -2957,6 +2957,16 @@ struct AmrSynchronizedSweepWorkspace {
     keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
     flux_registers.prepareFixedKeys(keys);
   }
+  // C04: sorted remote patch IDs classify MPI same-level ghost provenance.
+  std::vector<std::uint64_t> shadow_remote_patch_ids;
+  if (options.hydro_shadow_reference != nullptr && options.hydro_shadow_reference->cadenceStep() &&
+      distributed_exchange != nullptr) {
+    shadow_remote_patch_ids.reserve(distributed_exchange->remote_patches.size());
+    for (const DistributedAmrRemotePatch& remote : distributed_exchange->remote_patches) {
+      shadow_remote_patch_ids.push_back(remote.patch.patch_id);
+    }
+    std::sort(shadow_remote_patch_ids.begin(), shadow_remote_patch_ids.end());
+  }
   AmrSynchronizedSweepWorkspace sweep_workspace(geometries, options);
   core::GovernedScratchArena parent_mirror_arena(
       options.regrid_memory_governor, core::MemoryClass::kScratchArena,
@@ -3169,14 +3179,64 @@ struct AmrSynchronizedSweepWorkspace {
     } composition_sink_scope{global_source_context.face_mass_flux_sink};
     const hydro::HydroActiveSetView patch_active_set{
         .active_cells = active_patch_cells, .active_faces = active_faces};
-    auto shadow_sample = options.hydro_shadow_reference != nullptr
-        ? options.hydro_shadow_reference->capture(
-              patch_geometry.patch.patch_id, patch_geometry.patch.level,
-              conserved_state, patch_geometry.geometry, patch_active_set,
-              update, solver.numericsPolicy(), options.reconstruction_scheme,
-              reconstruction_policy, options.riemann_solver_kind,
-              source_terms, patch_source_context)
-        : hydro::HydroShadowReference::Sample{};
+    // C04: the sampled patch is identified by its physical region key; the
+    // production active set (partial activity, suppressed duplicate periodic
+    // faces) is passed unchanged. Provenance/composition maps are built only
+    // for a globally selected region (bounded by the global K).
+    hydro::HydroShadowReference::Sample shadow_sample;
+    if (options.hydro_shadow_reference != nullptr) {
+      hydro::HydroShadowPatchCapture shadow_spec;
+      shadow_spec.identity = hydro::HydroShadowCandidate{
+          .patch_id = patch_geometry.patch.patch_id,
+          .level = static_cast<int>(patch_geometry.patch.level),
+          .region_key = hydroShadowRegionKeyForPatch(patch_geometry.patch)};
+      shadow_spec.before = &conserved_state;
+      shadow_spec.geometry = &patch_geometry.geometry;
+      shadow_spec.active = patch_active_set;
+      shadow_spec.update = update;
+      shadow_spec.production_numerics = solver.numericsPolicy();
+      shadow_spec.production_reconstruction = options.reconstruction_scheme;
+      shadow_spec.production_policy = reconstruction_policy;
+      shadow_spec.production_riemann = options.riemann_solver_kind;
+      shadow_spec.source_terms = source_terms;
+      shadow_spec.source_context = &patch_source_context;
+      std::vector<hydro::HydroShadowGhostProvenance> shadow_provenance;
+      std::vector<std::uint32_t> shadow_ghost_rows;
+      if (options.hydro_shadow_reference->cadenceStep() &&
+          shadow_spec.identity.region_key != 0U &&
+          options.hydro_shadow_reference->isGloballySelected(
+              shadow_spec.identity.region_key, shadow_spec.identity.level)) {
+        shadow_provenance = hydroShadowGhostProvenance(patch_geometry, shadow_remote_patch_ids);
+        shadow_spec.ghost_provenance = shadow_provenance;
+        shadow_spec.endpoint_ghosts_will_be_provided = options.hydro_shadow_endpoint_ghosts;
+        shadow_spec.temperature_k_per_internal_energy_code =
+            options.hydro_shadow_temperature_k_per_internal_energy_code;
+        // Production patch-local source density = factor * rescale * rho with
+        // the factor at this level's evaluation epoch. Expressed at a = 1 so
+        // each private halfstep recomputes a^-3 at its own epoch.
+        const bool shadow_comoving = update.comoving_coordinates && update.scale_factor > 0.0;
+        const double shadow_epoch_cube = shadow_comoving
+            ? update.scale_factor * update.scale_factor * update.scale_factor : 1.0;
+        shadow_spec.density_cgs_per_code = options.physical_density_cgs_per_density_code > 0.0
+            ? options.physical_density_cgs_per_density_code * options.source_density_rescale * shadow_epoch_cube
+            : 0.0;
+        shadow_spec.comoving_density = shadow_comoving;
+        shadow_spec.cosmology = options.hydro_shadow_cosmology;
+        shadow_spec.time_si_per_code = options.hydro_shadow_time_si_per_code;
+        if (global_source_context.face_mass_flux_sink != nullptr && state.gas_composition.enabled()) {
+          shadow_ghost_rows.assign(patch_geometry.geometry.ghost_cells.size(), core::kInvalidGasCellRow);
+          for (const AmrHydroGhostDescriptor& ghost : patch_geometry.ghosts) {
+            if (ghost.ghost_slot >= shadow_ghost_rows.size() || ghost.source_gas_cell_id == 0U) continue;
+            const auto row = state.rowForGasCellId(ghost.source_gas_cell_id);
+            if (row.has_value()) shadow_ghost_rows[ghost.ghost_slot] = *row;
+          }
+          shadow_spec.composition = &state.gas_composition;
+          shadow_spec.composition_real_rows = composition_dense_rows;
+          shadow_spec.composition_ghost_rows = shadow_ghost_rows;
+        }
+      }
+      shadow_sample = options.hydro_shadow_reference->capture(shadow_spec);
+    }
     solver.advancePatchActiveSetBatchedWithScratch(
         conserved_state,
         patch_geometry.geometry,
@@ -3192,10 +3252,10 @@ struct AmrSynchronizedSweepWorkspace {
         &profile,
         &flux_registers);
     if (options.hydro_shadow_reference != nullptr && shadow_sample) {
-      options.hydro_shadow_reference->compare(
-          std::move(shadow_sample), conserved_state, patch_geometry.geometry,
-          patch_active_set, update, solver.numericsPolicy(),
-          options.reconstruction_scheme);
+      // Records the pre-reflux production result. Samples with imported
+      // ghosts wait for completeHydroShadowEndpointGhosts(); self-contained
+      // or single-step samples are compared immediately. Never throws.
+      options.hydro_shadow_reference->observeProduction(std::move(shadow_sample), conserved_state);
     }
     if (scratch.ownedCapacityBytes() != scratch_capacity_before) {
       throw std::logic_error("AMR solver scratch grew after physical admission: before=" +
@@ -3755,6 +3815,27 @@ ProductionAmrHydroDiagnostics advanceProductionAmrHydroRecursiveImpl(
       // this sweep's interval tags (exactly-once per substep via the
       // pending store's substep coverage mask).
       hooks->exchangeLevelFluxRegisters(state, outbound, level_options);
+    }
+
+    // C04-03: endpoint ghosts of shadow samples captured in this level sweep,
+    // at the level clock t_end, BEFORE the level post-source half mutates the
+    // state: same-level ghosts from the post-sweep state, coarse->fine ghosts
+    // from the open coarser history at t_end, MPI sources from the hook. The
+    // decision is rank-uniform (globalMax); the fill itself is local,
+    // read-only and failure-isolated. Fine->coarse slots have no endpoint yet
+    // and keep step-start authority (cone-excluded, counted).
+    if (options.hydro_shadow_reference != nullptr && options.hydro_shadow_endpoint_ghosts) {
+      const std::uint64_t local_pending =
+          options.hydro_shadow_reference->pendingEndpointCount() != 0U ? 1U : 0U;
+      const std::uint64_t any_pending = distributed ? hooks->globalMax(local_pending) : local_pending;
+      if (any_pending != 0U) {
+        std::span<const DistributedAmrRemotePatch> endpoint_sources;
+        if (distributed) {
+          endpoint_sources = hooks->shadowEndpointSources(level, coarser_level, finer_level, t_end);
+        }
+        (void)completeHydroShadowEndpointGhosts(state, level_options, endpoint_sources, t_end, true);
+        options.hydro_shadow_reference->finalizePendingEndpoints();
+      }
     }
 
     // T02 level-local Strang: S_L(dt_L/2) H_L(dt_L) S_L(dt_L/2). The post half
@@ -4598,6 +4679,271 @@ ProductionAmrRegridDiagnostics derefineProductionPatchInSimulationState(
     const ProductionAmrHydroOptions& options) {
   return derefineProductionPatchInSimulationState(
       state, parent_patch, nextFreeGasCellId(state, product(parent_patch.cell_dims)), options);
+}
+
+// ---------------------------------------------------------------------------
+// C04 shadow-reference support (read-only diagnostics; never mutate truth).
+// ---------------------------------------------------------------------------
+
+std::uint64_t hydroShadowRegionKeyForPatch(const PatchDescriptor& patch) noexcept {
+  std::array<std::int64_t, 3> origin{};
+  std::array<std::uint32_t, 3> extent{};
+  for (std::size_t axis = 0; axis < 3U; ++axis) {
+    const std::uint16_t cells = patch.cell_dims[axis];
+    if (cells == 0U || !(patch.extent_comov[axis] > 0.0) || !std::isfinite(patch.origin_comov[axis])) {
+      return 0U;
+    }
+    const double width = patch.extent_comov[axis] / static_cast<double>(cells);
+    const double index = patch.origin_comov[axis] / width;
+    if (!std::isfinite(index) || std::abs(index) > 9.0e15) return 0U;
+    origin[axis] = static_cast<std::int64_t>(std::nearbyint(index));
+    extent[axis] = cells;
+  }
+  return hydro::hydroShadowPhysicalRegionKey(static_cast<int>(patch.level), origin, extent);
+}
+
+std::vector<hydro::HydroShadowGhostProvenance> hydroShadowGhostProvenance(
+    const AmrHydroPatchGeometry& patch_geometry, std::span<const std::uint64_t> sorted_remote_patch_ids) {
+  using P = hydro::HydroShadowGhostProvenance;
+  const std::size_t slots = patch_geometry.geometry.ghost_cells.size();
+  std::vector<P> result(slots, P::kUnknownImported);
+  for (std::size_t slot = 0; slot < slots; ++slot) {
+    result[slot] = hydro::hydroShadowDefaultGhostProvenance(patch_geometry.geometry, slot);
+  }
+  for (const AmrHydroGhostDescriptor& ghost : patch_geometry.ghosts) {
+    const std::size_t slot = ghost.ghost_slot;
+    if (slot >= slots) continue;
+    const bool remote = ghost.source_patch_id != 0U &&
+        std::binary_search(sorted_remote_patch_ids.begin(), sorted_remote_patch_ids.end(), ghost.source_patch_id);
+    P value = P::kUnknownImported;
+    if (ghost.physical_closure_mapped ||
+        ghost.fill_status == AmrHydroGhostFillStatus::kFilledDeepLayerExtrapolated ||
+        ghost.fill_status == AmrHydroGhostFillStatus::kFilledDeepLayerReflected) {
+      // Resolved by the AMR filler beyond the opposite face/a thin neighbour;
+      // the hydro boundary helper only writes a provisional copy.
+      value = P::kPhysicalClosureMapped;
+    } else if (ghost.fill_status == AmrHydroGhostFillStatus::kFilledCoarseToFineTemporal) {
+      value = P::kCoarseToFineTemporal;
+    } else if (ghost.fill_status == AmrHydroGhostFillStatus::kFilledCoarseToFine) {
+      value = P::kCoarseToFine;
+    } else if (ghost.fill_status == AmrHydroGhostFillStatus::kFilledFineToCoarse) {
+      value = P::kFineToCoarse;
+    } else if (ghost.edge_stencil) {
+      value = P::kImportedEdgeDiagonal;
+    } else if (ghost.boundary_class == AmrHydroBoundaryClass::kPhysical) {
+      const auto& cell = patch_geometry.geometry.ghost_cells[slot];
+      value = cell.boundary_kind == hydro::HydroBoundaryKind::kPeriodic ? P::kSelfPeriodicWrap : P::kSelfPhysical;
+    } else if (ghost.boundary_class == AmrHydroBoundaryClass::kSameLevel) {
+      value = remote ? P::kImportedSameLevelRemote : P::kImportedSameLevel;
+    } else if (ghost.boundary_class == AmrHydroBoundaryClass::kCoarseFine) {
+      value = P::kCoarseToFine;
+    }
+    result[slot] = value;
+  }
+  return result;
+}
+
+HydroShadowEndpointDiagnostics completeHydroShadowEndpointGhosts(
+    const core::SimulationState& state,
+    const ProductionAmrHydroOptions& options,
+    std::span<const DistributedAmrRemotePatch> remote_patches,
+    double endpoint_time_code,
+    bool recursive_level_clock) noexcept {
+  HydroShadowEndpointDiagnostics diagnostics;
+  hydro::HydroShadowReference* shadow = options.hydro_shadow_reference;
+  if (shadow == nullptr) return diagnostics;
+  std::vector<hydro::HydroShadowReference::EndpointRequest> requests;
+  try {
+    requests = shadow->pendingEndpointRequests();
+  } catch (...) {
+    return diagnostics;
+  }
+  diagnostics.requested = requests.size();
+  if (requests.empty() || state.patches.size() == 0U || !hasProductionAmrHydroCoverage(state)) {
+    return diagnostics;
+  }
+  std::vector<PatchDescriptor> descriptors;
+  std::vector<PatchDescriptor> all_descriptors;
+  std::vector<AmrHydroSparseGhostSource> remote_sources;
+  try {
+    descriptors = buildProductionAmrPatchDescriptors(state);
+    all_descriptors = descriptors;
+    for (const DistributedAmrRemotePatch& remote : remote_patches) all_descriptors.push_back(remote.patch);
+    remote_sources.reserve(remote_patches.size());
+    for (const DistributedAmrRemotePatch& remote : remote_patches) {
+      remote_sources.push_back(AmrHydroSparseGhostSource{
+          .patch = &remote.patch,
+          .owner_rank = remote.owner_rank,
+          .ghost_hydro_epoch = remote.ghost_hydro_epoch,
+          .expected_ghost_hydro_epoch = remote.expected_ghost_hydro_epoch,
+          .source_current_state_time_code =
+              std::isnan(remote.state_time_code) ? endpoint_time_code : remote.state_time_code,
+          .cells = remote.boundary_cells});
+    }
+  } catch (...) {
+    diagnostics.failed = requests.size();
+    return diagnostics;
+  }
+  const bool periodic_box = options.physical_boundary_kind == hydro::HydroBoundaryKind::kPeriodic;
+  const internal::AmrPeriodicFrame periodic_frame =
+      internal::makeAmrPeriodicFrame(periodic_box, options.periodic_box_extent_comoving);
+  const std::uint8_t ghost_layers = amrHydroGhostLayersForOptions(options);
+  const std::uint8_t edge_stencil_depth = productionAmrHydroEdgeStencilDepth(options);
+  const bool dual_energy_auxiliary = options.active_batch_policy.dual_energy_workspace;
+  const auto geometry_options_for = [&](const PatchDescriptor& patch) {
+    AmrHydroGeometryOptions geometry_options;
+    geometry_options.physical_boundary_kind = options.physical_boundary_kind;
+    geometry_options.ghost_layers = ghost_layers;
+    geometry_options.edge_stencil_depth = edge_stencil_depth;
+    std::size_t slot = 0U;
+    for (const hydro::HydroFaceAxis axis : {hydro::HydroFaceAxis::kX, hydro::HydroFaceAxis::kY, hydro::HydroFaceAxis::kZ}) {
+      for (const hydro::HydroFaceSide side : {hydro::HydroFaceSide::kLower, hydro::HydroFaceSide::kUpper}) {
+        geometry_options.boundary_classes[slot++] =
+            boundaryClassForSide(patch, all_descriptors, axis, side, periodic_frame);
+      }
+    }
+    return geometry_options;
+  };
+  for (const auto& request : requests) {
+    try {
+      // Only samples whose interval ends at THIS legal point can use it.
+      const double tolerance = 1.0e-9 * std::max({1.0, std::abs(endpoint_time_code), std::abs(request.time_end_code)});
+      if (!(std::abs(request.time_end_code - endpoint_time_code) <= tolerance)) {
+        ++diagnostics.failed;
+        continue;
+      }
+      const auto target_it = std::find_if(descriptors.begin(), descriptors.end(), [&](const PatchDescriptor& patch) {
+        return static_cast<int>(patch.level) == request.identity.level &&
+            hydroShadowRegionKeyForPatch(patch) == hydro::hydroShadowEffectiveKey(request.identity);
+      });
+      if (target_it == descriptors.end()) {
+        ++diagnostics.failed;
+        continue;
+      }
+      std::vector<std::size_t> source_indices;
+      for (std::size_t index = 0; index < descriptors.size(); ++index) {
+        const PatchDescriptor& candidate = descriptors[index];
+        if (candidate.patch_id == target_it->patch_id) continue;
+        bool touches = false;
+        for (const hydro::HydroFaceAxis axis : {hydro::HydroFaceAxis::kX, hydro::HydroFaceAxis::kY, hydro::HydroFaceAxis::kZ}) {
+          touches = touches || touchesOnSide(*target_it, candidate, axis, hydro::HydroFaceSide::kLower, periodic_frame) ||
+              touchesOnSide(*target_it, candidate, axis, hydro::HydroFaceSide::kUpper, periodic_frame);
+        }
+        if (!touches && edge_stencil_depth != 0U) {
+          touches = edgeStencilSourceTouches(*target_it, candidate, edge_stencil_depth, periodic_frame);
+        }
+        if (touches) source_indices.push_back(index);
+      }
+      // Admission: target + every live local source SoA (7 lanes with dual
+      // energy), their geometries, and the delivered endpoint copy.
+      const std::size_t lane_bytes = (dual_energy_auxiliary ? 7U : 6U) * sizeof(double);
+      std::uint64_t bytes = 0U;
+      const auto add_patch = [&](const PatchDescriptor& patch) {
+        const auto capacity = amrHydroGeometryCapacity(patch, ghost_layers, edge_stencil_depth);
+        bytes = core::checkedMemoryBytesAdd(bytes, capacity.retained_bytes, "shadow endpoint geometry");
+        bytes = core::checkedMemoryBytesAdd(bytes, capacity.construction_scratch_bytes, "shadow endpoint geometry scratch");
+        bytes = core::checkedMemoryBytesAdd(bytes, static_cast<std::uint64_t>(core::checkedSizeMultiply(
+            core::checkedSizeAdd(capacity.real_cells, capacity.ghost_cells, "shadow endpoint cells"),
+            lane_bytes, "shadow endpoint SoA")), "shadow endpoint SoA bytes");
+      };
+      add_patch(*target_it);
+      for (const std::size_t index : source_indices) add_patch(descriptors[index]);
+      bytes = core::checkedMemoryBytesAdd(bytes, static_cast<std::uint64_t>(core::checkedSizeMultiply(
+          request.ghost_slot_count, sizeof(hydro::HydroConservedState) + sizeof(double) + 1U,
+          "shadow endpoint delivery")), "shadow endpoint delivery bytes");
+      core::MemoryReservation reservation;
+      if (options.regrid_memory_governor != nullptr) {
+        reservation = options.regrid_memory_governor->reserve(
+            core::MemoryClass::kDiagnostic, bytes, "hydro.shadow_reference.endpoint_ghost_fill");
+        reservation.commit();
+      }
+      std::vector<AmrHydroPatchGeometry> geometries;
+      geometries.reserve(source_indices.size() + 1U);
+      geometries.push_back(buildAmrHydroPatchGeometry(state, *target_it, geometry_options_for(*target_it)));
+      for (const std::size_t index : source_indices) {
+        geometries.push_back(buildAmrHydroPatchGeometry(state, descriptors[index], geometry_options_for(descriptors[index])));
+      }
+      refreshTraceableGhostSourceIds(geometries, periodic_frame);
+      if (!remote_patches.empty()) refreshRemoteTraceableGhostSourceIds(geometries, remote_patches, periodic_frame);
+      if (geometries.front().geometry.ghost_cells.size() != request.ghost_slot_count) {
+        ++diagnostics.failed;
+        continue;
+      }
+      std::vector<hydro::HydroConservedStateSoa> states;
+      states.reserve(geometries.size());
+      for (const AmrHydroPatchGeometry& geometry : geometries) {
+        states.push_back(loadAmrHydroConservedState(state, geometry, options.adiabatic_index));
+        states.back().enableAuxiliaryInternalEnergy(dual_energy_auxiliary);
+        loadCanonicalAuxiliaryInternalEnergy(state, geometry, states.back());
+      }
+      std::vector<AmrHydroGhostFillPatch> views;
+      views.reserve(geometries.size());
+      for (std::size_t g = 0; g < geometries.size(); ++g) {
+        views.push_back(AmrHydroGhostFillPatch{
+            .geometry = &geometries[g],
+            .conserved = &states[g],
+            .residency = AmrGhostSourceResidency::kLocal,
+            .ghost_hydro_epoch = state.gasCellIdentityGeneration(),
+            .expected_ghost_hydro_epoch = state.gasCellIdentityGeneration(),
+            .target_state_time_code = endpoint_time_code,
+            .ghost_fill_time_code = endpoint_time_code,
+            .source_current_state_time_code = endpoint_time_code,
+            .temporal_boundary_history = options.enable_temporal_coarse_to_fine
+                ? &state.amr_temporal_boundary_history : nullptr,
+            .enable_temporal_coarse_to_fine = options.enable_temporal_coarse_to_fine,
+            .requires_ghost_fill = g == 0U,
+            .periodic_box_extent_comoving = periodic_box
+                ? options.periodic_box_extent_comoving : std::array<double, 3>{0.0, 0.0, 0.0},
+            .physical_boundary_kind = options.physical_boundary_kind,
+            .domain_origin_comoving = options.domain_origin_comoving,
+            .domain_extent_comoving = options.domain_extent_comoving});
+      }
+      (void)fillAmrHydroGhostCells(views, remote_sources, options.adiabatic_index, options.regrid_memory_governor);
+      const AmrHydroPatchGeometry& target = geometries.front();
+      const std::size_t slots = target.geometry.ghost_cells.size();
+      std::vector<hydro::HydroConservedState> ghost_states(slots);
+      std::vector<double> ghost_auxiliary;
+      if (dual_energy_auxiliary) ghost_auxiliary.assign(slots, std::numeric_limits<double>::quiet_NaN());
+      std::vector<std::uint8_t> valid(slots, 1U);
+      for (std::size_t slot = 0; slot < slots; ++slot) {
+        const std::size_t row = target.geometry.ghost_cells[slot].ghost_cell;
+        ghost_states[slot] = states.front().loadCell(row);
+        if (dual_energy_auxiliary) ghost_auxiliary[slot] = states.front().auxiliaryInternalEnergyDensityComoving()[row];
+      }
+      for (const AmrHydroGhostDescriptor& ghost : target.ghosts) {
+        if (ghost.ghost_slot >= slots) continue;
+        switch (ghost.fill_status) {
+          case AmrHydroGhostFillStatus::kFilledFineToCoarse:
+            // Recursive clock: the finer level is still at the interval
+            // start, so no endpoint authority exists at this legal point.
+            if (recursive_level_clock) {
+              valid[ghost.ghost_slot] = 0U;
+              ++diagnostics.stale_fine_to_coarse_slots;
+            }
+            break;
+          case AmrHydroGhostFillStatus::kFilledPhysicalBoundary:
+          case AmrHydroGhostFillStatus::kFilledSameLevel:
+          case AmrHydroGhostFillStatus::kFilledCoarseToFine:
+          case AmrHydroGhostFillStatus::kFilledCoarseToFineTemporal:
+          case AmrHydroGhostFillStatus::kFilledDeepLayerExtrapolated:
+          case AmrHydroGhostFillStatus::kFilledDeepLayerReflected:
+            break;
+          default:
+            valid[ghost.ghost_slot] = 0U;
+            ++diagnostics.invalid_slots;
+            break;
+        }
+      }
+      shadow->provideEndpointGhosts(hydro::hydroShadowEffectiveKey(request.identity), request.time_end_code,
+                                    ghost_states, ghost_auxiliary, valid);
+      ++diagnostics.provided;
+    } catch (...) {
+      // Diagnostic only: the sample keeps step-start-only authority for its
+      // imported slots (cone exclusion) and the failure is counted.
+      ++diagnostics.failed;
+    }
+  }
+  return diagnostics;
 }
 
 }  // namespace cosmosim::amr

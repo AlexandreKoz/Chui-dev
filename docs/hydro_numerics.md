@@ -429,25 +429,47 @@ axis. Its snap tolerance `1e-6 + 64 ε span` is therefore bounded by about
 previous `2^40` span whose tolerance reached approximately `0.0156`. Larger
 spans are rejected before converting to the integer signed-corner lattice.
 
-### Independent sampled CTU/PPM shadow (C04; 2026-11)
+### Independent sampled CTU/PPM shadow (C04; 2026-11, revision 6)
 
 `hydro.shadow_reference` is an off-by-default **v10-mandatory diagnostic source
-feature** (not yet compiled or scientifically qualified). It advances a private
-CTU/PPM copy of selected complete active patches. For CTU/PPM production,
-two reference halfsteps retain its limiter, EOS, floors, fallback/Riemann and
-source operators; only the temporal subdivision changes. MUSCL/PLM or CTU/PLM
-production is explicitly a mixed spatial-and-temporal comparison. Smooth
-hydro-owned sources and evolving comoving expansion are replayed at substep
-midpoints, with private source properties reconstructed from the sampled state.
-External Strang/event physics and detached composition sidecars are outside
-this reference.
+feature** (source implemented, **not compiled or qualified**). It advances a
+private CTU/PPM copy of selected physical regions and never writes production
+state, flux registers, ledgers, RNG or event queues.
 
-Within a wholly self-contained periodic/open/reflective Cartesian patch, the
-private boundary and auxiliary-energy ghosts are recomputed after each halfstep:
-an 8³ patch is therefore eligible. Imported MPI, same-level and coarse/fine AMR
-ghosts do **not** yet have private temporal history; only guarded interior cells
-are compared, otherwise a named ghost-history skip is recorded. Full active
-patches and memory admission are required. AMR selection uses deterministic
-global top-K; fixed-grid rank-local sampling is not decomposition-invariant.
+* **Numerics.** Production limiter, EOS/closure, floors, dual energy and
+  Riemann kind; CTU/PPM production is compared with two private halfsteps
+  (`time_only_ctu_ppm_subdivision`), other schemes with one CTU/PPM step
+  (`mixed_spatial_temporal_scheme`). Halfstep epochs use the exact FLRW
+  inversion between the production endpoints with `dt/(a dx)` recomputed.
+* **Ghost authority.** Every ghost slot is classified (self physical/periodic,
+  same-level local/MPI, edge/diagonal, coarse→fine (temporal), fine→coarse,
+  closure-mapped). Halfstep 1 uses the exact production step-start shell.
+  Before halfstep 2, self slots are refreshed from the private state and every
+  imported slot is the linear time interpolation of its step-start value and
+  its **endpoint value formed by the production AMR ghost filler at the
+  interval end** (`amr::completeHydroShadowEndpointGhosts`: synchronized =
+  after the sweep and reflux, MPI via a post-advance directed exchange;
+  recursive = after each level sweep, MPI via the driver hook). Slots without
+  a legal endpoint (recursive fine→coarse) keep step-start values and the real
+  cells within Chebyshev radius 4 of their owner are excluded
+  (`bounded_projection`, counted). There is no interior guard: ordinary 8³
+  patches are compared on every active cell.
+* **Active sets.** The production active set (partial scheduler activity,
+  suppressed duplicate lower periodic faces) is used unchanged; only active
+  cells are compared.
+* **Composition.** The production face sink is replaced by a private
+  donor-cell sink with the production rule; composition-enabled runs are
+  sampled, never refused.
+* **Full-physics chronology.** With the T01 Strang split the region's
+  production state is snapshotted around each smooth sub-operator, and the
+  refined chronology `S(dt/4) H(dt/2) S(dt/2) H(dt/2) S(dt/4)` is replayed with
+  the production `BaryonicSourceStage` on a private state; diffusion/SGS shear
+  and discrete events enter as captured increments; recursive AMR uses the
+  level windows. Class `coupled_full_physics_strang_interval`.
+* **Selection.** Physical region keys (level, lattice origin, extent), one
+  global K, decomposition independent; results reduced in physical-key order
+  and published only at the next attempt's acceptance barrier.
+
 No compared cell means `no_samples`, never fabricated zero disagreement.
-See the C04 source note for remaining mandatory gaps.
+See `docs/repair/chui_c04_rev5_cloud_source_closure.md` for the evidence
+matrix, declared approximation scopes and fixtures.

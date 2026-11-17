@@ -170,26 +170,69 @@ void checkSmallClosedPatchWithActiveSourcesAndCosmology(h::HydroBoundaryKind bou
   }
 }
 
-void checkImportedGhostRequiresTemporalHistory() {
+h::HydroConservedStateSoa uniformState(const h::HydroPatchGeometry& geometry, double gamma) {
+  h::HydroConservedStateSoa state(geometry.totalCellStorageCount());
+  for (std::size_t row = 0; row < state.size(); ++row) {
+    h::HydroPrimitiveState primitive{};
+    primitive.rho_comoving = 1.0 + 1.0e-3 * static_cast<double>(row % 7U);
+    primitive.vel_x_peculiar = 0.01;
+    primitive.pressure_comoving = 1.0;
+    primitive.metallicity_mass_fraction = 0.01;
+    state.storeCell(row, h::HydroCoreSolver::conservedFromPrimitive(primitive, gamma));
+  }
+  return state;
+}
+
+// C04-03 (rev 6): an imported ghost without a promised endpoint is no longer a
+// blanket refusal. Its slot keeps step-start authority and every real cell in
+// its halfstep dependency cone is excluded (bounded projection, counted); a
+// patch whose EVERY cell lies in such cones is refused as skipped_temporal_ghost.
+void checkImportedGhostWithoutEndpointIsConeExcluded() {
+  constexpr double gamma = 5.0 / 3.0;
   auto geometry = makeClosedPatch(h::HydroBoundaryKind::kReflective);
   geometry.ghost_cells.front().mutation_rights = h::HydroGhostMutationRights::kReadOnlyImported;
   geometry.ghost_cells.front().boundary_kind = h::HydroBoundaryKind::kImportedMpi;
-  h::HydroConservedStateSoa before(geometry.totalCellStorageCount());
+  auto before = uniformState(geometry, gamma);
   std::vector<std::size_t> cells(geometry.cellCount());
   std::vector<std::size_t> faces(geometry.faces.size());
   std::iota(cells.begin(), cells.end(), 0U);
   std::iota(faces.begin(), faces.end(), 0U);
   h::HydroNumericsPolicy numerics;
   numerics.integration_scheme = h::HydroIntegrationScheme::kCornerTransportUpwind;
+  h::HydroUpdateContext update{.dt_code = 1.0e-5, .time_begin_code = 0.0, .time_end_code = 1.0e-5};
   h::HydroShadowReference monitor({.enabled = true, .cadence = 1});
   monitor.beginEpoch(0);
   monitor.setGlobalCandidates({{27U, 1}});
+  const h::HydroReconstructionPolicy policy{.adiabatic_index = gamma};
   auto sample = monitor.capture(27U, 1, before, geometry,
-      {.active_cells = cells, .active_faces = faces}, h::HydroUpdateContext{},
-      numerics, h::HydroReconstructionScheme::kPiecewiseParabolic, {},
+      {.active_cells = cells, .active_faces = faces}, update,
+      numerics, h::HydroReconstructionScheme::kPiecewiseParabolic, policy,
       h::HydroRiemannSolverKind::kHllc, {}, h::HydroSourceContext{});
-  assert(!sample);
-  assert(monitor.report().skipped_temporal_ghost == 1U);
+  assert(sample);
+  const auto produced = before;
+  monitor.compare(std::move(sample), produced, geometry, {.active_cells = cells, .active_faces = faces},
+                  update, numerics, h::HydroReconstructionScheme::kPiecewiseParabolic);
+  assert(monitor.report().completed == 1U);
+  assert(monitor.report().cone_excluded_cells > 0U);
+  assert(monitor.report().compared_cells + monitor.report().cone_excluded_cells == 512U);
+  assert(monitor.report().ghost_slots_step_start_only == 1U);
+  assert(monitor.report().completed_by_class[static_cast<std::size_t>(
+             h::HydroShadowComparisonClass::kBoundedProjection)] == 1U);
+
+  // Every slot imported, no endpoint: every cell of 8^3 lies in a cone.
+  auto imported = makeClosedPatch(h::HydroBoundaryKind::kReflective);
+  for (auto& ghost : imported.ghost_cells) {
+    ghost.mutation_rights = h::HydroGhostMutationRights::kReadOnlyImported;
+    ghost.boundary_kind = h::HydroBoundaryKind::kImportedMpi;
+  }
+  auto state = uniformState(imported, gamma);
+  h::HydroShadowReference refusing({.enabled = true, .cadence = 1});
+  refusing.beginEpoch(0);
+  refusing.setGlobalCandidates({{28U, 1}});
+  assert(!refusing.capture(28U, 1, state, imported, {.active_cells = cells, .active_faces = faces}, update,
+                           numerics, h::HydroReconstructionScheme::kPiecewiseParabolic, policy,
+                           h::HydroRiemannSolverKind::kHllc, {}, h::HydroSourceContext{}));
+  assert(refusing.report().skipped_temporal_ghost == 1U);
 }
 
 void checkCoolingReadOnlyProxyIsIndependent() {
@@ -207,7 +250,7 @@ int main() {
   checkGlobalTopKIndependentOfRankAndOrder();
   checkSmallClosedPatchWithActiveSourcesAndCosmology(h::HydroBoundaryKind::kPeriodic);
   checkSmallClosedPatchWithActiveSourcesAndCosmology(h::HydroBoundaryKind::kReflective);
-  checkImportedGhostRequiresTemporalHistory();
+  checkImportedGhostWithoutEndpointIsConeExcluded();
   checkCoolingReadOnlyProxyIsIndependent();
   return 0;
 }

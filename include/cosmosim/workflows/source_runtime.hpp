@@ -29,6 +29,7 @@ struct MemoryReport;
 namespace cosmosim::workflows {
 
 struct RuntimeServices;
+class HydroShadowChronologyObserver;
 
 // Owns construction and deterministic registration order for the existing
 // rung-zero source callbacks. No source model or update law is changed here.
@@ -131,6 +132,15 @@ class SourceRuntime {
   // All three calls are rank-uniform (the coordinator calls them on every
   // rank); restore performs no collective (collective caches are invalidated
   // and rebuilt at their next collective use).
+  // C04-02: non-owning observer of the sampled-region source chronology
+  // (hydro shadow diagnostic). Bound by HydroAmrRuntime::bindSourceRuntime()
+  // when hydro shadow sampling is enabled; nullptr unbinds. The owner calls
+  // it at the documented boundaries of every dispatch (see
+  // hydro_shadow_chronology.hpp) and lends a private smooth-operator replay
+  // at the end of the post half. Observing never changes source behaviour.
+  virtual void setHydroShadowChronologyObserver(HydroShadowChronologyObserver* observer) noexcept {
+    (void)observer;
+  }
   virtual void captureRollbackCheckpoint() {}
   virtual void restoreRollbackCheckpoint() {}
   virtual void discardRollbackCheckpoint() noexcept {}

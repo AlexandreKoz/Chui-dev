@@ -165,6 +165,19 @@ struct ProductionAmrHydroOptions {
   // The runtime owns its lifetime; the library never makes MPI calls through
   // this pointer and the disabled path does not allocate shadow storage.
   hydro::HydroShadowReference* hydro_shadow_reference = nullptr;
+  // C04-03: the caller guarantees a completeHydroShadowEndpointGhosts() call
+  // for every sample captured by this advance at a legal rank-uniform point
+  // after the sampled interval (the runtime after the synchronized sweep and
+  // its reflux; the recursive driver after each level sweep). Samples then
+  // use production-filler endpoint ghosts for the private midpoint instead of
+  // step-start-only boundary data. False keeps the cone-excluded fallback.
+  bool hydro_shadow_endpoint_ghosts = false;
+  // C04-02: composition-aware private closure for hydro-owned sources
+  // (T = factor * mu/0.59 * u, the production refresh convention) and the
+  // FLRW background for exact private halfstep epochs. Zero/null = legacy.
+  double hydro_shadow_temperature_k_per_internal_energy_code = 0.0;
+  const core::LambdaCdmBackground* hydro_shadow_cosmology = nullptr;
+  double hydro_shadow_time_si_per_code = 0.0;
   // P1-55-02: global hierarchy domain [origin, origin + extent) in the patch
   // frame, forwarded to every ghost-fill target view. On non-periodic axes a
   // deep/edge stencil ghost may use the physical closure only beyond these
@@ -432,6 +445,21 @@ class RecursiveAmrDistributedHooks {
   virtual void captureLevelEnd(int level, int finer_level, double t_end) = 0;
   // Drops the retained remote interval of `level` (local operation).
   virtual void retireLevel(int level) noexcept = 0;
+  // C04-03 (optional, collective when called): after the level-`level` sweep
+  // and its register exchange, returns the remote ghost sources at t_end for
+  // the private shadow endpoint ghosts: current same-level (and finer, still
+  // at t_begin) patches plus coarser patches interpolated to t_end from the
+  // retained interval. Called on every rank or on none (the driver decides
+  // with globalMax). The default supplies no remote sources (remote ghost
+  // slots then keep step-start-only authority with cone exclusion).
+  [[nodiscard]] virtual std::span<const DistributedAmrRemotePatch> shadowEndpointSources(
+      int level, int coarser_level, int finer_level, double t_end) {
+    (void)level;
+    (void)coarser_level;
+    (void)finer_level;
+    (void)t_end;
+    return {};
+  }
 };
 
 // G1.1: distributed recursive Berger-Oliger subcycling. Same time-ownership
@@ -507,5 +535,45 @@ class RecursiveAmrDistributedHooks {
     core::SimulationState& state,
     const PatchDescriptor& parent_patch,
     const ProductionAmrHydroOptions& options = {});
+
+// C04-04: physical shadow region key of a patch: hydroShadowPhysicalRegionKey
+// of (level, lattice origin nearbyint(origin / cell_width) measured from the
+// fixed frame origin 0, cell dims). Distinct same-level patches differ by at
+// least one cell width, so the key is unique, and it depends only on the
+// persistent patch geometry (never on rank, patch ID or container order).
+// Zero for a degenerate descriptor (never selected).
+[[nodiscard]] std::uint64_t hydroShadowRegionKeyForPatch(const PatchDescriptor& patch) noexcept;
+
+// C04-03: provenance of every ghost slot of a filled production patch
+// geometry (self physical/periodic, same-level local/MPI, edge/diagonal,
+// coarse->fine (temporal), fine->coarse, closure-mapped).
+[[nodiscard]] std::vector<hydro::HydroShadowGhostProvenance> hydroShadowGhostProvenance(
+    const AmrHydroPatchGeometry& patch_geometry, std::span<const std::uint64_t> sorted_remote_patch_ids);
+
+struct HydroShadowEndpointDiagnostics {
+  std::size_t requested = 0U;
+  std::size_t provided = 0U;
+  std::size_t failed = 0U;
+  std::size_t stale_fine_to_coarse_slots = 0U;
+  std::size_t invalid_slots = 0U;
+};
+
+// C04-03: forms, for every pending shadow sample of options.hydro_shadow_reference,
+// the ghost values at the END of its sampled interval with the production
+// ghost filler (same geometry options, owners, prolongation, restriction,
+// temporal history, sparse remote payloads), reading the current canonical
+// state. Read-only on `state`: no real halo, flux register, history or
+// canonical cell is written. Remote sources must be the current boundary
+// states (synchronized: a post-advance exchange; recursive: the hook above).
+// With recursive_level_clock, fine->coarse slots (finer level not yet
+// advanced) are marked without endpoint authority. All failures are local and
+// counted; never throws, never makes MPI calls. The governor admits the
+// working set before allocation (refusal = no endpoint, counted).
+[[nodiscard]] HydroShadowEndpointDiagnostics completeHydroShadowEndpointGhosts(
+    const core::SimulationState& state,
+    const ProductionAmrHydroOptions& options,
+    std::span<const DistributedAmrRemotePatch> remote_patches,
+    double endpoint_time_code,
+    bool recursive_level_clock) noexcept;
 
 }  // namespace cosmosim::amr

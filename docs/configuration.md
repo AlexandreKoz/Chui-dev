@@ -929,26 +929,29 @@ The existing `[numerics]` parameter-file section now accepts:
 | `hydro_shadow_enabled` | `false` | Enable independent CTU/PPM diagnostic on eligible sampled hydro patches |
 | `hydro_shadow_cadence_steps` | `16` | Positive coordinator-step interval for sampling |
 | `hydro_shadow_seed` | `0` | Deterministic patch/epoch selection seed |
-| `hydro_shadow_max_patches_per_rank` | `2` | **Legacy key now interpreted as a global top-K patch budget** in AMR, not a per-rank sample count (0 disables sampling) |
+| `hydro_shadow_max_patches_per_rank` | `2` | **Legacy key interpreted as the GLOBAL top-K of physical sample regions** (AMR patches and fixed-grid lattice tiles alike), not a per-rank count (0 disables sampling) |
 | `hydro_shadow_max_storage_cells_per_rank` | `8192` | Per-rank cap including sampled ghost slots |
 | `hydro_shadow_max_workspace_bytes_per_rank` | `67108864` | Per-rank bound on private state and scratch reservations |
 
-All fields enter the normalized configuration/provenance record. Shadow samples
-never update accepted physical state. AMR selection is global top-K by hash of
-stable physical patch ID, level, coordinator step and seed, with stable ID/level
-tie-breaks. The fixed-grid adapter still uses rank-local region ID zero, so
-fixed-grid sampling is **not** decomposition-invariant. Remaining per-rank
-storage/byte caps can refuse selected patches without replacing them.
+All fields enter the normalized configuration/provenance record (no key was
+added or renamed in revision 6). Shadow samples never update accepted
+physical state. Selection is a global top-K over **physical region keys**
+(refinement level, global lattice origin, extent) ranked by a hash of key,
+coordinator step and seed: AMR regions are production patches (one owner
+rank each); fixed-grid regions are `8`-cell lattice tiles (production fixed
+grid is single-rank; a multi-rank validation fixed grid submits no candidate,
+counted as `skipped_region_split_across_ranks`). The same physical regions are
+selected for any MPI decomposition. Per-rank storage/byte caps can refuse a
+selected region; a refusal is counted and never replaced by another region.
 
 The reference reuses production limiter, floors, gamma, dual-energy mode and
-Riemann selection. CTU/PPM uses two private halfsteps, while other production
-schemes use a mixed spatial-and-temporal CTU/PPM comparison. Smooth
-hydro-owned sources (including read-only cooling and isolated effective-ISM
-relaxation) and evolving comoving a/H may be sampled; external Strang/event
-operators and ion/element passive flux sinks are not independently replayed.
-Self-contained 8³ periodic/open/reflective patch ghosts are refreshed from
-private state for each reference halfstep. Imported MPI/same-level/coarse-fine
-ghosts lack an admitted midpoint shadow history; where the interior guard is
-empty they produce named `skipped_temporal_ghost`, not false zero errors.
-This contract is uncompiled/unverified; see
-`docs/repair/chui_c04_shadow_hydro_source_20261116.md`.
+Riemann selection. Imported AMR ghosts (same-level, diagonal, coarse/fine, MPI)
+receive endpoint values from the production ghost filler at the interval end
+and are interpolated to the private midpoint; slots without a legal endpoint
+are excluded through their dependency cones. Composition-enabled runs use a
+private composition sink. With the T01 Strang split the full interval
+(smooth thermochemistry/ISM/dust/SGS recomputed privately; diffusion, SGS
+shear and discrete events as captured increments) is compared as well.
+Results are published as `hydro.shadow_reference` at the acceptance barrier of
+the next step. This contract is uncompiled/unverified; see
+`docs/repair/chui_c04_rev5_cloud_source_closure.md`.
