@@ -1,4 +1,4 @@
-// C04 source fixture — NOT RUN (user owns compilation and qualification).
+// C04 source fixture — NOT COMPILED OR RUN (user owns compilation and qualification).
 #include <cassert>
 #include <cmath>
 #include <cstddef>
@@ -120,6 +120,9 @@ void checkSamplingBudgetsAndCadence() {
 }
 
 void checkSkippedWithoutStateMutation() {
+  // C04-03 (rev 6): the former 4/7-cell interior guard is gone. A patch with
+  // only self-contained boundary data is compared on EVERY active cell; a
+  // malformed production active set is the geometry refusal.
   h::HydroPatchGeometry geometry = h::makeCartesianPatchGeometry({
       .nx = 8, .ny = 1, .nz = 1, .cell_width_x_comoving = 1.0,
       .cell_width_y_comoving = 1.0, .cell_width_z_comoving = 1.0});
@@ -128,14 +131,26 @@ void checkSkippedWithoutStateMutation() {
   std::iota(cells.begin(), cells.end(), 0U);
   std::vector<std::size_t> faces(geometry.faces.size());
   std::iota(faces.begin(), faces.end(), 0U);
-  const h::HydroActiveSetView active{.active_cells = cells, .active_faces = faces};
+  std::vector<std::size_t> invalid_cells{geometry.cellCount() + 3U};
+  const h::HydroActiveSetView malformed{.active_cells = invalid_cells, .active_faces = faces};
   h::HydroShadowReference monitor({.enabled = true, .cadence = 1});
   monitor.beginEpoch(0);
   monitor.setGlobalCandidates({{0U, 0}});
-  auto sample = monitor.capture(0U, 0, state, geometry, active,
+  auto sample = monitor.capture(0U, 0, state, geometry, malformed,
                                 h::HydroUpdateContext{}, h::HydroNumericsPolicy{},
                                 h::HydroReconstructionScheme::kPiecewiseLinear, {}, h::HydroRiemannSolverKind::kHllc, {}, h::HydroSourceContext{});
   assert(!sample && monitor.report().skipped_geometry == 1U);
+  // An 8-cell patch is now an admissible sample (no 15-cell interior rule).
+  const h::HydroActiveSetView active{.active_cells = cells, .active_faces = faces};
+  h::HydroShadowReference narrow({.enabled = true, .cadence = 1});
+  narrow.beginEpoch(0);
+  narrow.setGlobalCandidates({{0U, 0}});
+  auto narrow_sample = narrow.capture(0U, 0, state, geometry, active,
+                                      h::HydroUpdateContext{}, h::HydroNumericsPolicy{},
+                                      h::HydroReconstructionScheme::kPiecewiseLinear, {},
+                                      h::HydroRiemannSolverKind::kHllc, {}, h::HydroSourceContext{});
+  assert(narrow_sample);
+  assert(narrow.report().skipped_geometry == 0U && narrow.report().skipped_temporal_ghost == 0U);
   h::HydroShadowReference disabled({.enabled = false});
   disabled.beginEpoch(0);
   assert(!disabled.capture(0U, 0, state, geometry, active,

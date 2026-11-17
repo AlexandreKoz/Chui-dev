@@ -986,6 +986,17 @@ if(COSMOSIM_ENABLE_TESTS)
       test_integration_reference_workflow_distributed_hydro_mpi
       tests/integration/test_reference_workflow_distributed_hydro_mpi.cpp)
     target_link_libraries(test_integration_reference_workflow_distributed_hydro_mpi PRIVATE cosmosim_all)
+    # C04 MPI shadow fixture (source only): 2- and 4-rank decompositions.
+    add_executable(test_integration_hydro_shadow_c04_mpi tests/integration/test_hydro_shadow_c04_mpi.cpp)
+    target_link_libraries(test_integration_hydro_shadow_c04_mpi PRIVATE cosmosim_all)
+    add_test(
+      NAME integration_hydro_shadow_c04_mpi_two_rank
+      COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 2 ${MPIEXEC_PREFLAGS}
+              $<TARGET_FILE:test_integration_hydro_shadow_c04_mpi> ${MPIEXEC_POSTFLAGS})
+    add_test(
+      NAME integration_hydro_shadow_c04_mpi_four_rank
+      COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 4 ${MPIEXEC_PREFLAGS}
+              $<TARGET_FILE:test_integration_hydro_shadow_c04_mpi> ${MPIEXEC_POSTFLAGS})
     add_test(
       NAME integration_reference_workflow_distributed_hydro_mpi_two_rank
       COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 2 ${MPIEXEC_PREFLAGS}
@@ -1259,6 +1270,12 @@ if(COSMOSIM_ENABLE_TESTS)
   add_executable(test_integration_star_formation_box tests/integration/test_star_formation_box.cpp)
   target_link_libraries(test_integration_star_formation_box PRIVATE cosmosim_all)
   add_test(NAME integration_star_formation_box COMMAND test_integration_star_formation_box)
+
+  # C04-02: real T01 Strang workflow with the hydro shadow chronology observer.
+  add_executable(test_integration_hydro_shadow_c04_workflow_strang tests/integration/test_hydro_shadow_c04_workflow_strang.cpp)
+  target_link_libraries(test_integration_hydro_shadow_c04_workflow_strang PRIVATE cosmosim_all)
+  add_test(NAME integration_hydro_shadow_c04_workflow_strang COMMAND test_integration_hydro_shadow_c04_workflow_strang)
+  set_tests_properties(integration_hydro_shadow_c04_workflow_strang PROPERTIES RUN_SERIAL TRUE)
 
   add_executable(test_integration_star_formation_source_runtime tests/integration/test_star_formation_source_runtime.cpp)
   target_link_libraries(test_integration_star_formation_source_runtime PRIVATE cosmosim_all)
@@ -1561,6 +1578,15 @@ if(COSMOSIM_ENABLE_TESTS)
   target_link_libraries(test_unit_hydro_shadow_c04_coupled PRIVATE cosmosim_hydro cosmosim_physics cosmosim_core)
   add_test(NAME unit_hydro_shadow_c04_coupled COMMAND test_unit_hydro_shadow_c04_coupled)
 
+  # C04 rev-6 source fixtures (written, not run in the source handoff).
+  add_executable(test_unit_hydro_shadow_c04_identity tests/unit/test_hydro_shadow_c04_identity.cpp)
+  target_link_libraries(test_unit_hydro_shadow_c04_identity PRIVATE cosmosim_hydro cosmosim_core)
+  add_test(NAME unit_hydro_shadow_c04_identity COMMAND test_unit_hydro_shadow_c04_identity)
+
+  add_executable(test_unit_hydro_shadow_c04_chronology tests/unit/test_hydro_shadow_c04_chronology.cpp)
+  target_link_libraries(test_unit_hydro_shadow_c04_chronology PRIVATE cosmosim_hydro cosmosim_physics cosmosim_core)
+  add_test(NAME unit_hydro_shadow_c04_chronology COMMAND test_unit_hydro_shadow_c04_chronology)
+
   add_executable(test_unit_hydro_core_solver tests/unit/test_hydro_core_solver.cpp)
   target_link_libraries(test_unit_hydro_core_solver PRIVATE cosmosim_hydro)
   add_test(NAME unit_hydro_core_solver COMMAND test_unit_hydro_core_solver)
@@ -1605,6 +1631,12 @@ if(COSMOSIM_ENABLE_TESTS)
   target_link_libraries(test_integration_amr_reflux_conservation PRIVATE cosmosim_amr cosmosim_hydro cosmosim_core)
   add_test(NAME integration_amr_reflux_conservation COMMAND test_integration_amr_reflux_conservation)
   cosmosim_mark_runtime_truth_test(integration_amr_reflux_conservation amr hydro gas integration)
+  # C04-03/05/06: production 8^3 AMR shadow (coarse/fine, diagonal, partial
+  # activity, recursive clock, refusal, rejected attempt). Source fixture.
+  add_executable(test_integration_amr_hydro_shadow_c04_production tests/integration/test_amr_hydro_shadow_c04_production.cpp)
+  target_link_libraries(test_integration_amr_hydro_shadow_c04_production PRIVATE cosmosim_amr cosmosim_hydro cosmosim_core)
+  add_test(NAME integration_amr_hydro_shadow_c04_production COMMAND test_integration_amr_hydro_shadow_c04_production)
+  cosmosim_mark_runtime_truth_test(integration_amr_hydro_shadow_c04_production amr hydro gas integration)
   add_executable(test_integration_amr_production_hydro_integration tests/integration/test_amr_production_hydro_integration.cpp)
   target_link_libraries(test_integration_amr_production_hydro_integration PRIVATE cosmosim_amr cosmosim_hydro cosmosim_core)
   add_test(NAME integration_amr_production_hydro_integration COMMAND test_integration_amr_production_hydro_integration)

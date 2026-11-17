@@ -15,6 +15,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
@@ -44,6 +45,7 @@
 #include "cosmosim/hydro/hydro_reconstruction.hpp"
 #include "cosmosim/hydro/hydro_riemann.hpp"
 #include "cosmosim/hydro/hydro_shadow_reference.hpp"
+#include "cosmosim/workflows/hydro_shadow_chronology.hpp"
 #include "cosmosim/workflows/runtime_services.hpp"
 #include "cosmosim/workflows/source_runtime.hpp"
 #include "workflows/internal/runtime_stage_resource_access.hpp"
@@ -766,7 +768,7 @@ class RecursiveAmrLevelSourceAdapter final : public amr::RecursiveAmrLevelSource
   core::StepContext& m_step;
 };
 
-class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
+class HydroAmrRuntimeImpl final : public HydroAmrRuntime, public HydroShadowChronologyObserver {
  public:
   HydroAmrRuntimeImpl(
       const core::SimulationConfig& config,
@@ -998,8 +1000,15 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
   void bindSourceRuntime(SourceRuntime* source_runtime) noexcept override {
     if (m_source_runtime != nullptr && m_source_runtime != source_runtime) {
       m_source_runtime->setAmrLevelSourceCouplingEnabled(false);
+      m_source_runtime->setHydroShadowChronologyObserver(nullptr);
     }
     m_source_runtime = source_runtime;
+    // C04-02: the source owner reports the sampled-region chronology
+    // boundaries (and lends its private smooth replay) only when the
+    // optional diagnostic is enabled; otherwise it never calls back.
+    if (m_source_runtime != nullptr && m_config.numerics.hydro_shadow_enabled) {
+      m_source_runtime->setHydroShadowChronologyObserver(this);
+    }
     // T02 composition contract: under recursive subcycling the AMR level
     // clocks own the smooth baryonic halves. The same predicate installs the
     // RecursiveAmrLevelSourceAdapter in runProductionAmrHydroPath(), so the
@@ -1063,8 +1072,14 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
     const bool all_ranks_have_hydro_cells =
         !m_mpi_context.isEnabled() ||
         hydro_cell_rank_count == static_cast<std::uint64_t>(m_mpi_context.worldSize());
-    m_shadow.beginEpoch(context.integrator_state.step_index);
-    prepareGlobalHydroShadowSelection(context, production_amr_rank_count > 0U);
+    // C04: one sampling epoch per accepted-step ATTEMPT. With a bound source
+    // owner the attempt (selection + chronology records) was opened at the
+    // Strang pre-half boundary of this step; otherwise it opens here.
+    if (m_config.numerics.hydro_shadow_enabled) {
+      const bool opened_by_source = m_shadow_attempt_open && m_shadow_attempt_from_source &&
+          m_shadow_epoch_step == context.integrator_state.step_index;
+      if (!opened_by_source) beginHydroShadowAttempt(context, false, false);
+    }
     m_last_hydro_profile = {};
     m_last_amr_hydro_diagnostics = {};
     m_last_floor_diagnostics = auditConfiguredHydroFloors(context.state);
@@ -1083,7 +1098,7 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
       // mutations without an O(N) source fingerprint.
       context.state.bumpGravitySourceGeneration();
       recordHydroFloorDiagnostics(context);
-      publishHydroShadow(context);
+      finishHydroStageShadow();
       return;
     }
     if (context.state.cells.size() == 0U) {
@@ -1091,7 +1106,7 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
       if (hydro_cell_rank_count > 0U) {
         context.state.bumpGravitySourceGeneration();
       }
-      publishHydroShadow(context);
+      finishHydroStageShadow();
       return;
     }
 
@@ -1298,11 +1313,38 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
         .pressure_floor = std::max(m_config.numerics.hydro_pressure_floor_code, 1.0e-30),
         .enable_muscl_hancock_predictor = true,
         .adiabatic_index = k_gamma_adiabatic};
-    auto shadow_sample = m_shadow.capture(
-        0U, 0, m_conserved, m_geometry, active_view, update,
-        m_solver.numericsPolicy(), hydroReconstructionSchemeFromConfig(m_config),
-        production_reconstruction_policy, hydroRiemannSolverKindFromConfig(m_config),
-        sources, source_context);
+    // C04: the fixed grid is one private sample domain (the local grid with
+    // its self-contained physical/periodic shell) compared on the globally
+    // selected physical tiles only. Region identity = global lattice tile.
+    hydro::HydroShadowReference::Sample shadow_sample;
+    if (m_config.numerics.hydro_shadow_enabled) {
+      hydro::HydroShadowPatchCapture shadow_spec;
+      shadow_spec.identity = m_shadow_fixed_domain;
+      shadow_spec.regions = m_shadow_fixed_regions;
+      shadow_spec.before = &m_conserved;
+      shadow_spec.geometry = &m_geometry;
+      shadow_spec.active = active_view;
+      shadow_spec.update = update;
+      shadow_spec.production_numerics = m_solver.numericsPolicy();
+      shadow_spec.production_reconstruction = hydroReconstructionSchemeFromConfig(m_config);
+      shadow_spec.production_policy = production_reconstruction_policy;
+      shadow_spec.production_riemann = hydroRiemannSolverKindFromConfig(m_config);
+      shadow_spec.source_terms = sources;
+      shadow_spec.source_context = &source_context;
+      shadow_spec.endpoint_ghosts_will_be_provided = false;
+      shadow_spec.temperature_k_per_internal_energy_code = m_temperature_k_per_internal_energy_code;
+      shadow_spec.density_cgs_per_code = m_units.densityCodeToCgs(1.0);
+      shadow_spec.comoving_density = update.comoving_coordinates;
+      shadow_spec.cosmology = context.cosmology_background;
+      shadow_spec.time_si_per_code = context.timeline_step.time_si_per_code;
+      shadow_spec.retain_for_chronology =
+          m_shadow.chronologyOpen(hydro::hydroShadowEffectiveKey(m_shadow_fixed_domain));
+      if (composition_flux != nullptr) {
+        shadow_spec.composition = &context.state.gas_composition;
+        shadow_spec.composition_real_rows = m_dense_row_by_geometry_row;
+      }
+      shadow_sample = m_shadow.capture(shadow_spec);
+    }
     std::string source_retry_failure;
     try {
       m_solver.advancePatchActiveSetBatchedWithScratch(
@@ -1325,9 +1367,10 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
       composition_flux->endAdvance();
     }
     if (source_retry_failure.empty() && shadow_sample) {
-      m_shadow.compare(std::move(shadow_sample), m_conserved, m_geometry,
-                       active_view, update, m_solver.numericsPolicy(),
-                       hydroReconstructionSchemeFromConfig(m_config));
+      // Fixed-grid ghosts are self-contained (physical/periodic) or imported
+      // validation ghosts without endpoint authority: compare immediately.
+      m_shadow.observeProduction(std::move(shadow_sample), m_conserved);
+      m_shadow.finalizePendingEndpoints();
     }
     if (context.profiler_session != nullptr) {
       const hydro::HydroConservationReport& conservation = m_last_hydro_profile.conservation;
@@ -1570,14 +1613,243 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
     persistEffectiveIsmDiagnostics(context.state);
     context.state.bumpGravitySourceGeneration();
     recordHydroFloorDiagnostics(context);
-    publishHydroShadow(context);
+    // C04: post-hydro production endpoint of the sampled domain (after the
+    // composition commit; the fixed grid has no regrid in this stage).
+    recordShadowChronologyPoint(context, hydro::HydroShadowChronologyPoint::kPostHalfBegin);
+    finishHydroStageShadow();
+  }
+
+  // C04-02: chronology observer (called by the source owner on every rank in
+  // the same order). Only read-only snapshots, rank-uniform selection and
+  // publication collectives; local failures are contained and counted.
+  void onSourceShadowBoundary(
+      core::StepContext& context, core::SourceSplitPhase phase,
+      HydroShadowSourceBoundary boundary, bool recursive_level_sources,
+      const hydro::HydroShadowSmoothSourceReplay* replay) override {
+    if (!m_config.numerics.hydro_shadow_enabled) return;
+    using B = HydroShadowSourceBoundary;
+    using P = hydro::HydroShadowChronologyPoint;
+    if (phase == core::SourceSplitPhase::kStrangPreHalf && boundary == B::kHalfBegin) {
+      beginHydroShadowAttempt(context, true, recursive_level_sources);
+      recordShadowChronologyPoint(context, P::kPreHalfBegin);
+      return;
+    }
+    if (!m_shadow_attempt_open || m_shadow_epoch_step != context.integrator_state.step_index) return;
+    if (phase == core::SourceSplitPhase::kStrangPreHalf) {
+      if (boundary == B::kAfterTransport) recordShadowChronologyPoint(context, P::kPreHalfAfterTransport);
+      if (boundary == B::kHalfEnd) recordShadowChronologyPoint(context, P::kPreHalfEnd);
+      return;
+    }
+    if (phase == core::SourceSplitPhase::kStrangPostHalf) {
+      if (boundary == B::kAfterThermochemistry) {
+        recordShadowChronologyPoint(context, P::kPostHalfAfterThermochemistry);
+      } else if (boundary == B::kAfterTransport) {
+        recordShadowChronologyPoint(context, P::kPostHalfAfterTransport);
+      } else if (boundary == B::kHalfEnd) {
+        recordShadowChronologyPoint(context, P::kPostHalfEnd);
+        m_shadow.finalizeChronologies(replay);
+        closeHydroShadowAttempt();
+      }
+      return;
+    }
+    // Unsplit compatibility dispatch (after hydro): no Strang chronology.
+    if (boundary == B::kHalfEnd) {
+      m_shadow.finalizeChronologies(nullptr);
+      closeHydroShadowAttempt();
+    }
+  }
+
+  // C04-02 recursive AMR: level-clock chronology. The first level-L window
+  // of the epoch (pre half S_L, sweep H_L, post half S_L) of every locally
+  // owned selected level-L domain is recorded and replayed with the
+  // level-interval replay. Local work only (this hook is not rank-uniform
+  // per domain); records are bounded by the global K.
+  void onLevelSourceShadowBoundary(
+      core::StepContext& level_context, int level, core::SourceSplitPhase phase,
+      HydroShadowSourceBoundary boundary, const hydro::HydroShadowSmoothSourceReplay* replay) override {
+    if (!m_config.numerics.hydro_shadow_enabled || !m_shadow_attempt_open ||
+        m_shadow_epoch_step != level_context.integrator_state.step_index || !m_shadow.cadenceStep()) {
+      return;
+    }
+    using B = HydroShadowSourceBoundary;
+    using P = hydro::HydroShadowChronologyPoint;
+    if (phase == core::SourceSplitPhase::kStrangPreHalf && boundary == B::kHalfBegin) {
+      openLevelShadowChronologies(level_context, level);
+      recordShadowChronologyPoint(level_context, P::kPreHalfBegin, level);
+      return;
+    }
+    if (phase == core::SourceSplitPhase::kStrangPreHalf) {
+      if (boundary == B::kAfterTransport) recordShadowChronologyPoint(level_context, P::kPreHalfAfterTransport, level);
+      if (boundary == B::kHalfEnd) recordShadowChronologyPoint(level_context, P::kPreHalfEnd, level);
+      return;
+    }
+    if (boundary == B::kAfterThermochemistry) {
+      recordShadowChronologyPoint(level_context, P::kPostHalfAfterThermochemistry, level);
+    } else if (boundary == B::kAfterTransport) {
+      recordShadowChronologyPoint(level_context, P::kPostHalfAfterTransport, level);
+    } else if (boundary == B::kHalfEnd) {
+      // No discrete events inside a level window: W = post-transport state.
+      recordShadowChronologyPoint(level_context, P::kPostHalfEnd, level);
+      m_shadow.finalizeChronologies(replay, level);
+    }
   }
 
  private:
-  // Deterministic global top-K without an all-patch gather. Each rank keeps
-  // only its top K physical patch IDs; the union contains the true global
-  // top K. Collective preparation failures disable the optional diagnostic
-  // uniformly, before the bounded allgather. Never call this inside a patch.
+  // ---------------------------------------------------------------------
+  // C04 sampling epoch / accepted-step lifecycle.
+  //
+  // One epoch per step ATTEMPT. The previous epoch is published at the start
+  // of the next attempt only when continuity proves it was accepted (the new
+  // attempt begins at the previous attempt's interval end with a later step
+  // index); a rejected/retried attempt is discarded. Publication is thus at a
+  // legal acceptance barrier, never inside a stage that may still roll back.
+  // Every decision below depends only on rank-uniform quantities.
+  // ---------------------------------------------------------------------
+  void beginHydroShadowAttempt(core::StepContext& context, bool from_source_pre_half,
+                               bool recursive_level_sources) {
+    publishOrDiscardCompletedShadowEpoch(context);
+    m_shadow.beginEpoch(context.integrator_state.step_index);
+    m_shadow_attempt_open = true;
+    m_shadow_attempt_from_source = from_source_pre_half;
+    m_shadow_epoch_step = context.integrator_state.step_index;
+    m_shadow_epoch_time_begin = context.timeline_step.time_begin_code;
+    m_shadow_epoch_time_end = context.timeline_step.time_end_code;
+    if (!(m_shadow_epoch_time_end > m_shadow_epoch_time_begin)) {
+      m_shadow_epoch_time_begin = context.integrator_state.current_time_code;
+      m_shadow_epoch_time_end = context.integrator_state.current_time_code + context.integrator_state.dt_time_code;
+    }
+    m_shadow_epoch_scale_factor = context.integrator_state.current_scale_factor;
+    m_shadow_fixed_regions.clear();
+    m_shadow_fixed_domain = {};
+    m_shadow_level_chronology_keys.clear();
+    if (!m_shadow.cadenceStep()) return;
+    const std::uint64_t local_amr = amr::hasProductionAmrHydroCoverage(context.state) ? 1U : 0U;
+    const bool use_amr = m_mpi_context.allreduceSumUint64(local_amr) > 0U;
+    prepareGlobalHydroShadowSelection(context, use_amr);
+    // Full-physics chronology needs the global Strang halves (pre-half
+    // boundaries observed here). Recursive level-owned smooth sources and
+    // the unsplit compatibility dispatch are refused with counted reasons.
+    const bool chronology_supported = from_source_pre_half && !recursive_level_sources;
+    openLocalShadowChronologies(context, use_amr, chronology_supported, from_source_pre_half,
+                                recursive_level_sources);
+  }
+
+  void closeHydroShadowAttempt() noexcept {
+    if (!m_shadow_attempt_open) return;
+    m_shadow.finalizePendingEndpoints();
+    m_shadow_attempt_open = false;
+    m_shadow_epoch_pending_publication = true;
+  }
+
+  // Hydro stage end: without a source owner the hydro stage closes the
+  // attempt; otherwise the post half does after the discrete events.
+  void finishHydroStageShadow() noexcept {
+    if (!m_config.numerics.hydro_shadow_enabled) return;
+    m_shadow.finalizePendingEndpoints();
+    if (!m_shadow_attempt_from_source) closeHydroShadowAttempt();
+  }
+
+  void publishOrDiscardCompletedShadowEpoch(const core::StepContext& context) {
+    if (!m_shadow_epoch_pending_publication) {
+      // An attempt that never closed (rejected before its end) is dropped
+      // with its pending samples by beginEpoch(); nothing is published.
+      return;
+    }
+    m_shadow_epoch_pending_publication = false;
+    double now_begin = context.timeline_step.time_begin_code;
+    if (!(context.timeline_step.time_end_code > now_begin)) now_begin = context.integrator_state.current_time_code;
+    const double tolerance = 1.0e-9 * std::max({1.0, std::abs(now_begin), std::abs(m_shadow_epoch_time_end)});
+    const bool accepted = context.integrator_state.step_index != m_shadow_epoch_step &&
+        std::abs(now_begin - m_shadow_epoch_time_end) <= tolerance;
+    if (accepted) publishHydroShadow(context);
+  }
+
+  // Physical identities of the locally owned sample domains.
+  struct LocalShadowDomain {
+    hydro::HydroShadowCandidate identity{};
+    std::size_t patch_index = 0U;
+    bool fixed_grid = false;
+  };
+
+  [[nodiscard]] std::vector<LocalShadowDomain> localShadowAmrDomains(const core::SimulationState& state) const {
+    std::vector<LocalShadowDomain> domains;
+    const auto& patches = state.patches;
+    for (std::size_t i = 0U; i < patches.size(); ++i) {
+      if (patches.cell_count[i] == 0U || patches.level[i] < 0 ||
+          static_cast<int>(patches.owning_rank[i]) != m_mpi_context.worldRank()) {
+        continue;
+      }
+      const amr::PatchDescriptor descriptor = amr::patchDescriptorFromStateRow(state, i);
+      const std::uint64_t key = amr::hydroShadowRegionKeyForPatch(descriptor);
+      if (key == 0U) continue;
+      domains.push_back(LocalShadowDomain{
+          .identity = hydro::HydroShadowCandidate{.patch_id = descriptor.patch_id,
+                                                  .level = static_cast<int>(descriptor.level),
+                                                  .region_key = key},
+          .patch_index = i,
+          .fixed_grid = false});
+    }
+    return domains;
+  }
+
+  // Fixed-grid physical tiles of k_hydro_shadow_fixed_grid_region_extent
+  // cells on the GLOBAL lattice (clipped at the grid edge). Production
+  // fixed-grid hydro is single-rank; on several ranks the fixed grid is a
+  // validation-only path and contributes no candidate (counted).
+  struct FixedShadowTile {
+    hydro::HydroShadowCandidate identity{};
+    std::array<std::size_t, 3> lo{};
+    std::array<std::uint32_t, 3> size{};
+  };
+
+  void buildFixedGridShadowRegions(const core::StepContext& context,
+                                   std::vector<hydro::HydroShadowCandidate>& tiles) {
+    m_shadow_fixed_tiles.clear();
+    rebuildGeometryIfNeeded(context.state, context.integrator_state.dt_time_code);
+    const hydro::HydroPatchGeometry& geometry = m_geometry;
+    if (geometry.cellCount() == 0U) return;
+    const std::array<double, 3> widths{geometry.cell_width_x_comoving, geometry.cell_width_y_comoving,
+                                       geometry.cell_width_z_comoving};
+    const std::array<double, 3> origin{geometry.origin_x_comoving, geometry.origin_y_comoving,
+                                       geometry.origin_z_comoving};
+    const std::array<std::size_t, 3> dims{geometry.nx, geometry.ny, geometry.nz};
+    std::array<std::int64_t, 3> base{};
+    for (std::size_t axis = 0; axis < 3U; ++axis) {
+      if (!(widths[axis] > 0.0)) return;
+      base[axis] = static_cast<std::int64_t>(std::nearbyint(origin[axis] / widths[axis]));
+    }
+    const std::size_t extent = hydro::k_hydro_shadow_fixed_grid_region_extent;
+    m_shadow_fixed_domain = hydro::HydroShadowCandidate{
+        .patch_id = 0U, .level = 0,
+        .region_key = hydro::hydroShadowPhysicalRegionKey(
+            0, base, {static_cast<std::uint32_t>(dims[0]), static_cast<std::uint32_t>(dims[1]),
+                      static_cast<std::uint32_t>(dims[2])})};
+    for (std::size_t tk = 0; tk < dims[2]; tk += (dims[2] > 1U ? extent : 1U)) {
+      for (std::size_t tj = 0; tj < dims[1]; tj += (dims[1] > 1U ? extent : 1U)) {
+        for (std::size_t ti = 0; ti < dims[0]; ti += (dims[0] > 1U ? extent : 1U)) {
+          const std::array<std::size_t, 3> lo{ti, tj, tk};
+          std::array<std::uint32_t, 3> size{};
+          std::array<std::int64_t, 3> lattice{};
+          for (std::size_t axis = 0; axis < 3U; ++axis) {
+            const std::size_t width = dims[axis] > 1U ? std::min(extent, dims[axis] - lo[axis]) : 1U;
+            size[axis] = static_cast<std::uint32_t>(width);
+            lattice[axis] = base[axis] + static_cast<std::int64_t>(lo[axis]);
+          }
+          tiles.push_back(hydro::HydroShadowCandidate{
+              .patch_id = 0U, .level = 0, .region_key = hydro::hydroShadowPhysicalRegionKey(0, lattice, size)});
+          // Compact tile descriptor only; cell lists are built after the
+          // global selection for the (at most K) selected tiles.
+          m_shadow_fixed_tiles.push_back(FixedShadowTile{.identity = tiles.back(), .lo = lo, .size = size});
+        }
+      }
+    }
+  }
+
+  // Deterministic global top-K over PHYSICAL region keys without an
+  // all-patch gather. Each rank keeps only its top K local keys; the union
+  // contains the true global top K. Collective preparation failures disable
+  // the optional diagnostic uniformly, before the bounded allgather. Ranks
+  // without cells still enter every collective. Never call this in a patch.
   void prepareGlobalHydroShadowSelection(const core::StepContext& context, bool use_amr) {
     if (!m_config.numerics.hydro_shadow_enabled) return;
     const std::size_t k = m_shadow.options().max_patches_per_rank;
@@ -1587,6 +1859,7 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
     std::vector<std::uint8_t> wire;
     core::MemoryReservation admission;
     bool local_refusal = false;
+    std::uint64_t split_regions = 0U;
     try {
       // Include the process's local maximum plus the allgathered wire and
       // global ranking. Bounded by K, rank count, and checked byte arithmetic.
@@ -1613,7 +1886,8 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
       local.reserve(k);
       const auto admit_candidate = [&](Candidate candidate) {
         if (std::any_of(local.begin(), local.end(), [&](const auto& other) {
-              return other.patch_id == candidate.patch_id && other.level == candidate.level;
+              return hydro::hydroShadowEffectiveKey(other) == hydro::hydroShadowEffectiveKey(candidate) &&
+                  other.level == candidate.level;
             })) return;
         if (local.size() < k) {
           local.push_back(candidate);
@@ -1628,17 +1902,22 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
                                            m_shadow.options().seed)) *worst = candidate;
       };
       if (use_amr) {
-        const auto& patches = context.state.patches;
-        for (std::size_t i = 0U; i < patches.size(); ++i) {
-          if (patches.cell_count[i] != 0U && patches.level[i] >= 0 &&
-              patches.owning_rank[i] == m_mpi_context.worldRank()) {
-            admit_candidate(Candidate{patches.patch_id[i], patches.level[i]});
-          }
+        // Each AMR patch has exactly one owner rank, so each physical region
+        // is submitted by exactly one rank whatever the decomposition.
+        for (const LocalShadowDomain& domain : localShadowAmrDomains(context.state)) {
+          admit_candidate(domain.identity);
         }
       } else if (context.state.cells.size() != 0U) {
-        // The fixed-grid adapter's region ID is 0. Its cross-rank layout
-        // independence is not guaranteed (see C04 documentation).
-        admit_candidate(Candidate{0U, 0});
+        if (m_mpi_context.isEnabled() && m_mpi_context.worldSize() > 1) {
+          // Validation-only multi-rank fixed grid: tile ownership across
+          // ranks is not a production contract; no duplicated rank-local
+          // candidate is ever submitted.
+          split_regions = 1U;
+        } else {
+          std::vector<Candidate> tiles;
+          buildFixedGridShadowRegions(context, tiles);
+          for (const Candidate& tile : tiles) admit_candidate(tile);
+        }
       }
       local = hydro::rankHydroShadowCandidates(local, k,
                  context.integrator_state.step_index, m_shadow.options().seed);
@@ -1649,15 +1928,17 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
         }
       };
       for (const auto& candidate : local) {
-        append_u64(candidate.patch_id);
+        append_u64(hydro::hydroShadowEffectiveKey(candidate));
         append_u64(static_cast<std::uint64_t>(static_cast<std::int64_t>(candidate.level)));
       }
     } catch (const std::exception&) {
       local_refusal = true;
     }
+    m_shadow.noteRegionSplitAcrossRanks(split_regions);
     // All ranks execute this vote even if they contain no gas or patches.
     if (m_mpi_context.allreduceMaxUint64(local_refusal ? 1U : 0U) != 0U) {
       m_shadow.noteGlobalSelectionResourceRefusal();
+      m_shadow_fixed_regions.clear();
       return;
     }
     const auto global_wire = m_mpi_context.allgatherBytesBounded(wire);
@@ -1674,12 +1955,12 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
         return value;
       };
       for (std::size_t offset = 0; offset < global_wire.size(); offset += 16U) {
-        const std::uint64_t id = read_u64(offset);
+        const std::uint64_t key = read_u64(offset);
         const std::int64_t level = static_cast<std::int64_t>(read_u64(offset + 8U));
-        if (level < 0 || level > std::numeric_limits<int>::max()) {
-          throw std::runtime_error("invalid shadow physical level in candidate wire");
+        if (key == 0U || level < 0 || level > std::numeric_limits<int>::max()) {
+          throw std::runtime_error("invalid shadow physical identity in candidate wire");
         }
-        global_candidates.push_back(Candidate{id, static_cast<int>(level)});
+        global_candidates.push_back(Candidate{.patch_id = 0U, .level = static_cast<int>(level), .region_key = key});
       }
       global_candidates = hydro::rankHydroShadowCandidates(global_candidates, k,
           context.integrator_state.step_index, m_shadow.options().seed);
@@ -1688,35 +1969,358 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
     }
     if (m_mpi_context.allreduceMaxUint64(local_refusal ? 1U : 0U) != 0U) {
       m_shadow.noteGlobalSelectionResourceRefusal();
+      m_shadow_fixed_regions.clear();
       return;
     }
     m_shadow.setGlobalCandidates(std::move(global_candidates));
+    // Comparison regions: only the selected fixed-grid tiles (<= K).
+    try {
+      for (const FixedShadowTile& tile : m_shadow_fixed_tiles) {
+        if (!m_shadow.isGloballySelected(tile.identity.region_key, tile.identity.level)) continue;
+        hydro::HydroShadowComparisonRegion region;
+        region.identity = tile.identity;
+        region.cells.reserve(static_cast<std::size_t>(tile.size[0]) * tile.size[1] * tile.size[2]);
+        for (std::size_t k = tile.lo[2]; k < tile.lo[2] + tile.size[2]; ++k) {
+          for (std::size_t j = tile.lo[1]; j < tile.lo[1] + tile.size[1]; ++j) {
+            for (std::size_t i = tile.lo[0]; i < tile.lo[0] + tile.size[0]; ++i) {
+              region.cells.push_back(m_geometry.linearCellIndex(i, j, k));
+            }
+          }
+        }
+        m_shadow_fixed_regions.push_back(std::move(region));
+      }
+    } catch (...) {
+      // Local only: the selected tiles of this rank are then not attempted
+      // (counted as selected-but-not-attempted in the published totals).
+      m_shadow_fixed_regions.clear();
+    }
+    m_shadow_fixed_tiles.clear();
+    m_shadow_fixed_tiles.shrink_to_fit();
   }
 
-  // Called at a legal, rank-uniform hydro stage completion point; there are
-  // no observer-side MPI operations in conditional patch loops. Diagnostic
-  // aggregates are ephemeral: an aborted stage never publishes them.
+  // Opens a chronology record for every locally owned selected domain.
+  void openLocalShadowChronologies(const core::StepContext& context, bool use_amr, bool supported,
+                                   bool from_source_pre_half, bool recursive_level_sources) {
+    if (m_shadow.globalCandidates().empty()) return;
+    // Recursive AMR: the level clocks own the smooth halves; their windows
+    // are opened by onLevelSourceShadowBoundary (first window per domain).
+    if (recursive_level_sources && from_source_pre_half) return;
+    std::vector<std::pair<hydro::HydroShadowCandidate, std::vector<std::uint64_t>>> domains;
+    try {
+      if (use_amr) {
+        for (const LocalShadowDomain& domain : localShadowAmrDomains(context.state)) {
+          if (!m_shadow.isGloballySelected(domain.identity.region_key, domain.identity.level)) continue;
+          if (!supported) {
+            domains.emplace_back(domain.identity, std::vector<std::uint64_t>{});
+            continue;
+          }
+          const amr::PatchDescriptor descriptor = amr::patchDescriptorFromStateRow(context.state, domain.patch_index);
+          const amr::AmrHydroPatchGeometry geometry = amr::buildAmrHydroPatchGeometry(context.state, descriptor);
+          std::vector<std::uint64_t> ids(geometry.geometry.cellCount(), 0U);
+          for (const amr::AmrHydroCellDescriptor& cell : geometry.real_cells) {
+            if (cell.patch_local_cell < ids.size()) ids[cell.patch_local_cell] = cell.gas_cell_id;
+          }
+          domains.emplace_back(domain.identity, std::move(ids));
+        }
+      } else if (!m_shadow_fixed_regions.empty() && !m_dense_row_by_geometry_row.empty()) {
+        std::vector<std::uint64_t> ids;
+        if (supported) {
+          ids.reserve(m_dense_row_by_geometry_row.size());
+          for (const std::uint32_t dense : m_dense_row_by_geometry_row) {
+            ids.push_back(dense < context.state.gas_cells.size() ? context.state.gas_cells.gas_cell_id[dense] : 0U);
+          }
+        }
+        domains.emplace_back(m_shadow_fixed_domain, std::move(ids));
+      }
+    } catch (const std::exception&) {
+      m_shadow.noteChronologyUnsupported(&hydro::HydroShadowReport::chronology_skipped_resource, 1U);
+      return;
+    }
+    if (!supported) {
+      auto reason = &hydro::HydroShadowReport::chronology_skipped_unsplit_compatibility;
+      if (recursive_level_sources) {
+        reason = &hydro::HydroShadowReport::chronology_skipped_recursive_level_sources;
+      } else if (m_source_runtime == nullptr || from_source_pre_half) {
+        // No smooth-source owner bound: hydro is the whole interval and
+        // there is no external Strang chronology to replay.
+        reason = &hydro::HydroShadowReport::chronology_skipped_no_replay_operator;
+      }
+      m_shadow.noteChronologyUnsupported(reason, domains.size());
+      return;
+    }
+    const std::size_t lanes = context.state.gas_composition.enabled()
+        ? context.state.gas_composition.laneCount() : 0U;
+    for (auto& [identity, ids] : domains) {
+      if (std::find(ids.begin(), ids.end(), 0U) != ids.end()) {
+        m_shadow.noteChronologyUnsupported(&hydro::HydroShadowReport::chronology_skipped_region_changed, 1U);
+        continue;
+      }
+      (void)m_shadow.openChronology(identity, ids, lanes);
+    }
+  }
+
+  void openLevelShadowChronologies(const core::StepContext& level_context, int level) noexcept {
+    try {
+      if (!amr::hasProductionAmrHydroCoverage(level_context.state)) return;
+      const std::size_t lanes = level_context.state.gas_composition.enabled()
+          ? level_context.state.gas_composition.laneCount() : 0U;
+      for (const LocalShadowDomain& domain : localShadowAmrDomains(level_context.state)) {
+        if (domain.identity.level != level ||
+            !m_shadow.isGloballySelected(domain.identity.region_key, domain.identity.level)) {
+          continue;
+        }
+        const std::uint64_t key = domain.identity.region_key;
+        if (std::find(m_shadow_level_chronology_keys.begin(), m_shadow_level_chronology_keys.end(), key) !=
+            m_shadow_level_chronology_keys.end()) {
+          continue;  // only the first level window of the epoch is sampled
+        }
+        m_shadow_level_chronology_keys.push_back(key);
+        const amr::PatchDescriptor descriptor =
+            amr::patchDescriptorFromStateRow(level_context.state, domain.patch_index);
+        const amr::AmrHydroPatchGeometry geometry = amr::buildAmrHydroPatchGeometry(level_context.state, descriptor);
+        std::vector<std::uint64_t> ids(geometry.geometry.cellCount(), 0U);
+        for (const amr::AmrHydroCellDescriptor& cell : geometry.real_cells) {
+          if (cell.patch_local_cell < ids.size()) ids[cell.patch_local_cell] = cell.gas_cell_id;
+        }
+        if (std::find(ids.begin(), ids.end(), 0U) != ids.end()) {
+          m_shadow.noteChronologyUnsupported(&hydro::HydroShadowReport::chronology_skipped_region_changed, 1U);
+          continue;
+        }
+        (void)m_shadow.openChronology(domain.identity, ids, lanes, true);
+      }
+    } catch (...) {
+      m_shadow.noteChronologyUnsupported(&hydro::HydroShadowReport::chronology_skipped_resource, 1U);
+    }
+  }
+
+  // Read-only production snapshot of a domain's gas cells (by stable id):
+  // (rho, momentum, e, Z, composition rows); E derived as rho (e + v^2/2),
+  // the same authority convention the hydro owner uses to rebuild E.
+  [[nodiscard]] std::optional<hydro::HydroShadowPrivateRegion> shadowSnapshot(
+      const core::SimulationState& state, std::span<const std::uint64_t> ids) const {
+    hydro::HydroShadowPrivateRegion region;
+    region.resize(ids.size());
+    const bool composition = state.gas_composition.enabled();
+    if (composition) region.composition = state.gas_composition.emptyLike(ids.size(), false);
+    for (std::size_t i = 0; i < ids.size(); ++i) {
+      const auto row = state.rowForGasCellId(ids[i]);
+      if (!row.has_value() || *row >= state.gas_cells.size() || *row >= state.cells.size()) return std::nullopt;
+      const std::uint32_t r = *row;
+      const double rho = state.gas_cells.density_code[r];
+      const double mass = state.cells.mass_code[r];
+      region.gas_cell_ids[i] = ids[i];
+      region.mass_density[i] = rho;
+      region.momentum_x[i] = rho * state.gas_cells.velocity_x_peculiar[r];
+      region.momentum_y[i] = rho * state.gas_cells.velocity_y_peculiar[r];
+      region.momentum_z[i] = rho * state.gas_cells.velocity_z_peculiar[r];
+      region.specific_internal_energy[i] = state.gas_cells.internal_energy_code[r];
+      region.metal_density[i] = mass > 0.0 ? rho * state.gas_cells.metal_mass_code[r] / mass : 0.0;
+      const double v2 = state.gas_cells.velocity_x_peculiar[r] * state.gas_cells.velocity_x_peculiar[r] +
+          state.gas_cells.velocity_y_peculiar[r] * state.gas_cells.velocity_y_peculiar[r] +
+          state.gas_cells.velocity_z_peculiar[r] * state.gas_cells.velocity_z_peculiar[r];
+      region.total_energy[i] = rho * (std::max(region.specific_internal_energy[i], 0.0) + 0.5 * v2);
+      if (mass > 0.0 && rho > 0.0 && region.cell_volume_comoving == 0.0) region.cell_volume_comoving = mass / rho;
+      if (composition) {
+        const std::vector<double> packed = state.gas_composition.packRow(r);
+        region.composition.unpackRow(i, packed, ids[i]);
+        region.composition.mean_molecular_weight[i] = state.gas_composition.mean_molecular_weight[r];
+      }
+    }
+    return region;
+  }
+
+  void recordShadowChronologyPoint(const core::StepContext& context, hydro::HydroShadowChronologyPoint point,
+                                   std::optional<int> level_filter = std::nullopt) noexcept {
+    if (!m_config.numerics.hydro_shadow_enabled || !m_shadow_attempt_open) return;
+    std::vector<hydro::HydroShadowCandidate> domains;
+    try {
+      domains = m_shadow.openChronologyDomains();
+    } catch (...) {
+      return;
+    }
+    // The post-hydro point also closes the hydro-only composition check of
+    // every retained sample with private composition (any stepping mode).
+    if (point == hydro::HydroShadowChronologyPoint::kPostHalfBegin && !level_filter.has_value()) {
+      std::vector<hydro::HydroShadowCandidate> composition_domains;
+      try {
+        composition_domains = m_shadow.compositionCheckDomains();
+      } catch (...) {
+        composition_domains.clear();
+      }
+      for (const hydro::HydroShadowCandidate& domain : composition_domains) {
+        const std::uint64_t key = hydro::hydroShadowEffectiveKey(domain);
+        try {
+          const auto snapshot = shadowSnapshot(context.state, m_shadow.sampleGasCellIds(key));
+          if (snapshot.has_value()) m_shadow.compareCompositionAfterCommit(key, *snapshot, m_shadow_epoch_time_end);
+        } catch (...) {
+          // Diagnostic only; the sample is simply not composition-checked.
+        }
+      }
+    }
+    for (const hydro::HydroShadowCandidate& domain : domains) {
+      if (level_filter.has_value() && domain.level != *level_filter) continue;
+      const std::uint64_t key = hydro::hydroShadowEffectiveKey(domain);
+      try {
+        const auto ids = m_shadow.chronologyGasCellIds(key);
+        auto snapshot = shadowSnapshot(context.state, ids);
+        if (!snapshot.has_value()) {
+          m_shadow.dropChronology(key, &hydro::HydroShadowReport::chronology_skipped_region_changed);
+          continue;
+        }
+        m_shadow.recordChronologyPoint(key, point, *snapshot);
+      } catch (...) {
+        m_shadow.dropChronology(key, &hydro::HydroShadowReport::chronology_skipped_resource);
+      }
+    }
+  }
+
+  // C04-03 synchronized stepping: one rank-uniform decision, one optional
+  // post-advance directed exchange (MPI), then the local endpoint fill.
+  void completeSynchronizedShadowEndpoints(core::StepContext& context,
+                                           const amr::ProductionAmrHydroOptions& amr_options,
+                                           double endpoint_time_code) {
+    if (!m_shadow.cadenceStep()) {
+      m_shadow.finalizePendingEndpoints();
+      return;
+    }
+    const std::uint64_t local_pending = m_shadow.pendingEndpointCount() != 0U ? 1U : 0U;
+    if (m_mpi_context.allreduceMaxUint64(local_pending) == 0U) {
+      m_shadow.finalizePendingEndpoints();
+      return;
+    }
+    std::optional<DirectedHydroGhostExchange> exchange;
+    if (m_mpi_context.isEnabled() && m_mpi_context.worldSize() > 1) {
+      try {
+        // Current (post-advance, post-reflux) boundary states of every
+        // neighbour, bounded by the same directed protocol as the production
+        // ghost exchange. Its preparation is voted collectively, so a refusal
+        // is caught uniformly and only withholds the optional endpoint.
+        exchange.emplace(exchangeDirectedHydroGhosts(
+            context, amr_options, {}, context.integrator_state.step_index ^ 0x4330345348ULL));
+      } catch (...) {
+        exchange.reset();
+      }
+    }
+    const std::span<const amr::DistributedAmrRemotePatch> remote = exchange.has_value()
+        ? std::span<const amr::DistributedAmrRemotePatch>(exchange->remote_patches)
+        : std::span<const amr::DistributedAmrRemotePatch>{};
+    (void)amr::completeHydroShadowEndpointGhosts(context.state, amr_options, remote, endpoint_time_code, false);
+    m_shadow.finalizePendingEndpoints();
+  }
+
+  // Called only at the acceptance barrier of the epoch (start of the next
+  // attempt). Integer counters are exact sums; the floating metrics are
+  // reduced from the per-region results gathered and sorted by physical key,
+  // so the published values do not depend on rank order or decomposition.
   void publishHydroShadow(const core::StepContext& context) {
     if (!m_config.numerics.hydro_shadow_enabled) return;
     const auto& local = m_shadow.report();
     const auto sum_u64 = [&](std::uint64_t value) { return m_mpi_context.allreduceSumUint64(value); };
-    const auto sum_double = [&](double value) { return m_mpi_context.allreduceSumDouble(value); };
     const auto max_double = [&](double value) {
       return -m_mpi_context.allreduceMinDouble(-value);
     };
+    // Deterministic region reduction (bounded by the global K: at most
+    // three result records per selected region).
+    std::vector<hydro::HydroShadowRegionResult> regions;
+    bool region_failure = false;
+    {
+      // Admission for the local wire and the gathered records: at most three
+      // records per globally selected region (hydro-only, composition,
+      // chronology), so the gather is bounded by the global K.
+      core::MemoryReservation gather_admission;
+      std::vector<std::uint8_t> wire;
+      try {
+        const std::uint64_t bound = core::checkedMemoryBytesAdd(
+            static_cast<std::uint64_t>(core::checkedSizeMultiply(
+                core::checkedSizeMultiply(m_shadow.globalCandidates().size() + 1U, 3U,
+                                          "shadow region record bound"),
+                hydro::k_hydro_shadow_region_result_wire_bytes * 3U, "shadow region gather bytes")),
+            static_cast<std::uint64_t>(core::checkedSizeMultiply(
+                m_shadow.regionResults().size(), hydro::k_hydro_shadow_region_result_wire_bytes,
+                "shadow region local wire bytes")),
+            "shadow region publication coexistence");
+        if (m_shadow.regionResults().size() > 3U * (m_shadow.globalCandidates().size() + 1U)) {
+          throw std::length_error("shadow region results exceed the global-K publication bound");
+        }
+        if (m_memory_governor != nullptr) {
+          gather_admission = m_memory_governor->reserve(core::MemoryClass::kDiagnostic, bound,
+                                                        "hydro.shadow_reference.region_publication");
+          gather_admission.commit();
+        }
+        wire.reserve(m_shadow.regionResults().size() * hydro::k_hydro_shadow_region_result_wire_bytes);
+        for (const auto& result : m_shadow.regionResults()) hydro::appendHydroShadowRegionResultWire(result, wire);
+      } catch (...) {
+        wire.clear();
+        region_failure = true;
+      }
+      if (m_mpi_context.allreduceMaxUint64(region_failure ? 1U : 0U) != 0U) wire.clear();
+      const auto gathered = m_mpi_context.allgatherBytesBounded(wire);
+      try {
+        const std::size_t width = hydro::k_hydro_shadow_region_result_wire_bytes;
+        for (std::size_t offset = 0; offset + width <= gathered.size(); offset += width) {
+          regions.push_back(hydro::readHydroShadowRegionResultWire(
+              std::span<const std::uint8_t>(gathered.data() + offset, width)));
+        }
+        std::stable_sort(regions.begin(), regions.end(), [](const auto& a, const auto& b) {
+          return std::tuple{a.region_key, a.level, static_cast<int>(a.comparison_class), a.compared_cells,
+                            a.compared_composition_cells} <
+                 std::tuple{b.region_key, b.level, static_cast<int>(b.comparison_class), b.compared_cells,
+                            b.compared_composition_cells};
+        });
+      } catch (...) {
+        regions.clear();
+      }
+    }
+    std::array<hydro::HydroShadowMetric, 7> components{};
+    hydro::HydroShadowMetric composition_metric{};
+    std::array<double, 6> reference_delta{};
+    std::array<double, 6> production_delta{};
+    double compared_volume = 0.0;
+    std::uint64_t unique_regions = 0U;
+    std::array<std::uint64_t, hydro::k_hydro_shadow_comparison_class_count> region_records_by_class{};
+    std::uint64_t previous_key = 0U;
+    for (const auto& result : regions) {
+      if (result.region_key != previous_key) ++unique_regions;
+      previous_key = result.region_key;
+      ++region_records_by_class[static_cast<std::size_t>(result.comparison_class)];
+      for (std::size_t k = 0; k < 7U; ++k) {
+        components[k].weighted_abs_difference += result.components[k].weighted_abs_difference;
+        components[k].weighted_reference_magnitude += result.components[k].weighted_reference_magnitude;
+        components[k].linf_difference = std::max(components[k].linf_difference, result.components[k].linf_difference);
+      }
+      composition_metric.weighted_abs_difference += result.composition.weighted_abs_difference;
+      composition_metric.weighted_reference_magnitude += result.composition.weighted_reference_magnitude;
+      composition_metric.linf_difference = std::max(composition_metric.linf_difference,
+                                                    result.composition.linf_difference);
+      for (std::size_t k = 0; k < 6U; ++k) {
+        reference_delta[k] += result.reference_delta[k];
+        production_delta[k] += result.production_delta[k];
+      }
+      compared_volume += result.compared_volume;
+    }
     const std::uint64_t completed = sum_u64(local.completed);
     const std::uint64_t compared_cells = sum_u64(local.compared_cells);
     const std::uint64_t auxiliary_cells = sum_u64(local.compared_auxiliary_cells);
-    const double compared_volume = sum_double(local.compared_volume);
     std::unordered_map<std::string, std::string> payload{
         {"eligible_patches", std::to_string(sum_u64(local.eligible))},
+        {"globally_selected_regions", std::to_string(local.globally_selected_regions)},
+        {"attempted_regions", std::to_string(sum_u64(local.attempted))},
         {"selected_patches", std::to_string(sum_u64(local.selected))},
         {"completed_patches", std::to_string(completed)},
+        {"completed_unique_physical_regions", std::to_string(unique_regions)},
+        {"region_result_records", std::to_string(regions.size())},
+        {"region_results_withheld", region_failure ? "true" : "false"},
         {"completed_closed_boundary_patches", std::to_string(sum_u64(local.completed_closed_boundary_patches))},
         {"completed_hydro_source_active_patches", std::to_string(sum_u64(local.completed_source_active_patches))},
         {"completed_evolving_comoving_patches", std::to_string(sum_u64(local.completed_evolving_comoving_patches))},
+        {"completed_endpoint_ghost_patches", std::to_string(sum_u64(local.completed_endpoint_ghost_patches))},
+        {"completed_partial_active_patches", std::to_string(sum_u64(local.completed_partial_active_patches))},
+        {"completed_composition_patches", std::to_string(sum_u64(local.completed_composition_patches))},
+        {"completed_chronology_regions", std::to_string(sum_u64(local.completed_chronology_regions))},
         {"compared_owned_cells", std::to_string(compared_cells)},
         {"compared_auxiliary_owned_cells", std::to_string(auxiliary_cells)},
+        {"compared_composition_cells", std::to_string(sum_u64(local.compared_composition_cells))},
+        {"cone_excluded_cells", std::to_string(sum_u64(local.cone_excluded_cells))},
         {"compared_volume_comoving", std::to_string(compared_volume)},
         {"skipped_cadence", std::to_string(sum_u64(local.skipped_cadence))},
         {"skipped_selection", std::to_string(sum_u64(local.skipped_selection))},
@@ -1727,6 +2331,31 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
         {"skipped_unsupported_source", std::to_string(sum_u64(local.skipped_unsupported_source))},
         {"skipped_external_passives", std::to_string(sum_u64(local.skipped_external_passives))},
         {"skipped_temporal_ghost", std::to_string(sum_u64(local.skipped_temporal_ghost))},
+        {"skipped_endpoint_unavailable", std::to_string(sum_u64(local.skipped_endpoint_unavailable))},
+        {"skipped_endpoint_geometry_mismatch", std::to_string(sum_u64(local.skipped_endpoint_geometry_mismatch))},
+        {"skipped_region_split_across_ranks", std::to_string(sum_u64(local.skipped_region_split_across_ranks))},
+        {"skipped_composition_endpoint_mismatch",
+         std::to_string(sum_u64(local.skipped_composition_endpoint_mismatch))},
+        {"discarded_rejected_attempt_samples", std::to_string(sum_u64(local.discarded_rejected_attempt))},
+        {"chronology_started", std::to_string(sum_u64(local.chronology_started))},
+        {"chronology_skipped_recursive_level_sources",
+         std::to_string(sum_u64(local.chronology_skipped_recursive_level_sources))},
+        {"chronology_skipped_unsplit_compatibility",
+         std::to_string(sum_u64(local.chronology_skipped_unsplit_compatibility))},
+        {"chronology_skipped_no_replay_operator", std::to_string(sum_u64(local.chronology_skipped_no_replay_operator))},
+        {"chronology_skipped_replay_unavailable", std::to_string(sum_u64(local.chronology_skipped_replay_unavailable))},
+        {"chronology_skipped_replay_incomplete", std::to_string(sum_u64(local.chronology_skipped_replay_incomplete))},
+        {"chronology_skipped_region_changed", std::to_string(sum_u64(local.chronology_skipped_region_changed))},
+        {"chronology_skipped_partial_activity", std::to_string(sum_u64(local.chronology_skipped_partial_activity))},
+        {"chronology_skipped_missing_point", std::to_string(sum_u64(local.chronology_skipped_missing_point))},
+        {"chronology_skipped_hydro_sample_missing",
+         std::to_string(sum_u64(local.chronology_skipped_hydro_sample_missing))},
+        {"chronology_skipped_resource", std::to_string(sum_u64(local.chronology_skipped_resource))},
+        {"chronology_replay_identity_linf", std::to_string(max_double(local.chronology_replay_identity_linf))},
+        {"composition_remote_donor_faces", std::to_string(sum_u64(local.composition_remote_donor_faces))},
+        {"ghost_slots_self_refreshed", std::to_string(sum_u64(local.ghost_slots_self_refreshed))},
+        {"ghost_slots_endpoint_interpolated", std::to_string(sum_u64(local.ghost_slots_endpoint_interpolated))},
+        {"ghost_slots_step_start_only", std::to_string(sum_u64(local.ghost_slots_step_start_only))},
         {"reference_substeps", std::to_string(sum_u64(local.reference_substeps))},
         {"reference_fallbacks", std::to_string(sum_u64(local.fallback_count))},
         {"max_rank_reserved_workspace_bytes", std::to_string(
@@ -1758,44 +2387,82 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
              hydroReconstructionSchemeFromConfig(m_config) ==
              hydro::HydroReconstructionScheme::kPiecewiseParabolic
                  ? "temporal_subdivision_only" : "mixed_spatial_temporal_scheme"},
-        {"boundary_reference", "self_contained_physical_ghost_refresh_or_interior_guard"},
-        {"hydro_owned_sources", "private_cloned_smooth_source_calls;external_strang_not_replayed"},
+        {"boundary_reference",
+         "self_ghosts_refreshed_from_private_state;imported_ghosts_production_filler_endpoint_linear_in_time;"
+         "stale_slots_dependency_cone_excluded"},
+        {"hydro_owned_sources", "private_cloned_smooth_source_calls;composition_aware_private_temperature"},
+        {"chronology_model",
+         "refined_strang_S4_H2_S4_S4_H2_S4;smooth_thermochemistry_private_production_operator;"
+         "diffusion_sgs_shear_captured_increments_linear_in_time;discrete_events_captured_increment_at_interval_end;"
+         "gravity_kdk_outside_compared_window"},
+        {"composition_transport", "private_donor_cell_sink_same_rule_as_production;no_private_reflux"},
         {"production_method", core::hydroIntegrationModeToString(
             m_config.numerics.hydro_integration_scheme)},
-        {"sampling_budget_semantics", "global_amr_top_k;rank_local_bytes_and_cells"},
+        {"sampling_identity", "physical_region_key(level,lattice_origin,extent)"},
+        {"sampling_budget_semantics", "global_physical_top_k;rank_local_bytes_and_cells"},
         {"sampling_global_k", std::to_string(m_shadow.options().max_patches_per_rank)},
-        {"diagnostic_scope", "sampled_hydro_interval_disagreement_not_a_global_error_bar"}};
+        {"aggregation", "per_region_records_sorted_by_physical_key"},
+        {"publication_barrier", "next_attempt_start_after_continuity_acceptance"},
+        {"epoch_step_index", std::to_string(m_shadow_epoch_step)},
+        {"selected_region_keys", [this] {
+           // Rank-uniform (identical global ranking on every rank), bounded by K.
+           std::string keys;
+           for (const auto& candidate : m_shadow.globalCandidates()) {
+             if (!keys.empty()) keys += ',';
+             keys += std::to_string(hydro::hydroShadowEffectiveKey(candidate));
+             keys += ':';
+             keys += std::to_string(candidate.level);
+           }
+           return keys.empty() ? std::string("none") : keys;
+         }()},
+        {"diagnostic_scope", "sampled_interval_disagreement_not_a_global_error_bar"}};
+    for (std::size_t c = 0; c < hydro::k_hydro_shadow_comparison_class_count; ++c) {
+      payload.emplace(std::string("region_records_") +
+                          std::string(hydro::hydroShadowComparisonClassToString(
+                              static_cast<hydro::HydroShadowComparisonClass>(c))),
+                      std::to_string(region_records_by_class[c]));
+    }
+    for (std::size_t p = 0; p < hydro::k_hydro_shadow_ghost_provenance_count; ++p) {
+      payload.emplace(std::string("ghost_slots_") +
+                          std::string(hydro::hydroShadowGhostProvenanceToString(
+                              static_cast<hydro::HydroShadowGhostProvenance>(p))),
+                      std::to_string(sum_u64(local.ghost_slots_by_provenance[p])));
+    }
     const std::array<const char*, 7> labels{"rho", "momentum_x", "momentum_y",
         "momentum_z", "total_energy", "metal_density", "aux_thermal_density"};
     for (std::size_t field = 0; field < labels.size(); ++field) {
-      const auto& lane = local.components[field];
-      const double l1_volume = sum_double(lane.weighted_abs_difference);
-      const double reference_magnitude = sum_double(lane.weighted_reference_magnitude);
-      const double linf = max_double(lane.linf_difference);
+      const auto& lane = components[field];
       const std::string prefix = std::string("disagreement_") + labels[field];
-      const bool has_samples = completed != 0U && (field != 6U || auxiliary_cells != 0U);
-      payload.emplace(prefix + "_l1_volume_weighted", has_samples && compared_volume > 0.0
-          ? std::to_string(l1_volume / compared_volume) : "no_samples");
-      payload.emplace(prefix + "_linf", has_samples ? std::to_string(linf) : "no_samples");
+      const bool has_samples = !regions.empty() && compared_volume > 0.0 &&
+          (field != 6U || auxiliary_cells != 0U);
+      payload.emplace(prefix + "_l1_volume_weighted", has_samples
+          ? std::to_string(lane.weighted_abs_difference / compared_volume) : "no_samples");
+      payload.emplace(prefix + "_linf", has_samples ? std::to_string(lane.linf_difference) : "no_samples");
       payload.emplace(prefix + "_normalized_l1", has_samples
-          ? std::to_string(l1_volume / std::max(reference_magnitude, 1.0e-12 * compared_volume))
+          ? std::to_string(lane.weighted_abs_difference /
+                           std::max(lane.weighted_reference_magnitude, 1.0e-12 * compared_volume))
           : "no_samples");
       if (field < 6U) {
-        payload.emplace(std::string("reference_region_delta_") + labels[field],
-                             std::to_string(sum_double(local.reference_delta[field])));
-        payload.emplace(std::string("production_region_delta_") + labels[field],
-                             std::to_string(sum_double(local.production_delta[field])));
+        payload.emplace(std::string("reference_region_delta_") + labels[field], std::to_string(reference_delta[field]));
+        payload.emplace(std::string("production_region_delta_") + labels[field], std::to_string(production_delta[field]));
       }
     }
+    const bool composition_samples = composition_metric.weighted_reference_magnitude > 0.0;
+    payload.emplace("disagreement_composition_mass_normalized_l1", composition_samples
+        ? std::to_string(composition_metric.weighted_abs_difference / composition_metric.weighted_reference_magnitude)
+        : "no_samples");
+    payload.emplace("disagreement_composition_mass_linf", composition_samples
+        ? std::to_string(composition_metric.linf_difference) : "no_samples");
     if (context.profiler_session != nullptr) {
       context.profiler_session->recordEvent(core::RuntimeEvent{
           .event_kind = "hydro.shadow_reference",
           .severity = core::RuntimeEventSeverity::kInfo,
           .subsystem = "hydro.godunov",
-          .step_index = context.integrator_state.step_index,
-          .simulation_time_code = context.integrator_state.current_time_code,
-          .scale_factor = context.integrator_state.current_scale_factor,
-          .message = "bounded private CTU/PPM hydro trajectory; sampled numerical disagreement, not a physical error bar",
+          .step_index = m_shadow_epoch_step,
+          .simulation_time_code = m_shadow_epoch_time_begin,
+          .scale_factor = m_shadow_epoch_scale_factor,
+          .message = "bounded private CTU/PPM and Strang-chronology trajectories of accepted intervals; "
+                     "sampled numerical disagreement, not a physical error bar",
           .payload = std::move(payload)});
     }
   }
@@ -2869,6 +3536,75 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
       return m_sweep_sources;
     }
 
+    // C04-03: remote sources for the shadow endpoint ghosts of this level
+    // clock. Same-level (post-sweep) and finer patches are exchanged with the
+    // ordinary directed protocol and labelled t_end (the finer level is still
+    // at the interval start: the endpoint function marks every fine->coarse
+    // slot without endpoint authority); coarser remote patches are linearly
+    // interpolated to t_end from their retained interval, exactly as the
+    // production sweep interpolates to t_begin. Collective; called on every
+    // rank or on none (the driver's globalMax decision). The ownership/owner
+    // maps of the production exchange are not modified (no absorb()).
+    [[nodiscard]] std::span<const amr::DistributedAmrRemotePatch> shadowEndpointSources(
+        int level, int coarser_level, int finer_level, double t_end) override {
+      std::array<int, 2> filter{level, finer_level};
+      std::optional<DirectedHydroGhostExchange> exchange;
+      std::exception_ptr failure;
+      try {
+        // The directed exchange votes its own preparation collectively, so a
+        // refusal is raised on every rank at the same point and is caught
+        // uniformly here: the optional diagnostic never fails the step.
+        exchange.emplace(m_runtime.exchangeDirectedHydroGhosts(
+            m_context, m_options, std::span<const int>(filter.data(), finer_level >= 0 ? 2U : 1U),
+            nextSequence()));
+      } catch (...) {
+        failure = std::current_exception();
+      }
+      try {
+        if (!exchange.has_value()) throw std::runtime_error("shadow endpoint exchange unavailable");
+        m_shadow_endpoint_sources.clear();
+        m_shadow_endpoint_reservation.release();
+        std::size_t interpolated_cells = 0U;
+        if (coarser_level >= 0) {
+          for (const RetainedInterval& interval : intervalStore(coarser_level)) {
+            interpolated_cells = core::checkedSizeAdd(interpolated_cells, interval.start.size(),
+                                                      "shadow endpoint interpolated remote cells");
+          }
+        }
+        if (m_runtime.m_memory_governor != nullptr && interpolated_cells != 0U) {
+          m_shadow_endpoint_reservation = m_runtime.m_memory_governor->reserve(
+              core::MemoryClass::kDiagnostic,
+              core::checkedIntegralNarrow<std::uint64_t>(
+                  core::checkedSizeMultiply(interpolated_cells, sizeof(amr::AmrHydroSparseRemoteCell),
+                                            "shadow endpoint interpolated remote bytes"),
+                  "shadow endpoint interpolated remote bytes"),
+              "hydro.shadow_reference.endpoint_remote_interpolated");
+          m_shadow_endpoint_reservation.commit();
+        }
+        m_shadow_endpoint_sources.reserve(exchange->remote_patches.size() +
+                                          (coarser_level >= 0 ? intervalStore(coarser_level).size() : 0U));
+        for (amr::DistributedAmrRemotePatch& remote : exchange->remote_patches) {
+          remote.state_time_code = t_end;
+          m_shadow_endpoint_sources.push_back(std::move(remote));
+        }
+        if (coarser_level >= 0) {
+          for (const RetainedInterval& interval : intervalStore(coarser_level)) {
+            m_shadow_endpoint_sources.push_back(interpolate(interval, t_end));
+          }
+        }
+      } catch (...) {
+        if (failure == nullptr) failure = std::current_exception();
+      }
+      // A failure only withholds the optional endpoint sources: every rank
+      // learns it collectively and continues with no remote endpoint data.
+      std::uint64_t local_failed = failure != nullptr ? 1U : 0U;
+      if (m_runtime.m_mpi_context.allreduceMaxUint64(local_failed) != 0U) {
+        m_shadow_endpoint_sources.clear();
+        m_shadow_endpoint_reservation.release();
+      }
+      return m_shadow_endpoint_sources;
+    }
+
     void exchangeLevelFluxRegisters(core::SimulationState& state,
                                     std::span<const amr::FluxRegisterEntry> outbound,
                                     const amr::ProductionAmrHydroOptions& level_options) override {
@@ -3096,6 +3832,9 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
     // Leases are declared before (destroyed after) the buffers they cover.
     std::vector<core::MemoryReservation> m_retained_reservations;
     core::MemoryReservation m_sweep_reservation;
+    // C04 shadow endpoint sources (diagnostic lease declared before storage).
+    core::MemoryReservation m_shadow_endpoint_reservation;
+    std::vector<amr::DistributedAmrRemotePatch> m_shadow_endpoint_sources;
     std::vector<amr::PatchDescriptor> m_neighbours;
     std::vector<amr::DistributedAmrRemotePatch> m_sweep_sources;
     std::vector<std::vector<RetainedInterval>> m_intervals;
@@ -3314,7 +4053,13 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
         // authority as the solver's integration scheme, rank-uniform).
         .ctu_edge_stencils = m_config.numerics.hydro_integration_scheme ==
             core::HydroIntegrationMode::kCornerTransportUpwind,
-        .hydro_shadow_reference = m_config.numerics.hydro_shadow_enabled ? &m_shadow : nullptr};
+        .hydro_shadow_reference = m_config.numerics.hydro_shadow_enabled ? &m_shadow : nullptr,
+        // C04-03: this owner completes endpoint ghosts after the synchronized
+        // sweep (below); the recursive driver does so after each level sweep.
+        .hydro_shadow_endpoint_ghosts = m_config.numerics.hydro_shadow_enabled,
+        .hydro_shadow_temperature_k_per_internal_energy_code = m_temperature_k_per_internal_energy_code,
+        .hydro_shadow_cosmology = context.cosmology_background,
+        .hydro_shadow_time_si_per_code = context.timeline_step.time_si_per_code};
     {
       const auto [domain_origin, domain_extent] = globalAmrHierarchyDomain(
           context.state, amr_options, "production AMR hydro leaf-tiling proof (pre-ghost-fill)");
@@ -3583,6 +4328,13 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
           sources,
           amr_options);
     }
+    // C04-03: synchronized stepping has one legal endpoint for every sample
+    // (the accepted hydro end, after local and remote reflux). Recursive
+    // stepping completed its endpoints per level clock inside the driver.
+    if (m_config.numerics.hydro_shadow_enabled &&
+        m_config.numerics.amr_time_stepping != core::AmrTimeSteppingConfigMode::kRecursiveSubcycling) {
+      completeSynchronizedShadowEndpoints(context, amr_options, update.time_end_code);
+    }
     m_last_amr_hydro_diagnostics = amr_diagnostics;
     if (distributed_composition) {
       completeDistributedCompositionTransport(context, composition_flux.get(), remote_cell_owner);
@@ -3610,6 +4362,9 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
         m_current_world_rank,
         "production AMR hydro parent compatibility mirror");
     m_last_directed_amr_diagnostics = directed_amr_diagnostics;
+    // C04: post-hydro production endpoint of every sampled domain, after the
+    // composition commit and BEFORE an automatic regrid can change identity.
+    recordShadowChronologyPoint(context, hydro::HydroShadowChronologyPoint::kPostHalfBegin);
     runAutomaticAmrRegrid(context, amr_options, regrid_remote_neighbors);
     // H01 telemetry: CTU interface outcomes summed over ranks (the per-rank
     // values above are summed over patches and recursive level clocks). The
@@ -4977,6 +5732,18 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime {
   double m_temperature_k_per_internal_energy_code = 0.0;
   hydro::HydroCoreSolver m_solver;
   hydro::HydroShadowReference m_shadow;
+  // C04 sampling-attempt state (rank-uniform). See beginHydroShadowAttempt().
+  bool m_shadow_attempt_open = false;
+  bool m_shadow_attempt_from_source = false;
+  bool m_shadow_epoch_pending_publication = false;
+  std::uint64_t m_shadow_epoch_step = 0U;
+  double m_shadow_epoch_time_begin = 0.0;
+  double m_shadow_epoch_time_end = 0.0;
+  double m_shadow_epoch_scale_factor = 1.0;
+  hydro::HydroShadowCandidate m_shadow_fixed_domain{};
+  std::vector<hydro::HydroShadowComparisonRegion> m_shadow_fixed_regions;
+  std::vector<FixedShadowTile> m_shadow_fixed_tiles;
+  std::vector<std::uint64_t> m_shadow_level_chronology_keys;
   std::unique_ptr<hydro::HydroReconstruction> m_reconstruction;
   std::unique_ptr<hydro::HydroRiemannSolver> m_riemann_solver;
   std::unique_ptr<physics::CoolingHeatingSource> m_cooling_source;

@@ -53,6 +53,7 @@
 #include "workflows/internal/amr_migration_payload.hpp"
 #include "workflows/internal/amr_geometry_assurance.hpp"
 #include "cosmosim/physics/baryon_composition.hpp"
+#include "cosmosim/workflows/hydro_shadow_chronology.hpp"
 #include "cosmosim/workflows/runtime_services.hpp"
 #include "workflows/internal/gas_cell_ownership.hpp"
 #include "workflows/internal/mpi_stage_collective_decision.hpp"
@@ -1741,6 +1742,158 @@ class SourceRuntimeImpl final : public SourceRuntime {
     m_amr_level_source_coupling_enabled = enabled;
   }
 
+  void setHydroShadowChronologyObserver(HydroShadowChronologyObserver* observer) noexcept override {
+    m_shadow_observer = observer;
+  }
+
+  // C04-02: private, non-authoritative replay of THIS owner's smooth source
+  // operator (BaryonicSourceStage: ISM regime, chemistry fidelity,
+  // thermochemistry, dust, SGS dissipation) over [f0, f1] of the accepted
+  // coarse interval of `context`. It runs the production operator and data
+  // tables on a PRIVATE single-region SimulationState (rows = the sample's
+  // cells), commits into that private state only, and returns. It never
+  // reads or writes the canonical state, ledgers, controller sidecar, RNG or
+  // event queues; the operator is const and its controller bias is the one
+  // committed for this interval (replay happens before interval close).
+  class ShadowSmoothReplay final : public hydro::HydroShadowSmoothSourceReplay {
+   public:
+    ShadowSmoothReplay(const SourceRuntimeImpl& owner, const core::StepContext& context)
+        : m_owner(owner), m_context(context) {}
+
+    [[nodiscard]] hydro::HydroShadowReplayStatus advanceSmooth(
+        hydro::HydroShadowPrivateRegion& region, double fraction_begin, double fraction_end) const override {
+      // No smooth thermochemistry owner: the production smooth half is the
+      // identity for these lanes, so the exact private replay is too.
+      if (m_owner.m_thermochemistry == nullptr) return hydro::HydroShadowReplayStatus::kCompleted;
+      try {
+        if (!(fraction_begin >= 0.0 && fraction_end <= 1.0 && fraction_end > fraction_begin) ||
+            region.cell_count == 0U || !(region.cell_volume_comoving > 0.0)) {
+          return hydro::HydroShadowReplayStatus::kInvalidState;
+        }
+        double coarse_begin = m_context.timeline_step.time_begin_code;
+        double coarse_dt = m_context.timeline_step.time_end_code - coarse_begin;
+        if (!(std::isfinite(coarse_dt) && coarse_dt > 0.0)) {
+          coarse_begin = m_context.integrator_state.current_time_code;
+          coarse_dt = m_context.integrator_state.dt_time_code;
+        }
+        physics::SourceInterval interval;
+        interval.time_begin_code = coarse_begin + fraction_begin * coarse_dt;
+        interval.time_end_code = coarse_begin + fraction_end * coarse_dt;
+        interval.scale_factor_begin = m_owner.scaleFactorAtPhysicalFraction(m_context, fraction_begin);
+        interval.scale_factor_end = m_owner.scaleFactorAtPhysicalFraction(m_context, fraction_end);
+        if (m_owner.m_is_cosmological && m_context.cosmology_background != nullptr) {
+          interval.physical_seconds = m_context.cosmology_background->cosmicTimeIntervalSi(
+              interval.scale_factor_begin, interval.scale_factor_end);
+        } else {
+          interval.physical_seconds = (fraction_end - fraction_begin) * coarse_dt * m_owner.m_units.timeSiPerCode();
+        }
+        // Physical-time midpoint of the sub-interval: the production rule
+        // (pre half [0,1/2] evaluates at 1/4, post half [1/2,1] at 3/4).
+        interval.evaluation_scale_factor = m_owner.m_is_cosmological
+            ? m_owner.scaleFactorAtPhysicalFraction(m_context, 0.5 * (fraction_begin + fraction_end))
+            : 1.0;
+        interval.evaluation_redshift = m_owner.m_is_cosmological
+            ? std::max(0.0, 1.0 / interval.evaluation_scale_factor - 1.0) : 0.0;
+        interval.cosmological = m_owner.m_is_cosmological;
+        interval.accepted_step_index = m_context.integrator_state.step_index;
+        if (!interval.valid()) return hydro::HydroShadowReplayStatus::kInvalidState;
+
+        const std::size_t n = region.cell_count;
+        core::SimulationState mini;
+        mini.cells.resize(n);
+        mini.gas_cells.resize(n);
+        mini.gas_composition = region.composition;
+        const double volume = region.cell_volume_comoving;
+        const double base_factor =
+            hydro::temperatureKelvinPerInternalEnergyCode(5.0 / 3.0, m_owner.m_units.velocity_si_per_code);
+        for (std::size_t i = 0; i < n; ++i) {
+          const double rho = region.mass_density[i];
+          if (!(rho > 0.0) || !std::isfinite(rho)) return hydro::HydroShadowReplayStatus::kInvalidState;
+          mini.gas_cells.gas_cell_id[i] = region.gas_cell_ids[i];
+          mini.gas_cells.density_code[i] = rho;
+          mini.cells.mass_code[i] = rho * volume;
+          mini.gas_cells.velocity_x_peculiar[i] = region.momentum_x[i] / rho;
+          mini.gas_cells.velocity_y_peculiar[i] = region.momentum_y[i] / rho;
+          mini.gas_cells.velocity_z_peculiar[i] = region.momentum_z[i] / rho;
+          mini.gas_cells.internal_energy_code[i] = region.specific_internal_energy[i];
+          mini.gas_cells.metal_mass_code[i] = region.metal_density[i] * volume;
+          double factor = base_factor;
+          if (mini.gas_composition.enabled() && i < mini.gas_composition.rowCount()) {
+            const double mu = mini.gas_composition.mean_molecular_weight[i];
+            if (std::isfinite(mu) && mu > 0.0) {
+              factor *= mu * (1.66053906660e-24 / 1.67262192369e-24) / hydro::k_part1_reference_mean_molecular_weight;
+            }
+          }
+          mini.gas_cells.temperature_code[i] = factor * std::max(region.specific_internal_energy[i], 0.0);
+        }
+        physics::BaryonicSourceStage stage(*m_owner.m_thermochemistry, m_owner.m_source_stage_config);
+        stage.prepare(mini, interval, {});
+        (void)stage.commit(mini);
+        for (std::size_t i = 0; i < n; ++i) {
+          const double rho = region.mass_density[i];
+          region.specific_internal_energy[i] = mini.gas_cells.internal_energy_code[i];
+          region.metal_density[i] = mini.gas_cells.metal_mass_code[i] / volume;
+          const double momentum_sq = region.momentum_x[i] * region.momentum_x[i] +
+              region.momentum_y[i] * region.momentum_y[i] + region.momentum_z[i] * region.momentum_z[i];
+          region.total_energy[i] = rho * std::max(region.specific_internal_energy[i], 0.0) + 0.5 * momentum_sq / rho;
+        }
+        region.composition = std::move(mini.gas_composition);
+        return hydro::HydroShadowReplayStatus::kCompleted;
+      } catch (const physics::SourceIntervalIncompleteError&) {
+        return hydro::HydroShadowReplayStatus::kIntervalIncomplete;
+      } catch (const physics::SourceModelUnavailableError&) {
+        return hydro::HydroShadowReplayStatus::kModelUnavailable;
+      } catch (const std::exception&) {
+        return hydro::HydroShadowReplayStatus::kInvalidState;
+      }
+    }
+
+    [[nodiscard]] std::string_view modelLabel() const noexcept override {
+      return "production_baryonic_source_stage_private_replay";
+    }
+
+    void synchronizeDerivedMirrors(hydro::HydroShadowPrivateRegion& region) const override {
+      if (!region.composition.enabled() || !(region.cell_volume_comoving > 0.0)) return;
+      core::SimulationState mini;
+      mini.cells.resize(region.cell_count);
+      mini.gas_cells.resize(region.cell_count);
+      mini.gas_composition = region.composition;
+      for (std::size_t i = 0; i < region.cell_count; ++i) {
+        mini.gas_cells.gas_cell_id[i] = region.gas_cell_ids[i];
+        mini.gas_cells.metal_mass_code[i] = region.metal_density[i] * region.cell_volume_comoving;
+      }
+      (void)physics::synchronizeMetalMirrorFromComposition(mini, std::span<const std::uint32_t>{});
+      for (std::size_t i = 0; i < region.cell_count; ++i) {
+        region.metal_density[i] = mini.gas_cells.metal_mass_code[i] / region.cell_volume_comoving;
+      }
+    }
+
+   private:
+    const SourceRuntimeImpl& m_owner;
+    const core::StepContext& m_context;
+  };
+
+  void notifyShadow(core::StepContext& context, core::SourceSplitPhase phase,
+                    HydroShadowSourceBoundary boundary, bool recursive_levels,
+                    const hydro::HydroShadowSmoothSourceReplay* replay) {
+    if (m_shadow_observer != nullptr) {
+      m_shadow_observer->onSourceShadowBoundary(context, phase, boundary, recursive_levels, replay);
+    }
+  }
+
+  void notifyLevelShadow(core::StepContext& level_context, int level, core::SourceSplitPhase phase,
+                         HydroShadowSourceBoundary boundary, bool lend_replay) {
+    if (m_shadow_observer == nullptr) return;
+    if (lend_replay) {
+      // Fractions are of the LEVEL interval: level_context's timeline is the
+      // level clock, so the replay reproduces the level half intervals.
+      const ShadowSmoothReplay replay(*this, level_context);
+      m_shadow_observer->onLevelSourceShadowBoundary(level_context, level, phase, boundary, &replay);
+    } else {
+      m_shadow_observer->onLevelSourceShadowBoundary(level_context, level, phase, boundary, nullptr);
+    }
+  }
+
   void executeAmrLevelSmoothSources(
       core::StepContext& parent_context,
       std::span<const std::uint32_t> level_rows,
@@ -1851,6 +2004,9 @@ class SourceRuntimeImpl final : public SourceRuntime {
     (void)physics::ensureGasCompositionInitialized(level_context.state, m_physics_config);
     const physics::SourceInterval interval = makeSourceInterval(
         level_context, sourceEvaluationScaleFactor(level_context));
+    // C04-02: level-clock chronology boundaries (read-only, local; no-op
+    // unless the hydro shadow observer is bound).
+    notifyLevelShadow(level_context, level, phase, HydroShadowSourceBoundary::kHalfBegin, false);
     // Palindromic level split, identical to the global halves: pre = smooth
     // transport then thermochemistry, post = thermochemistry then transport.
     // Transport faces follow the causal owner rule documented at
@@ -1906,16 +2062,23 @@ class SourceRuntimeImpl final : public SourceRuntime {
       // so that "pre half seen, no coarse/fine faces" is distinguishable.
       const std::uint64_t opened = m_mpi_context.allreduceSumUint64(m_last_level_face_selection.coarse_fine);
       m_source_interval.pending_interface_sync[level_index] = opened + 1U;
+      notifyLevelShadow(level_context, level, phase, HydroShadowSourceBoundary::kAfterTransport, false);
     }
     executeThermochemistryInterval(
         level_context, interval, level_rows, false, level);
     if (phase == core::SourceSplitPhase::kStrangPostHalf) {
+      notifyLevelShadow(level_context, level, phase, HydroShadowSourceBoundary::kAfterThermochemistry, false);
       executeDiffusionAndSgsShear(
           level_context, transport_scale_factor, half_dt_code,
           LevelFaceSelection{.level = static_cast<std::int32_t>(level), .same_level = true, .coarse_fine = false,
                              .phase_tag = levelPhaseTag(parent_context.integrator_state.step_index, level,
                                                         level_update.time_begin_code, 1U)});
+      notifyLevelShadow(level_context, level, phase, HydroShadowSourceBoundary::kAfterTransport, false);
     }
+    // Level windows contain no discrete events (coarse-end chronology); the
+    // post half lends the level-interval replay.
+    notifyLevelShadow(level_context, level, phase, HydroShadowSourceBoundary::kHalfEnd,
+                      phase == core::SourceSplitPhase::kStrangPostHalf);
     if (m_source_interval.level_transport_halves == std::numeric_limits<std::uint64_t>::max()) {
       throw std::overflow_error("recursive AMR level transport counter overflow");
     }
@@ -2077,22 +2240,41 @@ class SourceRuntimeImpl final : public SourceRuntime {
     // thermochemistry, the post half thermochemistry then transport, so the
     // composition S_pre H S_post is palindromic in its smooth sub-operators.
     // Cooling is never also applied inside the hydro solver.
+    // C04-02: read-only chronology boundaries for the hydro shadow
+    // diagnostic (no-op unless an observer is bound). Every rank reaches each
+    // boundary in the same order; the observer never mutates source state.
+    const bool recursive_levels = !plan.global_smooth_thermochemistry;
+    notifyShadow(context, plan.phase, HydroShadowSourceBoundary::kHalfBegin, recursive_levels, nullptr);
     if (plan.phase == core::SourceSplitPhase::kStrangPreHalf) {
       if (plan.smooth_transport) {
         executeDiffusionAndSgsShear(
             context, plan.smooth_evaluation_scale_factor, plan.smooth_dt_code);
       }
+      notifyShadow(context, plan.phase, HydroShadowSourceBoundary::kAfterTransport, recursive_levels, nullptr);
       if (plan.global_smooth_thermochemistry) executeThermochemistry(context, plan);
     } else {
       if (plan.global_smooth_thermochemistry) executeThermochemistry(context, plan);
+      notifyShadow(context, plan.phase, HydroShadowSourceBoundary::kAfterThermochemistry, recursive_levels, nullptr);
       if (plan.smooth_transport) {
         executeDiffusionAndSgsShear(
             context, plan.smooth_evaluation_scale_factor, plan.smooth_dt_code);
       }
+      notifyShadow(context, plan.phase, HydroShadowSourceBoundary::kAfterTransport, recursive_levels, nullptr);
     }
 
     if (plan.discrete_events) {
       executeDiscreteSourceEvents(context, plan);
+    }
+    // The private replay is lent only at the end of the interval-closing
+    // dispatch and BEFORE closeSourceInterval() publishes the controller, so
+    // it uses exactly the controller bias committed for this interval.
+    if (m_shadow_observer != nullptr) {
+      if (plan.discrete_events) {
+        const ShadowSmoothReplay replay(*this, context);
+        notifyShadow(context, plan.phase, HydroShadowSourceBoundary::kHalfEnd, recursive_levels, &replay);
+      } else {
+        notifyShadow(context, plan.phase, HydroShadowSourceBoundary::kHalfEnd, recursive_levels, nullptr);
+      }
     }
     // The controller publishes exactly once per Strang interval, after every
     // half (and every AMR level half) contributed its observations.
@@ -5298,6 +5480,8 @@ class SourceRuntimeImpl final : public SourceRuntime {
   core::PhysicsConfig m_physics_config{};
   physics::BaryonicDataProducts m_baryonic_data{};
   std::unique_ptr<physics::ThermochemistryOperator> m_thermochemistry;
+  // C04-02: non-owning chronology observer (hydro shadow diagnostic).
+  HydroShadowChronologyObserver* m_shadow_observer = nullptr;
   physics::SourceLedger m_last_thermochemistry_ledger{};
   std::shared_ptr<const physics::SspYieldTable> m_ssp_yield_table;
   std::unique_ptr<physics::SspModel> m_ssp_model;

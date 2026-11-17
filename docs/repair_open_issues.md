@@ -1055,3 +1055,23 @@ events, element/ion sidecars and variable thermochemical conversions; and
 fixed-grid decomposition-independent spatial identity remain OPEN. Source-only
 fixtures added, not compiled or executed. See
 `docs/repair/chui_c04_shadow_hydro_source_20261116.md` for exact boundaries.
+
+## 2026-11-17 — C04 revision-6 cloud source closure (SOURCE IMPLEMENTED — UNVERIFIED)
+
+Supersedes the revision-4 OPEN list above. Integrated source now provides:
+production-filler endpoint ghosts with linear-in-time midpoint values for
+same-level, diagonal (edge), coarse/fine, closure-mapped and MPI ghosts of
+ordinary 8³ AMR patches in synchronized and recursive stepping (no interior
+guard; dependency-cone exclusion only where no legal endpoint exists);
+production active sets including partial activity and suppressed periodic
+faces; a private composition sink (composition runs are no longer refused);
+a refined T01 Strang chronology replaying the production
+`BaryonicSourceStage` on private state (global halves and recursive level
+windows) with captured diffusion/SGS-shear/event forcing and exact FLRW
+epochs; physical region keys with one global K for AMR and fixed grid;
+deterministic per-region aggregation; publication at the accepted-epoch
+barrier. Remaining items are verification only (build, unit/integration,
+MPI 2/4-rank, workflow Strang, convergence and resource qualification), plus
+the declared approximation scopes in
+`docs/repair/chui_c04_rev5_cloud_source_closure.md` §5. Nothing was compiled
+or executed in this campaign.
