@@ -1075,3 +1075,62 @@ MPI 2/4-rank, workflow Strang, convergence and resource qualification), plus
 the declared approximation scopes in
 `docs/repair/chui_c04_rev5_cloud_source_closure.md` §5. Nothing was compiled
 or executed in this campaign.
+
+## 2026-11-17 — C04 final source campaign (SOURCE IMPLEMENTED — UNVERIFIED)
+
+Independent re-audit of HEAD `8317141` found four residual source defects
+in revision 6, now fixed in the working tree (uncommitted, uncompiled):
+(1) shadow capture/observe/selection could leak a local exception into the
+production sweep or a rank-uniform section — now `noexcept`-contained with
+counted refusals; (2) the private composition sink lacked the production
+clamp and per-row mass reconciliation of `CompositionFluxAccumulator::commit`;
+(3) on the synchronized distributed path, remote composition donors always
+used the counted receiver-fraction fallback although production exchanges
+the exact step-start donor fractions — the shadow now holds composition
+samples and uses that production table (no new collective); (4) rejected
+attempts were never reported — losses are now carried to the next accepted
+publication (`discarded_rejected_attempts`). Evidence matrix, operator and
+boundary tables, fixture list and owner build steps:
+`docs/repair/chui_c04_final_precompile_handoff.md`. Remaining declared
+scopes (captured diffusion/event forcing, recursive fine→coarse cones,
+recursive-MPI composition donor fallback, unpublished final epoch) are not
+mandatory gaps. Build/test/science remain owner-reserved.
+
+## 2026-11-17 — Baryonic design audit repairs (implemented in source, UNVERIFIED)
+
+An independent audit of the baryonic subsystems against the v01/v10/v02
+design found one P1 contract break and several C04/C03 risks; all are
+repaired in source (not compiled or run):
+
+* **I01 (P1):** the per-solver-row ISM regime gate of the effective closure
+  was never populated in production, so the hydro closure and the
+  effective-ISM relaxation source decided effective/resolved from density
+  and temperature while thermochemistry and the P/c_s refresh followed the
+  regime tag. Now `hydro::buildIsmRegimeGate` (one rule, shared with the
+  refresh) feeds the fixed-grid and every AMR sweep (synchronized,
+  distributed, recursive levels); imported ghosts take their origin cell's
+  tag, remote origins keep the closure's own decision. Fixture
+  `unit_ism_regime_gate`.
+* **C04-05 / M01:** optional diagnostics now use
+  `MemoryGovernor::reserveBestEffort` (refused outside the green band of a
+  finite limit), and a refused mandatory `reserve()` first runs the
+  registered best-effort reclaimer (the hydro shadow drops its pending
+  samples, counted `evicted_for_mandatory_memory`) and retries once.
+  Fixture `unit_memory_governor_best_effort`.
+* **C03/C04:** chemistry-shadow selection is key-only (order and
+  decomposition independent); cap truncation and failed references are
+  counted and hold the adaptive promotion bias instead of steering it from
+  partial evidence; the per-row key is formatted without heap allocation
+  (same key text, so the sampled set is unchanged when the cap does not
+  bind). Fixture `unit_chemistry_shadow_sampling` (skips without the
+  detailed backend).
+* **C04 telemetry:** private-work wall time and a specific
+  `skipped_source_interval_incomplete` reason are published.
+* **S01 (P3):** the divergence-only `applyFromView` path no longer
+  fabricates `|grad v|^2 = div^2/3` for the adaptive bound/Jeans model.
+
+Reproducibility impact: I01 changes evolved state for Part-2 runs with
+`ism_regime_model = effective_or_resolved` wherever the regime tag and the
+closure's own criterion disagreed (intended correction). The adaptive
+chemistry bias is now held on intervals with truncated/failed shadow
+evidence. Other changes affect only optional diagnostics.

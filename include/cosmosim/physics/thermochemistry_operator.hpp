@@ -95,6 +95,14 @@ struct ChemistryShadowReport {
   double max_relative_electron_difference = 0.0;
   double max_relative_energy_difference = 0.0;
   double mean_substep_cost_ratio = 0.0;  // reference / production substeps
+  // Key-selected rows NOT sampled because the per-stage cost cap was reached
+  // (the sampled subset then depends on row order / decomposition: the
+  // adaptive controller holds its bias for that interval).
+  std::uint64_t cap_truncated = 0U;
+  // Key-selected rows whose reference could not run or complete (outside its
+  // dataset, integration failure): unknown disagreement, never "agreement";
+  // the adaptive controller holds its bias for that interval.
+  std::uint64_t reference_failures = 0U;
   // P1-49-07: independent reference integration of the C02 ladders (same
   // sampled rows; reference ladder solver with 10x tighter tolerance and a
   // 4x substep cap, its own light-network reference and CO transfer).

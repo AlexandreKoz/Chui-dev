@@ -459,7 +459,20 @@ state, flux registers, ledgers, RNG or event queues.
   cells are compared.
 * **Composition.** The production face sink is replaced by a private
   donor-cell sink with the production rule; composition-enabled runs are
-  sampled, never refused.
+  sampled, never refused. After each private halfstep the sink applies the
+  production commit rule (lane clamp at zero, per-row reconciliation of the
+  composition mass with the private hydro mass). On the synchronized
+  distributed path remote ghost donors use the production step-start donor
+  fractions assembled by the distributed composition exchange (the sample is
+  held until that table exists; no extra collective); otherwise, and in
+  recursive MPI stepping, an unknown donor uses the receiver's fractions,
+  is counted (`composition_remote_donor_faces`) and its cells are excluded
+  from the composition metric.
+* **Failure containment.** Capture, observation and candidate installation
+  are `noexcept`; a local shadow failure is a counted refusal and can never
+  abort or desynchronize the production advance. Rejected attempts are
+  never published; their loss is reported at the next accepted epoch
+  (`discarded_rejected_attempts`, `discarded_rejected_attempt_samples`).
 * **Full-physics chronology.** With the T01 Strang split the region's
   production state is snapshotted around each smooth sub-operator, and the
   refined chronology `S(dt/4) H(dt/2) S(dt/2) H(dt/2) S(dt/4)` is replayed with

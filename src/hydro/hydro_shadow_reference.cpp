@@ -2,10 +2,12 @@
 
 #include "cosmosim/core/cosmology.hpp"
 #include "cosmosim/core/simulation_state.hpp"
+#include "cosmosim/core/stage_transaction.hpp"
 #include "cosmosim/hydro/hydro_boundary_conditions.hpp"
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <limits>
@@ -177,7 +179,10 @@ class ShadowSourceProperties final : public HydroCellSourcePropertyProvider {
 // fractions taken from the halfstep-start composition), applied only to the
 // sample's private real rows. The private reference has no reflux, so every
 // face (including coarse-role faces) transports composition with exactly the
-// private mass flux; Sum(lanes) therefore follows the private mass.
+// private mass flux. apply() then mirrors CompositionFluxAccumulator::commit:
+// each lane is clamped at zero after its delta and every row is reconciled
+// with the PRIVATE hydro cell mass by scaling with the row's own composition
+// (density-floor mass / round-off), the reconciled mass being accumulated.
 class ShadowCompositionSink final : public HydroFaceMassFluxSink {
  public:
   ShadowCompositionSink(core::GasCompositionSidecar& composition,
@@ -201,10 +206,13 @@ class ShadowCompositionSink final : public HydroFaceMassFluxSink {
     m_records.push_back(Record{owner_cell, neighbor_cell, donor_row, mass_transfer_code});
   }
 
-  // Applies all recorded transfers against the halfstep-start composition.
-  // Returns the number of faces whose ghost donor composition was unknown
-  // (the receiving cell's own fractions are used and the cell is marked).
-  std::uint64_t apply(std::vector<std::uint8_t>& composition_unknown_cell) {
+  // Applies all recorded transfers against the halfstep-start composition,
+  // then the production commit rule (clamp + mass reconciliation against
+  // private_state, real rows only). Returns the number of faces whose ghost
+  // donor composition was unknown (the receiving cell's own fractions are
+  // used and the cell is marked).
+  std::uint64_t apply(std::vector<std::uint8_t>& composition_unknown_cell,
+                      const HydroConservedStateSoa& private_state, double& reconciled_mass_code) {
     const std::size_t lanes = m_composition.laneCount();
     const std::size_t rows = m_composition.rowCount();
     const std::size_t real = m_geometry.cellCount();
@@ -249,7 +257,20 @@ class ShadowCompositionSink final : public HydroFaceMassFluxSink {
     for (std::size_t l = 0; l < lanes; ++l) {
       for (std::size_t row = 0; row < rows; ++row) {
         const double d = delta[l * rows + row];
-        if (d != 0.0) m_composition.addValue(l, row, d);
+        if (d != 0.0) m_composition.setValue(l, row, std::max(m_composition.value(l, row) + d, 0.0));
+      }
+    }
+    // Production reconciliation (CompositionFluxAccumulator::commit): the
+    // composition mass of each row follows the hydro cell mass.
+    const double volume = m_geometry.cell_volume_comoving;
+    const std::size_t reconcile_rows = std::min({rows, real, private_state.size()});
+    for (std::size_t row = 0; row < reconcile_rows; ++row) {
+      const double comp = compositionGasMassOf(m_composition, row);
+      const double mass = private_state.loadCell(row).mass_density_comoving * volume;
+      if (!(comp > 0.0) || !(mass > 0.0) || !std::isfinite(mass)) continue;
+      if (comp != mass) {
+        m_composition.scaleRow(row, mass / comp);
+        reconciled_mass_code += mass - comp;
       }
     }
     m_records.clear();
@@ -604,6 +625,24 @@ template <typename T>
   return value;
 }
 
+// Marks the reference busy while one of its members iterates the pending
+// sample / chronology lists, so the governor's best-effort reclaimer cannot
+// drop them underneath (reclaimBestEffort() then returns 0).
+class BusyScope {
+ public:
+  explicit BusyScope(bool& flag) noexcept : m_flag(flag), m_previous(flag) { m_flag = true; }
+  ~BusyScope() { m_flag = m_previous; }
+  BusyScope(const BusyScope&) = delete;
+  BusyScope& operator=(const BusyScope&) = delete;
+ private:
+  bool& m_flag;
+  bool m_previous;
+};
+
+[[nodiscard]] double secondsSince(std::chrono::steady_clock::time_point start) noexcept {
+  return std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -876,11 +915,18 @@ void HydroShadowReference::beginEpoch(std::uint64_t step_index) {
   m_region_results.clear();
 }
 
-void HydroShadowReference::setGlobalCandidates(std::vector<HydroShadowCandidate> ranked) {
-  m_global_candidates = rankHydroShadowCandidates(ranked, m_options.max_patches_per_rank,
-                                                 m_step_index, m_options.seed);
-  m_report.globally_selected_regions = m_global_candidates.size();
+void HydroShadowReference::setGlobalCandidates(std::vector<HydroShadowCandidate> ranked) noexcept {
   m_selected_once.clear();
+  try {
+    m_global_candidates = rankHydroShadowCandidates(ranked, m_options.max_patches_per_rank,
+                                                   m_step_index, m_options.seed);
+  } catch (...) {
+    // Local allocation failure: this rank samples nothing this epoch. Every
+    // later shadow decision is local or voted, so no collective diverges.
+    m_global_candidates.clear();
+    ++m_report.skipped_resource;
+  }
+  m_report.globally_selected_regions = m_global_candidates.size();
 }
 
 bool HydroShadowReference::isGloballySelected(std::uint64_t region_key, int level) const noexcept {
@@ -898,7 +944,7 @@ HydroShadowReference::Sample HydroShadowReference::capture(
     const HydroReconstructionPolicy& production_policy,
     HydroRiemannSolverKind production_riemann,
     std::span<const HydroSourceTerm* const> source_terms,
-    const HydroSourceContext& source_context) {
+    const HydroSourceContext& source_context) noexcept {
   HydroShadowPatchCapture spec;
   spec.identity = HydroShadowCandidate{.patch_id = patch_id, .level = level, .region_key = 0U};
   spec.before = &before;
@@ -914,7 +960,29 @@ HydroShadowReference::Sample HydroShadowReference::capture(
   return capture(spec);
 }
 
-HydroShadowReference::Sample HydroShadowReference::capture(const HydroShadowPatchCapture& spec) {
+HydroShadowReference::Sample HydroShadowReference::capture(const HydroShadowPatchCapture& spec) noexcept {
+  // C04-05: an optional diagnostic must never abort the production advance.
+  // captureImpl() counts every regular refusal itself; anything escaping it
+  // (allocation of provenance/cone scratch, a malformed span) is contained.
+  const auto start = std::chrono::steady_clock::now();
+  struct CostScope {
+    double& total;
+    std::chrono::steady_clock::time_point start;
+    ~CostScope() { total += secondsSince(start); }
+  } cost{m_report.private_work_seconds, start};
+  try {
+    return captureImpl(spec);
+  } catch (const std::bad_alloc&) {
+    ++m_report.skipped_resource;
+  } catch (const std::overflow_error&) {
+    ++m_report.skipped_resource;
+  } catch (...) {
+    ++m_report.skipped_numerical;
+  }
+  return {};
+}
+
+HydroShadowReference::Sample HydroShadowReference::captureImpl(const HydroShadowPatchCapture& spec) {
   Sample sample;
   if (!m_options.enabled) return sample;
   ++m_report.eligible;
@@ -1036,6 +1104,7 @@ HydroShadowReference::Sample HydroShadowReference::capture(const HydroShadowPatc
     retained = checkedAdd(retained, vectorBytes(spec.active.active_cells.size() + spec.active.active_faces.size(),
                                                 sizeof(std::size_t)));
     retained = checkedAdd(retained, vectorBytes(before.size(), sizeof(std::size_t)));  // slot map
+    retained = checkedAdd(retained, vectorBytes(before.size(), 2U * sizeof(std::uint8_t)));  // regime gates
     retained = checkedAdd(retained, vectorBytes(count, sizeof(HydroCellSourceProperties) + 2U));
     retained = checkedAdd(retained, checkedMul(spec.source_terms.size(),
                                                sizeof(std::unique_ptr<HydroSourceTerm>) + 512U));
@@ -1044,6 +1113,7 @@ HydroShadowReference::Sample HydroShadowReference::capture(const HydroShadowPatc
       retained = checkedAdd(retained, vectorBytes(checkedMul(slots, lanes + 1U), sizeof(double)));
       retained = checkedAdd(retained, vectorBytes(checkedMul(count, lanes), sizeof(double)));  // deltas
       retained = checkedAdd(retained, vectorBytes(spec.active.active_faces.size(), 4U * sizeof(std::size_t)));
+      retained = checkedAdd(retained, vectorBytes(slots, sizeof(std::uint64_t)));  // ghost origin ids
     }
     std::size_t region_cells = 0U;
     for (const auto& region : spec.regions) region_cells += region.cells.size();
@@ -1057,7 +1127,7 @@ HydroShadowReference::Sample HydroShadowReference::capture(const HydroShadowPatc
       return sample;
     }
     if (m_governor != nullptr) {
-      sample.lease = m_governor->reserve(core::MemoryClass::kDiagnostic, requested,
+      sample.lease = m_governor->reserveBestEffort(core::MemoryClass::kDiagnostic, requested,
                                          "hydro.shadow_reference.private_state_and_scratch");
       sample.lease.commit();
     }
@@ -1098,9 +1168,13 @@ HydroShadowReference::Sample HydroShadowReference::capture(const HydroShadowPatc
         ++m_report.skipped_unsupported_source;
         return {};
       }
+      // I01: production gates are indexed by SOLVER row (real + ghost rows);
+      // keep every row the production gate covers so private ghost rows get
+      // the same regime decision as the production advance.
+      const std::size_t gate_rows = std::min(source_context.effective_closure_allowed.size(), before.size());
       sample.effective_closure_allowed.assign(
           source_context.effective_closure_allowed.begin(),
-          source_context.effective_closure_allowed.begin() + static_cast<std::ptrdiff_t>(count));
+          source_context.effective_closure_allowed.begin() + static_cast<std::ptrdiff_t>(gate_rows));
     }
     if (!spec.source_terms.empty()) {
       sample.captured_properties.reserve(count);
@@ -1201,6 +1275,22 @@ HydroShadowReference::Sample HydroShadowReference::capture(const HydroShadowPatc
           sample.ghost_donor_fractions[slot * lanes + l] = production.value(l, dense) / mass;
         }
       }
+      // Remote donors (C04-02/03): imported slots whose origin is not a local
+      // row are resolved later from the PRODUCTION donor-fraction exchange
+      // (same step-start fractions production uses) when the caller promises
+      // them; the comparison is then held until they arrive.
+      sample.ghost_source_gas_cell_ids.assign(slots, 0U);
+      for (std::size_t slot = 0; slot < slots; ++slot) {
+        if (slot < spec.composition_ghost_gas_cell_ids.size()) {
+          sample.ghost_source_gas_cell_ids[slot] = spec.composition_ghost_gas_cell_ids[slot];
+        }
+        if (!selfAuthority(sample.provenance[slot]) && sample.ghost_source_gas_cell_ids[slot] != 0U &&
+            !std::isfinite(sample.ghost_donor_fractions[slot * lanes])) {
+          ++sample.remote_donor_slot_count;
+        }
+      }
+      sample.awaiting_remote_donors =
+          spec.remote_donor_fractions_will_be_provided && sample.remote_donor_slot_count != 0U;
     }
   } catch (const core::MemoryAdmissionError&) {
     ++m_report.skipped_resource;
@@ -1227,7 +1317,7 @@ HydroShadowReference::Sample HydroShadowReference::capture(const HydroShadowPatc
   return sample;
 }
 
-void HydroShadowReference::observeProduction(Sample&& sample, const HydroConservedStateSoa& production_after) {
+void HydroShadowReference::observeProduction(Sample&& sample, const HydroConservedStateSoa& production_after) noexcept {
   if (!sample) return;
   try {
     const std::size_t count = sample.geometry.cellCount();
@@ -1245,12 +1335,20 @@ void HydroShadowReference::observeProduction(Sample&& sample, const HydroConserv
     ++m_report.skipped_numerical;
     return;
   }
-  if (sample.needs_endpoint) {
-    m_pending.push_back(std::move(sample));
-    return;
+  try {
+    // Held: endpoint ghosts and/or promised remote donor fractions arrive
+    // later at a rank-uniform point of this attempt.
+    if (sample.needs_endpoint || sample.awaiting_remote_donors) {
+      m_pending.push_back(std::move(sample));
+      return;
+    }
+    runHydroComparison(sample);
+    if (sample.retain_for_chronology && sample.valid) m_pending.push_back(std::move(sample));
+  } catch (...) {
+    // Only the pending-list growth can throw; the sample (and its lease) is
+    // released by this frame. Diagnostic only.
+    ++m_report.skipped_resource;
   }
-  runHydroComparison(sample);
-  if (sample.retain_for_chronology && sample.valid) m_pending.push_back(std::move(sample));
 }
 
 void HydroShadowReference::compare(
@@ -1284,6 +1382,7 @@ void HydroShadowReference::provideEndpointGhosts(
     std::span<const HydroConservedState> ghost_states,
     std::span<const double> ghost_auxiliary,
     std::span<const std::uint8_t> slot_valid) noexcept {
+  const BusyScope busy(m_busy);
   for (Sample& sample : m_pending) {
     if (hydroShadowEffectiveKey(sample.identity) != region_key || sample.endpoint_received ||
         sample.hydro_compared) {
@@ -1321,9 +1420,61 @@ void HydroShadowReference::provideEndpointGhosts(
   }
 }
 
-void HydroShadowReference::finalizePendingEndpoints() noexcept {
+void HydroShadowReference::provideRemoteDonorFractions(std::span<const std::uint64_t> sorted_gas_cell_ids,
+                                                       std::span<const double> fractions_row_major,
+                                                       std::size_t lanes) noexcept {
+  const BusyScope busy(m_busy);
+  if (lanes == 0U || sorted_gas_cell_ids.size() > fractions_row_major.size() / lanes) {
+    // Malformed table: held samples keep the counted receiver-fraction
+    // fallback (composition_remote_donor_faces) when they are compared.
+    for (Sample& sample : m_pending) sample.remote_donors_received = sample.awaiting_remote_donors;
+    return;
+  }
+  for (Sample& sample : m_pending) {
+    if (!sample.valid || sample.hydro_compared || !sample.composition.enabled() ||
+        sample.ghost_source_gas_cell_ids.empty() || sample.remote_donor_slot_count == 0U) {
+      continue;
+    }
+    sample.remote_donors_received = true;
+    if (sample.composition.laneCount() != lanes) continue;
+    const std::size_t slots = sample.ghost_source_gas_cell_ids.size();
+    if (sample.ghost_donor_fractions.size() < slots * lanes) continue;
+    for (std::size_t slot = 0; slot < slots; ++slot) {
+      const std::uint64_t id = sample.ghost_source_gas_cell_ids[slot];
+      if (id == 0U || std::isfinite(sample.ghost_donor_fractions[slot * lanes]) ||
+          selfAuthority(sample.provenance[slot])) {
+        continue;
+      }
+      const auto it = std::lower_bound(sorted_gas_cell_ids.begin(), sorted_gas_cell_ids.end(), id);
+      if (it == sorted_gas_cell_ids.end() || *it != id) continue;
+      const std::size_t index = static_cast<std::size_t>(it - sorted_gas_cell_ids.begin());
+      const std::span<const double> fraction = fractions_row_major.subspan(index * lanes, lanes);
+      if (std::any_of(fraction.begin(), fraction.end(), [](double f) { return !std::isfinite(f) || f < 0.0; })) {
+        continue;
+      }
+      std::copy(fraction.begin(), fraction.end(),
+                sample.ghost_donor_fractions.begin() + static_cast<std::ptrdiff_t>(slot * lanes));
+      ++m_report.composition_remote_donor_slots_resolved;
+    }
+  }
+}
+
+std::uint64_t HydroShadowReference::unpublishedResultCount() const noexcept {
+  std::uint64_t count = static_cast<std::uint64_t>(m_region_results.size()) +
+      static_cast<std::uint64_t>(m_chronologies.size());
+  for (const Sample& sample : m_pending) {
+    if (sample.valid && !sample.hydro_compared) ++count;
+  }
+  return count;
+}
+
+void HydroShadowReference::finalizePendingEndpoints(bool include_awaiting_remote_donors) noexcept {
+  const BusyScope busy(m_busy);
   for (Sample& sample : m_pending) {
     if (!sample.valid || sample.hydro_compared || !sample.production_observed) continue;
+    if (!include_awaiting_remote_donors && sample.awaiting_remote_donors && !sample.remote_donors_received) {
+      continue;
+    }
     if (sample.needs_endpoint && !sample.endpoint_received) {
       ++m_report.skipped_endpoint_unavailable;
       for (auto& authority : sample.authority) {
@@ -1362,6 +1513,12 @@ void HydroShadowReference::accumulateRegionResult(const HydroShadowRegionResult&
 void HydroShadowReference::runHydroComparison(Sample& sample) noexcept {
   if (!sample.valid || sample.hydro_compared) return;
   sample.hydro_compared = true;
+  const auto cost_start = std::chrono::steady_clock::now();
+  struct CostScope {
+    double& total;
+    std::chrono::steady_clock::time_point start;
+    ~CostScope() { total += secondsSince(start); }
+  } cost{m_report.private_work_seconds, cost_start};
   // All sample work is private and non-authoritative, including Riemann
   // fallback counters; no production source terms, registers or flux sinks.
   try {
@@ -1401,7 +1558,10 @@ void HydroShadowReference::runHydroComparison(Sample& sample) noexcept {
       engine.advance(reference, view, sample.update, substep, substeps, shadow_sources,
                      sample.initial, composition.enabled() ? &composition : nullptr,
                      sink.has_value() ? &*sink : nullptr, m_report.fallback_count);
-      if (sink.has_value()) m_report.composition_remote_donor_faces += sink->apply(composition_unknown);
+      if (sink.has_value()) {
+        m_report.composition_remote_donor_faces +=
+            sink->apply(composition_unknown, reference, m_report.composition_reconciled_mass_code);
+      }
     }
     // Only the halfstep-2 boundary data can be stale: cone exclusion for
     // step-start-only slots of a two-halfstep reference.
@@ -1506,6 +1666,11 @@ void HydroShadowReference::runHydroComparison(Sample& sample) noexcept {
     if (sample.endpoint_received) ++m_report.completed_endpoint_ghost_patches;
     if (sample.partial_active) ++m_report.completed_partial_active_patches;
     m_report.reference_substeps += substeps;
+  } catch (const core::StageNumericalRetryRequest&) {
+    // A cloned hydro-owned source (e.g. full-interval cooling, audit F2)
+    // could not complete the private interval: specific counted refusal.
+    ++m_report.skipped_source_interval_incomplete;
+    sample.valid = false;
   } catch (const std::exception&) {
     // Shadow is a diagnostic. A failed reference must not change a step,
     // acceptance decision, source history or physical model. Count and skip.
@@ -1536,7 +1701,7 @@ bool HydroShadowReference::openChronology(const HydroShadowCandidate& domain,
     }
     ChronologyRecord record;
     if (m_governor != nullptr) {
-      record.lease = m_governor->reserve(core::MemoryClass::kDiagnostic, bytes,
+      record.lease = m_governor->reserveBestEffort(core::MemoryClass::kDiagnostic, bytes,
                                          "hydro.shadow_reference.chronology_snapshots");
       record.lease.commit();
     }
@@ -1544,6 +1709,7 @@ bool HydroShadowReference::openChronology(const HydroShadowCandidate& domain,
     record.gas_cell_ids.assign(gas_cell_ids.begin(), gas_cell_ids.end());
     record.composition_lanes = composition_lanes;
     record.level_clock = level_clock;
+    record.admitted_bytes = bytes;
     m_workspace_bytes_charged += bytes;
     m_chronologies.push_back(std::move(record));
     ++m_report.chronology_started;
@@ -1576,6 +1742,7 @@ std::span<const std::uint64_t> HydroShadowReference::chronologyGasCellIds(std::u
 
 void HydroShadowReference::recordChronologyPoint(std::uint64_t domain_key, HydroShadowChronologyPoint point,
                                                  const HydroShadowPrivateRegion& snapshot) noexcept {
+  const BusyScope busy(m_busy);
   for (ChronologyRecord& record : m_chronologies) {
     if (hydroShadowEffectiveKey(record.domain) != domain_key) continue;
     if (snapshot.cell_count != record.gas_cell_ids.size() || snapshot.gas_cell_ids != record.gas_cell_ids) {
@@ -1612,6 +1779,7 @@ std::span<const std::uint64_t> HydroShadowReference::sampleGasCellIds(std::uint6
 void HydroShadowReference::compareCompositionAfterCommit(std::uint64_t domain_key,
                                                          const HydroShadowPrivateRegion& snapshot,
                                                          double endpoint_time_code) noexcept {
+  const BusyScope busy(m_busy);
   // Hydro-only composition check: the private composition transported with
   // the private mass fluxes vs the committed production composition at the
   // same physical endpoint (post-hydro, pre-regrid). Ghost donor fractions
@@ -1683,6 +1851,7 @@ void HydroShadowReference::noteChronologyUnsupported(std::uint64_t HydroShadowRe
 
 void HydroShadowReference::finalizeChronologies(const HydroShadowSmoothSourceReplay* replay,
                                                 std::optional<int> level_filter) noexcept {
+  const BusyScope busy(m_busy);
   std::vector<std::uint64_t> finished;
   for (ChronologyRecord& record : m_chronologies) {
     const std::uint64_t key = hydroShadowEffectiveKey(record.domain);
@@ -1736,6 +1905,12 @@ void HydroShadowReference::runChronology(ChronologyRecord& record, Sample& sampl
     ++m_report.chronology_skipped_region_changed;
     return;
   }
+  const auto cost_start = std::chrono::steady_clock::now();
+  struct CostScope {
+    double& total;
+    std::chrono::steady_clock::time_point start;
+    ~CostScope() { total += secondsSince(start); }
+  } cost{m_report.private_work_seconds, cost_start};
   try {
     const auto status_ok = [this](HydroShadowReplayStatus status) {
       switch (status) {
@@ -1791,7 +1966,19 @@ void HydroShadowReference::runChronology(ChronologyRecord& record, Sample& sampl
     std::vector<std::size_t> slot_by_row;
     (void)storageSlotMap(sample.geometry, slot_by_row);
     std::vector<std::uint8_t> composition_unknown(count, 0U);
+    // I01: the private smooth replay evolves the private ISM regime tags; the
+    // private hydro halfstep follows them (real rows), ghost rows keep the
+    // captured production gate (their origin is outside the private region).
+    std::vector<std::uint8_t> private_gate(sample.effective_closure_allowed.begin(),
+                                           sample.effective_closure_allowed.end());
     const auto hydro_halfstep = [&](std::uint32_t substep) {
+      if (!private_gate.empty() && x.composition.enabled()) {
+        const std::size_t rows = std::min({count, private_gate.size(), x.composition.ism_regime_tag.size()});
+        for (std::size_t row = 0; row < rows; ++row) {
+          private_gate[row] = x.composition.ism_regime_tag[row] == core::k_gas_ism_regime_effective ? 1U : 0U;
+        }
+        view.effective_closure_allowed = private_gate;
+      }
       regionToSoa(x, soa);
       engine.setGhosts(soa, sample.authority, sample.endpoint_ghosts,
                        sample.endpoint_ghost_auxiliary, substep, 2U);
@@ -1807,7 +1994,10 @@ void HydroShadowReference::runChronology(ChronologyRecord& record, Sample& sampl
       engine.advance(soa, view, sample.update, substep, 2U, shadow_sources, sample.initial,
                      x.composition.enabled() ? &x.composition : nullptr,
                      sink.has_value() ? &*sink : nullptr, m_report.fallback_count);
-      if (sink.has_value()) m_report.composition_remote_donor_faces += sink->apply(composition_unknown);
+      if (sink.has_value()) {
+        m_report.composition_remote_donor_faces +=
+            sink->apply(composition_unknown, soa, m_report.composition_reconciled_mass_code);
+      }
       soaToRegion(soa, x);
       // Production commits composition transport and then re-derives the
       // metal mirror from the inventory; the private chronology does too.
@@ -1901,6 +2091,8 @@ void HydroShadowReference::runChronology(ChronologyRecord& record, Sample& sampl
     }
     if (completed_regions == 0U) return;
     ++m_report.completed_chronology_regions;
+  } catch (const core::StageNumericalRetryRequest&) {
+    ++m_report.skipped_source_interval_incomplete;
   } catch (const std::exception&) {
     ++m_report.skipped_numerical;
   }
@@ -1913,6 +2105,24 @@ void HydroShadowReference::discardPending() noexcept {
   m_report.discarded_rejected_attempt += m_chronologies.size();
   m_pending.clear();
   m_chronologies.clear();
+}
+
+std::uint64_t HydroShadowReference::reclaimBestEffort() noexcept {
+  if (m_busy) return 0U;
+  std::uint64_t released = 0U;
+  for (const Sample& sample : m_pending) {
+    if (sample.valid) {
+      released += sample.admitted_bytes;
+      ++m_report.evicted_for_mandatory_memory;
+    }
+  }
+  for (const ChronologyRecord& record : m_chronologies) {
+    released += record.admitted_bytes;
+    ++m_report.evicted_for_mandatory_memory;
+  }
+  m_pending.clear();
+  m_chronologies.clear();
+  return released;
 }
 
 }  // namespace cosmosim::hydro

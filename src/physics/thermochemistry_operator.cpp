@@ -1,10 +1,13 @@
 #include "cosmosim/physics/thermochemistry_operator.hpp"
 
 #include <algorithm>
+#include <array>
+#include <charconv>
 #include <cmath>
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 
 #include "cosmosim/core/simulation_state.hpp"
 
@@ -453,12 +456,24 @@ ThermochemistryRowResult ThermochemistryOperator::advanceRow(const core::Simulat
   const ThermochemistryCellOutput& output = production.output;
   SourceLedger& per_volume = production.ledger;
   const MetalIonRowState& ion_state = production.ions;
-  if (m_reference_solver != nullptr && shadow.samples < m_config.shadow.max_cells) {
-    // Deterministic sample keyed by stable id and accepted step.
-    const std::uint64_t key = core::fnv1a64(std::to_string(state.gas_cells.gas_cell_id[row]) + ":" +
-                                            std::to_string(interval.accepted_step_index));
+  if (m_reference_solver != nullptr) {
+    // Deterministic sample keyed by stable id and accepted step (same key
+    // text "<id>:<step>" as before, formatted on the stack: no per-row heap
+    // allocation). Selection is decided by the key ALONE, before the cost
+    // cap, so the selected set is independent of row order and MPI
+    // decomposition; rows cut by the cap are counted (cap_truncated).
+    std::array<char, 48> key_text{};
+    char* key_end = std::to_chars(key_text.data(), key_text.data() + key_text.size(),
+                                  state.gas_cells.gas_cell_id[row]).ptr;
+    *key_end++ = ':';
+    key_end = std::to_chars(key_end, key_text.data() + key_text.size(), interval.accepted_step_index).ptr;
+    const std::uint64_t key = core::fnv1a64(
+        std::string_view(key_text.data(), static_cast<std::size_t>(key_end - key_text.data())));
     const double u01 = static_cast<double>(key >> 11U) * (1.0 / 9007199254740992.0);
-    if (u01 < m_config.shadow.sample_fraction) {
+    const bool selected = u01 < m_config.shadow.sample_fraction;
+    if (selected && shadow.samples + shadow.reference_failures >= m_config.shadow.max_cells) {
+      ++shadow.cap_truncated;
+    } else if (selected) {
       // P1-49-07 / patch 51: the reference ALWAYS runs the full detailed
       // coupled chronology (its own higher-accuracy light network AND, when
       // ladders are configured, its own higher-accuracy ladder:
@@ -562,6 +577,8 @@ ThermochemistryRowResult ThermochemistryOperator::advanceRow(const core::Simulat
             static_cast<double>(reference.ledger.accepted_substeps + reference.ledger.rejected_substeps) /
             std::max<double>(1.0, static_cast<double>(per_volume.accepted_substeps + per_volume.rejected_substeps));
         shadow.mean_substep_cost_ratio += (ratio - shadow.mean_substep_cost_ratio) / static_cast<double>(shadow.samples);
+      } else {
+        ++shadow.reference_failures;
       }
     }
   }

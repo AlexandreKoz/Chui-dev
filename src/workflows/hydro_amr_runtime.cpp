@@ -17,6 +17,7 @@
 #include <string_view>
 #include <tuple>
 #include <type_traits>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -786,6 +787,12 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime, public HydroShadowChro
         m_shadow(hydroShadowOptionsFromConfig(config), services.memory_governor),
         m_reconstruction(makeConfiguredReconstruction(config, {0.0, 0.0, 0.0})),
         m_riemann_solver(hydro::makeHydroRiemannSolver(hydroRiemannSolverKindFromConfig(config))) {
+    // C04-05 / v10 §5.2: a refused MANDATORY reservation first reclaims the
+    // optional shadow samples (local, no collective; only on this thread).
+    if (m_memory_governor != nullptr && config.numerics.hydro_shadow_enabled) {
+      m_memory_governor->setBestEffortReclaimer([this] { return m_shadow.reclaimBestEffort(); },
+                                                std::this_thread::get_id());
+    }
     // CHUI Part 2: one owner per physical source. A Part 2 thermochemistry
     // backend is advanced by the SourceRuntime thermochemistry stage; the
     // legacy in-solver cooling source is then NOT registered (no double
@@ -859,6 +866,14 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime, public HydroShadowChro
           std::make_unique<physics::EffectiveIsmEnergyRelaxationSource>(*m_effective_ism_closure);
     }
   }
+
+  ~HydroAmrRuntimeImpl() override {
+    if (m_memory_governor != nullptr && m_config.numerics.hydro_shadow_enabled) {
+      m_memory_governor->clearBestEffortReclaimer();
+    }
+  }
+  HydroAmrRuntimeImpl(const HydroAmrRuntimeImpl&) = delete;
+  HydroAmrRuntimeImpl& operator=(const HydroAmrRuntimeImpl&) = delete;
 
   [[nodiscard]] const hydro::HydroProfileEvent& lastHydroProfile() const noexcept { return m_last_hydro_profile; }
   [[nodiscard]] const internal::SolverGhostRefreshReport&
@@ -1266,6 +1281,15 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime, public HydroShadowChro
         .thermodynamic_closure = m_effective_ism_closure.get(),
         .redshift = std::max(0.0, (update.scale_factor > 0.0 ? (1.0 / update.scale_factor - 1.0) : 0.0)),
     };
+    // I01: the ISM regime tag owns the effective/resolved split for the solver
+    // closure and the relaxation source exactly as for the P/c_s refresh and
+    // the source-stage thermochemistry (one authority). Solver rows: real rows
+    // map to dense rows; boundary ghosts take their in-grid source cell. (The
+    // AMR path builds patch-local gates in the orchestrator.)
+    if (m_effective_ism_closure != nullptr &&
+        hydro::buildIsmRegimeGate(context.state, m_geometry, m_dense_row_by_geometry_row, m_regime_gate)) {
+      source_context.effective_closure_allowed = m_regime_gate;
+    }
 
     // Gravity and homogeneous expansion are integrated by the gravity-owned
     // KDK half-kicks around hydro/source evolution. Hydro owns transport plus
@@ -1752,7 +1776,12 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime, public HydroShadowChro
   void publishOrDiscardCompletedShadowEpoch(const core::StepContext& context) {
     if (!m_shadow_epoch_pending_publication) {
       // An attempt that never closed (rejected before its end) is dropped
-      // with its pending samples by beginEpoch(); nothing is published.
+      // with its pending samples by beginEpoch(); nothing is published, but
+      // the loss is carried to the next accepted publication.
+      if (m_shadow_attempt_open) {
+        ++m_shadow_rejected_attempts_carry;
+        m_shadow_rejected_results_carry += m_shadow.unpublishedResultCount();
+      }
       return;
     }
     m_shadow_epoch_pending_publication = false;
@@ -1761,7 +1790,16 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime, public HydroShadowChro
     const double tolerance = 1.0e-9 * std::max({1.0, std::abs(now_begin), std::abs(m_shadow_epoch_time_end)});
     const bool accepted = context.integrator_state.step_index != m_shadow_epoch_step &&
         std::abs(now_begin - m_shadow_epoch_time_end) <= tolerance;
-    if (accepted) publishHydroShadow(context);
+    if (accepted) {
+      publishHydroShadow(context);
+      m_shadow_rejected_attempts_carry = 0U;
+      m_shadow_rejected_results_carry = 0U;
+      return;
+    }
+    // Closed but rejected afterwards (e.g. global step vote / rollback):
+    // its comparisons are never published as accepted-step metrics.
+    ++m_shadow_rejected_attempts_carry;
+    m_shadow_rejected_results_carry += m_shadow.unpublishedResultCount();
   }
 
   // Physical identities of the locally owned sample domains.
@@ -1879,7 +1917,7 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime, public HydroShadowChro
         throw std::runtime_error("shadow global selection exceeds diagnostic workspace cap");
       }
       if (m_memory_governor != nullptr) {
-        admission = m_memory_governor->reserve(core::MemoryClass::kDiagnostic,
+        admission = m_memory_governor->reserveBestEffort(core::MemoryClass::kDiagnostic,
                    workspace_bytes, "hydro.shadow_reference.global_candidate_ranking");
         admission.commit();
       }
@@ -2176,16 +2214,20 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime, public HydroShadowChro
 
   // C04-03 synchronized stepping: one rank-uniform decision, one optional
   // post-advance directed exchange (MPI), then the local endpoint fill.
+  // hold_remote_donor_samples: composition samples awaiting the production
+  // remote donor fractions stay pending (compared after the exchange).
   void completeSynchronizedShadowEndpoints(core::StepContext& context,
                                            const amr::ProductionAmrHydroOptions& amr_options,
-                                           double endpoint_time_code) {
+                                           double endpoint_time_code,
+                                           bool hold_remote_donor_samples = false) {
+    const bool include_awaiting = !hold_remote_donor_samples;
     if (!m_shadow.cadenceStep()) {
-      m_shadow.finalizePendingEndpoints();
+      m_shadow.finalizePendingEndpoints(include_awaiting);
       return;
     }
     const std::uint64_t local_pending = m_shadow.pendingEndpointCount() != 0U ? 1U : 0U;
     if (m_mpi_context.allreduceMaxUint64(local_pending) == 0U) {
-      m_shadow.finalizePendingEndpoints();
+      m_shadow.finalizePendingEndpoints(include_awaiting);
       return;
     }
     std::optional<DirectedHydroGhostExchange> exchange;
@@ -2205,7 +2247,7 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime, public HydroShadowChro
         ? std::span<const amr::DistributedAmrRemotePatch>(exchange->remote_patches)
         : std::span<const amr::DistributedAmrRemotePatch>{};
     (void)amr::completeHydroShadowEndpointGhosts(context.state, amr_options, remote, endpoint_time_code, false);
-    m_shadow.finalizePendingEndpoints();
+    m_shadow.finalizePendingEndpoints(include_awaiting);
   }
 
   // Called only at the acceptance barrier of the epoch (start of the next
@@ -2243,7 +2285,7 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime, public HydroShadowChro
           throw std::length_error("shadow region results exceed the global-K publication bound");
         }
         if (m_memory_governor != nullptr) {
-          gather_admission = m_memory_governor->reserve(core::MemoryClass::kDiagnostic, bound,
+          gather_admission = m_memory_governor->reserveBestEffort(core::MemoryClass::kDiagnostic, bound,
                                                         "hydro.shadow_reference.region_publication");
           gather_admission.commit();
         }
@@ -2336,7 +2378,19 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime, public HydroShadowChro
         {"skipped_region_split_across_ranks", std::to_string(sum_u64(local.skipped_region_split_across_ranks))},
         {"skipped_composition_endpoint_mismatch",
          std::to_string(sum_u64(local.skipped_composition_endpoint_mismatch))},
-        {"discarded_rejected_attempt_samples", std::to_string(sum_u64(local.discarded_rejected_attempt))},
+        {"discarded_rejected_attempt_samples", std::to_string(
+            sum_u64(local.discarded_rejected_attempt) + sum_u64(m_shadow_rejected_results_carry))},
+        {"discarded_rejected_attempts", std::to_string(m_shadow_rejected_attempts_carry)},
+        {"evicted_for_mandatory_memory", std::to_string(sum_u64(local.evicted_for_mandatory_memory))},
+        {"skipped_source_interval_incomplete", std::to_string(sum_u64(local.skipped_source_interval_incomplete))},
+        {"private_work_seconds_max_rank", std::to_string(max_double(local.private_work_seconds))},
+        {"private_work_seconds_sum", std::to_string(
+            m_mpi_context.allreduceSumDouble(local.private_work_seconds))},
+        {"admission_policy", "best_effort_green_band;reclaimed_before_mandatory_refusal"},
+        {"composition_remote_donor_slots_resolved",
+         std::to_string(sum_u64(local.composition_remote_donor_slots_resolved))},
+        {"composition_reconciled_mass_code", std::to_string(max_double(
+            std::abs(local.composition_reconciled_mass_code)))},
         {"chronology_started", std::to_string(sum_u64(local.chronology_started))},
         {"chronology_skipped_recursive_level_sources",
          std::to_string(sum_u64(local.chronology_skipped_recursive_level_sources))},
@@ -2395,7 +2449,9 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime, public HydroShadowChro
          "refined_strang_S4_H2_S4_S4_H2_S4;smooth_thermochemistry_private_production_operator;"
          "diffusion_sgs_shear_captured_increments_linear_in_time;discrete_events_captured_increment_at_interval_end;"
          "gravity_kdk_outside_compared_window"},
-        {"composition_transport", "private_donor_cell_sink_same_rule_as_production;no_private_reflux"},
+        {"composition_transport",
+         "private_donor_cell_sink_same_rule_as_production;production_clamp_and_mass_reconciliation;"
+         "remote_donors_from_production_exchange_synchronized_mpi;no_private_reflux"},
         {"production_method", core::hydroIntegrationModeToString(
             m_config.numerics.hydro_integration_scheme)},
         {"sampling_identity", "physical_region_key(level,lattice_origin,extent)"},
@@ -3572,7 +3628,7 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime, public HydroShadowChro
           }
         }
         if (m_runtime.m_memory_governor != nullptr && interpolated_cells != 0U) {
-          m_shadow_endpoint_reservation = m_runtime.m_memory_governor->reserve(
+          m_shadow_endpoint_reservation = m_runtime.m_memory_governor->reserveBestEffort(
               core::MemoryClass::kDiagnostic,
               core::checkedIntegralNarrow<std::uint64_t>(
                   core::checkedSizeMultiply(interpolated_cells, sizeof(amr::AmrHydroSparseRemoteCell),
@@ -4093,6 +4149,15 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime, public HydroShadowChro
         source_context.face_mass_flux_sink = composition_flux.get();
       }
     }
+    // C04-02/03: on the synchronized distributed path the production donor
+    // fraction exchange (completeDistributedCompositionTransport) delivers
+    // the step-start fractions of remote donor cells; the shadow holds its
+    // composition samples until then and uses the SAME table. Rank-uniform
+    // (config + allreduced composition flag). Recursive stepping keeps the
+    // counted receiver-fraction fallback (level samples compare per clock).
+    amr_options.hydro_shadow_remote_donor_fractions =
+        m_config.numerics.hydro_shadow_enabled && distributed_composition &&
+        m_config.numerics.amr_time_stepping != core::AmrTimeSteppingConfigMode::kRecursiveSubcycling;
     if (m_mpi_context.isEnabled() && m_mpi_context.worldSize() > 1 &&
         m_config.numerics.amr_time_stepping == core::AmrTimeSteppingConfigMode::kRecursiveSubcycling) {
       // G1.1: distributed recursive Berger-Oliger subcycling. One directed
@@ -4333,11 +4398,15 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime, public HydroShadowChro
     // stepping completed its endpoints per level clock inside the driver.
     if (m_config.numerics.hydro_shadow_enabled &&
         m_config.numerics.amr_time_stepping != core::AmrTimeSteppingConfigMode::kRecursiveSubcycling) {
-      completeSynchronizedShadowEndpoints(context, amr_options, update.time_end_code);
+      completeSynchronizedShadowEndpoints(context, amr_options, update.time_end_code,
+                                          amr_options.hydro_shadow_remote_donor_fractions);
     }
     m_last_amr_hydro_diagnostics = amr_diagnostics;
     if (distributed_composition) {
       completeDistributedCompositionTransport(context, composition_flux.get(), remote_cell_owner);
+      // Held composition samples now have the production remote donors (or
+      // keep the counted fallback): compare before the post-hydro record.
+      if (m_config.numerics.hydro_shadow_enabled) m_shadow.finalizePendingEndpoints();
     } else if (composition_flux != nullptr) {
       // Single rank: the composition update is prepared (may throw = hard
       // stage failure) and committed immediately after the hydro sweep.
@@ -4595,6 +4664,12 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime, public HydroShadowChro
           }
         }
         composition_flux->setRemoteDonorFractions(fractions.gas_cell_id, fractions.lanes, lanes);
+        // C04-02/03: the private shadow composition uses exactly these
+        // production step-start remote donor fractions (read-only, local,
+        // noexcept; no effect on production when the shadow is disabled).
+        if (m_config.numerics.hydro_shadow_enabled) {
+          m_shadow.provideRemoteDonorFractions(fractions.gas_cell_id, fractions.lanes, lanes);
+        }
         composition_flux->prepareDeferred(context.state);
         const auto identity = lane_identity(parallel::CompositionLaneStream::kCorrection);
         const std::size_t outbound_count = composition_flux->outboundRemoteCorrections().size();
@@ -5736,6 +5811,11 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime, public HydroShadowChro
   bool m_shadow_attempt_open = false;
   bool m_shadow_attempt_from_source = false;
   bool m_shadow_epoch_pending_publication = false;
+  // Rejected/retried attempts since the last published epoch (rank-uniform:
+  // rejection is collective) and the local result/sample count they lost.
+  // Published, then cleared, at the next accepted barrier (C04-02/06).
+  std::uint64_t m_shadow_rejected_attempts_carry = 0U;
+  std::uint64_t m_shadow_rejected_results_carry = 0U;
   std::uint64_t m_shadow_epoch_step = 0U;
   double m_shadow_epoch_time_begin = 0.0;
   double m_shadow_epoch_time_end = 0.0;
@@ -5762,6 +5842,8 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime, public HydroShadowChro
   hydro::HydroPatchGeometry m_geometry;
   // Dense CellSoa row <-> physical Cartesian solver-row maps.
   std::vector<std::uint32_t> m_dense_row_by_geometry_row;
+  // I01 fixed-grid regime gate (one byte per solver row, capacity reused).
+  std::vector<std::uint8_t> m_regime_gate;
   std::vector<std::uint32_t> m_geometry_row_by_dense_row;
   hydro::HydroProfileEvent m_last_hydro_profile{};
   core::HydroCflDiagnostics m_last_hydro_cfl_diagnostics{};

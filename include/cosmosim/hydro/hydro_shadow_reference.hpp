@@ -302,6 +302,14 @@ struct HydroShadowReport {
   std::uint64_t skipped_region_split_across_ranks = 0U;
   std::uint64_t skipped_composition_endpoint_mismatch = 0U;
   std::uint64_t discarded_rejected_attempt = 0U;
+  // Pending samples/chronologies released so a MANDATORY reservation could
+  // be admitted (MemoryGovernor best-effort reclaimer, v10 §5.2).
+  std::uint64_t evicted_for_mandatory_memory = 0U;
+  // Hydro-owned source refused the private interval (would need a retry).
+  std::uint64_t skipped_source_interval_incomplete = 0U;
+  // Wall-clock cost of the private work on this rank (capture, private
+  // hydro halfsteps, chronology replay), seconds (C04 cost telemetry).
+  double private_work_seconds = 0.0;
   // Chronology (full-physics Strang interval) reasons.
   std::uint64_t chronology_started = 0U;
   std::uint64_t chronology_skipped_recursive_level_sources = 0U;
@@ -315,7 +323,11 @@ struct HydroShadowReport {
   std::uint64_t chronology_skipped_hydro_sample_missing = 0U;
   std::uint64_t chronology_skipped_resource = 0U;
   double chronology_replay_identity_linf = 0.0;  // private S1 vs production S1
-  std::uint64_t composition_remote_donor_faces = 0U;
+  std::uint64_t composition_remote_donor_faces = 0U;           // donor still unknown (receiver fractions used)
+  std::uint64_t composition_remote_donor_slots_resolved = 0U;  // remote ghost donors from the production exchange
+  // Signed private mass added by the production-rule reconciliation of the
+  // private composition with the private hydro mass (density floor/round-off).
+  double composition_reconciled_mass_code = 0.0;
   std::uint64_t reference_substeps = 0U;
   std::uint64_t fallback_count = 0U;
   std::array<std::uint64_t, k_hydro_shadow_ghost_provenance_count> ghost_slots_by_provenance{};
@@ -357,6 +369,16 @@ struct HydroShadowPatchCapture {
   // Dense composition row of the LOCAL origin of each ghost slot;
   // core::kInvalidGasCellRow = remote/unknown (donor fractions unavailable).
   std::span<const std::uint32_t> composition_ghost_rows{};
+  // Stable gas-cell id of the origin of each ghost slot (0 = unknown or
+  // physical). Used to resolve REMOTE donors through
+  // provideRemoteDonorFractions(); empty = no remote resolution.
+  std::span<const std::uint64_t> composition_ghost_gas_cell_ids{};
+  // True when the caller will call provideRemoteDonorFractions() (with the
+  // production step-start donor fractions of remote cells, exchanged by the
+  // production distributed composition transport) before the final
+  // finalizePendingEndpoints() of this attempt. Samples with unresolved
+  // remote donors are then held instead of compared immediately.
+  bool remote_donor_fractions_will_be_provided = false;
   // Composition-dependent temperature closure (T = factor * mu/0.59 * u).
   double temperature_k_per_internal_energy_code = 0.0;
   // Physical cgs density per comoving code density at a = 1.
@@ -410,7 +432,9 @@ class HydroShadowReference final {
     // Private composition (real rows) and ghost donor fractions.
     core::GasCompositionSidecar composition;
     std::vector<double> ghost_donor_fractions;  // slot-major x lanes, NaN = unavailable
+    std::vector<std::uint64_t> ghost_source_gas_cell_ids;  // per slot, 0 = unknown
     std::vector<std::uint64_t> gas_cell_ids;
+    std::size_t remote_donor_slot_count = 0U;  // imported slots whose donor is not local
     std::array<double, 5> epoch_scale_factor{};
     std::array<double, 5> epoch_hubble_code{};
     double temperature_k_per_internal_energy_code = 0.0;
@@ -428,6 +452,8 @@ class HydroShadowReference final {
     bool retain_for_chronology = false;
     bool hydro_compared = false;
     bool composition_checked = false;
+    bool awaiting_remote_donors = false;  // unresolved remote donor slots, fractions promised
+    bool remote_donors_received = false;
     std::uint64_t admitted_bytes = 0U;
     bool valid = false;
   };
@@ -444,19 +470,24 @@ class HydroShadowReference final {
   // The coordinator must call this once at a rank-uniform boundary with
   // global candidates computed by a bounded collective. No MPI inside
   // conditional patch advances.
-  void setGlobalCandidates(std::vector<HydroShadowCandidate> ranked);
+  // Never throws: an allocation failure leaves this rank with no candidate
+  // (counted skipped_resource). All later shadow work is rank-local or voted,
+  // so asymmetric candidate sets cannot desynchronize a collective.
+  void setGlobalCandidates(std::vector<HydroShadowCandidate> ranked) noexcept;
   [[nodiscard]] std::span<const HydroShadowCandidate> globalCandidates() const noexcept {
     return m_global_candidates;
   }
   [[nodiscard]] bool isGloballySelected(std::uint64_t region_key, int level) const noexcept;
   void noteGlobalSelectionResourceRefusal() noexcept { ++m_report.skipped_resource; }
+  void noteLocalResourceRefusal() noexcept { ++m_report.skipped_resource; }
   void noteRegionSplitAcrossRanks(std::uint64_t count) noexcept {
     m_report.skipped_region_split_across_ranks += count;
   }
 
   // Preferred capture. Returns an invalid sample when not selected, not
-  // eligible or not admitted (each counted by reason).
-  [[nodiscard]] Sample capture(const HydroShadowPatchCapture& spec);
+  // eligible or not admitted (each counted by reason). Never throws: an
+  // optional diagnostic can never veto or abort the production advance.
+  [[nodiscard]] Sample capture(const HydroShadowPatchCapture& spec) noexcept;
   // Legacy capture (standalone callers): one region, default provenance,
   // no endpoint ghosts, no composition.
   [[nodiscard]] Sample capture(
@@ -470,12 +501,13 @@ class HydroShadowReference final {
       const HydroReconstructionPolicy& production_policy,
       HydroRiemannSolverKind production_riemann,
       std::span<const HydroSourceTerm* const> source_terms,
-      const HydroSourceContext& source_context);
+      const HydroSourceContext& source_context) noexcept;
 
   // Records the production post-advance real-cell state (pre-reflux) and
   // either runs the comparison immediately (all ghosts self-refreshed or a
   // single-step reference) or keeps the sample pending its endpoint ghosts.
-  void observeProduction(Sample&& sample, const HydroConservedStateSoa& production_after);
+  // Never throws (failures are counted skipped_numerical/skipped_resource).
+  void observeProduction(Sample&& sample, const HydroConservedStateSoa& production_after) noexcept;
   // Legacy one-shot API: observeProduction() followed by finalizePendingEndpoints().
   void compare(
       Sample&& sample,
@@ -502,9 +534,24 @@ class HydroShadowReference final {
       std::span<const HydroConservedState> ghost_states,
       std::span<const double> ghost_auxiliary,
       std::span<const std::uint8_t> slot_valid) noexcept;
+  // Remote donor fractions (C04-02/03, distributed composition): the
+  // production step-start lane mass fractions of remote cells, exactly as
+  // assembled by the production donor-fraction exchange (ids sorted unique,
+  // `lanes` doubles per id, row-major). Fills every still-unknown ghost donor
+  // slot of every held sample whose origin id is listed. Local, never throws.
+  void provideRemoteDonorFractions(std::span<const std::uint64_t> sorted_gas_cell_ids,
+                                   std::span<const double> fractions_row_major,
+                                   std::size_t lanes) noexcept;
   // Runs every pending hydro comparison. Samples without endpoint values use
-  // kStepStartOnly for imported slots (cone exclusion). Never throws.
-  void finalizePendingEndpoints() noexcept;
+  // kStepStartOnly for imported slots (cone exclusion). With
+  // include_awaiting_remote_donors == false, samples still waiting for
+  // promised remote donor fractions are held (compared by a later call).
+  // Never throws.
+  void finalizePendingEndpoints(bool include_awaiting_remote_donors = true) noexcept;
+  // Results of this attempt that would be lost if the attempt were rejected
+  // (completed region records + still-pending samples + open chronologies);
+  // the runtime carries this count to the next accepted publication.
+  [[nodiscard]] std::uint64_t unpublishedResultCount() const noexcept;
 
   // ---- Full-physics chronology (kCoupledFullPhysicsStrang) ----
   // Opens a chronology record for a locally owned selected domain. Rows are
@@ -543,6 +590,12 @@ class HydroShadowReference final {
 
   // Every pending sample/chronology is dropped (rejected attempt), counted.
   void discardPending() noexcept;
+  // Best-effort reclaimer (registered with the MemoryGovernor by the
+  // runtime): drops every pending sample and chronology record, counted as
+  // evicted_for_mandatory_memory, and returns the bytes they had admitted.
+  // Returns 0 (drops nothing) while a shadow operation is iterating them.
+  // Local, no collective, never throws.
+  [[nodiscard]] std::uint64_t reclaimBestEffort() noexcept;
 
   [[nodiscard]] const HydroShadowReport& report() const noexcept { return m_report; }
   [[nodiscard]] std::span<const HydroShadowRegionResult> regionResults() const noexcept {
@@ -557,9 +610,11 @@ class HydroShadowReference final {
     std::vector<std::uint64_t> gas_cell_ids;
     std::array<std::optional<HydroShadowPrivateRegion>, k_hydro_shadow_chronology_point_count> points;
     std::size_t composition_lanes = 0U;
+    std::uint64_t admitted_bytes = 0U;
     bool level_clock = false;
   };
 
+  [[nodiscard]] Sample captureImpl(const HydroShadowPatchCapture& spec);
   void runHydroComparison(Sample& sample) noexcept;
   void runChronology(ChronologyRecord& record, Sample& sample,
                      const HydroShadowSmoothSourceReplay& replay) noexcept;
@@ -576,6 +631,7 @@ class HydroShadowReference final {
   std::vector<Sample> m_pending;
   std::vector<ChronologyRecord> m_chronologies;
   std::vector<HydroShadowRegionResult> m_region_results;
+  bool m_busy = false;  // a member is iterating m_pending / m_chronologies
 };
 
 }  // namespace cosmosim::hydro

@@ -178,6 +178,12 @@ struct ProductionAmrHydroOptions {
   double hydro_shadow_temperature_k_per_internal_energy_code = 0.0;
   const core::LambdaCdmBackground* hydro_shadow_cosmology = nullptr;
   double hydro_shadow_time_si_per_code = 0.0;
+  // C04-02/03: the caller will hand the production step-start donor
+  // fractions of REMOTE cells (distributed composition transport exchange)
+  // to the shadow via HydroShadowReference::provideRemoteDonorFractions()
+  // before the attempt's final finalizePendingEndpoints(). Set by the runtime
+  // only on the synchronized distributed path with composition enabled.
+  bool hydro_shadow_remote_donor_fractions = false;
   // P1-55-02: global hierarchy domain [origin, origin + extent) in the patch
   // frame, forwarded to every ghost-fill target view. On non-periodic axes a
   // deep/edge stencil ghost may use the physical closure only beyond these

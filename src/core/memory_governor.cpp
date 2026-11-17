@@ -4,10 +4,12 @@
 #include <algorithm>
 #include <cmath>
 #include <exception>
+#include <functional>
 #include <limits>
 #include <optional>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <utility>
 
 namespace cosmosim::core {
@@ -383,6 +385,66 @@ MemoryReservation MemoryGovernor::reserve(
     MemoryClass memory_class,
     std::uint64_t requested_bytes,
     std::string_view owner) {
+  try {
+    return reserveImpl(memory_class, requested_bytes, owner, false);
+  } catch (const MemoryAdmissionError&) {
+    // Optional work yields first (v10 §5.2): reclaim best-effort diagnostics
+    // and retry once. Never for diagnostics themselves, never re-entrantly,
+    // only on the registering thread (the reclaimer's owner is not
+    // thread-safe), never while the lock is held.
+    if (memory_class == MemoryClass::kDiagnostic) throw;
+    BestEffortReclaimer reclaimer;
+    {
+      std::lock_guard lock(m_mutex);
+      if (!m_reclaimer || m_reclaiming || m_reclaimer_thread != std::this_thread::get_id()) throw;
+      reclaimer = m_reclaimer;
+      m_reclaiming = true;
+    }
+    std::uint64_t released = 0U;
+    try {
+      released = reclaimer();
+    } catch (...) {
+      released = 0U;
+    }
+    {
+      std::lock_guard lock(m_mutex);
+      m_reclaiming = false;
+      if (released != 0U) ++m_reclaim_count;
+    }
+    if (released == 0U) throw;
+  }
+  return reserveImpl(memory_class, requested_bytes, owner, false);
+}
+
+MemoryReservation MemoryGovernor::reserveBestEffort(
+    MemoryClass memory_class,
+    std::uint64_t requested_bytes,
+    std::string_view owner) {
+  return reserveImpl(memory_class, requested_bytes, owner, true);
+}
+
+void MemoryGovernor::setBestEffortReclaimer(BestEffortReclaimer reclaimer, std::thread::id owner_thread) {
+  std::lock_guard lock(m_mutex);
+  m_reclaimer = std::move(reclaimer);
+  m_reclaimer_thread = owner_thread;
+}
+
+void MemoryGovernor::clearBestEffortReclaimer() noexcept {
+  std::lock_guard lock(m_mutex);
+  m_reclaimer = nullptr;
+  m_reclaimer_thread = std::thread::id{};
+}
+
+std::uint64_t MemoryGovernor::bestEffortReclaimCount() const {
+  std::lock_guard lock(m_mutex);
+  return m_reclaim_count;
+}
+
+MemoryReservation MemoryGovernor::reserveImpl(
+    MemoryClass memory_class,
+    std::uint64_t requested_bytes,
+    std::string_view owner,
+    bool best_effort) {
   if (!validMemoryClass(memory_class)) {
     throw std::invalid_argument("MemoryGovernor.reserve received invalid memory class");
   }
@@ -425,8 +487,10 @@ MemoryReservation MemoryGovernor::reserve(
   }
 
   const std::uint64_t prospective_adjusted = safetyAdjustedBytes(prospective_raw);
+  const bool outside_best_effort_band = best_effort && m_policy.hard_limit_bytes != 0U &&
+      pressureForAdjustedBytes(prospective_adjusted) != MemoryPressure::kGreen;
   if (m_policy.hard_limit_bytes != 0U &&
-      prospective_adjusted > m_policy.hard_limit_bytes) {
+      (prospective_adjusted > m_policy.hard_limit_bytes || outside_best_effort_band)) {
     ++m_rejection_count;
     ++m_owner_slots[ownerSlotLocked(owner)].rejection_count;
     MemoryGovernorSnapshot current;
@@ -451,7 +515,8 @@ MemoryReservation MemoryGovernor::reserve(
         owner,
         requested_bytes,
         current,
-        "hard_limit_would_be_exceeded"));
+        prospective_adjusted > m_policy.hard_limit_bytes ? "hard_limit_would_be_exceeded"
+                                                         : "best_effort_outside_green_band"));
   }
 
   if (m_node_pool != nullptr && !m_node_pool->tryAcquire(requested_bytes)) {

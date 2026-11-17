@@ -1305,8 +1305,16 @@ StarFormationStepReport StarFormationModel::applyFromView(
     input.velocity_divergence_code = cell_index < view.velocity_divergence_code.size()
         ? view.velocity_divergence_code[cell_index]
         : 0.0;
+    // A divergence-only view carries no shear/vorticity: div^2/3 is only a
+    // LOWER bound of |grad v|^2 and would understate the virial parameter
+    // (over-eligible star formation in shearing/rotating gas). The adaptive
+    // bound/Jeans model therefore refuses it (NaN = gradient unavailable,
+    // ineligible), exactly as the production patch-gradient path does; the
+    // legacy model keeps its historical divergence-only convention.
     input.velocity_gradient_frobenius_sq_code =
-        input.velocity_divergence_code * input.velocity_divergence_code / 3.0;
+        m_config.model == core::StarFormationModelKind::kAdaptiveBoundJeans
+            ? std::numeric_limits<double>::quiet_NaN()
+            : input.velocity_divergence_code * input.velocity_divergence_code / 3.0;
     input.metallicity_mass_fraction = cell_index < view.metallicity_mass_fraction.size()
         ? view.metallicity_mass_fraction[cell_index]
         : 0.0;

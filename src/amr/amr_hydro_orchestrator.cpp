@@ -2968,6 +2968,13 @@ struct AmrSynchronizedSweepWorkspace {
     std::sort(shadow_remote_patch_ids.begin(), shadow_remote_patch_ids.end());
   }
   AmrSynchronizedSweepWorkspace sweep_workspace(geometries, options);
+  // I01: per-solver-row ISM regime gate of the effective closure, rebuilt per
+  // patch (patch storage size, capacity reused across patches; at most one
+  // byte per real+ghost cell of the largest patch).
+  std::vector<std::uint8_t> regime_gate;
+  std::vector<std::uint32_t> regime_dense_rows;
+  const bool regime_gate_active =
+      global_source_context.thermodynamic_closure != nullptr && hydro::ismRegimeGateActive(state);
   core::GovernedScratchArena parent_mirror_arena(
       options.regrid_memory_governor, core::MemoryClass::kScratchArena,
       AmrParentMirrorIndex::workspaceBytes(state), "amr.parent_mirror.index");
@@ -3111,6 +3118,34 @@ struct AmrSynchronizedSweepWorkspace {
         temperature[local_cell] = state.gas_cells.temperature_code[row];
       }
     }
+    // I01 (v10 §4.3): the ISM regime tag owns the effective/resolved split,
+    // so the hydro closure and the effective-ISM relaxation source see the
+    // SAME decision as the source stage's thermochemistry and the derived
+    // P/c_s refresh used by the CFL. Real rows use their own tag; ghost rows
+    // the tag of their origin cell (physical/self ghosts: in-patch source
+    // cell; imported ghosts: origin gas-cell id). An origin whose tag is not
+    // locally known (remote MPI ghost) keeps the closure's own decision.
+    std::span<const std::uint8_t> patch_regime_gate;
+    if (regime_gate_active) {
+      const hydro::HydroPatchGeometry& gate_geometry = patch_geometry.geometry;
+      regime_dense_rows.assign(gate_geometry.cellCount(), core::kInvalidGasCellRow);
+      for (const AmrHydroCellDescriptor& cell : patch_geometry.real_cells) {
+        if (cell.patch_local_cell < regime_dense_rows.size()) {
+          regime_dense_rows[cell.patch_local_cell] = cell.local_cell_row;
+        }
+      }
+      (void)hydro::buildIsmRegimeGate(state, gate_geometry, regime_dense_rows, regime_gate);
+      for (const AmrHydroGhostDescriptor& ghost : patch_geometry.ghosts) {
+        if (ghost.ghost_slot >= gate_geometry.ghost_cells.size() || ghost.source_gas_cell_id == 0U) continue;
+        const std::size_t storage = gate_geometry.ghost_cells[ghost.ghost_slot].ghost_cell;
+        if (storage >= regime_gate.size()) continue;
+        const auto origin = state.rowForGasCellId(ghost.source_gas_cell_id);
+        regime_gate[storage] = origin.has_value()
+            ? hydro::ismRegimeAllowsEffectiveClosure(state, *origin)
+            : hydro::k_ism_regime_gate_unknown_origin;
+      }
+      patch_regime_gate = regime_gate;
+    }
     const hydro::HydroSourceContext patch_source_context{
         .update = update,
         .gravity_accel_x_peculiar = gravity_x,
@@ -3122,7 +3157,8 @@ struct AmrSynchronizedSweepWorkspace {
         .temperature_k = temperature,
         .thermodynamic_closure = global_source_context.thermodynamic_closure,
         .redshift = global_source_context.redshift,
-        .face_mass_flux_sink = global_source_context.face_mass_flux_sink};
+        .face_mass_flux_sink = global_source_context.face_mass_flux_sink,
+        .effective_closure_allowed = patch_regime_gate};
 
     const auto widths = cellWidths(patch_geometry.patch);
     // Audit F1 follow-up: predictor Courant factors are dt/(a dx), matching
@@ -3202,6 +3238,11 @@ struct AmrSynchronizedSweepWorkspace {
       shadow_spec.source_context = &patch_source_context;
       std::vector<hydro::HydroShadowGhostProvenance> shadow_provenance;
       std::vector<std::uint32_t> shadow_ghost_rows;
+      bool shadow_prepared = true;
+      // C04-05: the bounded preparation below allocates; a local failure only
+      // withholds this optional sample (counted) and never escapes into the
+      // production sweep. No collective is involved.
+      try {
       if (options.hydro_shadow_reference->cadenceStep() &&
           shadow_spec.identity.region_key != 0U &&
           options.hydro_shadow_reference->isGloballySelected(
@@ -3233,9 +3274,18 @@ struct AmrSynchronizedSweepWorkspace {
           shadow_spec.composition = &state.gas_composition;
           shadow_spec.composition_real_rows = composition_dense_rows;
           shadow_spec.composition_ghost_rows = shadow_ghost_rows;
+          // Stable origin ids of every ghost slot (same table the production
+          // sink resolves): remote donors are filled from the production
+          // donor-fraction exchange when the runtime promises it.
+          shadow_spec.composition_ghost_gas_cell_ids = composition_ghost_origins;
+          shadow_spec.remote_donor_fractions_will_be_provided = options.hydro_shadow_remote_donor_fractions;
         }
       }
-      shadow_sample = options.hydro_shadow_reference->capture(shadow_spec);
+      } catch (...) {
+        shadow_prepared = false;
+        options.hydro_shadow_reference->noteLocalResourceRefusal();
+      }
+      if (shadow_prepared) shadow_sample = options.hydro_shadow_reference->capture(shadow_spec);
     }
     solver.advancePatchActiveSetBatchedWithScratch(
         conserved_state,
@@ -4853,7 +4903,7 @@ HydroShadowEndpointDiagnostics completeHydroShadowEndpointGhosts(
           "shadow endpoint delivery")), "shadow endpoint delivery bytes");
       core::MemoryReservation reservation;
       if (options.regrid_memory_governor != nullptr) {
-        reservation = options.regrid_memory_governor->reserve(
+        reservation = options.regrid_memory_governor->reserveBestEffort(
             core::MemoryClass::kDiagnostic, bytes, "hydro.shadow_reference.endpoint_ghost_fill");
         reservation.commit();
       }
