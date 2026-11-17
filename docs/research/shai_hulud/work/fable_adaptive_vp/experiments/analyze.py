@@ -167,6 +167,17 @@ def main():
                        f"{w['rss_mb']:.1f} | {w['ratio_x_eq_rss']:.3g}{e('rss')} | {w['ratio_rho_eq_rss']:.3g} | {w['state_mb']:.1f} | {w['ratio_x_eq_state']:.3g}{e('state')} | {w['ratio_rho_eq_state']:.3g} | "
                        f"{'PASS' if w['pass_wall'] else ('pos only' if w['pass_wall_position_only'] else 'FAIL')} | {'PASS' if w['pass_mem_rss'] else 'FAIL'} | {'PASS' if w['pass_mem_state'] else 'FAIL'} |")
         out += ["", "† N-body value extrapolated beyond the measured ladder (cost outside its range).", ""]
+        # the same criteria at lower fold fractions (supplementary; the gate itself is t = 3)
+        for snap in ("200", "250"):
+            rws = gate_table(d, ng, snap)
+            ge[f"{ng}@t{int(snap) / 100:.1f}"] = rws
+            ff = next(iter(runs.values()))["snaps"][snap]["ref_folded_fraction"]
+            out += [f"### Same criteria at t = {int(snap) / 100:.1f}, PM {ng}² (folded label fraction {ff:.3f}; supplementary)", "",
+                    "| sheet arm | x_rms | N-body x at eq. wall | x ratio eq. wall | rho ratio eq. wall | x ratio eq. RSS | rho ratio eq. RSS | wall | mem (RSS) |", "|:--|--:|--:|--:|--:|--:|--:|:-:|:-:|"]
+            for w in rws:
+                out.append(f"| {w['arm']} | {fmt(w['x_rms'])} | {fmt(w['nb_x_eq_wall'])}{'†' if w['extrap_wall'] else ''} | **{w['ratio_x_eq_wall']:.2f}** | **{w['ratio_rho_eq_wall']:.2f}** | "
+                           f"{w['ratio_x_eq_rss']:.3g} | {w['ratio_rho_eq_rss']:.3g} | {'PASS' if w['pass_wall'] else ('pos only' if w['pass_wall_position_only'] else 'FAIL')} | {'PASS' if w['pass_mem_rss'] else 'FAIL'} |")
+            out.append("")
     # ---------------------------------------------------------------- triggers
     for ng in (256, 512):
         d = load(f"exp04_triggers_ng{ng}.json")
@@ -197,6 +208,41 @@ def main():
                 continue
             s3 = r["snaps"]["300"]
             out.append(f"| {name} | {r['deposit_samples_per_step']:.0f} | {fmt(s3['x_rms'])} | {fmt(s3['rho_rel_l2'])} | {fmt(s3['force_rel_l2'])} | {r['wall_s']:.1f} |")
+        out.append("")
+    # ---------------------------------------------------------------- indicator validation
+    first = True
+    for tag in ("ng256_n128", "ng256_n256", "ng512_n512"):
+        d = load(f"exp06_indicator_validation_{tag}.json")
+        if not d:
+            continue
+        if first:
+            out += ["## 5. Offline validation of the state-only indicators (uniform quintic sheet; error vs the 4096² control, per block)\n",
+                    "| case | t | folded labels | blocks with fold | err rms (PM cells) | err max | share of err² in folded blocks | corr(log d6, log err) | d6/err median | corr(log pred, log err) | pred/err median |",
+                    "|:--|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|"]
+            first = False
+        for k, r in d["snaps"].items():
+            out.append(f"| PM {d['meta']['ng']}, n = {d['meta']['n0']} | {r['t']:.1f} | {r['folded_label_fraction']:.3f} | {r['blocks_with_fold']:.2f} | {fmt(r['err_rms_cells'])} | {fmt(r['err_max_cells'])} | "
+                       f"{r['share_of_squared_error_in_folded_blocks']:.2f} | {r['eta_d6_logcorr_with_err']:.2f} | {r['eta_d6_over_err_median']:.3g} | {r['eta_pred_logcorr_with_err']:.2f} | {r['eta_pred_over_err_median']:.3g} |")
+    out.append("")
+    # ---------------------------------------------------------------- deep local / multi-stream trigger
+    for name, title in (("exp07_deep_local_ng512.json", "## 6. Local refinement beyond n = ng, truncation monitor (PM 512², 4ng lattice; two arms at a time: timings indicative)"),
+                        ("exp08_multistream_trigger_ng512.json", "## 7. Multi-stream proximity trigger, PM 512² (4ng lattice; timings indicative)"),
+                        ("exp08_multistream_trigger_ng256.json", "## 7b. Multi-stream proximity trigger, PM 256² (4ng lattice; timings indicative)")):
+        d = load(name)
+        if not d:
+            continue
+        out += [title + "\n", "| arm | nodes t=2 | nodes t=2.5 | nodes t=3 | node-steps (M) | first split t | x_rms t=2 | x_rms t=2.5 | x_rms t=3 | rho t=3 | F t=3 | wall s | RSS+ MB | budget denials |",
+                "|:--|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|"]
+        for arm, r in d["runs"].items():
+            if r.get("failed"):
+                out.append(f"| {arm} | FAILED | | | | | | | | | | | | |")
+                continue
+            sn = r["snaps"]
+            c = r.get("controller") or {}
+            nd = lambda q: sn[q].get("nodes", r["nodes_final"])
+            fs = c.get("first_split_t")
+            out.append(f"| {arm} | {nd('200')} | {nd('250')} | {nd('300')} | {r['node_steps'] / 1e6:.0f} | {'—' if fs is None else f'{fs:.2f}'} | {fmt(sn['200']['x_rms'])} | {fmt(sn['250']['x_rms'])} | "
+                       f"{fmt(sn['300']['x_rms'])} | {fmt(sn['300']['rho_rel_l2'])} | {fmt(sn['300']['force_rel_l2'])} | {r['wall_s']:.1f} | {r['peak_rss_incr_mb']:.0f} | {c.get('denied_budget', '—')} |")
         out.append("")
     with open(os.path.join(R, "SUMMARY.md"), "w") as f:
         f.write("\n".join(out) + "\n")

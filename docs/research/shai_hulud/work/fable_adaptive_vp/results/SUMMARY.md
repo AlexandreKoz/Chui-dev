@@ -124,6 +124,58 @@ Conservation and structure at t = 3 (sheet integrals by leaf quadrature of the c
 
 † N-body value extrapolated beyond the measured ladder (cost outside its range).
 
+### Same criteria at t = 2.0, PM 256² (folded label fraction 0.058; supplementary)
+
+| sheet arm | x_rms | N-body x at eq. wall | x ratio eq. wall | rho ratio eq. wall | x ratio eq. RSS | rho ratio eq. RSS | wall | mem (RSS) |
+|:--|--:|--:|--:|--:|--:|--:|:-:|:-:|
+| sheet-quin/n64s8 | 1.75e-06 | 8.51e-07 | **2.06** | **0.86** | 1.43 | 0.161 | FAIL | FAIL |
+| sheet-quin/n128s4 | 2.77e-07 | 5.40e-07 | **0.51** | **0.93** | 0.247 | 0.226 | PASS | PASS |
+| sheet-quin/n256s2 | 1.23e-07 | 1.32e-07 | **0.93** | **1.19** | 0.33 | 0.947 | pos only | FAIL |
+| sheet-quin/n128s8 | 2.56e-07 | 2.43e-08 | **10.50** | **0.36** | 0.219 | 0.0142 | FAIL | PASS |
+| sheet-quin/n256s4 | 5.14e-09 | 1.39e-08 | **0.37** | **0.54** | 0.00946 | 0.0617 | PASS | PASS |
+| sheet-cub/n256s2 | 1.23e-07 | 1.16e-07 | **1.06** | **1.33** | 0.268 | 0.935 | FAIL | FAIL |
+| sheet-cub/n256s4 | 5.11e-09 | 1.51e-08 | **0.34** | **0.50** | 0.00834 | 0.0612 | PASS | PASS |
+| sheet-quin/n256s8 | 3.89e-10 | 1.00e-09 | **0.39** | **0.27** | 0.00068 | 0.00288 | PASS | PASS |
+| sheet-quin/n512s4 | 1.66e-10 | 5.89e-10† | **0.28** | **0.41** | 0.01 | 0.02 | PASS | PASS |
+| href-quin/128to256@t1.0 | 5.27e-09 | 1.60e-08 | **0.33** | **0.47** | 0.0324 | 0.067 | PASS | PASS |
+| href-quin/128to256@t1.5 | 6.90e-09 | 1.70e-08 | **0.41** | **0.44** | 0.0416 | 0.0666 | PASS | PASS |
+| href-quin/128to256@t2.0 | 2.56e-07 | 2.13e-08 | **11.98** | **0.40** | 1.6 | 0.0764 | FAIL | FAIL |
+| local-quin/n128L1 pred | 8.43e-09 | 1.27e-08 | **0.67** | **0.59** | 0.74 | 0.648 | PASS | FAIL |
+| local-quin/n64L2 pred | 8.63e-09 | 1.22e-08 | **0.71** | **0.61** | 0.764 | 0.653 | PASS | FAIL |
+| local-quin/n128L1 d6 | 2.11e-08 | 1.30e-08 | **1.62** | **0.57** | 1.66 | 0.584 | FAIL | FAIL |
+| local-quin/n128L1 pred tol1e-5 | 2.04e-08 | 1.24e-08 | **1.65** | **0.60** | 1.64 | 0.596 | FAIL | FAIL |
+| local-quin/n128L1 pred gate=crossing | 2.29e-07 | 1.67e-08 | **13.68** | **0.48** | 16.8 | 0.578 | FAIL | FAIL |
+| local-cub/n128L1 pred | 6.88e-09 | 1.36e-08 | **0.50** | **0.55** | 0.328 | 0.365 | PASS | PASS |
+| local-quin/n256L1 pred budget1.5 | 5.14e-09 | 1.07e-09 | **4.81** | **5.50** | 0.411 | 0.593 | FAIL | FAIL |
+| local-quin/n128L1 pred tol1e-5 (2ng lattice) | 1.09e-07 | 8.18e-08 | **1.34** | **1.77** | 9.08 | 9.21 | FAIL | FAIL |
+| local-quin/n64L2 pred tol3e-5 (2ng lattice) | 3.24e-07 | 9.97e-08 | **3.25** | **1.50** | 28.9 | 9.85 | FAIL | FAIL |
+
+### Same criteria at t = 2.5, PM 256² (folded label fraction 0.193; supplementary)
+
+| sheet arm | x_rms | N-body x at eq. wall | x ratio eq. wall | rho ratio eq. wall | x ratio eq. RSS | rho ratio eq. RSS | wall | mem (RSS) |
+|:--|--:|--:|--:|--:|--:|--:|:-:|:-:|
+| sheet-quin/n64s8 | 1.35e-05 | 1.32e-06 | **10.23** | **0.23** | 6.45 | 0.0822 | FAIL | FAIL |
+| sheet-quin/n128s4 | 1.40e-06 | 8.51e-07 | **1.65** | **0.13** | 0.749 | 0.0245 | FAIL | FAIL |
+| sheet-quin/n256s2 | 1.94e-07 | 2.19e-07 | **0.88** | **1.01** | 0.324 | 0.223 | pos only | PASS |
+| sheet-quin/n128s8 | 1.39e-06 | 3.80e-08 | **36.67** | **0.54** | 0.709 | 0.00943 | FAIL | FAIL |
+| sheet-quin/n256s4 | 8.16e-09 | 2.14e-08 | **0.38** | **0.32** | 0.00954 | 0.0145 | PASS | PASS |
+| sheet-cub/n256s2 | 1.93e-07 | 1.91e-07 | **1.01** | **1.02** | 0.265 | 0.154 | FAIL | PASS |
+| sheet-cub/n256s4 | 8.19e-09 | 2.34e-08 | **0.35** | **0.28** | 0.00853 | 0.0117 | PASS | PASS |
+| sheet-quin/n256s8 | 2.93e-09 | 1.48e-09 | **1.97** | **0.73** | 0.00326 | 0.0028 | FAIL | PASS |
+| sheet-quin/n512s4 | 3.94e-10 | 8.62e-10† | **0.46** | **0.54** | 0.0154 | 0.0267 | PASS | PASS |
+| href-quin/128to256@t1.0 | 8.37e-09 | 2.48e-08 | **0.34** | **0.25** | 0.0308 | 0.128 | PASS | PASS |
+| href-quin/128to256@t1.5 | 9.57e-09 | 2.64e-08 | **0.36** | **0.22** | 0.0346 | 0.125 | PASS | PASS |
+| href-quin/128to256@t2.0 | 6.43e-07 | 3.31e-08 | **19.41** | **0.29** | 2.41 | 0.246 | FAIL | FAIL |
+| local-quin/n128L1 pred | 1.09e-08 | 1.95e-08 | **0.56** | **0.38** | 0.619 | 0.455 | PASS | FAIL |
+| local-quin/n64L2 pred | 1.14e-08 | 1.88e-08 | **0.60** | **0.40** | 0.654 | 0.462 | PASS | FAIL |
+| local-quin/n128L1 d6 | 3.80e-08 | 2.00e-08 | **1.89** | **0.36** | 1.93 | 0.376 | FAIL | FAIL |
+| local-quin/n128L1 pred tol1e-5 | 2.27e-08 | 1.91e-08 | **1.19** | **0.39** | 1.18 | 0.39 | FAIL | FAIL |
+| local-quin/n128L1 pred gate=crossing | 3.73e-07 | 2.59e-08 | **14.41** | **0.24** | 17.7 | 0.336 | FAIL | FAIL |
+| local-cub/n128L1 pred | 9.73e-09 | 2.11e-08 | **0.46** | **0.33** | 0.299 | 0.158 | PASS | PASS |
+| local-quin/n256L1 pred budget1.5 | 7.70e-09 | 1.58e-09 | **4.88** | **3.28** | 0.399 | 0.384 | FAIL | PASS |
+| local-quin/n128L1 pred tol1e-5 (2ng lattice) | 1.68e-07 | 1.33e-07 | **1.26** | **1.05** | 9.02 | 3.22 | FAIL | FAIL |
+| local-quin/n64L2 pred tol3e-5 (2ng lattice) | 5.02e-07 | 1.64e-07 | **3.06** | **1.04** | 29 | 3.66 | FAIL | FAIL |
+
 ## 2.2 Gate benchmark, PM 512² (clean sequential timings; control 4096²)
 
 meta: numpy 2.5.3, scipy 1.18.1, numba 0.68.1, source `43540d3323f00548`, 4 cores, 1 thread per arm, arms run one at a time.
@@ -212,4 +264,129 @@ Conservation and structure at t = 3 (sheet integrals by leaf quadrature of the c
 | local-quin/n128L2 pred tol3e-5 (2ng lattice) | 35.1 | 5.22e-08 | **4.65** | **6.60** | 4.80 | 292.5 | 19.9 | 38.6 | 16.0 | 0.256 | 0.186 | FAIL | FAIL | PASS |
 
 † N-body value extrapolated beyond the measured ladder (cost outside its range).
+
+### Same criteria at t = 2.0, PM 512² (folded label fraction 0.059; supplementary)
+
+| sheet arm | x_rms | N-body x at eq. wall | x ratio eq. wall | rho ratio eq. wall | x ratio eq. RSS | rho ratio eq. RSS | wall | mem (RSS) |
+|:--|--:|--:|--:|--:|--:|--:|:-:|:-:|
+| sheet-quin/n128s8 | 7.85e-07 | 1.44e-07 | **5.45** | **0.99** | 0.855 | 0.00487 | FAIL | FAIL |
+| sheet-quin/n256s4 | 4.60e-08 | 7.68e-08 | **0.60** | **0.98** | 0.0694 | 0.0212 | PASS | PASS |
+| sheet-quin/n512s2 | 4.66e-08 | 2.40e-08 | **1.94** | **1.88** | 0.246 | 0.928 | FAIL | FAIL |
+| sheet-quin/n256s8 | 2.02e-09 | 7.29e-09 | **0.28** | **0.42** | 0.00293 | 0.00131 | PASS | PASS |
+| sheet-quin/n512s4 | 1.90e-09 | 4.25e-09 | **0.45** | **0.55** | 0.00998 | 0.0613 | PASS | PASS |
+| sheet-cub/n512s2 | 4.64e-08 | 2.69e-08 | **1.73** | **1.70** | 0.233 | 0.926 | FAIL | FAIL |
+| sheet-cub/n512s4 | 1.89e-09 | 4.65e-09 | **0.41** | **0.52** | 0.00949 | 0.0612 | PASS | PASS |
+| href-quin/256to512@t1.0 | 2.00e-09 | 5.25e-09 | **0.38** | **0.47** | 0.0387 | 0.0657 | PASS | PASS |
+| href-quin/256to512@t1.5 | 2.01e-09 | 5.54e-09 | **0.36** | **0.45** | 0.039 | 0.0658 | PASS | PASS |
+| href-quin/256to512@t2.0 | 2.02e-09 | 6.30e-09 | **0.32** | **0.46** | 0.0392 | 0.0737 | PASS | PASS |
+| local-quin/n256L1 pred | 2.01e-09 | 3.12e-09 | **0.64** | **0.70** | 0.485 | 0.564 | PASS | FAIL |
+| local-quin/n128L2 pred | 1.88e-09 | 2.96e-09 | **0.63** | **0.72** | 0.48 | 0.589 | PASS | FAIL |
+| local-quin/n256L1 d6 | 2.01e-09 | 3.92e-09 | **0.51** | **0.59** | 0.31 | 0.405 | PASS | PASS |
+| local-quin/n256L1 pred tol1e-5 | 2.01e-09 | 3.67e-09 | **0.55** | **0.62** | 0.375 | 0.466 | PASS | PASS |
+| local-quin/n256L1 pred gate=crossing | 2.01e-09 | 3.45e-09 | **0.58** | **0.70** | 0.49 | 0.612 | PASS | FAIL |
+| local-cub/n256L1 pred | 2.00e-09 | 2.92e-09 | **0.68** | **0.73** | 0.364 | 0.458 | PASS | PASS |
+| local-quin/n512L1 pred budget1.5 | 1.90e-09 | 1.71e-11† | **111.24** | **33.68** | 0.423 | 0.531 | FAIL | FAIL |
+| local-quin/n256L1 pred tol1e-5 (2ng lattice) | 4.60e-08 | 1.55e-08 | **2.97** | **2.83** | 12.8 | 9.48 | FAIL | FAIL |
+| local-quin/n128L2 pred tol3e-5 (2ng lattice) | 6.61e-08 | 1.89e-08 | **3.50** | **2.36** | 14.6 | 7.98 | FAIL | FAIL |
+
+### Same criteria at t = 2.5, PM 512² (folded label fraction 0.195; supplementary)
+
+| sheet arm | x_rms | N-body x at eq. wall | x ratio eq. wall | rho ratio eq. wall | x ratio eq. RSS | rho ratio eq. RSS | wall | mem (RSS) |
+|:--|--:|--:|--:|--:|--:|--:|:-:|:-:|
+| sheet-quin/n128s8 | 4.33e-06 | 2.28e-07 | **18.95** | **0.60** | 2.23 | 0.00722 | FAIL | FAIL |
+| sheet-quin/n256s4 | 7.62e-08 | 1.25e-07 | **0.61** | **0.52** | 0.0595 | 0.00586 | PASS | PASS |
+| sheet-quin/n512s2 | 7.67e-08 | 3.90e-08 | **1.97** | **1.07** | 0.258 | 0.111 | FAIL | PASS |
+| sheet-quin/n256s8 | 1.72e-08 | 1.14e-08 | **1.51** | **0.66** | 0.0128 | 0.00249 | FAIL | PASS |
+| sheet-quin/n512s4 | 6.28e-09 | 6.65e-09 | **0.94** | **0.71** | 0.021 | 0.029 | PASS | PASS |
+| sheet-cub/n512s2 | 7.62e-08 | 4.38e-08 | **1.74** | **1.06** | 0.244 | 0.102 | FAIL | PASS |
+| sheet-cub/n512s4 | 6.28e-09 | 7.28e-09 | **0.86** | **0.62** | 0.0201 | 0.0268 | PASS | PASS |
+| href-quin/256to512@t1.0 | 6.34e-09 | 8.23e-09 | **0.77** | **0.53** | 0.0741 | 0.237 | PASS | PASS |
+| href-quin/256to512@t1.5 | 6.34e-09 | 8.67e-09 | **0.73** | **0.49** | 0.0747 | 0.24 | PASS | PASS |
+| href-quin/256to512@t2.0 | 1.58e-08 | 9.87e-09 | **1.60** | **0.47** | 0.186 | 0.276 | FAIL | PASS |
+| local-quin/n256L1 pred | 6.35e-09 | 4.88e-09 | **1.30** | **1.09** | 0.982 | 0.736 | FAIL | FAIL |
+| local-quin/n128L2 pred | 6.28e-09 | 4.63e-09 | **1.36** | **1.18** | 1.03 | 0.798 | FAIL | FAIL |
+| local-quin/n256L1 d6 | 7.84e-09 | 6.13e-09 | **1.28** | **0.85** | 0.771 | 0.418 | FAIL | FAIL |
+| local-quin/n256L1 pred tol1e-5 | 6.94e-09 | 5.74e-09 | **1.21** | **0.88** | 0.828 | 0.518 | FAIL | FAIL |
+| local-quin/n256L1 pred gate=crossing | 8.08e-09 | 5.39e-09 | **1.50** | **0.96** | 1.26 | 0.749 | FAIL | FAIL |
+| local-cub/n256L1 pred | 6.34e-09 | 4.55e-09 | **1.39** | **1.20** | 0.738 | 0.492 | FAIL | FAIL |
+| local-quin/n512L1 pred budget1.5 | 5.79e-09 | 2.57e-11† | **225.06** | **1506.06** | 0.823 | 0.597 | FAIL | FAIL |
+| local-quin/n256L1 pred tol1e-5 (2ng lattice) | 7.45e-08 | 2.48e-08 | **3.00** | **1.10** | 13.2 | 3.39 | FAIL | FAIL |
+| local-quin/n128L2 pred tol3e-5 (2ng lattice) | 1.16e-07 | 3.04e-08 | **3.81** | **1.09** | 16.3 | 2.47 | FAIL | FAIL |
+
+## 3. Trigger-timing study, PM 256² (4ng lattice, quintic 128→256; timings indicative)
+
+| arm | first split t | x_rms t=2.0 | x_rms t=2.5 | x_rms t=3.0 | rho t=3 | nodes t=2 | nodes t=3 | node-steps (M) | splits ind/balance | budget denials |
+|:--|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| sheet-quin/n256s4 (uniform from t=0) | — | 5.14e-09 | 8.16e-09 | 2.57e-08 | 1.11e-04 | 65536 | 65536 | 19.7 | —/— | — |
+| sheet-quin/n128s8 (never refined) | — | 2.56e-07 | 1.39e-06 | 5.23e-06 | 3.79e-04 | 16384 | 16384 | 4.9 | —/— | — |
+| href/uniform@t1.00 | 1.00 | 5.27e-09 | 8.37e-09 | 2.58e-08 | 1.11e-04 | 65536 | 65536 | 14.7 | —/— | — |
+| href/uniform@t1.50 | 1.50 | 6.90e-09 | 9.57e-09 | 2.70e-08 | 1.11e-04 | 65536 | 65536 | 12.3 | —/— | — |
+| href/uniform@t1.75 | 1.75 | 2.61e-08 | 3.05e-08 | 5.12e-08 | 1.11e-04 | 65536 | 65536 | 11.1 | —/— | — |
+| href/uniform@t2.00 | 2.00 | 2.56e-07 | 6.43e-07 | 1.22e-06 | 1.39e-04 | 65536 | 65536 | 9.8 | —/— | — |
+| local/pred tau0.3 tol1e-05 | 1.70 | 2.11e-08 | 2.49e-08 | 4.89e-08 | 1.11e-04 | 31136 | 61032 | 8.2 | 232/0 | 0 |
+| local/pred tau0.3 tol1e-06 | 1.60 | 1.30e-08 | 1.52e-08 | 3.47e-08 | 1.11e-04 | 38264 | 64432 | 8.9 | 250/0 | 0 |
+| local/pred tau0.3 tol1e-07 | 0.80 | 5.64e-09 | 8.64e-09 | 2.61e-08 | 1.11e-04 | 65536 | 65536 | 13.7 | 256/0 | 0 |
+| local/pred tau0.6 tol1e-05 | 1.70 | 2.04e-08 | 2.27e-08 | 4.55e-08 | 1.11e-04 | 35384 | 62928 | 8.6 | 242/0 | 0 |
+| local/pred tau0.6 tol1e-06 | 1.50 | 8.43e-09 | 1.09e-08 | 2.85e-08 | 1.11e-04 | 45024 | 65536 | 9.7 | 256/0 | 0 |
+| local/pred tau0.6 tol1e-07 | 0.30 | 5.82e-09 | 9.23e-09 | 2.65e-08 | 1.11e-04 | 65536 | 65536 | 16.5 | 256/0 | 0 |
+| local/d6 tol1e-05 | 1.80 | 7.88e-08 | 2.50e-07 | 3.96e-07 | 1.12e-04 | 26312 | 59728 | 7.6 | 225/0 | 0 |
+| local/d6 tol1e-06 | 1.70 | 2.11e-08 | 3.80e-08 | 5.13e-08 | 1.11e-04 | 30368 | 61032 | 8.1 | 232/0 | 0 |
+| local/d6 tol1e-07 | 1.10 | 8.85e-09 | 1.14e-08 | 2.88e-08 | 1.11e-04 | 52280 | 65360 | 10.4 | 255/0 | 0 |
+| local/pred tol1e-7 gate=precaustic(0.3) | 1.60 | 9.73e-09 | 1.20e-08 | 2.93e-08 | 1.11e-04 | 65536 | 65536 | 11.3 | 256/0 | 0 |
+| local/pred tol1e-7 gate=precaustic(0.6) | 1.40 | 6.22e-09 | 9.03e-09 | 2.65e-08 | 1.11e-04 | 65536 | 65536 | 11.9 | 256/0 | 0 |
+| local/pred tol1e-7 gate=crossing | 1.90 | 2.29e-07 | 3.73e-07 | 7.67e-07 | 1.19e-04 | 61904 | 65536 | 10.1 | 256/0 | 0 |
+| local/pred tol1e-7 gate=t1.5 | 1.50 | 6.99e-09 | 9.65e-09 | 2.70e-08 | 1.11e-04 | 65536 | 65536 | 11.6 | 256/0 | 0 |
+| local/pred tol1e-7 gate=t1.0 | 1.00 | 5.60e-09 | 8.54e-09 | 2.60e-08 | 1.11e-04 | 65536 | 65536 | 13.1 | 256/0 | 0 |
+| local/pred tau0.6 tol1e-6 buffer1 | 1.50 | 7.27e-09 | 9.85e-09 | 2.72e-08 | 1.11e-04 | 64456 | 65536 | 11.0 | 99/0 | 0 |
+| local/pred tau0.6 tol1e-6 halo2 | 1.50 | 8.78e-09 | 1.13e-08 | 2.87e-08 | 1.11e-04 | 42696 | 65536 | 9.6 | 256/0 | 0 |
+| local/pred tau0.6 tol1e-6 sweeps2 | 1.50 | 8.43e-09 | 1.09e-08 | 2.85e-08 | 1.11e-04 | 45024 | 65536 | 9.7 | 256/0 | 0 |
+| local/pred tau0.6 tol1e-6 budget0.6 | 1.50 | 8.43e-09 | 8.33e-08 | 3.54e-06 | 2.60e-04 | 39232 | 39232 | 7.7 | 118/0 | 843 |
+| local/pred tau0.6 tol1e-6 no-rebase | 1.50 | 8.43e-09 | 1.09e-08 | 2.85e-08 | 1.11e-04 | 45024 | 65536 | 9.7 | 256/0 | 0 |
+
+## 4. Quadrature study, PM 256², quintic n = 256 (timings indicative)
+
+| arm | samples/step | x_rms t=3 | rho t=3 | F t=3 | wall s |
+|:--|--:|--:|--:|--:|--:|
+| lattice-midpoint/s2 | 262144 | 3.22e-07 | 3.75e-03 | 1.94e-05 | 7.3 |
+| lattice-gauss2/s2 | 262144 | 2.00e-06 | 0.014 | 1.39e-04 | 7.0 |
+| lattice-midpoint/s4 | 1048576 | 2.57e-08 | 1.11e-04 | 1.40e-06 | 17.6 |
+| lattice-gauss2/s4 | 1048576 | 8.00e-08 | 9.07e-04 | 4.83e-06 | 17.7 |
+| adaptive-midpoint/target1.0 | 207311 | 1.37e-05 | 1.82e-03 | 9.51e-05 | 7.2 |
+| adaptive-gauss2/target1.0 | 253037 | 1.78e-06 | 2.03e-03 | 9.06e-06 | 7.3 |
+| adaptive-midpoint/target0.7 | 330167 | 4.54e-06 | 7.61e-04 | 4.37e-05 | 9.0 |
+| adaptive-gauss2/target0.7 | 419184 | 7.67e-07 | 1.84e-04 | 2.54e-06 | 10.3 |
+| adaptive-midpoint/target0.5 | 670868 | 1.18e-05 | 1.05e-03 | 6.48e-05 | 11.9 |
+| adaptive-gauss2/target0.5 | 983313 | 1.03e-07 | 7.14e-05 | 1.31e-06 | 17.2 |
+| adaptive-midpoint/target0.35 | 1300603 | 2.63e-06 | 3.22e-04 | 2.28e-05 | 21.4 |
+| adaptive-gauss2/target0.35 | 1662131 | 9.29e-08 | 4.53e-05 | 1.23e-06 | 27.3 |
+| adaptive-midpoint/target1.0 lumped(nq_min=2) | 197494 | 4.39e-05 | 5.93e-03 | 3.78e-04 | 7.5 |
+| adaptive-midpoint/target0.7 lumped(nq_min=2) | 323946 | 2.62e-05 | 3.20e-03 | 2.12e-04 | 9.1 |
+
+## 5. Offline validation of the state-only indicators (uniform quintic sheet; error vs the 4096² control, per block)
+
+| case | t | folded labels | blocks with fold | err rms (PM cells) | err max | share of err² in folded blocks | corr(log d6, log err) | d6/err median | corr(log pred, log err) | pred/err median |
+|:--|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| PM 256, n = 128 | 1.5 | 0.000 | 0.00 | 9.70e-07 | 1.49e-05 | 0.00 | 0.92 | 0.0199 | 0.59 | 0.0896 |
+| PM 256, n = 128 | 2.0 | 0.058 | 0.10 | 6.55e-05 | 1.89e-03 | 0.99 | 0.85 | 0.0335 | 0.61 | 0.335 |
+| PM 256, n = 128 | 2.5 | 0.192 | 0.34 | 3.56e-04 | 8.84e-03 | 0.87 | 0.88 | 0.146 | 0.76 | 3.21 |
+| PM 256, n = 128 | 3.0 | 0.372 | 0.59 | 1.34e-03 | 0.0293 | 0.89 | 0.84 | 0.25 | 0.74 | 10.7 |
+| PM 256, n = 256 | 1.5 | 0.000 | 0.00 | 8.68e-07 | 8.25e-06 | 0.00 | 0.82 | 0.00799 | 0.41 | 0.0754 |
+| PM 256, n = 256 | 2.0 | 0.058 | 0.08 | 1.31e-06 | 1.32e-05 | 0.01 | 0.33 | 0.0169 | -0.05 | 0.184 |
+| PM 256, n = 256 | 2.5 | 0.192 | 0.26 | 2.09e-06 | 2.18e-05 | 0.06 | -0.03 | 0.176 | -0.29 | 9.12 |
+| PM 256, n = 256 | 3.0 | 0.372 | 0.49 | 6.57e-06 | 6.52e-05 | 0.60 | 0.20 | 2.97 | -0.00 | 65.1 |
+| PM 512, n = 512 | 1.5 | 0.000 | 0.00 | 6.30e-07 | 8.32e-06 | 0.00 | 0.80 | 0.0137 | 0.51 | 0.0832 |
+| PM 512, n = 512 | 2.0 | 0.059 | 0.08 | 9.74e-07 | 1.41e-05 | 0.01 | 0.19 | 0.0224 | 0.01 | 0.152 |
+| PM 512, n = 512 | 2.5 | 0.195 | 0.26 | 3.22e-06 | 9.75e-05 | 0.73 | 0.27 | 0.0735 | 0.09 | 3.51 |
+| PM 512, n = 512 | 3.0 | 0.368 | 0.50 | 2.94e-05 | 8.12e-04 | 0.49 | 0.57 | 3.11 | 0.37 | 39.4 |
+
+## 6. Local refinement beyond n = ng, truncation monitor (PM 512², 4ng lattice; two arms at a time: timings indicative)
+
+| arm | nodes t=2 | nodes t=2.5 | nodes t=3 | node-steps (M) | first split t | x_rms t=2 | x_rms t=2.5 | x_rms t=3 | rho t=3 | F t=3 | wall s | RSS+ MB | budget denials |
+|:--|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| sheet-quin/n512s4 (uniform, n = ng) | 262144 | 262144 | 262144 | 79 | — | 1.90e-09 | 6.28e-09 | 5.74e-08 | 3.23e-04 | 3.24e-06 | 68.5 | 67 | — |
+| sheet-quin/n1024s2 (uniform, n = 2 ng) | 1048576 | 1048576 | 1048576 | 315 | — | 1.92e-09 | 2.98e-09 | 6.20e-09 | 1.09e-04 | 4.30e-07 | 120.8 | 266 | — |
+| local/n512L1 tol0.001 floor0 nobudget | 269512 | 461344 | 752560 | 98 | 1.90 | 1.90e-09 | 4.63e-09 | 3.30e-08 | 1.54e-04 | 1.30e-06 | 108.5 | 710 | 0 |
+| local/n512L1 tol0.0001 floor0 nobudget | 362976 | 588848 | 826288 | 110 | 1.80 | 1.90e-09 | 4.13e-09 | 2.11e-08 | 1.17e-04 | 6.32e-07 | 123.4 | 852 | 0 |
+| local/n512L1 tol1e-6 floor0 budget1.5 | 393216 | 393216 | 393216 | 94 | 1.70 | 1.90e-09 | 6.26e-09 | 5.69e-08 | 3.11e-04 | 3.18e-06 | 107.8 | 295 | 14888 |
+| local/n512L2 tol1e-6 floor0 budget2.0 | 524240 | 524240 | 524240 | 109 | 1.70 | 1.90e-09 | 6.25e-09 | 5.74e-08 | 3.23e-04 | 3.24e-06 | 154.9 | 424 | 25967 |
 

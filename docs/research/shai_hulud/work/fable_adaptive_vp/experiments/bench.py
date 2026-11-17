@@ -56,6 +56,7 @@ def run_arms(out_name, arms, jobs=1, meta_extra=None, script=__file__):
     with ThreadPoolExecutor(max_workers=jobs) as ex:
         for name, r in ex.map(lambda a: _one(*a), todo):
             r["concurrent_jobs"] = jobs
+            r["source_sha256_16"] = common.source_hash()      # source the arm actually ran with
             res["runs"][name] = r
             common.save(out_name, res)
             print(fmt(name, r), flush=True)
