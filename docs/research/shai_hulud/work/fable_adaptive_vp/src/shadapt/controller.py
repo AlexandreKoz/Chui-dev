@@ -231,24 +231,32 @@ class Controller:
                 budget = self.max_nodes
                 n_before = len(f.events)
 
+                min_add = 3 * car.B ** 2 - 2 * car.B        # a split never creates fewer nodes than this
+
                 def change(forest):
                     for (blk, _info) in merges:
                         if forest.can_coarsen(*blk):
                             forest.coarsen(*blk, reason="hysteresis", step=step, t=t, info=_info)
                             self.merged_at[blk] = step
+                    cur = forest.n_nodes() if budget is not None else 0
                     for (blk, reason, info) in requests:
                         if not forest.is_leaf(*blk):
                             continue                      # already split by a balance cascade
                         if budget is not None:
+                            if cur + min_add > budget:    # cannot fit: deny without a trial
+                                rec["n_denied_budget"] += 1
+                                continue
                             trial = copy.deepcopy((forest.exists, forest.refined))
                             ev, lin, ver = len(forest.events), dict(forest.lineage), forest.version
                             forest.refine(*blk, reason=reason, step=step, t=t, info=info)
-                            if forest.n_nodes() > budget:   # hard budget: roll this request back
+                            after = forest.n_nodes()
+                            if after > budget:              # hard budget: roll this request back
                                 forest.exists, forest.refined = trial
                                 del forest.events[ev:]
                                 forest.lineage, forest.version = lin, ver
                                 rec["n_denied_budget"] += 1
                                 continue
+                            cur = after
                         else:
                             forest.refine(*blk, reason=reason, step=step, t=t, info=info)
                 sh.auto_rebase = self.auto_rebase and not self.coarsen
