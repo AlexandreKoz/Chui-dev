@@ -53,19 +53,23 @@ def eval_weights(t, k, nder=0):
 
 def prefilter_periodic(f, k):
     """Coefficients of the periodic interpolating tensor spline of degree k
-    through f[i, j, ...] (same operation as the baseline `_prefilter`)."""
+    through f[i, j, ...] (the baseline `_prefilter` operator, evaluated with a
+    real 2D FFT; agrees with it to round-off)."""
     if k == 1:
         return f.copy()
     n = f.shape[0]
     taps = COLLOC[k]
     h = (len(taps) - 1) // 2
-    m = np.arange(n)
-    lam = np.full(n, taps[h])
-    for j in range(1, h + 1):
-        lam = lam + 2.0 * taps[h + j] * np.cos(TWO_PI * j * m / n)
-    c = np.fft.fft(f, axis=0) / lam.reshape((n,) + (1,) * (f.ndim - 1))
-    c = np.fft.fft(c, axis=1) / lam.reshape((1, n) + (1,) * (f.ndim - 2))
-    return np.real(np.fft.ifft(np.fft.ifft(c, axis=1), axis=0))
+
+    def symbol(m):
+        lam = np.full(len(m), taps[h])
+        for j in range(1, h + 1):
+            lam = lam + 2.0 * taps[h + j] * np.cos(TWO_PI * j * m / n)
+        return lam
+    lam2 = symbol(np.arange(n))[:, None] * symbol(np.arange(n // 2 + 1))[None, :]
+    c = np.fft.rfft2(f, axes=(0, 1))
+    c /= lam2.reshape(lam2.shape + (1,) * (f.ndim - 2))
+    return np.fft.irfft2(c, s=(n, n), axes=(0, 1))
 
 
 # ---------------------------------------------------------------------------

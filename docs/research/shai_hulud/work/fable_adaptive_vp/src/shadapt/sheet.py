@@ -27,6 +27,9 @@ class AdaptiveSheet:
         self.car = HierarchicalCarrier(forest, k=k, halo_tiles=halo_tiles, solver=solver, sweeps=sweeps)
         self.keys, self.xi, self.d, self.p, self.S = [], [], [], [], []
         self.transfer_log = []
+        # if True, a topology change that leaves every level-0 block split is followed
+        # immediately by `rebase()` (exact relabelling n0 -> 2 n0)
+        self.auto_rebase = False
         self._sync_nodes_new()
 
     # ------------------------------------------------------------------ nodes
@@ -152,8 +155,12 @@ class AdaptiveSheet:
             nd.append(d), npp.append(p), nS.append(S), nxi.append(xi)
         removed = self.n_nodes() - kept
         self.keys, self.xi, self.d, self.p, self.S = new_keys, nxi, nd, npp, nS
+        f = self.f
+        if self.auto_rebase and f.lmax >= 1 and len(f.refined[0]) == len(f.exists[0]):
+            self.rebase()                 # builds the (shallower) layout of the relabelled forest directly
+            return created, removed, True
         self.car.build_layout()
-        return created, removed
+        return created, removed, False
 
     def apply_topology_change(self, change):
         """Run `change(forest)` (which may split and merge blocks) and transfer
@@ -162,9 +169,9 @@ class AdaptiveSheet:
         v0 = self.f.version
         change(self.f)
         if self.f.version == v0:
-            return dict(created=0, removed=0)
-        created, removed = self._retopologize(a_old, self.car.eval_points)
-        rec = dict(created=created, removed=removed, nodes=self.n_nodes(), version=self.f.version)
+            return dict(created=0, removed=0, rebased=False)
+        created, removed, rebased = self._retopologize(a_old, self.car.eval_points)
+        rec = dict(created=created, removed=removed, nodes=self.n_nodes(), version=self.f.version, rebased=rebased)
         self.transfer_log.append(rec)
         return rec
 
@@ -199,8 +206,9 @@ class AdaptiveSheet:
                 for a in (0, 1):
                     for b in (0, 1):
                         nf.exists[l].add((2 * I + a, 2 * J + b))
-        nf.lineage = {(k[0] - 1, k[1], k[2]): v for k, v in f.lineage.items() if k[0] >= 2}
-        nf.events = f.events + [dict(kind="rebase", n0=nf.n0)]
+        nf.lineage = {(k[0] - 1, k[1], k[2]): dict(v, parent=[v["parent"][0] - 1] + list(v["parent"][1:]))
+                      for k, v in f.lineage.items() if k[0] >= 2}
+        nf.events = f.events + [dict(kind="rebase", reason="level-0 fully refined", n0=nf.n0)]
         nf.version = f.version + 1
         nf.check()
         # merge node arrays of old levels 0 and 1 into the new level 0
@@ -214,7 +222,12 @@ class AdaptiveSheet:
         d0, p0, S0 = cat(self.d), cat(self.p), cat(self.S)
         rest = (self.d[2:], self.p[2:], self.S[2:])
         self.f = nf
-        self.car = HierarchicalCarrier(nf, k=self.k, halo_tiles=self.car.ht, solver=self.car.solver, sweeps=self.car.sweeps)
+        old_car = self.car
+        old_car.lev = None                # release the two-level operators before building the new layout
+        self.car = HierarchicalCarrier(nf, k=self.k, halo_tiles=old_car.ht, solver=old_car.solver, sweeps=old_car.sweeps)
+        self.car.stats["n_layout"] += old_car.stats["n_layout"]
+        self.car.stats["layout_s"] += old_car.stats["layout_s"]
+        self.car.stats["update_s"] += old_car.stats["update_s"]
         self.keys = [nf.node_keys(l) for l in range(nf.top_level() + 1)]
         self.xi = [self._xi_of(l, k) for l, k in enumerate(self.keys)]
         self.d, self.p, self.S = [d0] + list(rest[0]), [p0] + list(rest[1]), [S0] + list(rest[2])

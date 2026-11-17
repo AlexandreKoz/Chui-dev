@@ -97,7 +97,7 @@ def test_adaptive_run_refines_locally_and_conserves():
     # part of the torus, and the node count is far below the uniform fine mesh
     assert len({l for (l, _, _) in f.leaves()}) >= 2
     top = f.top_level()
-    assert top == 2 and 0.0 < len(f.exists[top]) / f.nbl(top) ** 2 < 0.5
+    assert f.ncell(top) == 128 and 0.0 < len(f.exists[top]) / f.nbl(top) ** 2 < 0.5     # (level 1 filled up and was re-based)
     assert sh.n_nodes() < 0.6 * f.ncell(top) ** 2
     # every split is explained
     assert all(e["reason"].startswith("indicator") or e["reason"] in ("balance", "buffer") for e in f.events if e["kind"] == "split")
@@ -108,6 +108,29 @@ def test_adaptive_run_refines_locally_and_conserves():
     # interfaces stay C^4 during the evolution
     j = dg.continuity_jumps(sh, "xp")
     assert all(j["jump"][m] <= 1e-6 * j["scale"][m] + 1e-10 for m in range(5))
+
+
+def test_auto_rebase_does_not_change_the_solution():
+    """When every level-0 block has been split the controller relabels the
+    hierarchy (n0 -> 2 n0).  The represented sheet and its evolution are the
+    same as without re-basing, up to round-off-level effects."""
+    def go(auto):
+        sh = AdaptiveSheet.from_ic(GrowingModeIC(eps=(0.30, 0.21, 0.09)), 32, B=8, lmax=2, k=5)
+        ctrl = Controller(indicator="pred", tol=3e-4, interval=5, cooldown=10, auto_rebase=auto)
+        run = AdaptiveVP(sh, 64, Quadrature("lattice", 8), ctrl)
+        for _ in range(60):
+            run.step(0.02)
+        run.sync()
+        return run
+    a, b = go(True), go(False)
+    assert a.ctrl.n_rebase == 1 and a.sh.f.n0 == 64 and b.sh.f.n0 == 32
+    assert a.sh.n_nodes() == b.sh.n_nodes()
+    xi = np.random.default_rng(0).random((4000, 2))
+    xa, pa = a.sh.evaluate(xi, "xp")
+    xb, pb = b.sh.evaluate(xi, "xp")
+    assert np.abs(xa - xb).max() < 1e-9 and np.abs(pa - pb).max() < 1e-8
+    assert np.abs(a.rho - b.rho).max() < 1e-7 * a.rho.max()
+    assert a.mass_ledger == 1.0 == b.mass_ledger
 
 
 def test_determinism():

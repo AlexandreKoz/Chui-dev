@@ -171,41 +171,64 @@ class HierarchicalCarrier:
                         offs[par, q] = (par - o) // 2             # coarse index = q + (par - o)/2
                         wts[par, q] = mask[o + hw]
                         q += 1
-            pi, pj = gi & 1, gj & 1
-            ci = (gi >> 1)[:, None] + offs[pi]                    # (nD, nst)
-            cj = (gj >> 1)[:, None] + offs[pj]
-            wi, wj = wts[pi], wts[pj]
-            cols = np.empty((lv.nD, nst, nst), dtype=np.int64)
-            for qa in range(nst):
-                fl, ok = self._flat(m - 1, np.broadcast_to(ci[:, qa, None], (lv.nD, nst)), cj)
-                if not ok.all():
-                    raise RuntimeError("layout error: coarse support missing for subdivision")
-                cols[:, qa, :] = fl
-            vals = wi[:, :, None] * wj[:, None, :]
-            keep = vals != 0.0
             ncoarse = f.n0 * f.n0 if m == 1 else self.lev[m - 1].nD
-            indptr = np.concatenate([[0], np.cumsum(keep.reshape(lv.nD, -1).sum(axis=1))])
-            lv.P = sp.csr_matrix((vals[keep], cols[keep], indptr), shape=(lv.nD, ncoarse))
+            CH = 1 << 15                                          # rows per chunk: bounds the transient memory
+            dat, col, cnt = [], [], []
+            for r0 in range(0, lv.nD, CH):
+                ci_, cj_ = gi[r0:r0 + CH], gj[r0:r0 + CH]
+                n = len(ci_)
+                pi, pj = ci_ & 1, cj_ & 1
+                ci = (ci_ >> 1)[:, None] + offs[pi]                # (n, nst)
+                cj = (cj_ >> 1)[:, None] + offs[pj]
+                vals = wts[pi][:, :, None] * wts[pj][:, None, :]
+                cols = np.empty((n, nst, nst), dtype=np.int32)
+                for qa in range(nst):
+                    fl, ok = self._flat(m - 1, np.broadcast_to(ci[:, qa, None], (n, nst)), cj)
+                    if not ok.all():
+                        raise RuntimeError("layout error: coarse support missing for subdivision")
+                    cols[:, qa, :] = fl
+                keep = vals != 0.0
+                dat.append(vals[keep])
+                col.append(cols[keep])
+                cnt.append(keep.reshape(n, -1).sum(axis=1))
+            indptr = np.concatenate([[0], np.cumsum(np.concatenate(cnt))]).astype(np.int32)
+            lv.P = sp.csr_matrix((np.concatenate(dat), np.concatenate(col), indptr), shape=(lv.nD, ncoarse))
+            del dat, col, cnt
             # solve region T_m (subset of D_m points, in D flat order)
             inT = T[m][tI, tJ]
             tsel = np.nonzero(np.repeat(inT, B * B))[0]
             lv.tsel, lv.nT = tsel, len(tsel)
-            tindex = np.full(lv.nD, -1, dtype=np.int64)
-            tindex[tsel] = np.arange(lv.nT)
+            tindex = np.full(lv.nD, -1, dtype=np.int32)
+            tindex[tsel] = np.arange(lv.nT, dtype=np.int32)
             ti, tj = gi[tsel], gj[tsel]
             taps = COLLOC[k]
             w = np.arange(-h, h + 1, dtype=np.int64)
-            cols = np.empty((lv.nT, k, k), dtype=np.int64)
-            for a in range(k):
-                fl, ok = self._flat(m, np.broadcast_to((ti + w[a])[:, None], (lv.nT, k)), tj[:, None] + w[None, :])
-                cols[:, a, :] = np.where(ok, tindex[fl], -1)
-            keep = cols >= 0
-            vals = np.broadcast_to(taps[:, None] * taps[None, :], (lv.nT, k, k))
-            indptr = np.concatenate([[0], np.cumsum(keep.reshape(lv.nT, -1).sum(axis=1))])
-            lv.M = sp.csr_matrix((vals[keep], cols[keep], indptr), shape=(lv.nT, lv.nT))
+            tt = np.broadcast_to(taps[:, None] * taps[None, :], (1, k, k))
+
+            def colloc_rows(ri, rj):
+                """CSR rows of the collocation operator restricted to T_m for the
+                level-m grid points (ri, rj) (columns outside T_m dropped)."""
+                dat, col, cnt = [], [], []
+                for r0 in range(0, len(ri), CH):
+                    a_, b_ = ri[r0:r0 + CH], rj[r0:r0 + CH]
+                    n = len(a_)
+                    cols = np.empty((n, k, k), dtype=np.int32)
+                    for a in range(k):
+                        fl, ok = self._flat(m, np.broadcast_to((a_ + w[a])[:, None], (n, k)), b_[:, None] + w[None, :])
+                        cols[:, a, :] = np.where(ok, tindex[fl], -1)
+                    keep = cols >= 0
+                    dat.append(np.broadcast_to(tt, (n, k, k))[keep])
+                    col.append(cols[keep])
+                    cnt.append(keep.reshape(n, -1).sum(axis=1))
+                indptr = np.concatenate([[0], np.cumsum(np.concatenate(cnt))]).astype(np.int32)
+                return sp.csr_matrix((np.concatenate(dat), np.concatenate(col), indptr), shape=(len(ri), lv.nT))
+
             # full-torus level: the solve is the periodic prefilter (2D FFT)
             lv.full = lv.nT == N * N
             lv.dense_of_T = (ti % N) * N + (tj % N) if lv.full else None
+            # the full SPD matrix is only needed by the verification solvers / extra sweeps
+            need_M = self.solver != "adi" or (self.sweeps > 1 and not lv.full)
+            lv.M = colloc_rows(ti, tj) if need_M else None
             # active nodes of this level -> rows of the solve region
             keys = f.node_keys(m)
             lv.node_keys = keys
@@ -213,8 +236,11 @@ class HierarchicalCarrier:
             if not ok.all() or (tindex[fl] < 0).any():
                 raise RuntimeError("layout error: active node outside its solve region")
             lv.node_rows = tindex[fl]
-            lv.Mn = lv.M[lv.node_rows]
+            lv.Mn = colloc_rows(keys // N, keys % N)
             lv.lu = None
+            lv.perm, lv.chol, lv.crow, lv.lam = [], [], [], None
+            if lv.full and self.solver != "splu":
+                continue
             # line (ADI) operators: exact inverses of the 1D collocation matrix restricted
             # to each grid line of T_m (banded Cholesky; complete periodic lines by FFT)
             lv.perm, lv.chol, lv.crow = [], [], []
@@ -281,7 +307,8 @@ class HierarchicalCarrier:
         for m in range(1, self.top + 1):
             lv = self.lev[m]
             n += lv.nD * ncomp
-            op += 1.5 * (lv.P.nnz + lv.M.nnz + lv.Mn.nnz) + 2 * (self.h + 1) * lv.nT + 2 * lv.nT
+            op += 1.5 * (lv.P.nnz + (lv.M.nnz if lv.M is not None else 0) + lv.Mn.nnz)
+            op += (2 * (self.h + 1) * lv.nT + 2 * lv.nT) if lv.chol else 0
         win = sum(v[1].size for v in self.groups.values())
         return dict(coefficients=float(n), operators=float(op), windows=float(win))
 

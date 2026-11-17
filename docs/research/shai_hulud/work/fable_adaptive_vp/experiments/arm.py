@@ -49,6 +49,7 @@ def warmup():
 def run_nbody(spec, scratch):
     run = NBodyVP(GrowingModeIC(), spec["n"], spec["ng"])
     c0 = run.conserved()
+    rss_max = common.current_rss_mb()
     wall = 0.0
     cpu0 = time.process_time()
     io_cpu = 0.0
@@ -57,30 +58,37 @@ def run_nbody(spec, scratch):
         t0 = time.perf_counter()
         run.step(spec["dt"])
         wall += time.perf_counter() - t0
+        if k % 10 == 0:
+            rss_max = max(rss_max, common.current_rss_mb())
         if k in spec["snaps"]:
             c1 = time.process_time()
-            f = os.path.join(scratch, f"nb_{k}.npz")
+            f = os.path.join(scratch, f"nb_{k}")
             run.sync()
-            np.savez(f, x=run.x, p=run.p, rho=run.rho)
+            run.x.tofile(f + ".x")          # raw writes: no transient copies in the peak RSS
+            run.p.tofile(f + ".p")
+            run.rho.tofile(f + ".rho")
             saved[k] = f
             io_cpu += time.process_time() - c1
-    res = dict(wall_s=wall, cpu_s=time.process_time() - cpu0 - io_cpu, peak_rss_mb=common.peak_rss_mb(), cpu=dict(run.cpu),
-               memory=run.memory_report(), deposit_samples_per_step=spec["n"] ** 2, nodes_final=spec["n"] ** 2,
+    res = dict(wall_s=wall, cpu_s=time.process_time() - cpu0 - io_cpu, peak_rss_mb=common.peak_rss_mb(), rss_sampled_max_mb=rss_max,
+               cpu=dict(run.cpu), memory=run.memory_report(), deposit_samples_per_step=spec["n"] ** 2, nodes_final=spec["n"] ** 2,
                node_steps=spec["n"] ** 2 * spec["nsteps"], E0=c0["E"], K0=c0["K"])
     # phase 2
     ref = np.load(spec["ref"])
     snaps = {}
     for k, f in saved.items():
-        z = np.load(f)
-        run.x, run.p, run.rho = z["x"], z["p"], z["rho"]
+        run.x = np.fromfile(f + ".x").reshape(-1, 2)
+        run.p = np.fromfile(f + ".p").reshape(-1, 2)
+        run.rho = np.fromfile(f + ".rho").reshape(spec["ng"], spec["ng"])
         run.phi = run.pm.potential(run.rho)
+        run._lag = False
         r = dg.compare_nbody(run, ref, k)
         c = run.conserved()
         fr, dm = run.folded_fraction()
         r.update(E=c["E"], K=c["K"], U=c["U"], Px=c["Px"], Py=c["Py"], mass=c["mass"], folded_fraction=fr, det_min=dm,
                  ref_folded_fraction=float(ref[f"negdet{k}"]))
         snaps[str(k)] = r
-        os.remove(f)
+        for ext in (".x", ".p", ".rho"):
+            os.remove(f + ext)
     res["snaps"] = snaps
     return res
 
@@ -102,14 +110,15 @@ def run_sheet(spec, scratch):
     refine_all = set(spec.get("refine_all_at", []))
     samples_hist, nodes_hist = [], []
     manual = []
+    rss_max = common.current_rss_mb()
     for k in range(1, spec["nsteps"] + 1):
         t0 = time.perf_counter()
         run.step(spec["dt"])
         if k in refine_all:
             # uniform early refinement control (the baseline `refine2`): split everything, then relabel
             run.sync()
-            sh.refine(sh.f.leaves(), reason="uniform", step=k, t=run.t)
-            if sh.rebase():
+            sh.auto_rebase = True
+            if sh.refine(sh.f.leaves(), reason="uniform", step=k, t=run.t)["rebased"]:
                 run.quad.sub0 = max(1, run.quad.sub0 // 2)
             run.quad.sync(sh.car)
             run.solve_field()
@@ -118,6 +127,7 @@ def run_sheet(spec, scratch):
         if k % 10 == 0 or k == spec["nsteps"]:
             samples_hist.append(run.last_samples)
             nodes_hist.append(sh.n_nodes())
+            rss_max = max(rss_max, common.current_rss_mb())
         if k in spec["snaps"]:
             c1 = time.process_time()
             f = os.path.join(scratch, f"sh_{k}.npz")
@@ -125,8 +135,8 @@ def run_sheet(spec, scratch):
             run.save_checkpoint(f)
             saved[k] = f
             io_cpu += time.process_time() - c1
-    res = dict(wall_s=wall, cpu_s=time.process_time() - cpu0 - io_cpu, peak_rss_mb=common.peak_rss_mb(), cpu=dict(run.cpu),
-               memory=run.memory_report(), deposit_samples_total=run.deposit_samples,
+    res = dict(wall_s=wall, cpu_s=time.process_time() - cpu0 - io_cpu, peak_rss_mb=common.peak_rss_mb(), rss_sampled_max_mb=rss_max,
+               cpu=dict(run.cpu), memory=run.memory_report(), deposit_samples_total=run.deposit_samples,
                deposit_samples_per_step=run.deposit_samples / max(run.n_field_solves, 1), nodes_final=sh.n_nodes(),
                nodes_per_level_final=sh.nodes_per_level(), node_steps=run.node_steps, E0=c0["E"], K0=c0["K"],
                samples_every_10=samples_hist, nodes_every_10=nodes_hist, n_field_solves=run.n_field_solves,
@@ -138,7 +148,8 @@ def run_sheet(spec, scratch):
         res["controller"] = dict(params=ctrl.params(), first_split_t=ctrl.first_split_t, latch_step=ctrl.latch_step,
                                  n_events=len(ev), n_indicator=sum(1 for e in ev if e["reason"].startswith("indicator")),
                                  n_balance=sum(1 for e in ev if e["reason"] == "balance"),
-                                 n_buffer=sum(1 for e in ev if e["reason"] == "buffer"),
+                                 n_buffer=sum(1 for e in ev if e["reason"] == "buffer"), n_rebase=ctrl.n_rebase,
+                                 final_n0=sh.f.n0, final_lmax=sh.f.lmax,
                                  n_merge=sum(1 for e in ev if e["kind"] == "merge"),
                                  denied_budget=sum(h["n_denied_budget"] for h in ctrl.history),
                                  denied_floor_evals=sum(1 for h in ctrl.history if h["n_denied_floor"]),
@@ -179,7 +190,8 @@ if __name__ == "__main__":
     base = common.current_rss_mb()
     res = run_nbody(spec, scratch) if spec["kind"] == "nbody" else run_sheet(spec, scratch)
     res["rss_baseline_mb"] = base
-    res["peak_rss_incr_mb"] = res["peak_rss_mb"] - base
+    res["peak_rss_incr_mb"] = res["peak_rss_mb"] - base            # high-water mark above the post-warm-up baseline
+    res["rss_sampled_incr_mb"] = res["rss_sampled_max_mb"] - base  # largest RSS seen between steps (no transients)
     res["spec"] = spec
     try:
         os.rmdir(scratch)

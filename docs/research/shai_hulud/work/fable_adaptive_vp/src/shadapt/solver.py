@@ -475,7 +475,7 @@ class NBodyVP:
             self.solve_field()
         self.sync()
         m = 1.0 / (self.n * self.n)
-        K = 0.5 * m * float(np.sum(self.p ** 2))
+        K = 0.5 * m * float(np.vdot(self.p, self.p))
         U = self.pm.energy_potential(self.rho, self.phi)
         P = m * self.p.sum(axis=0)
         return dict(t=self.t, K=K, U=U, E=K + U, Px=float(P[0]), Py=float(P[1]), mass=float(self.rho.mean()))

@@ -46,7 +46,7 @@ KAPPA = {3: 1.0 / 384.0, 5: 1.0 / 15360.0}
 class Controller:
     def __init__(self, indicator="pred", tol=1e-3, hyst=0.1, interval=5, cooldown=10, max_nodes=None,
                  tau=0.3, tau_p=0.3, floor_cells=0.5, t_enable=0.0, enable_on="always", tau_lead=0.3,
-                 buffer=0, coarsen=False, max_splits_per_event=None):
+                 buffer=0, coarsen=False, max_splits_per_event=None, auto_rebase=True):
         if indicator not in ("d6", "pred", "max"):
             raise ValueError(indicator)
         self.indicator, self.tol, self.hyst = indicator, float(tol), float(hyst)
@@ -55,6 +55,10 @@ class Controller:
         self.t_enable, self.enable_on, self.tau_lead = float(t_enable), enable_on, float(tau_lead)
         self.buffer, self.coarsen = int(buffer), bool(coarsen)
         self.max_splits_per_event = max_splits_per_event
+        # when every level-0 block has been split the hierarchy is relabelled (n0 -> 2 n0):
+        # exact, and it returns the carrier to the cost of a uniform sheet
+        self.auto_rebase = bool(auto_rebase)
+        self.n_rebase = 0
         self.latched = False            # gate latch for "precaustic" / "crossing"
         self.latch_step = None
         self.merged_at = {}             # (l, I, J) -> step of last merge
@@ -66,12 +70,12 @@ class Controller:
         return dict(indicator=self.indicator, tol=self.tol, hyst=self.hyst, interval=self.interval, cooldown=self.cooldown,
                     max_nodes=self.max_nodes, tau=self.tau, tau_p=self.tau_p, floor_cells=self.floor_cells,
                     t_enable=self.t_enable, enable_on=self.enable_on, tau_lead=self.tau_lead, buffer=self.buffer,
-                    coarsen=self.coarsen, max_splits_per_event=self.max_splits_per_event)
+                    coarsen=self.coarsen, max_splits_per_event=self.max_splits_per_event, auto_rebase=self.auto_rebase)
 
     def state_dict(self):
         return dict(params=self.params(), latched=self.latched, latch_step=self.latch_step,
                     merged_at=[[list(k), v] for k, v in sorted(self.merged_at.items())],
-                    history=self.history, first_split_t=self.first_split_t)
+                    history=self.history, first_split_t=self.first_split_t, n_rebase=self.n_rebase)
 
     @classmethod
     def from_state(cls, st):
@@ -80,6 +84,7 @@ class Controller:
         c.merged_at = {tuple(k): v for k, v in st["merged_at"]}
         c.history = list(st["history"])
         c.first_split_t = st["first_split_t"]
+        c.n_rebase = st.get("n_rebase", 0)
         return c
 
     # ------------------------------------------------------------------ indicators
@@ -246,6 +251,7 @@ class Controller:
                                 continue
                         else:
                             forest.refine(*blk, reason=reason, step=step, t=t, info=info)
+                sh.auto_rebase = self.auto_rebase and not self.coarsen
                 res = sh.apply_topology_change(change)
                 new_events = f.events[n_before:]
                 rec["n_split"] = sum(1 for e in new_events if e["kind"] == "split" and e["reason"].startswith("indicator"))
@@ -254,7 +260,26 @@ class Controller:
                 rec["n_merge"] = sum(1 for e in new_events if e["kind"] == "merge")
                 changed = bool(new_events)
                 if changed:
-                    run.quad.sync(sh.car, old_nq)
+                    if res["rebased"]:
+                        self.n_rebase += 1
+                        rec["rebased_to_n0"] = sh.f.n0
+                        if run.quad.mode == "lattice":
+                            run.quad.sub0 = max(1, run.quad.sub0 // 2)
+                            run.quad.sync(sh.car)
+                        else:
+                            # children inherit half of the parent's counts, then the level index shifts down by one
+                            shifted = {}
+                            for (L, I, J), v in (old_nq or {}).items():
+                                if L >= 1:
+                                    shifted[(L - 1, I, J)] = v
+                                else:
+                                    for a in (0, 1):
+                                        for b in (0, 1):
+                                            shifted[(0, 2 * I + a, 2 * J + b)] = (v[0] // 2, v[1] // 2)
+                            run.quad.sync(sh.car, shifted)
+                        self.merged_at = {(k[0] - 1, k[1], k[2]): v for k, v in self.merged_at.items() if k[0] >= 1}
+                    else:
+                        run.quad.sync(sh.car, old_nq)
                     rec["nodes_after"] = sh.n_nodes()
                     rec["created"], rec["removed"] = res["created"], res["removed"]
                     if self.first_split_t is None and (rec["n_split"] + rec["n_buffer"]) > 0:
