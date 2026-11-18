@@ -1,8 +1,8 @@
 {
   "schema": "chui_dataset_registry_v1",
-  "assessed": "2026-11-09 (patch 53, data-only checks; no CHUI build, test or simulation)",
+  "assessed": "2026-11-09 (patch 53, data-only checks; no CHUI build, test or simulation); 2026-11-18: HM01 TREECOOL derived, WSS09 bound to it, bundled files committed by owner decision",
   "policy": [
-    "No third-party data file is committed to this repository. Files are staged in a user-local directory (default chui_data/, git-ignored) and bound to a run by SHA-256 in the .param.txt configuration.",
+    "Owner decision 2026-11-18 (supersedes the earlier no-commit rule): the files of entries with bytes_present = true except C01_wss09_hm01_z0-8.989 (reproducible, superseded by its TREECOOL-bound variant) are committed under chui_data/ (force-added; the directory stays git-ignored for anything else; chui_data/** is -text so bytes are never normalized). Redistribution rights are NOT confirmed for any of them; the repository is public only for AI-assistant access and used by the owner. Every run still binds each file by SHA-256 in the .param.txt configuration.",
     "Fact fields are independent: bytes may be present yet unqualified; scientifically unqualified data may still be loadable behind an explicit opt-in; nothing here is a scientific qualification.",
     "bytes_present is evaluated by 'chui_data.py report <dir>' against the local directory; the value below records what this assessment observed."
   ],
@@ -119,8 +119,36 @@
         "production_enabled": false
       },
       "evidence": "Acquired 2026-11-09 in this session: tarball sha256 matched the pinned value; converted with the repository converter to the expected derived sha256 4bbca8a9...; validate_metal_cooling_table.py VALID, max float32 round-trip difference vs source 4.99e-9. Kept user-local; NOT in the supplied bundle and NOT committed.",
-      "limitations": ["embeds HM01 + CMB; no HM01-consistent H/He TREECOOL table is available, so pairing with FG20 is a declared mismatch", "per-element increments are non-additive with respect to Total_Metals (difference-run definition)", "optically thin, ionization equilibrium, dust free"],
-      "blocked_reason": "no licence statement by the authors (not redistributable here); HM01-consistent UVB absent, so a physically consistent C01 + UVB model cannot be assembled without the explicit mismatch opt-in"
+      "limitations": ["embeds HM01 + CMB; this unbound derivation declares no TREECOOL SHA-256, so every TREECOOL pairing is a declared mismatch; use C01_wss09_hm01_z0-8.989_hm05treecool for the consistent HM01 pairing", "per-element increments are non-additive with respect to Total_Metals (difference-run definition)", "optically thin, ionization equilibrium, dust free"],
+      "blocked_reason": "no licence statement by the authors; superseded for use by the TREECOOL-bound variant below (identical data rows)"
+    },
+    {
+      "id": "C01_wss09_hm01_z0-8.989_hm05treecool",
+      "subsystem": "C01",
+      "file": "wss09_hm01_z0-8.989_hm05treecool_chui_metal_cooling_table_v1.txt",
+      "sha256": "75e6bd733fd78f16c2b76793651e4a04b0570771b20d5a3aa6e4dc7d2af6d30b",
+      "bytes": 52159274,
+      "schema": "chui_metal_cooling_table_v1",
+      "config": {"physics.metal_cooling_mode": "element_table | element_table_and_fine_structure", "physics.metal_cooling_table_path": "<data_dir>/wss09_hm01_z0-8.989_hm05treecool_chui_metal_cooling_table_v1.txt", "physics.metal_cooling_table_sha256": "75e6bd733fd78f16c2b76793651e4a04b0570771b20d5a3aa6e4dc7d2af6d30b", "physics.uv_background_model": "treecool_table", "physics.uv_background_table_path": "<data_dir>/hm01_treecool_cloudy0702_hm05_galaxy_v1.dat", "physics.uv_background_table_sha256": "1621b3c5d8894d94ad9afca5dca4f81ca7e33d126f023b812782b1f1d71b862e"},
+      "upstream": [
+        {"url": "https://virgodb.cosma.dur.ac.uk/swift-webstorage/CoolingTables/EAGLE/coolingtables.tar.gz", "sha256": "228ec92871e8170a181ca5fb80a591b33daec4475a30b9482419f127670a1543", "bytes": 37448052, "last_modified": "Sat, 12 Oct 2019 15:12:32 GMT"}
+      ],
+      "converter": "tools/chui_data/convert_wss09_metal_cooling.py (chui_wss09_converter_v2), 49 redshift files z_0.000..z_8.989, --uv-background-treecool-sha256 1621b3c5d8894d94ad9afca5dca4f81ca7e33d126f023b812782b1f1d71b862e",
+      "citations": ["Wiersma, Schaye & Smith 2009 MNRAS 393 99", "Haardt & Madau 2001 (embedded UVB)", "CLOUDY 07.02"],
+      "facts": {
+        "bytes_present": true,
+        "schema_checked": true,
+        "provenance_recorded": true,
+        "source_independently_cross_checked": true,
+        "license_to_redistribute_confirmed": false,
+        "loader_connected": true,
+        "supported_by_configuration": true,
+        "scientifically_qualified": false,
+        "production_enabled": false
+      },
+      "evidence": "Regenerated 2026-11-18 from the pinned tarball (sha256 matched) with the TREECOOL binding; data rows byte-identical to the unbound derivation 4bbca8a9...; the header declares uv_background_treecool_sha256 = 1621b3c5d8894d94ad9afca5dca4f81ca7e33d126f023b812782b1f1d71b862e, so MetalCoolingTable::checkUvBackgroundCompatibility accepts the pairing with HM01_treecool without metal_cooling_accept_uv_background_mismatch. validate_metal_cooling_table.py VALID (round trip 4.99e-9).",
+      "limitations": ["embeds HM01 + CMB; consistent with HM01_treecool (both from the CLOUDY 07.02 HM05 galaxies+quasars spectrum), NOT with FG20", "per-element increments are non-additive with respect to Total_Metals (difference-run definition)", "optically thin, ionization equilibrium, dust free"],
+      "blocked_reason": "no licence statement by the authors (committed by owner decision, redistribution unconfirmed); scientific qualification pending"
     },
     {
       "id": "C02_metal_ion_rates_C_O_Si_Fe_unverified",
@@ -161,20 +189,32 @@
     {
       "id": "HM01_treecool",
       "subsystem": "UVB consistent with C01",
-      "file": null,
-      "sha256": null,
+      "file": "hm01_treecool_cloudy0702_hm05_galaxy_v1.dat",
+      "sha256": "1621b3c5d8894d94ad9afca5dca4f81ca7e33d126f023b812782b1f1d71b862e",
+      "bytes": 6397,
+      "schema": "TREECOOL (7 columns; src/physics/radiation_background.cpp UvBackgroundTable::loadTreecool)",
+      "config": {"physics.uv_background_model": "treecool_table", "physics.uv_background_table_path": "<data_dir>/hm01_treecool_cloudy0702_hm05_galaxy_v1.dat", "physics.uv_background_table_sha256": "1621b3c5d8894d94ad9afca5dca4f81ca7e33d126f023b812782b1f1d71b862e"},
+      "upstream": [
+        {"url": "https://data.nublado.org/cloudy_releases/c07_02/c07.02.01.tar.gz", "sha256": "9aeed6a9096e70fd021224d07b61b539049660a69b4311fb90d31fda2b5832b8", "member": "c07.02.01/data/haardt_madau_galaxy.dat", "member_sha256": "50fb788ee6c35b97a9703489bee792b9fd6777abdbf39da0576a13d465dc6d04", "note": "identical member in c07.02.00.tar.gz (sha256 065af3c7b502a8a05a67345a3519463e1a5770e318cb2800a1ff5edb99cbdc78); the spectrum read by CLOUDY 07.02 'table HM05' (default galaxies+quasars), i.e. the WSS09 UVB"},
+        {"url": "https://www.ucolick.org/~pmadau/CUBA/Media/UVB.out", "sha256": "a708586ead551202c068b049d48afa87b96695c5a5d12253e9b9bbb74efd75dc", "note": "HM12 spectrum, method validation only"},
+        {"url": "https://www.ucolick.org/~pmadau/CUBA/Media/photorates.out", "sha256": "b831cc1537f86d24f2bcdf99fe7ea6a2ea239d761ee673d433e85c8d6756a06b", "note": "HM12 reference rates, method validation only"}
+      ],
+      "converter": "tools/chui_data/convert_hm_spectrum_treecool.py (chui_treecool_from_spectrum_v1), --format cloudy_hm05, 16 substeps",
+      "citations": ["Haardt & Madau 2001 (CUBA; 2005 revision supplied to CLOUDY)", "Verner, Ferland, Korista & Yakovlev 1996 ApJ 465 487 (cross sections)", "Ferland et al. 1998 (CLOUDY 07.02)"],
       "facts": {
-        "bytes_present": false,
-        "schema_checked": false,
-        "provenance_recorded": false,
-        "source_independently_cross_checked": false,
+        "bytes_present": true,
+        "schema_checked": true,
+        "provenance_recorded": true,
+        "source_independently_cross_checked": true,
         "license_to_redistribute_confirmed": false,
         "loader_connected": true,
         "supported_by_configuration": true,
         "scientifically_qualified": false,
         "production_enabled": false
       },
-      "blocked_reason": "no HM01 H/He photo-rate (TREECOOL-format) table derived from the CUBA HM01 spectra was found; none is synthesized"
+      "evidence": "Derived 2026-11-18 by direct frequency integration of the CLOUDY 07.02 HM05 spectrum (no rescaling). Method validated on the authors' HM12 pair (UVB.out -> photorates.out, 41 redshifts z <= 10): Gamma_HI <= 1.1%, Gamma_HeI <= 0.8%, all heating <= 0.6%; Gamma_HeII <= 2.5% at z <= 6 rising to 6.8% at z ~ 10 where Gamma_HeII < 1e-20 s^-1. 4x-resolution convergence 1.5e-7. validate_treecool.py VALID: 50 rows, z = 0..9.479 (last row zero as in the source); Gamma_HI = 9.75e-14 (z=0), 1.56e-12 (z~2), 1.22e-12 (z~3) s^-1; qdot_HI/Gamma_HI(z=0) = 3.23 eV.",
+      "limitations": ["optically thin per-ion rates (self-shielding is applied separately by CHUI)", "CMB excluded; the z = 9.479 row is zero because the source spectrum is zero there", "Verner 1996 fits truncated at their E_max = 50 keV"],
+      "blocked_reason": "scientific qualification pending; redistribution unconfirmed (committed by owner decision)"
     }
   ]
 }

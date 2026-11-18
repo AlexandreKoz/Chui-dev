@@ -1986,6 +1986,8 @@ void accumulateDiagnostics(ProductionAmrHydroDiagnostics& lhs, const ProductionA
   lhs.reflux.corrected_internal_energy_code += rhs.reflux.corrected_internal_energy_code;
   lhs.reflux.dual_energy_reflux_cells += rhs.reflux.dual_energy_reflux_cells;
   lhs.reflux.dual_energy_reflux_thermal_correction_code += rhs.reflux.dual_energy_reflux_thermal_correction_code;
+  lhs.ism_regime_gate_remote_ghosts += rhs.ism_regime_gate_remote_ghosts;
+  lhs.ism_regime_gate_owner_proxied_ghosts += rhs.ism_regime_gate_owner_proxied_ghosts;
 }
 
 [[nodiscard]] std::vector<std::uint32_t> activeRowsForLevel(
@@ -2973,8 +2975,26 @@ struct AmrSynchronizedSweepWorkspace {
   // byte per real+ghost cell of the largest patch).
   std::vector<std::uint8_t> regime_gate;
   std::vector<std::uint32_t> regime_dense_rows;
+  std::vector<std::uint8_t> regime_slot_resolved;
   const bool regime_gate_active =
       global_source_context.thermodynamic_closure != nullptr && hydro::ismRegimeGateActive(state);
+  // Owner-authoritative regime tags of every remote boundary cell delivered
+  // by the directed exchange (sorted by stable id; bounded by the already
+  // admitted remote boundary payload).
+  std::vector<std::pair<std::uint64_t, std::uint8_t>> remote_regime_tags;
+  if (regime_gate_active && distributed_exchange != nullptr) {
+    std::size_t remote_cells = 0U;
+    for (const DistributedAmrRemotePatch& remote : distributed_exchange->remote_patches) {
+      remote_cells += remote.boundary_cells.size();
+    }
+    remote_regime_tags.reserve(remote_cells);
+    for (const DistributedAmrRemotePatch& remote : distributed_exchange->remote_patches) {
+      for (const AmrHydroSparseRemoteCell& cell : remote.boundary_cells) {
+        remote_regime_tags.emplace_back(cell.gas_cell_id, cell.ism_regime_tag);
+      }
+    }
+    std::sort(remote_regime_tags.begin(), remote_regime_tags.end());
+  }
   core::GovernedScratchArena parent_mirror_arena(
       options.regrid_memory_governor, core::MemoryClass::kScratchArena,
       AmrParentMirrorIndex::workspaceBytes(state), "amr.parent_mirror.index");
@@ -3135,14 +3155,49 @@ struct AmrSynchronizedSweepWorkspace {
         }
       }
       (void)hydro::buildIsmRegimeGate(state, gate_geometry, regime_dense_rows, regime_gate);
+      // Every imported ghost row takes the regime of ONE authoritative tag:
+      // its origin cell's (local row, or the owner tag shipped in the MPI
+      // payload). No row ever falls back to the closure's own
+      // density/temperature criterion (that would be a second authority).
+      const std::size_t slots = gate_geometry.ghost_cells.size();
+      regime_slot_resolved.assign(slots, 0U);
+      for (std::size_t slot = 0; slot < slots; ++slot) {
+        if (hydro::ismRegimeSelfGhost(gate_geometry.ghost_cells[slot])) regime_slot_resolved[slot] = 1U;
+      }
       for (const AmrHydroGhostDescriptor& ghost : patch_geometry.ghosts) {
-        if (ghost.ghost_slot >= gate_geometry.ghost_cells.size() || ghost.source_gas_cell_id == 0U) continue;
+        if (ghost.ghost_slot >= slots || ghost.source_gas_cell_id == 0U ||
+            regime_slot_resolved[ghost.ghost_slot] != 0U) {
+          continue;
+        }
         const std::size_t storage = gate_geometry.ghost_cells[ghost.ghost_slot].ghost_cell;
         if (storage >= regime_gate.size()) continue;
-        const auto origin = state.rowForGasCellId(ghost.source_gas_cell_id);
-        regime_gate[storage] = origin.has_value()
-            ? hydro::ismRegimeAllowsEffectiveClosure(state, *origin)
-            : hydro::k_ism_regime_gate_unknown_origin;
+        if (const auto origin = state.rowForGasCellId(ghost.source_gas_cell_id); origin.has_value()) {
+          regime_gate[storage] = hydro::ismRegimeAllowsEffectiveClosure(state, *origin);
+        } else {
+          const auto it = std::lower_bound(
+              remote_regime_tags.begin(), remote_regime_tags.end(),
+              std::pair<std::uint64_t, std::uint8_t>{ghost.source_gas_cell_id, 0U});
+          if (it == remote_regime_tags.end() || it->first != ghost.source_gas_cell_id ||
+              it->second == k_amr_remote_ism_regime_tag_unknown) {
+            // Fail closed (voted by the caller's sweep-failure protocol).
+            throw std::runtime_error(
+                "I01: imported ghost origin gas cell " + std::to_string(ghost.source_gas_cell_id) +
+                " has no authoritative ISM regime tag (not local and not in the remote payload)");
+          }
+          regime_gate[storage] = it->second == core::k_gas_ism_regime_effective ? 1U : 0U;
+          ++diagnostics.ism_regime_gate_remote_ghosts;
+        }
+        regime_slot_resolved[ghost.ghost_slot] = 1U;
+      }
+      // Composite imported ghosts without a single origin (multi-source edge
+      // averages) take the tag of the adjacent owner cell they serve.
+      for (std::size_t slot = 0; slot < slots; ++slot) {
+        if (regime_slot_resolved[slot] != 0U) continue;
+        const hydro::HydroGhostCell& ghost = gate_geometry.ghost_cells[slot];
+        if (ghost.ghost_cell < regime_gate.size() && ghost.owner_real_cell < gate_geometry.cellCount()) {
+          regime_gate[ghost.ghost_cell] = regime_gate[ghost.owner_real_cell];
+          ++diagnostics.ism_regime_gate_owner_proxied_ghosts;
+        }
       }
       patch_regime_gate = regime_gate;
     }

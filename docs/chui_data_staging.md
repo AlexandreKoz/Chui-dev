@@ -1,6 +1,10 @@
 # Staging the CHUI external physics data (user-local)
 
-Patch 53. No third-party table is committed to this repository. Each run binds
+Patch 53; **2026-11-18 owner decision:** the bundled tables below are committed
+under `chui_data/` (force-added; the directory stays git-ignored for anything
+else, and `.gitattributes` marks `chui_data/** -text` so bytes are never
+normalized). Redistribution rights are still unconfirmed for every product;
+the repository is public only for AI-assistant access. Each run binds
 its tables by path **and** SHA-256 in the `.param.txt` configuration; the
 loaders recompute the checksum on every rank and refuse a mismatch, and a
 failure on any rank is agreed collectively during runtime-module
@@ -17,9 +21,10 @@ table below; `python3 -I tools/chui_data/chui_data.py report <dir>` evaluates
 | S02 NuGrid + W7 yields | `nugrid_fryer12delay_w7_chui_ssp_yield_table_v1.txt` | `e2161646…f8e14` | yes | regenerated from pinned NuPyCEE upstream | no | no |
 | F02 SB99 winds Z=0.014 | `sb99_z014_genevav00_chui_ssp_wind_table_v1.txt` | `ba232a1c…5da5` | yes | regenerated from pinned pyathena SB99 outputs | no | no |
 | FG20 TREECOOL ×0.68 | `fg20_treecool_eff_rescaled_heating_rates_068.dat` | `4bfc5d9b…b313` | yes | mirror only (original host unreachable) | no | no |
-| C01 WSS09 (HM01) | `wss09_hm01_z0-8.989_chui_metal_cooling_table_v1.txt` | `4bbca8a9…3410` | yes, user-local (acquired 2026-11-09) | bit-exact vs source HDF5; pinned tarball hash | no (no licence stated) | no |
+| C01 WSS09 (HM01), unbound | `wss09_hm01_z0-8.989_chui_metal_cooling_table_v1.txt` | `4bbca8a9…3410` | user-local, not committed (reproducible; superseded below) | bit-exact vs source HDF5; pinned tarball hash; regenerated 2026-11-18 | no (no licence stated) | no |
+| C01 WSS09 (HM01), bound to HM01 TREECOOL | `wss09_hm01_z0-8.989_hm05treecool_chui_metal_cooling_table_v1.txt` | `75e6bd73…d30b` | yes, committed | data rows byte-identical to the unbound table; header binds `1621b3c5…` | no (no licence stated) | no |
 | C02 C/O/Si/Fe ions | `chui_metal_ion_rates_v1_C_O_Si_Fe_unverified.txt` | `633a66ee…2d00` | yes | cooling vs GF12 mirror only; CI/RR/DR NOT independently verified | no | no (`unverified`) |
-| HM01 TREECOOL | — | — | **no** | — | — | — |
+| HM01 TREECOOL | `hm01_treecool_cloudy0702_hm05_galaxy_v1.dat` | `1621b3c5…862e` | yes, committed (derived 2026-11-18) | integrated from the CLOUDY 07.02 HM05 spectrum (the WSS09 UVB); method validated against the HM12 spectrum/rate pair | no | no |
 
 ## Procedure
 
@@ -40,7 +45,25 @@ python3 -I tools/chui_data/chui_data.py fetch chui_data
 
 `stage` never overwrites a file with different bytes and refuses any member
 whose SHA-256 differs from the registry. `chui_data/` and `chui_data_local/`
-are git-ignored.
+are git-ignored; the registered bundle is force-added.
+
+## Consistent HM01 pairing (C01 + UVB)
+
+The WSS09 metal table and the H/He photo-rates come from the same spectrum
+only with the TREECOOL-bound table:
+
+```
+physics.metal_cooling_table_path = chui_data/wss09_hm01_z0-8.989_hm05treecool_chui_metal_cooling_table_v1.txt
+physics.metal_cooling_table_sha256 = 75e6bd733fd78f16c2b76793651e4a04b0570771b20d5a3aa6e4dc7d2af6d30b
+physics.uv_background_model = treecool_table
+physics.uv_background_table_path = chui_data/hm01_treecool_cloudy0702_hm05_galaxy_v1.dat
+physics.uv_background_table_sha256 = 1621b3c5d8894d94ad9afca5dca4f81ca7e33d126f023b812782b1f1d71b862e
+```
+
+`MetalCoolingTable::checkUvBackgroundCompatibility` then accepts the pairing
+without `metal_cooling_accept_uv_background_mismatch`. The thermochemistry
+backends that consume a UVB remain gated by
+`thermochemistry_allow_unqualified_rates` (no scientific qualification yet).
 
 ## Configuration fragments
 
@@ -50,7 +73,7 @@ are git-ignored.
   edge_clamp_research`, `ssp_wind_table_compatibility = approximate_research`)
   because the strict defaults refuse the staged S02/F02 data. The
   FG20 UVB is excluded because every backend that consumes it is gated as
-  unqualified; C01 is excluded because no HM01-consistent UVB exists; C02 is
+  unqualified; C01 is excluded because its consistent HM01 pairing (below) also needs a UVB-consuming, unqualified backend; C02 is
   excluded because it is unverified.
 * `profiles/RESEARCH_C02_EXPLICIT_OPT_IN.param.fragment`: **research only**.
   `fixed_detailed` with the C/O/Si/Fe ladders, the checked C02 hash, the

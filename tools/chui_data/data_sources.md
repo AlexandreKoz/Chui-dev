@@ -271,3 +271,42 @@ Data-only commands; CHUI was not built or run. Details and fact fields:
   thermal energy is cooled by `n_e Σ_k n_k L_k`, and the stored ion potential
   (`metal_ion_potential_delta_erg`) is a diagnostic partition never subtracted
   again. The C01 table query excludes ladder elements (no double count).
+
+## §D6 — HM01-consistent TREECOOL derived from the HM05 spectrum (2026-11-18)
+
+**Spectrum.** WSS09 used CLOUDY 07.02 photoionized by the Haardt & Madau
+galaxies+quasars background. In CLOUDY 07.02 this is `table HM05`, whose
+default data file is `data/haardt_madau_galaxy.dat` (header: the HM continuum
+revised by F. Haardt in 2005, galaxies + quasars, CMB excluded; magic number
+50808). Source archive
+`https://data.nublado.org/cloudy_releases/c07_02/c07.02.01.tar.gz`
+(sha256 `9aeed6a9…`); the member (sha256 `50fb788e…`) is byte-identical in
+`c07.02.00.tar.gz`, so the WSS09 patch level does not matter. The CUBA site
+now hosts only HM12 (not used for the product).
+
+**Method.** `tools/chui_data/convert_hm_spectrum_treecool.py`: optically thin
+per-ion rates Γ = 4π∫J_ν σ/(hν)dν and q̇ = 4π∫J_ν σ(hν − hν_th)/(hν)dν,
+with the Verner et al. (1996) cross sections for H I, He I and He II
+(threshold values self-checked); log-log J interpolation, Simpson in ln E,
+exact thresholds, repeated wavelengths treated as spectral edges; 4×-resolution
+convergence 1.5e-7.
+
+**Method validation.** The same integrator applied to the authors' HM12
+spectrum (`UVB.out`, sha256 `a708586e…`) reproduces their HM12
+`photorates.out` (sha256 `b831cc15…`) over 41 redshifts at z ≤ 10:
+Γ_HI ≤ 1.1%, Γ_HeI ≤ 0.8%, all photoheating rates ≤ 0.6%; Γ_HeII ≤ 2.5% at
+z ≤ 6, rising to 6.8% at z ≈ 10, where Γ_HeII < 1e-20 s⁻¹. The reference
+values have three significant figures.
+
+**Product.** `hm01_treecool_cloudy0702_hm05_galaxy_v1.dat`, sha256
+`1621b3c5d8894d94ad9afca5dca4f81ca7e33d126f023b812782b1f1d71b862e`, 50 rows,
+z = 0–9.479 (the last row is zero because the source spectrum is zero).
+`validate_treecool.py`: VALID. Γ_HI = 9.75e-14 s⁻¹ (z = 0), 1.56e-12 (z ≈ 2),
+1.22e-12 (z ≈ 3); q̇_HI/Γ_HI = 3.23 eV at z = 0.
+
+**Binding.** WSS09 regenerated with
+`--uv-background-treecool-sha256 1621b3c5…` →
+`wss09_hm01_z0-8.989_hm05treecool_chui_metal_cooling_table_v1.txt`
+(sha256 `75e6bd73…`, data rows identical to `4bbca8a9…`), so C01 + UVB is a
+declared-consistent pairing. Reproducible with `fetch_and_convert.sh` (§D6
+block). Not a scientific qualification.

@@ -86,7 +86,11 @@ struct AmrHydroSparseRemoteCell {
   // (interpolated rho) so the product is the interpolated density. NaN =
   // unknown (every ghost touching it is marked invalid, counted).
   double internal_energy_code = std::numeric_limits<double>::quiet_NaN();
+  // I01: the owner's authoritative ISM regime tag (0 resolved, 1 effective);
+  // k_amr_remote_ism_regime_tag_unknown when the owner carries none.
+  std::uint8_t ism_regime_tag = 0xFFU;
 };
+inline constexpr std::uint8_t k_amr_remote_ism_regime_tag_unknown = 0xFFU;
 
 struct AmrHydroSparseGhostSource {
   const PatchDescriptor* patch = nullptr;

@@ -40,7 +40,8 @@ __pycache__/
 *Zone.Identifier*
 *#Uf03aZone.Identifier*
 
-# Patch 53: user-local physics data (third-party tables are never committed;
-# see tools/chui_data/dataset_registry.json and docs/chui_data_staging.md)
+# Patch 53: user-local physics data (see tools/chui_data/dataset_registry.json
+# and docs/chui_data_staging.md). The bundled tables registered in tools/chui_data/dataset_registry.json are
+# force-added (owner decision 2026-11-18); anything else staged here stays local.
 /chui_data/
 /chui_data_local/

@@ -218,6 +218,9 @@ void validateAmrPatchCellPayloadRecord(const AmrPatchCellPayloadRecord& record) 
       record.metal_mass_code > record.mass_code + 1.0e-12 * std::max(1.0, std::abs(record.mass_code))) {
     throw std::invalid_argument("AMR patch cell payload metal mass must lie within the gas-cell mass");
   }
+  if (record.ism_regime_tag > 1U && record.ism_regime_tag != k_amr_payload_ism_regime_tag_unknown) {
+    throw std::invalid_argument("AMR patch cell payload carries an invalid ISM regime tag");
+  }
 }
 
 void validateAmrFluxRegisterPayloadRecord(const AmrFluxRegisterPayloadRecord& record) {

@@ -1134,3 +1134,52 @@ Reproducibility impact: I01 changes evolved state for Part-2 runs with
 closure's own criterion disagreed (intended correction). The adaptive
 chemistry bias is now held on intervals with truncated/failed shadow
 evidence. Other changes affect only optional diagnostics.
+
+## 2026-11-18 — Revision-8 audit follow-up (implemented in source, UNVERIFIED)
+
+The revision-8 independent audit's findings were verified against the
+current branch and repaired (not compiled or run):
+
+* **I01 remote MPI ghosts (P1, confirmed):** the directed AMR ghost payload
+  (`parallel::AmrPatchCellPayloadRecord`, transient same-build wire record,
+  not a restart/snapshot field) now carries the owner's authoritative
+  `ism_regime_tag`, decoded into `amr::AmrHydroSparseRemoteCell` and kept
+  through recursive temporal interpolation (nearer endpoint). The AMR regime
+  gate resolves every imported ghost from ONE tag: local origin row, or the
+  owner tag from the payload; a remote origin without a tag now fails closed
+  (voted sweep failure) instead of falling back to the closure's own
+  criterion. Composite edge ghosts without a single origin take the adjacent
+  owner cell's tag (counted `ism_regime_gate_owner_proxied_ghosts`). The
+  validator refuses invalid tags. Fixture: `unit_migration_wire` extended.
+* **C03/C04 chemistry-shadow cap (P1/P2, confirmed):** rows are counted as
+  key-selected before the cap (`selected`); the adaptive controller acts only
+  when the interval-global selected count is `<= chemistry_shadow_max_cells`
+  and no reference failed, so whether it acts is identical for every
+  decomposition (the 16-cells / cap-10 example now holds on 1 and 2 ranks).
+  Migration note in `docs/configuration.md`. Fixture:
+  `unit_chemistry_shadow_sampling` extended (1-way vs 2-way split).
+* **Best-effort memory (P2, confirmed policy limitation):** reclaim remains
+  restricted to the registering thread (the shadow is not thread-safe; a
+  worker-thread mandatory refusal is not reclaimed). New: best-effort leases
+  are also banded against an attached node-shared pool, so unlimited per-rank
+  policies still leave the node amber band to mandatory work. Fixture:
+  `unit_memory_governor_best_effort` extended.
+* **C04 chronology approximations (P2):** no change; the captured-forcing
+  scope is labelled in the publication payload and the handoff document. It
+  remains a sampled numerical-disagreement diagnostic, never an accuracy
+  bound for a full galaxy-formation evolution.
+
+**External data (local, git-ignored `chui_data/`, never committed):** the four
+recovered tables match the registry SHA-256 exactly (S02 NuGrid+W7, F02 SB99,
+UVB FG20, C02 C/O/Si/Fe). C01 WSS09 was regenerated reproducibly from the
+pinned upstream tarball (sha256 `228ec928…`) with
+`tools/chui_data/convert_wss09_metal_cooling.py`, giving the registered
+derived sha256 `4bbca8a9…` (52,159,175 bytes; validator VALID, round-trip
+4.99e-9). **HM01 TREECOOL: derived the same day** from the exact spectrum
+CLOUDY 07.02 `table HM05` reads (the WSS09 UVB) with the new
+`tools/chui_data/convert_hm_spectrum_treecool.py` (method validated against the
+authors' HM12 spectrum/rate pair), sha256 `1621b3c5…`; WSS09 was re-converted
+bound to it (sha256 `75e6bd73…`, identical data rows), so C01 + UVB is now a
+declared-consistent pairing (`tools/chui_data/data_sources.md` §D6). By owner
+decision the bundled tables are committed under `chui_data/`. Redistribution
+rights remain unconfirmed for all products; none is scientifically qualified.

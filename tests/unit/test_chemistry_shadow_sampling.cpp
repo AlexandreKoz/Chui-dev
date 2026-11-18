@@ -6,7 +6,10 @@
 //   * selection is decided by the (gas_cell_id, accepted step) key alone;
 //     forward and reverse row order give identical samples and maxima;
 //   * the per-stage cost cap never silently reshapes the set: rows cut by it
-//     are counted (cap_truncated) and the runtime holds the controller bias;
+//     are counted (cap_truncated);
+//   * the controller acts only when the interval-GLOBAL key-selected count
+//     fits the budget (decomposition independent), checked on a 1-way vs
+//     2-way split where the cap binds in one layout only;
 //   * failed references are counted (reference_failures), never dropped.
 // Exit code 77 (registered as SKIP_RETURN_CODE) when the detailed reference
 // backend cannot be constructed in this build (external data required).
@@ -57,11 +60,29 @@ constexpr std::size_t k_rows = 64U;
   return state;
 }
 
+[[nodiscard]] p::ChemistryShadowReport runRowList(const p::ThermochemistryOperator& chemistry,
+                                                  const core::SimulationState& state,
+                                                  const std::vector<std::uint32_t>& order);
+
 [[nodiscard]] p::ChemistryShadowReport runRows(const p::ThermochemistryOperator& chemistry,
                                                const core::SimulationState& state, bool reverse) {
   std::vector<std::uint32_t> order(k_rows);
   std::iota(order.begin(), order.end(), 0U);
   if (reverse) std::reverse(order.begin(), order.end());
+  return runRowList(chemistry, state, order);
+}
+
+// The runtime's controller rule (source_runtime updateGlobalChemistryControl):
+// act only when the interval-global key-selected count fits the budget and no
+// reference failed.
+[[nodiscard]] bool controllerActs(std::uint64_t global_selected, std::uint64_t global_failures,
+                                  std::uint32_t budget) {
+  return global_failures == 0U && global_selected <= budget;
+}
+
+p::ChemistryShadowReport runRowList(const p::ThermochemistryOperator& chemistry,
+                                    const core::SimulationState& state,
+                                    const std::vector<std::uint32_t>& order) {
   const p::SourceInterval interval{.physical_seconds = 3.15576e12, .evaluation_scale_factor = 1.0,
                                    .accepted_step_index = 11U};
   p::ChemistryShadowReport shadow;
@@ -107,12 +128,34 @@ int main() {
   const std::uint64_t selected = forward.samples + forward.reference_failures;
   assert(selected > 0U && selected < k_rows);  // key-based ~half of the rows
 
+  assert(forward.selected == selected && backward.selected == selected);
+
   // Capped: the cut is counted, never silent; the selected total is unchanged.
   if (selected > 3U) {
     const p::ThermochemistryOperator capped(config(3U), layout);
     const p::ChemistryShadowReport cut = runRows(capped, state, false);
     assert(cut.samples + cut.reference_failures == 3U);
     assert(cut.cap_truncated == selected - 3U);
+    assert(cut.selected == selected);
+  }
+
+  // Decomposition independence of the controller decision (rev-8 audit
+  // example): budget below the one-rank selected count but above each half.
+  // One "rank" truncates, two "ranks" do not; the decision must agree.
+  if (selected >= 4U) {
+    const auto budget = static_cast<std::uint32_t>(selected - 1U);
+    const p::ThermochemistryOperator op(config(budget), layout);
+    std::vector<std::uint32_t> all(k_rows);
+    std::iota(all.begin(), all.end(), 0U);
+    const std::vector<std::uint32_t> lower(all.begin(), all.begin() + k_rows / 2U);
+    const std::vector<std::uint32_t> upper(all.begin() + k_rows / 2U, all.end());
+    const p::ChemistryShadowReport one = runRowList(op, state, all);
+    const p::ChemistryShadowReport a = runRowList(op, state, lower);
+    const p::ChemistryShadowReport b = runRowList(op, state, upper);
+    assert(one.selected == a.selected + b.selected);
+    assert(controllerActs(one.selected, one.reference_failures, budget) ==
+           controllerActs(a.selected + b.selected, a.reference_failures + b.reference_failures, budget));
+    assert(!controllerActs(one.selected, 0U, budget));  // over budget: held on every layout
   }
   return 0;
 }

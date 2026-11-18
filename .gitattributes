@@ -1,2 +1,6 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# CHUI physics data tables are bound by SHA-256 in run configurations:
+# never normalize their bytes (line endings) on checkout or commit.
+chui_data/** -text

@@ -176,7 +176,15 @@ struct AmrPatchCellPayloadRecord {
   // record. The receiver derives rho*Z using the same mass/density contract as
   // the local AMR hydro path; this is not a restart-schema field.
   double metal_mass_code = 0.0;
+  // I01: the owner's authoritative ISM regime tag (GasCompositionSidecar::
+  // ism_regime_tag: 0 resolved, 1 effective) so a neighbouring rank applies
+  // the SAME effective/resolved decision to this cell's ghost image.
+  // k_amr_payload_ism_regime_tag_unknown when the owner has no composition
+  // sidecar (no regime authority). Transient wire field (same-build MPI
+  // exchange of struct bytes); not a restart/snapshot schema field.
+  std::uint8_t ism_regime_tag = 0xFFU;
 };
+inline constexpr std::uint8_t k_amr_payload_ism_regime_tag_unknown = 0xFFU;
 
 enum class AmrPatchBoundaryFace : std::uint8_t {
   kXLower = 1U << 0U,

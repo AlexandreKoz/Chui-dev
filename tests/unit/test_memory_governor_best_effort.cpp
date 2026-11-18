@@ -12,6 +12,7 @@
 #include <thread>
 
 #include "cosmosim/core/memory_governor.hpp"
+#include "cosmosim/core/node_memory_admission.hpp"
 
 namespace {
 
@@ -105,10 +106,39 @@ void checkReclaimBeforeMandatoryRefusal() {
   governor.clearBestEffortReclaimer();
 }
 
+// Unlimited per-rank policy with a node-shared pool: best-effort work is
+// banded against the NODE budget (two co-located governors).
+void checkBestEffortNodeBand() {
+  cosmosim::core::ProcessLocalNodeMemoryPool pool(1000U);  // node amber at 850
+  {
+    MemoryGovernor rank_a;  // unlimited per rank
+    MemoryGovernor rank_b;
+    rank_a.attachNodePool(&pool);
+    rank_b.attachNodePool(&pool);
+    MemoryReservation mandatory = rank_a.reserve(MemoryClass::kPhaseResident, 700U, "test.node.mandatory");
+    MemoryReservation small = rank_b.reserveBestEffort(MemoryClass::kDiagnostic, 100U, "test.node.small");
+    bool refused = false;
+    try {
+      (void)rank_b.reserveBestEffort(MemoryClass::kDiagnostic, 100U, "test.node.over_band");  // 900 >= 850
+    } catch (const MemoryAdmissionError&) {
+      refused = true;
+    }
+    assert(refused);
+    // Mandatory work may still use the band up to the node capacity.
+    MemoryReservation more = rank_a.reserve(MemoryClass::kPhaseResident, 150U, "test.node.mandatory2");
+    (void)mandatory;
+    (void)small;
+    (void)more;
+    rank_a.detachNodePool();
+    rank_b.detachNodePool();
+  }
+}
+
 }  // namespace
 
 int main() {
   checkBestEffortBand();
   checkReclaimBeforeMandatoryRefusal();
+  checkBestEffortNodeBand();
   return 0;
 }

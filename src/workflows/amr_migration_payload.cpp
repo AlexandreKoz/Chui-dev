@@ -66,6 +66,11 @@ namespace {
   record.metal_mass_code = cell_index < state.gas_cells.metal_mass_code.size()
       ? state.gas_cells.metal_mass_code[cell_index]
       : 0.0;
+  // I01: ship the owner's regime authority with the hydro state.
+  record.ism_regime_tag = state.gas_composition.enabled() &&
+          cell_index < state.gas_composition.ism_regime_tag.size()
+      ? state.gas_composition.ism_regime_tag[cell_index]
+      : parallel::k_amr_payload_ism_regime_tag_unknown;
   parallel::validateAmrPatchCellPayloadRecord(record);
   return record;
 }

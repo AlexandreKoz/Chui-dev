@@ -109,6 +109,12 @@ std::uint8_t ismRegimeAllowsEffectiveClosure(const core::SimulationState& state,
   return state.gas_composition.ism_regime_tag[row] == core::k_gas_ism_regime_effective ? 1U : 0U;
 }
 
+bool ismRegimeSelfGhost(const HydroGhostCell& ghost) noexcept {
+  return ghost.mutation_rights == HydroGhostMutationRights::kWritablePhysicalBoundaryScratch &&
+      ghost.boundary_kind != HydroBoundaryKind::kImportedMpi &&
+      ghost.boundary_kind != HydroBoundaryKind::kInterior;
+}
+
 bool buildIsmRegimeGate(const core::SimulationState& state, const HydroPatchGeometry& geometry,
                         std::span<const std::uint32_t> dense_row_by_real_cell, std::vector<std::uint8_t>& gate) {
   if (!ismRegimeGateActive(state)) {
@@ -123,9 +129,7 @@ bool buildIsmRegimeGate(const core::SimulationState& state, const HydroPatchGeom
         : 0U;
   }
   for (const HydroGhostCell& ghost : geometry.ghost_cells) {
-    const bool self_ghost = ghost.mutation_rights == HydroGhostMutationRights::kWritablePhysicalBoundaryScratch &&
-        ghost.boundary_kind != HydroBoundaryKind::kImportedMpi &&
-        ghost.boundary_kind != HydroBoundaryKind::kInterior;
+    const bool self_ghost = ismRegimeSelfGhost(ghost);
     const std::size_t source = ghost.source_real_cell < real_count ? ghost.source_real_cell : ghost.owner_real_cell;
     if (self_ghost && ghost.ghost_cell < gate.size() && source < real_count) {
       gate[ghost.ghost_cell] = gate[source];

@@ -69,6 +69,9 @@ inline constexpr double k_part1_reference_mean_molecular_weight = 0.59;
 // imported from a remote MPI owner): the closure keeps its own
 // density/temperature decision there (counted by callers).
 inline constexpr std::uint8_t k_ism_regime_gate_unknown_origin = 1U;
+// A ghost reconstructible from its own patch (physical boundary scratch,
+// including in-patch periodic wrap): it takes the tag of its source cell.
+[[nodiscard]] bool ismRegimeSelfGhost(const HydroGhostCell& ghost) noexcept;
 // Per-SOLVER-row gate of `geometry` (size totalCellStorageCount()):
 //  * real row r: ismRegimeAllowsEffectiveClosure(state, dense_row_by_real_cell[r]);
 //  * physical/self ghost (writable physical-boundary scratch, incl. in-patch

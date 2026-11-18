@@ -3368,7 +3368,10 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime, public HydroShadowChro
                     k_gamma_adiabatic),
                 .internal_energy_code = cell_record.internal_energy_code > 0.0
                     ? cell_record.internal_energy_code
-                    : std::numeric_limits<double>::quiet_NaN()});
+                    : std::numeric_limits<double>::quiet_NaN(),
+                .ism_regime_tag = cell_record.ism_regime_tag == parallel::k_amr_payload_ism_regime_tag_unknown
+                    ? amr::k_amr_remote_ism_regime_tag_unknown
+                    : cell_record.ism_regime_tag});
           }
         };
 
@@ -3829,6 +3832,9 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime, public HydroShadowChro
         }
         amr::AmrHydroSparseRemoteCell cell = a;
         cell.conserved = (1.0 - alpha) * a.conserved + alpha * b.conserved;
+        // I01: a regime tag is piecewise constant between source commits;
+        // the ghost at t takes the owner tag of the nearer retained endpoint.
+        cell.ism_regime_tag = alpha <= 0.5 ? a.ism_regime_tag : b.ism_regime_tag;
         // P1-55-01: the auxiliary lane is a DENSITY, so it is interpolated as
         // rho*e with the same alpha as the conserved state, then divided by
         // the interpolated rho: the ghost filler's rho_interp * e_interp is
