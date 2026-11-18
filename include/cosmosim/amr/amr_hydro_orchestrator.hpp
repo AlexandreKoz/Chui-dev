@@ -250,6 +250,9 @@ struct ProductionAmrHydroDiagnostics {
   std::size_t face_batch_capacity = 0;
   AmrHydroGhostFillDiagnostics ghost_fill;
   RefluxDiagnostics reflux;
+  // I01 regime gate provenance of imported ghost rows (gate active only).
+  std::uint64_t ism_regime_gate_remote_ghosts = 0;         // owner tag from the MPI payload
+  std::uint64_t ism_regime_gate_owner_proxied_ghosts = 0;  // composite ghost: adjacent owner's tag
 };
 
 struct DistributedAmrRemotePatch {

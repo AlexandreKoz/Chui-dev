@@ -2,10 +2,12 @@
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <vector>
 
 #include "cosmosim/core/simulation_state.hpp"
+#include "cosmosim/physics/baryon_composition.hpp"
 #include "workflows/internal/amr_migration_payload.hpp"
 #include "workflows/internal/migration_wire.hpp"
 
@@ -216,6 +218,32 @@ void testAmrBoundaryPayloadCarriesDepthAndCanonicalMetalMass() {
   assert(payload[1].local_cell_offset == 1U);
   assert(payload[0].metal_mass_code == state.gas_cells.metal_mass_code[0]);
   assert(payload[1].metal_mass_code == state.gas_cells.metal_mass_code[1]);
+  // I01: without a composition sidecar the owner has no regime authority.
+  assert(payload[0].ism_regime_tag == cosmosim::parallel::k_amr_payload_ism_regime_tag_unknown);
+  // With a sidecar the owner's authoritative tag travels with the hydro state,
+  // so a neighbouring rank gates the effective closure on the same decision.
+  cosmosim::physics::enableGasComposition(
+      state, cosmosim::physics::CompositionLayout::make({.network = cosmosim::physics::CompositionNetworkKind::kHybridLight}),
+      {});
+  state.gas_composition.ism_regime_tag[0] = cosmosim::core::k_gas_ism_regime_effective;
+  state.gas_composition.ism_regime_tag[1] = 0U;
+  payload.clear();
+  cosmosim::workflows::internal::fillMigrationAmrPatchBoundaryCellPayloadChunk(
+      state, 0, std::span<const cosmosim::parallel::AmrPatchBoundaryCellRequest>(&request, 1U),
+      0U, 8U, payload);
+  assert(payload.size() == 2U);
+  assert(payload[0].ism_regime_tag == cosmosim::core::k_gas_ism_regime_effective);
+  assert(payload[1].ism_regime_tag == 0U);
+  // The validator refuses a tag that is neither a regime nor "unknown".
+  auto corrupt = payload[0];
+  corrupt.ism_regime_tag = 2U;
+  bool refused = false;
+  try {
+    cosmosim::parallel::validateAmrPatchCellPayloadRecord(corrupt);
+  } catch (const std::invalid_argument&) {
+    refused = true;
+  }
+  assert(refused);
 }
 
 void testAmrMigrationWireCarriesPendingSynchronizationState() {

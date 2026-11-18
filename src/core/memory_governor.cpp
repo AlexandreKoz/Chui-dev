@@ -519,6 +519,34 @@ MemoryReservation MemoryGovernor::reserveImpl(
                                                          : "best_effort_outside_green_band"));
   }
 
+  // Best-effort work is also banded against the NODE-aggregate pool when one
+  // is attached (also with an unlimited per-rank policy): it must leave the
+  // amber band of the shared node budget to mandatory work of every
+  // co-located rank. (Usage is read lock-free; under contention the band test
+  // is conservative-but-racy, exactly like the pool's own admission.)
+  if (best_effort && m_node_pool != nullptr && m_node_pool->capacityBytes() != 0U) {
+    const std::uint64_t capacity = m_node_pool->capacityBytes();
+    const std::uint64_t used = m_node_pool->usedBytes();
+    const auto [node_amber, node_red] =
+        pressureThresholds(capacity, m_policy.amber_basis_points, m_policy.red_basis_points);
+    (void)node_red;
+    if (used >= node_amber || requested_bytes >= node_amber - used) {
+      ++m_rejection_count;
+      ++m_owner_slots[ownerSlotLocked(owner)].rejection_count;
+      MemoryGovernorSnapshot current;
+      current.hard_limit_bytes = m_policy.hard_limit_bytes;
+      current.committed_bytes = m_committed_bytes;
+      current.reserved_bytes = m_reserved_bytes;
+      current.accounted_bytes = current_raw;
+      current.headroom_bytes = headroomBytesLocked(current_raw);
+      current.rejection_count = m_rejection_count;
+      current.pressure = MemoryPressure::kAmber;
+      throw MemoryAdmissionError(rejectionDiagnostic(
+          memory_class, owner, requested_bytes, current,
+          "best_effort_outside_node_green_band used=" + std::to_string(used) +
+              " capacity=" + std::to_string(capacity)));
+    }
+  }
   if (m_node_pool != nullptr && !m_node_pool->tryAcquire(requested_bytes)) {
     ++m_rejection_count;
     ++m_owner_slots[ownerSlotLocked(owner)].rejection_count;

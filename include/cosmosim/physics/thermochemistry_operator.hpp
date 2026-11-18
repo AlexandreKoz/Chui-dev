@@ -99,6 +99,11 @@ struct ChemistryShadowReport {
   // (the sampled subset then depends on row order / decomposition: the
   // adaptive controller holds its bias for that interval).
   std::uint64_t cap_truncated = 0U;
+  // Key-selected rows (hash(gas_cell_id, step) < sample_fraction), counted
+  // BEFORE the cost cap: a pure function of cell identities and the step,
+  // independent of row order and MPI decomposition. The adaptive controller
+  // uses only interval-global totals of this count (see source runtime).
+  std::uint64_t selected = 0U;
   // Key-selected rows whose reference could not run or complete (outside its
   // dataset, integration failure): unknown disagreement, never "agreement";
   // the adaptive controller holds its bias for that interval.

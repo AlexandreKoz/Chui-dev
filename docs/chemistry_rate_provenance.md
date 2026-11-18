@@ -234,10 +234,15 @@ These were computed from the published equations by a stand-alone script
 - **No double counting.** The table's H/He (`Metal_free`) contribution and
   Compton term are never converted (the converter excludes them), and the
   reader refuses H/He columns.
-- **Recommendation.** For FG20 runs, use a metal table computed with FG20,
-  for example a future Ploeckinger & Schaye 2020 conversion (blocked; see
-  `tools/chui_data/data_sources.md`). Alternatively, accept the WSS09/HM01
-  mismatch explicitly and quantify it in validation.
+- **Recommendation.** Since 2026-11-18 a consistent HM01 pairing exists: the
+  HM01 TREECOOL derived from the CLOUDY 07.02 HM05 spectrum
+  (`hm01_treecool_cloudy0702_hm05_galaxy_v1.dat`, `1621b3c5…`) with the WSS09
+  table that declares it
+  (`wss09_hm01_z0-8.989_hm05treecool_chui_metal_cooling_table_v1.txt`,
+  `75e6bd73…`); see `tools/chui_data/data_sources.md` §D6 and
+  `docs/chui_data_staging.md`. For FG20 runs, use a metal table computed with
+  FG20, for example a future Ploeckinger & Schaye 2020 conversion (blocked),
+  or accept the WSS09/HM01 mismatch explicitly and quantify it in validation.
 
 ## 6. Owner validation still required (USER-RESERVED)
 

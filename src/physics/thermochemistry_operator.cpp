@@ -471,6 +471,7 @@ ThermochemistryRowResult ThermochemistryOperator::advanceRow(const core::Simulat
         std::string_view(key_text.data(), static_cast<std::size_t>(key_end - key_text.data())));
     const double u01 = static_cast<double>(key >> 11U) * (1.0 / 9007199254740992.0);
     const bool selected = u01 < m_config.shadow.sample_fraction;
+    if (selected) ++shadow.selected;
     if (selected && shadow.samples + shadow.reference_failures >= m_config.shadow.max_cells) {
       ++shadow.cap_truncated;
     } else if (selected) {

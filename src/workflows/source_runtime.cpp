@@ -2835,6 +2835,7 @@ class SourceRuntimeImpl final : public SourceRuntime {
         total.max_relative_energy_difference, shadow.max_relative_energy_difference);
     add(total.ion_samples, shadow.ion_samples);
     add(total.cap_truncated, shadow.cap_truncated);
+    add(total.selected, shadow.selected);
     add(total.reference_failures, shadow.reference_failures);
     total.max_ion_stage_fraction_difference = std::max(
         total.max_ion_stage_fraction_difference, shadow.max_ion_stage_fraction_difference);
@@ -3192,6 +3193,7 @@ class SourceRuntimeImpl final : public SourceRuntime {
                        std::to_string(m_last_sgs_ledger.resolved_stress_work_code)},
                       {"shadow_samples", std::to_string(m_last_shadow_report.samples)},
                       {"shadow_cap_truncated", std::to_string(m_last_shadow_report.cap_truncated)},
+                      {"shadow_selected", std::to_string(m_last_shadow_report.selected)},
                       {"shadow_reference_failures", std::to_string(m_last_shadow_report.reference_failures)},
                       {"physical_seconds", std::to_string(interval.physical_seconds)},
                       {"recursive_level", std::to_string(recursive_level)},
@@ -3295,14 +3297,20 @@ class SourceRuntimeImpl final : public SourceRuntime {
     const std::uint64_t global_samples = m_mpi_context.allreduceSumUint64(current_shadow.samples);
     const std::uint64_t global_ion_samples = m_mpi_context.allreduceSumUint64(current_shadow.ion_samples);
     // C03/C04: learn only from complete, decomposition-independent evidence.
-    // A cost-cap truncation (order-dependent subset) or a failed reference
-    // (unknown disagreement) anywhere holds the committed bias for this
-    // interval instead of steering production from partial evidence.
-    const std::uint64_t global_incomplete = m_mpi_context.allreduceSumUint64(
-        current_shadow.cap_truncated + current_shadow.reference_failures);
-    const double bias = global_incomplete != 0U
-        ? committed_bias
-        : physics::nextChemistryPromotionBias(committed_bias, global_max, global_samples);
+    // The decision uses the interval-GLOBAL count of key-selected rows (a
+    // function of cell identities and the step only) against the configured
+    // budget: when it fits, no rank's per-stage cap (= the same budget) can
+    // have bound, so the evidence is the complete key-selected set on every
+    // decomposition; otherwise (or after any failed reference: unknown
+    // disagreement) the committed bias is held. Whether the controller acts
+    // is therefore identical for every rank count and layout.
+    const std::uint64_t global_selected = m_mpi_context.allreduceSumUint64(current_shadow.selected);
+    const std::uint64_t global_failures = m_mpi_context.allreduceSumUint64(current_shadow.reference_failures);
+    const std::uint64_t evidence_budget = m_thermochemistry->config().shadow.max_cells;
+    const bool complete_evidence = global_failures == 0U && global_selected <= evidence_budget;
+    const double bias = complete_evidence
+        ? physics::nextChemistryPromotionBias(committed_bias, global_max, global_samples)
+        : committed_bias;
     m_thermochemistry->setGlobalPromotionBias(bias);
     if (joint) {
       std::uint64_t local_detailed = 0U;

@@ -65,4 +65,29 @@ python3 -I "$HERE/convert_wss09_metal_cooling.py" "$RAW"/eagle/coolingtables/z_[
 python3 -I "$HERE/validate_metal_cooling_table.py" "$OUT/wss09_hm01_z0-8.989_chui_metal_cooling_table_v1.txt" \
   --sources "$RAW"/eagle/coolingtables/z_[0-9].[0-9][0-9][0-9].hdf5
 cp "$RAW/fg20_treecool_eff_rescaled_heating_rates_068.dat" "$OUT/"
+# D6 (2026-11-18) HM01-consistent TREECOOL: integrate the exact spectrum
+# CLOUDY 07.02 'table HM05' reads (the WSS09 UVB), validate the method on the
+# authors' HM12 spectrum/rate pair, then bind WSS09 to the derived TREECOOL.
+fetch https://data.nublado.org/cloudy_releases/c07_02/c07.02.01.tar.gz c07.02.01.tar.gz \
+  9aeed6a9096e70fd021224d07b61b539049660a69b4311fb90d31fda2b5832b8
+fetch https://www.ucolick.org/~pmadau/CUBA/Media/UVB.out hm12_UVB.out \
+  a708586ead551202c068b049d48afa87b96695c5a5d12253e9b9bbb74efd75dc
+fetch https://www.ucolick.org/~pmadau/CUBA/Media/photorates.out hm12_photorates.out \
+  b831cc1537f86d24f2bcdf99fe7ea6a2ea239d761ee673d433e85c8d6756a06b
+mkdir -p "$RAW/cloudy" && tar xzf "$RAW/c07.02.01.tar.gz" -C "$RAW/cloudy" c07.02.01/data/haardt_madau_galaxy.dat
+python3 -I "$HERE/convert_hm_spectrum_treecool.py" "$RAW/hm12_UVB.out" --format cuba_uvb --zmax 10 \
+  --reference-photorates "$RAW/hm12_photorates.out" --reference-tolerance 0.07
+HM01_TREECOOL_SHA=1621b3c5d8894d94ad9afca5dca4f81ca7e33d126f023b812782b1f1d71b862e
+python3 -I "$HERE/convert_hm_spectrum_treecool.py" "$RAW/cloudy/c07.02.01/data/haardt_madau_galaxy.dat" \
+  --format cloudy_hm05 --expect-spectrum-sha256 50fb788ee6c35b97a9703489bee792b9fd6777abdbf39da0576a13d465dc6d04 \
+  --identity "HM01 galaxies+quasars (Haardt & Madau 2001; 2005 revision) as used by CLOUDY 07.02 'table HM05' (WSS09), CMB excluded" \
+  --source "https://data.nublado.org/cloudy_releases/c07_02/c07.02.01.tar.gz sha256 9aeed6a9096e70fd021224d07b61b539049660a69b4311fb90d31fda2b5832b8, member c07.02.01/data/haardt_madau_galaxy.dat (identical in c07.02.00)" \
+  --license "Spectrum supplied by F. Haardt to the CLOUDY project (2005) and distributed in the CLOUDY 07.02 data directory; no separate licence stated" \
+  --output "$OUT/hm01_treecool_cloudy0702_hm05_galaxy_v1.dat"
+python3 -I "$HERE/validate_treecool.py" "$OUT/hm01_treecool_cloudy0702_hm05_galaxy_v1.dat" --expect-sha256 "$HM01_TREECOOL_SHA"
+python3 -I "$HERE/convert_wss09_metal_cooling.py" "$RAW"/eagle/coolingtables/z_[0-9].[0-9][0-9][0-9].hdf5 \
+  --output "$OUT/wss09_hm01_z0-8.989_hm05treecool_chui_metal_cooling_table_v1.txt" \
+  --license "No licence stated by the authors (WSS08 page; SWIFT webstorage mirror); not redistributed" \
+  --uv-background "HM01+CMB (Haardt & Madau 2001), CLOUDY 07.02, optically thin, ionization equilibrium" \
+  --uv-background-treecool-sha256 "$HM01_TREECOOL_SHA"
 sha256sum "$OUT"/*.txt "$OUT"/*.dat
