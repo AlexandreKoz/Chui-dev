@@ -1,0 +1,105 @@
+# CHUI-MHD-REF-v1 non-ideal reference example (mhd_ref_nonideal_v01),
+# isolated disk, constant-coefficient provider for controlled numerical
+# comparison (NOT a claim of realistic galactic microphysics, REF 8.1).
+# STATUS: parses and validates, but is REJECTED at runtime capability
+# admission (mhd_nonideal_transport / mhd_production_dispatch) until the
+# magnetized dispatch is wired. A table-provider variant requires a real,
+# validated HDF5 table (contract chui_mhd_transport_table_v1) whose SHA-256 is
+# pinned; no such physical table is distributed with the repository.
+schema_version = 1
+
+[units]
+length_unit = kpc
+mass_unit = msun
+velocity_unit = km_s
+coordinate_frame = physical
+
+[mode]
+mode = isolated_galaxy
+ic_file = isolated_galaxy_ics.hdf5
+ic_convention = gadget_arepo_bridge_v1
+ic_bridge_source_length_unit_to_si = 3.0856775814913673e19
+ic_bridge_source_mass_unit_to_si = 1.98847e30
+ic_bridge_source_velocity_unit_to_si = 1000
+ic_bridge_coordinate_frame = comoving
+ic_bridge_velocity_convention = physical_peculiar
+ic_bridge_length_hubble_exponent = 0
+ic_bridge_length_scale_factor_exponent = 0
+ic_bridge_mass_hubble_exponent = 0
+ic_bridge_mass_scale_factor_exponent = 0
+ic_bridge_velocity_hubble_exponent = 0
+ic_bridge_velocity_scale_factor_exponent = 0
+zoom_high_res_region = false
+hydro_boundary = open
+gravity_boundary = isolated_monopole
+
+[cosmology]
+omega_matter = 0.31
+omega_lambda = 0.69
+omega_baryon = 0.0486
+hubble_param = 0.677
+sigma8 = 0.81
+scalar_index_ns = 0.966
+box_size = 400 kpc
+
+[numerics]
+time_begin_code = 0.0
+time_end_code = 1.0
+max_global_steps = 3000
+hierarchical_max_rung = 0
+amr_max_level = 11
+gravity_softening = 0.05 kpc
+treepm_pm_grid = 32
+treepm_asmth_cells = 1.25
+treepm_rcut_cells = 6.25
+treepm_assignment_scheme = cic
+treepm_enable_window_deconvolution = false
+treepm_update_cadence_steps = 1
+
+[output]
+run_name = disk_mhd_ref_v01
+output_directory = outputs/isolated_galaxy
+output_stem = snapshot
+restart_stem = restart
+snapshot_interval_steps = 50
+write_restarts = true
+
+[parallel]
+mpi_ranks_expected = 1
+omp_threads = 1
+gpu_devices = 0
+deterministic_reduction = true
+
+[mhd]
+enabled = true
+reference_profile = mhd_ref_nonideal_v01
+reconstruction = ppm
+riemann_solver = hlld
+cfl_ideal = 0.3
+cfl_diffusion = 0.15
+cfl_hall = 0.1
+
+[mhd_nonideal]
+enabled = true
+ohmic_enabled = true
+ambipolar_enabled = true
+hall_enabled = true
+integration = strang_d_h_i_h_d
+diffusion_integrator = auto_rkl2
+hall_integrator = explicit_hll_ssprk2
+rkl_switch_ratio = 4
+rkl_max_stages = 128
+coefficient_provider = constant
+coefficient_table_path =
+eta_ohmic_phys_cgs = 1.0e20
+eta_hall_phys_cgs = -5.0e19
+eta_ambipolar_phys_cgs = 2.0e20
+
+[mhd_amr]
+distributed_subcycling = false
+checkpoint_sync_only = true
+
+[mhd_performance]
+profile = workstation_48gib_v01
+hall_subcycle_cost_cap_per_level_interval = 4096
+rkl_stage_cost_cap_per_level_interval = 4096

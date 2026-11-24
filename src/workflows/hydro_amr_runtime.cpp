@@ -5877,6 +5877,15 @@ std::unique_ptr<HydroAmrRuntime> makeHydroAmrRuntime(
     const core::ModePolicy& mode_policy,
     const RuntimeServices& services,
     std::shared_ptr<const physics::EffectiveMultiphaseEosTable> effective_eos_table) {
+  // Defense in depth for callers that bypass ReferenceWorkflow capability
+  // admission: this owner implements nonmagnetic hydro only and must never
+  // run a magnetized configuration as ordinary hydro.
+  if (config.mhd.enabled) {
+    throw std::invalid_argument(
+        "MHD_UNSUPPORTED_PHYSICS: makeHydroAmrRuntime has no magnetized kHydroUpdate "
+        "dispatch; mhd.enabled=true is rejected (see runtime capability "
+        "mhd_production_dispatch)");
+  }
   return std::make_unique<HydroAmrRuntimeImpl>(
       config, mode_policy, services, std::move(effective_eos_table));
 }

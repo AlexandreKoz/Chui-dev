@@ -616,7 +616,8 @@ add_library(cosmosim_io STATIC
   src/io/ic_byte_codec.cpp
   src/io/ic_sha256.cpp
   src/io/snapshot_hdf5.cpp
-  src/io/restart_checkpoint.cpp)
+  src/io/restart_checkpoint.cpp
+  src/io/mhd_restart_state.cpp)
 add_library(cosmosim_analysis STATIC
   src/analysis/diagnostics.cpp
   src/analysis/halo_workflow.cpp
@@ -637,6 +638,26 @@ add_library(cosmosim_parallel STATIC
   src/parallel/node_memory_pool.cpp)
 target_link_libraries(cosmosim_gravity PUBLIC cosmosim_parallel)
 target_link_libraries(cosmosim_analysis PUBLIC cosmosim_parallel)
+
+# CHUI-MHD-REF-v1 magnetohydrodynamics module. Depends on cosmosim_core only
+# (core never includes mhd). Source-implemented and unvalidated; the production
+# workflow rejects mhd.enabled=true at capability admission until the
+# magnetized kHydroUpdate dispatch is wired (see
+# docs/architecture/chui_mhd_implementation_pass01_status.md).
+add_library(cosmosim_mhd STATIC
+  src/mhd/internal/mhd_sha256.cpp
+  src/mhd/mhd_amr.cpp
+  src/mhd/mhd_geometry.cpp
+  src/mhd/mhd_induction.cpp
+  src/mhd/mhd_initial_conditions.cpp
+  src/mhd/mhd_level_stepper.cpp
+  src/mhd/mhd_memory.cpp
+  src/mhd/mhd_riemann.cpp
+  src/mhd/mhd_runtime_adapter.cpp
+  src/mhd/mhd_state.cpp
+  src/mhd/mhd_step_operator.cpp
+  src/mhd/mhd_transport.cpp
+  src/mhd/mhd_validation.cpp)
 
 add_library(cosmosim_workflows STATIC
   src/workflows/analysis_runtime.cpp
@@ -667,6 +688,7 @@ add_library(cosmosim_workflows STATIC
   src/workflows/reference_workflow.cpp)
 
 set(COSMOSIM_MODULE_LIBS
+  cosmosim_mhd
   cosmosim_gravity
   cosmosim_hydro
   cosmosim_amr
@@ -722,9 +744,13 @@ endif()
 if(COSMOSIM_ENABLE_HDF5)
   if(TARGET HDF5::HDF5)
     target_link_libraries(cosmosim_io PUBLIC HDF5::HDF5)
+    # MHD transport-coefficient table provider reads versioned HDF5 tables.
+    target_link_libraries(cosmosim_mhd PRIVATE HDF5::HDF5)
   else()
     target_include_directories(cosmosim_io PUBLIC ${HDF5_INCLUDE_DIRS})
     target_link_libraries(cosmosim_io PUBLIC ${HDF5_LIBRARIES})
+    target_include_directories(cosmosim_mhd PRIVATE ${HDF5_INCLUDE_DIRS})
+    target_link_libraries(cosmosim_mhd PRIVATE ${HDF5_LIBRARIES})
   endif()
 endif()
 
@@ -765,6 +791,7 @@ target_link_libraries(cosmosim_all
     ${COSMOSIM_MODULE_LIBS})
 
 set_target_properties(cosmosim_core PROPERTIES EXPORT_NAME core)
+set_target_properties(cosmosim_mhd PROPERTIES EXPORT_NAME mhd)
 set_target_properties(cosmosim_gravity PROPERTIES EXPORT_NAME gravity)
 set_target_properties(cosmosim_hydro PROPERTIES EXPORT_NAME hydro)
 set_target_properties(cosmosim_amr PROPERTIES EXPORT_NAME amr)
@@ -776,6 +803,7 @@ set_target_properties(cosmosim_workflows PROPERTIES EXPORT_NAME workflows)
 set_target_properties(cosmosim_all PROPERTIES EXPORT_NAME all)
 
 add_library(CosmoSim::core ALIAS cosmosim_core)
+add_library(CosmoSim::mhd ALIAS cosmosim_mhd)
 add_library(CosmoSim::gravity ALIAS cosmosim_gravity)
 add_library(CosmoSim::hydro ALIAS cosmosim_hydro)
 add_library(CosmoSim::amr ALIAS cosmosim_amr)
@@ -793,6 +821,7 @@ target_link_libraries(cosmosim_harness PRIVATE cosmosim_all)
 set(COSMOSIM_INSTALL_CMAKEDIR "${CMAKE_INSTALL_LIBDIR}/cmake/CosmoSim")
 set(COSMOSIM_INSTALL_TARGETS
   cosmosim_core
+  cosmosim_mhd
   cosmosim_gravity
   cosmosim_hydro
   cosmosim_amr
@@ -1066,6 +1095,39 @@ if(COSMOSIM_ENABLE_TESTS)
   add_executable(test_unit_memory_governor_best_effort tests/unit/test_memory_governor_best_effort.cpp)
   target_link_libraries(test_unit_memory_governor_best_effort PRIVATE cosmosim_core Threads::Threads)
   add_test(NAME unit_memory_governor_best_effort COMMAND test_unit_memory_governor_best_effort)
+
+  # CHUI-MHD-REF-v1 / CHUI-MHD-PERF-v1 test sources (written in the source-only
+  # MHD continuation campaign; not yet built or executed by the authors of the
+  # change). See docs/architecture/chui_mhd_implementation_pass01_status.md.
+  add_executable(test_unit_mhd_discrete_complex tests/unit/mhd/test_mhd_discrete_complex.cpp)
+  target_link_libraries(test_unit_mhd_discrete_complex PRIVATE cosmosim_mhd)
+  add_test(NAME unit_mhd_discrete_complex COMMAND test_unit_mhd_discrete_complex)
+
+  add_executable(test_unit_mhd_riemann_reconstruction
+    tests/unit/mhd/test_mhd_riemann_reconstruction.cpp)
+  target_link_libraries(test_unit_mhd_riemann_reconstruction PRIVATE cosmosim_mhd)
+  add_test(NAME unit_mhd_riemann_reconstruction COMMAND test_unit_mhd_riemann_reconstruction)
+
+  add_executable(test_unit_mhd_memory_governance tests/unit/mhd/test_mhd_memory_governance.cpp)
+  target_link_libraries(test_unit_mhd_memory_governance PRIVATE cosmosim_mhd)
+  add_test(NAME unit_mhd_memory_governance COMMAND test_unit_mhd_memory_governance)
+
+  add_executable(test_integration_mhd_ideal_reference
+    tests/integration/test_mhd_ideal_reference.cpp)
+  target_link_libraries(test_integration_mhd_ideal_reference PRIVATE cosmosim_mhd)
+  add_test(NAME integration_mhd_ideal_reference COMMAND test_integration_mhd_ideal_reference)
+
+  add_executable(test_integration_mhd_nonideal_reference
+    tests/integration/test_mhd_nonideal_reference.cpp)
+  # cosmosim_io carries the HDF5 include/link interface for the table fixture.
+  target_link_libraries(test_integration_mhd_nonideal_reference PRIVATE cosmosim_mhd cosmosim_io)
+  add_test(NAME integration_mhd_nonideal_reference COMMAND test_integration_mhd_nonideal_reference)
+
+  add_executable(test_integration_mhd_amr_mpi_restarts
+    tests/integration/test_mhd_amr_mpi_restarts.cpp)
+  target_link_libraries(test_integration_mhd_amr_mpi_restarts PRIVATE
+    cosmosim_mhd cosmosim_io cosmosim_workflows)
+  add_test(NAME integration_mhd_amr_mpi_restarts COMMAND test_integration_mhd_amr_mpi_restarts)
   add_executable(test_unit_retained_capacity_transaction tests/unit/test_retained_capacity_transaction.cpp)
   target_link_libraries(test_unit_retained_capacity_transaction PRIVATE cosmosim_core)
   add_test(NAME unit_retained_capacity_transaction COMMAND test_unit_retained_capacity_transaction)
@@ -2912,6 +2974,11 @@ if(COSMOSIM_ENABLE_BENCHMARKS)
       DEPENDS bench_pm_only_scaling_mpi bench_tree_only_scaling_mpi
       WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
   endif()
+
+  # CHUI-MHD-PERF-v1 BP01-BP10 runner (reports not_evaluated for every item
+  # that needs external codes or the not-yet-wired production dispatch).
+  add_executable(bench_mhd_reference_suite bench/mhd/bench_mhd_reference_suite.cpp)
+  target_link_libraries(bench_mhd_reference_suite PRIVATE cosmosim_mhd)
 
   add_executable(bench_amr_regrid_sync bench/bench_amr_regrid_sync.cpp)
   target_link_libraries(bench_amr_regrid_sync PRIVATE cosmosim_amr)

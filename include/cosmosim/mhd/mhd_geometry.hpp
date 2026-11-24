@@ -20,7 +20,14 @@ enum class MhdBoundaryKind : std::uint8_t {
   kPeriodic = 0,
   kOpen = 1,
   kReflectingConductingWall = 2,
+  // Remote-rank neighbour. No MPI magnetic halo protocol exists in this source
+  // pass; any patch side of this kind is rejected by validateBoundarySupport.
   kImportedMpi = 3,
+  // Same-rank, same-level neighbour patch. Ghost cells and padded staggered
+  // faces on this side are filled by MhdLevelStepper from the neighbour's
+  // stage state; shared faces/edges are reconciled from the deterministic
+  // owner (lowest (level, patch_id)).
+  kNeighborPatch = 4,
 };
 
 struct MhdPatchBoundary {

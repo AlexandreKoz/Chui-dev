@@ -1183,3 +1183,23 @@ bound to it (sha256 `75e6bd73…`, identical data rows), so C01 + UVB is now a
 declared-consistent pairing (`tools/chui_data/data_sources.md` §D6). By owner
 decision the bundled tables are committed under `chui_data/`. Redistribution
 rights remain unconfirmed for all products; none is scientifically qualified.
+
+## CHUI MHD continuation pass 01 (20261124) — open blockers
+
+Source only; nothing configured, compiled, run or certified. Detailed ledger:
+`docs/architecture/chui_mhd_implementation_pass01_status.md`.
+
+* P0 — No magnetized `kHydroUpdate` dispatch: `HydroAmrRuntime` /
+  `ReferenceWorkflow` do not build `MhdLevelStepper` bindings from
+  `SimulationState`; MHD runs fail closed at capability admission.
+* P0 — v26 restart writer/reader pipeline and v7 science snapshot not wired
+  (codec for `/state/mhd` exists; writers fail closed for magnetized states).
+* P1 — No MPI magnetic face/edge halo or migration packet; multi-rank MHD is
+  rejected (`kImportedMpi` sides).
+* P1 — Multi-level synchronized MHD stepping (coarse/fine EMF registers fed by
+  `MhdLevelStepper` edge integrals, reflux-curl application, regrid wiring) is
+  not composed; transfer and register kernels exist.
+* P1 — Expansion-source ownership: the existing hydro comoving gravity source
+  applies `-H m` and `-H(2K+3p)`; the MHD stage source adds `-H M_c`. The
+  integration must route both through one owner (`apply_expansion_source`).
+* P1 — The compile viability of every new/changed file is unverified.

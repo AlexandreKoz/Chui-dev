@@ -1,0 +1,116 @@
+# CHUI-MHD-REF-v1 ideal reference example (mhd_ref_ideal_v01), cosmological
+# cube. STATUS: parses and validates as typed configuration, but the run is
+# REJECTED at runtime capability admission (MHD_UNSUPPORTED_PHYSICS,
+# capability mhd_production_dispatch) until the magnetized kHydroUpdate
+# dispatch, v26 restart and v7 snapshot are wired. The effective multiphase
+# ISM EOS of the nonmagnetic cube is replaced by the legacy threshold model
+# because MHD + effective-EOS has no verified contract (REF section 9).
+# The initial magnetic face flux must come from a certified face-flux IC or
+# a deterministic seed (REF section 10); cell-centred IC fields are rejected.
+schema_version = 1
+
+[units]
+length_unit = mpc
+mass_unit = msun
+velocity_unit = km_s
+coordinate_frame = comoving
+
+[mode]
+mode = cosmo_cube
+ic_file = cosmo_cube_ics.hdf5
+ic_convention = gadget_arepo_bridge_v1
+ic_bridge_source_length_unit_to_si = 3.0856775814913673e19
+ic_bridge_source_mass_unit_to_si = 1.98847e30
+ic_bridge_source_velocity_unit_to_si = 1000
+ic_bridge_coordinate_frame = comoving
+ic_bridge_velocity_convention = gadget_arepo_stored_peculiar
+ic_bridge_length_hubble_exponent = 0
+ic_bridge_length_scale_factor_exponent = 0
+ic_bridge_mass_hubble_exponent = 0
+ic_bridge_mass_scale_factor_exponent = 0
+ic_bridge_velocity_hubble_exponent = 0
+ic_bridge_velocity_scale_factor_exponent = 0
+zoom_high_res_region = false
+hydro_boundary = periodic
+gravity_boundary = periodic
+
+[cosmology]
+omega_matter = 0.31
+omega_lambda = 0.69
+omega_baryon = 0.0486
+hubble_param = 0.677
+sigma8 = 0.81
+scalar_index_ns = 0.966
+box_size = 100 mpc
+
+[numerics]
+time_begin_code = 0.0
+time_end_code = 1.0
+max_global_steps = 2048
+hierarchical_max_rung = 0
+amr_max_level = 9
+gravity_softening = 3.0 kpc
+gravity_solver = treepm
+hydro_solver = godunov_fv
+treepm_pm_grid = 64
+treepm_asmth_cells = 1.25
+treepm_rcut_cells = 6.25
+treepm_assignment_scheme = tsc
+treepm_enable_window_deconvolution = true
+treepm_update_cadence_steps = 1
+
+[physics]
+enable_cooling = true
+enable_star_formation = true
+star_formation_model = legacy_schmidt_threshold
+enable_feedback = true
+reionization_model = hm12
+
+[output]
+run_name = cube_mhd_ref_v01
+output_directory = outputs/cube_mhd_ref_v01
+output_stem = snapshot
+restart_stem = restart
+snapshot_interval_steps = 64
+write_restarts = true
+
+[parallel]
+mpi_ranks_expected = 1
+omp_threads = 1
+gpu_devices = 0
+deterministic_reduction = true
+
+[mhd]
+enabled = true
+reference_profile = mhd_ref_ideal_v01
+magnetic_representation = face_flux_ct
+spatial_method = finite_volume_unsplit
+reconstruction = ppm
+riemann_solver = hlld
+riemann_fallback = hlle
+emf_scheme = uct_hll
+time_integrator = ssprk2
+divergence_policy = strict_ct
+precision = float64
+cfl_ideal = 0.3
+max_step_retries = 8
+fallback_fraction_limit = 0.001
+floor_energy_fraction_limit = 1e-8
+deterministic = true
+
+[mhd_amr]
+refinement_ratio = 2
+magnetic_transfer = toth_roe_compatible
+emf_reflux = curl
+distributed_subcycling = false
+checkpoint_sync_only = true
+
+[mhd_io]
+science_b_field = derived_cell_center
+checkpoint_face_flux = true
+initial_field_format = face_flux
+input_projection = reject
+output_divergence_diagnostics = true
+
+[mhd_performance]
+profile = workstation_48gib_v01

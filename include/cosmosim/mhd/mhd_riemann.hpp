@@ -52,10 +52,17 @@ struct MhdConservedState {
                                           const MhdConservedState& rhs) noexcept;
 [[nodiscard]] MhdConservedState operator*(double scalar, MhdConservedState state) noexcept;
 
-// Numerical flux at one face. momentum_flux/magnetic_flux are absolute
-// components of the flux vector along the face normal; electric_field holds the
-// two tangential ideal electric-field components (E = -u x B); the normal
-// component is identically zero and unused.
+// Numerical flux at one face. momentum_flux/magnetic_flux are GLOBAL (x,y,z)
+// components of the flux vector along the face normal. electric_field holds the
+// ideal electric field in the LOCAL right-handed basis {n, t1, t2} with
+// t1/t2 = cyclic successors of the normal axis (x:(y,z), y:(z,x), z:(x,y));
+// E_n = 0, E_t1 = F_B,t2, E_t2 = -F_B,t1. slowest/fastest_signal_speed are the
+// SIGNED outer fan bounds S_L <= S_R used by HLL upwinding.
+//
+// Cosmological runs pass B_eff = B_c/sqrt(a) in the primitive states and the
+// shared normal field; the returned fluxes are then the comoving-volume
+// gas+magnetic fluxes and electric_field is E_eff = -(u x B_eff). The CT EMF
+// for B_c is E_eff/sqrt(a) (CHUI-MHD-REF v1.0 section 4.3).
 struct MhdRiemannFlux {
   double mass_flux = 0.0;
   std::array<double, 3> momentum_flux{};
@@ -86,8 +93,16 @@ struct MhdRiemannFlux {
 [[nodiscard]] double alfvenSpeedAlong(const MhdPrimitiveState& primitive,
                                       MhdAxis axis) noexcept;
 
+// Signed HLL fan bounds at one face (Davis/Einfeldt estimates).
+struct MhdSignalBounds {
+  double speed_left = 0.0;
+  double speed_right = 0.0;
+  bool valid = false;
+};
+
 // Ideal-MHD Riemann solvers. The normal magnetic field must be the single
-// face-shared value on both sides (enforced by the caller).
+// face-shared value on both sides (enforced by the solver, which overrides the
+// normal component of both input states).
 class MhdRiemann {
  public:
   enum class Solver : std::uint8_t { kHlld = 0, kHlle = 1 };
@@ -106,6 +121,14 @@ class MhdRiemann {
                                     double gamma_adiabatic,
                                     Solver preferred = Solver::kHlld) noexcept;
 
+  // Signed outer fan bounds only (used for EMF upwinding on ghost-row faces
+  // whose gas flux is not applied).
+  [[nodiscard]] static MhdSignalBounds signalBounds(MhdAxis axis,
+                                                    const MhdPrimitiveState& left,
+                                                    const MhdPrimitiveState& right,
+                                                    double shared_normal_b_comoving,
+                                                    double gamma_adiabatic) noexcept;
+
   // Explicit HLLE entry point (also used as the HLLD degeneracy fallback).
   [[nodiscard]] static Result solveHlle(MhdAxis axis,
                                         const MhdPrimitiveState& left,
@@ -115,12 +138,14 @@ class MhdRiemann {
 };
 
 // First-order positivity-preserving local fallback used only after HLLE has
-// also failed. It is a documented Rusanov/Lax-Friedrichs flux over the
-// supplied states; it is never a silent zero flux.
-[[nodiscard]] MhdRiemannFlux firstOrderPositivityFlux(
+// also failed on the reconstructed states. It is a Rusanov/local Lax-Friedrichs
+// flux between the two adjacent CELL-AVERAGE states (not the rejected
+// reconstructed states) with the shared face normal field. Returns
+// valid=false for an inadmissible pair; it never returns a silent zero flux.
+[[nodiscard]] MhdRiemann::Result firstOrderPositivityFlux(
     MhdAxis axis,
-    const MhdPrimitiveState& left,
-    const MhdPrimitiveState& right,
+    const MhdPrimitiveState& left_cell_average,
+    const MhdPrimitiveState& right_cell_average,
     double shared_normal_b_comoving,
     double gamma_adiabatic) noexcept;
 

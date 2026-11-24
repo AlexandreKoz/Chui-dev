@@ -190,48 +190,30 @@ MhdFaceFluxMutableView makeMutableFaceFluxView(MhdFaceFluxStorage& storage,
   };
 }
 
-// ---------------------------------------------------------------------------
-// Exact storage budget (CHUI-MHD-PERF v1.0 section 4)
-// ---------------------------------------------------------------------------
-
-MhdPatchMemoryEstimate estimatePatchMemory(const MhdPatchGeometry& geometry,
-                                           std::size_t gas_lane_count,
-                                           bool nonideal_enabled,
-                                           std::int32_t rkl_max_stages) {
-  MhdPatchMemoryEstimate estimate{};
-  const auto doubles_to_bytes = [](std::size_t count) {
-    return static_cast<std::uint64_t>(alignedBytesFor(count));
+MhdStageContext subIntervalContext(const MhdStageContext& interval,
+                                   double begin_fraction,
+                                   double end_fraction) noexcept {
+  // a(t) and H(t) are interpolated linearly between the timeline-supplied
+  // endpoints. This is second-order accurate over the interval and is only
+  // used to provide sub-interval endpoints to the split D/H operators; the
+  // ideal operator always receives the exact interval endpoints.
+  const auto lerp = [](double lhs, double rhs, double fraction) {
+    return lhs + (rhs - lhs) * fraction;
   };
+  MhdStageContext sub = interval;
+  sub.time_code = interval.time_code + begin_fraction * interval.dt_code;
+  sub.dt_code = (end_fraction - begin_fraction) * interval.dt_code;
+  sub.scale_factor = lerp(interval.scale_factor, interval.scale_factor_end, begin_fraction);
+  sub.scale_factor_end = lerp(interval.scale_factor, interval.scale_factor_end, end_fraction);
+  sub.hubble_rate_code =
+      lerp(interval.hubble_rate_code, interval.hubble_rate_end_code, begin_fraction);
+  sub.hubble_rate_end_code =
+      lerp(interval.hubble_rate_code, interval.hubble_rate_end_code, end_fraction);
+  return sub;
+}
 
-  const std::size_t cells = geometry.cellCount();
-  const std::size_t faces = geometry.faceCountTotal();
-  const std::size_t edges = geometry.edgeCountTotal();
-
-  estimate.face_flux_capacity_bytes = doubles_to_bytes(faces);
-  estimate.edge_emf_capacity_bytes = doubles_to_bytes(edges);
-  // SSPRK2 trial gas copy: one full conserved-lane copy.
-  estimate.gas_trial_capacity_bytes = doubles_to_bytes(cells * gas_lane_count);
-  estimate.edge_current_capacity_bytes =
-      nonideal_enabled ? doubles_to_bytes(cells * 3U) : 0U;
-
-  std::uint64_t rkl_extra = 0U;
-  if (nonideal_enabled) {
-    const std::int32_t stages = rkl_max_stages > 1 ? rkl_max_stages : 1;
-    // RKL2 reuses a single stage edge buffer plus a single stage energy lane,
-    // so residency does not grow with the stage count. The bound records the
-    // per-cycle reusable footprint; the stage count only affects the cost.
-    (void)stages;
-    rkl_extra = doubles_to_bytes(edges) + doubles_to_bytes(cells);
-  }
-  estimate.rkl_cycle_extra_capacity_bytes = rkl_extra;
-
-  // Phase scratch excludes the canonical persistent face flux.
-  estimate.total_phase_scratch_bytes = estimate.edge_emf_capacity_bytes +
-      estimate.gas_trial_capacity_bytes + estimate.edge_current_capacity_bytes +
-      estimate.rkl_cycle_extra_capacity_bytes;
-
-  estimate.total_canonical_persistent_bytes = estimate.face_flux_capacity_bytes;
-  return estimate;
+std::uint64_t mhdAlignedLaneBytes(std::size_t count) {
+  return static_cast<std::uint64_t>(alignedBytesFor(count));
 }
 
 }  // namespace cosmosim::mhd

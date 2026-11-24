@@ -378,14 +378,18 @@ void validateBoundarySupport(const MhdPatchBoundary& boundary,
   };
 
   for (int axis_index = 0; axis_index < 3; ++axis_index) {
-    const bool lower_periodic =
-        boundary.lower[static_cast<std::size_t>(axis_index)] == MhdBoundaryKind::kPeriodic;
-    const bool upper_periodic =
-        boundary.upper[static_cast<std::size_t>(axis_index)] == MhdBoundaryKind::kPeriodic;
+    const std::size_t axis = static_cast<std::size_t>(axis_index);
+    const char* name = axis_index == 0 ? "x" : (axis_index == 1 ? "y" : "z");
+    const bool lower_periodic = boundary.lower[axis] == MhdBoundaryKind::kPeriodic;
+    const bool upper_periodic = boundary.upper[axis] == MhdBoundaryKind::kPeriodic;
     if (lower_periodic != upper_periodic) {
-      const char* name = axis_index == 0 ? "x" : (axis_index == 1 ? "y" : "z");
       reject(std::string("one-sided periodic boundary on axis ") + name +
              " is not a supported MHD topology");
+    }
+    if (boundary.lower[axis] == MhdBoundaryKind::kImportedMpi ||
+        boundary.upper[axis] == MhdBoundaryKind::kImportedMpi) {
+      reject(std::string("remote-rank magnetic halo on axis ") + name +
+             " requested, but no MPI face/edge halo protocol is implemented");
     }
   }
 }

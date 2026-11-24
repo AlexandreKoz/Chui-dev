@@ -1170,3 +1170,31 @@ Source only; NOT compiled or run.
   sources counted.
 * Periodic cross-patch AMR topology remains refused (mandatory Part 3
   deliverable).
+
+## CHUI MHD continuation pass 01 — 20261124
+
+Source only; NOT configured, compiled or run (explicit user-reserved
+source-only campaign). Ledger: `docs/architecture/chui_mhd_implementation_pass01_status.md`.
+
+* New module library `cosmosim_mhd` (`include/cosmosim/mhd`, `src/mhd`)
+  depends on `cosmosim_core` only; `core` never includes `mhd`. The workflow
+  layer will compose MHD through `mhd_runtime_adapter`. No dependency-boundary
+  exception is introduced.
+* The `/state/mhd` v26 restart group codec lives in `cosmosim_io`
+  (`io/mhd_restart_state.hpp`) and serializes the core-plain
+  `core::MagneticFaceSoa`, so `io` does not depend on `mhd`.
+* Fail-closed perimeter: `mhd.enabled=true` is rejected at runtime capability
+  admission (`mhd_production_dispatch`), by `makeHydroAmrRuntime`, by the v25
+  restart writer (non-empty magnetic state) and by the v6 snapshot writer.
+  These guards are not an implementation and stay until the magnetized
+  `kHydroUpdate` dispatch, v26 writer/reader and v7 snapshot are wired.
+* Config-hash compatibility: `[mhd*]` sections are emitted into the
+  normalized text only for `mhd.enabled=true`; an MHD-disabled run produces
+  byte-identical normalized text/hash to the predecessor schema, and any
+  non-default MHD key on a disabled run is rejected (no inert keys).
+* Stage contracts: only the `kHydroUpdate` owner (`kHydro` or `kMhd`) may
+  declare `kMagneticFaces` mutation; `kMhd` owns no other stage.
+* Interval ownership: `MhdLevelStepper` is the single committer of a
+  synchronized same-level, same-rank MHD interval (rollback image, retries,
+  owner reconciliation of shared faces/edges). Multi-level, multi-rank and
+  recursive magnetized stepping are rejected, not emulated.

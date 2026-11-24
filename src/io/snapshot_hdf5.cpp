@@ -973,6 +973,13 @@ void writeScienceSnapshotHdf5(
   if (payload.state == nullptr || payload.config == nullptr) {
     throw std::runtime_error("snapshot writer requires non-null state and config");
   }
+  // CHUI-MHD amendment R6: MHD science output is chui_science_snapshot_v7 with
+  // derived PartType0/MagneticField; v6 must never silently omit a field.
+  if (!payload.state->magnetic_faces.empty() || payload.config->mhd.enabled) {
+    throw std::runtime_error(
+        "MHD_UNSUPPORTED_PHYSICS: magnetized science output requires snapshot schema v7, "
+        "which is not wired into writeScienceSnapshotHdf5");
+  }
   if (policy.chunk_particle_count == 0) {
     throw std::runtime_error("chunk_particle_count must be > 0");
   }

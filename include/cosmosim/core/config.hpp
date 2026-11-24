@@ -199,6 +199,7 @@ struct MhdConfig {
     std::string composition_id;
     std::string grain_model_id;
     std::string expected_table_sha256;
+    friend bool operator==(const NonIdeal&, const NonIdeal&) = default;
   } nonideal;
 
   struct Amr {
@@ -208,6 +209,7 @@ struct MhdConfig {
     MhdEmfRefluxConfigMode emf_reflux = MhdEmfRefluxConfigMode::kCurl;
     bool distributed_subcycling = false;
     bool checkpoint_sync_only = true;
+    friend bool operator==(const Amr&, const Amr&) = default;
   } amr;
 
   struct Io {
@@ -219,6 +221,7 @@ struct MhdConfig {
     MhdInputProjectionConfigMode input_projection =
         MhdInputProjectionConfigMode::kReject;
     bool output_divergence_diagnostics = true;
+    friend bool operator==(const Io&, const Io&) = default;
   } io;
 
   struct Performance {
@@ -242,7 +245,11 @@ struct MhdConfig {
     bool optional_gpu_backend = false;
     std::uint64_t gpu_device_target_mib = 6144U;
     bool allow_untracked_allocations = false;
+    friend bool operator==(const Performance&, const Performance&) = default;
   } performance;
+
+  // Field-wise equality, used to reject inert MHD keys on disabled runs.
+  friend bool operator==(const MhdConfig&, const MhdConfig&) = default;
 };
 
 // CHUI Part 3: stellar wind / pre-SN mechanical channel.

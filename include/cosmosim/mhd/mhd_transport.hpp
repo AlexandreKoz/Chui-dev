@@ -94,12 +94,18 @@ class ConstantMhdCoefficientProvider final : public MhdCoefficientProvider {
   double m_eta_ambipolar_cgs;
 };
 
-// Monotone versioned HDF5 table. Axes:
+// Versioned HDF5 table (contract chui_mhd_transport_table_v1; full layout in
+// src/mhd/mhd_transport.cpp and docs/configuration.md). Axes:
 //   (log_rho_phys_cgs, log_temperature_k, log_b_phys_gauss,
 //    composition_id, grain_model_id)
-// Datasets: EtaOhmicCgs, EtaHallCgs, EtaAmbipolarCgs, BZeroLimit.
-// Continuous axes must be sorted and unique; categorical axes are exact-match
-// and never interpolated. Outside coverage is fatal; no extrapolation.
+// Datasets EtaOhmicCgs, EtaHallCgs, EtaAmbipolarCgs and the exact zero-field
+// group BZeroLimit/{EtaOhmicCgs,EtaHallCgs,EtaAmbipolarCgs}. Continuous axes
+// must be finite, sorted and unique; categorical axes are exact-match and never
+// interpolated. Ohmic/ambipolar use monotone log interpolation, Hall signed
+// linear interpolation. Outside coverage returns valid=false (fatal for the
+// caller); no extrapolation or clamping. The SHA-256 of the file bytes is the
+// provenance/restart pin. evaluate() returns valid=false until
+// validateAdmission() has succeeded.
 class TableMhdCoefficientProvider final : public MhdCoefficientProvider {
  public:
   struct Options {
@@ -153,35 +159,52 @@ class ChemistryMhdCoefficientProvider final : public MhdCoefficientProvider {
 };
 
 // ---------------------------------------------------------------------------
-// RKL2 (second-order Runge-Kutta-Legendre) super-time-stepping.
-//
-// Coefficients follow the Meyer-Balsara-Aslam recurrence:
-//   b_j = (j^2 + j - 2) / (2 j (j + 1)),  a_j = 1 - b_j,
-//   w_1 = 4 / (s^2 + s - 2),
-//   mu_j   = (2j - 1)/j * b_j / b_{j-1},
-//   nu_j   = -(j - 1)/j * b_j / b_{j-2},
-//   mu_tilde_j = mu_j * w_1,   gamma_tilde_j = -a_{j-1} * mu_tilde_j.
-// The formal explicit stability interval of the s-stage scheme is
-//   dt <= 2 s (s + 1) / (s^2 + s - 2) * dt_explicit_single_stage,
-// and the implementation verifies the recurrence itself in the unit tests.
+// RKL2 (second-order Runge-Kutta-Legendre) super-time-stepping,
+// Meyer, Balsara & Aslam (2014, J. Comput. Phys. 257, 594), eqs. (16)-(17):
+//   b_0 = b_1 = b_2 = 1/3,  b_j = (j^2 + j - 2) / (2 j (j + 1)) for j >= 2,
+//   a_j = 1 - b_j,  w_1 = 4 / (s^2 + s - 2),
+//   Y_1 = Y_0 + mu~_1 tau L(Y_0),  mu~_1 = b_1 w_1,
+//   Y_j = mu_j Y_{j-1} + nu_j Y_{j-2} + (1 - mu_j - nu_j) Y_0
+//         + mu~_j tau L(Y_{j-1}) + gamma~_j tau L(Y_0),         j = 2..s,
+//   mu_j = (2j-1)/j * b_j/b_{j-1},  nu_j = -(j-1)/j * b_j/b_{j-2},
+//   mu~_j = mu_j w_1,  gamma~_j = -a_{j-1} mu~_j.
+// Linear stability: tau <= dt_explicit * (s^2 + s - 2) / 4, where
+// dt_explicit is the forward-Euler (equivalently SSPRK2) diffusive bound.
+// Vectors are indexed 0..s; index 0 is unused except b_0.
 // ---------------------------------------------------------------------------
 struct MhdRkl2Coefficients {
-  std::int32_t stages = 1;
-  double w1 = 1.0;
+  std::int32_t stages = 0;
+  double w1 = 0.0;
+  std::vector<double> b;
   std::vector<double> mu;
   std::vector<double> nu;
   std::vector<double> mu_tilde;
   std::vector<double> gamma_tilde;
 };
 
+// Throws MHD_INVALID_FIELD for stages < 2.
 [[nodiscard]] MhdRkl2Coefficients makeRkl2Coefficients(std::int32_t stages);
+// (s^2 + s - 2) / 4 for s >= 2; 1 for s <= 1.
 [[nodiscard]] double rkl2StabilityFactor(std::int32_t stages) noexcept;
-// Least deterministic stage count whose stability interval covers `ratio`,
-// bounded by `max_stages`. Returns 0 when ratio <= 1 (single explicit step).
+// Least s >= 2 with rkl2StabilityFactor(s) >= ratio. Returns 0 when
+// ratio <= 1 (no super-stepping needed) and max_stages + 1 when even
+// max_stages does not cover ratio (caller partitions into cycles).
 [[nodiscard]] std::int32_t selectRkl2StageCount(double ratio, std::int32_t max_stages) noexcept;
 
+// Deterministic partition of a diffusion interval of `ratio` explicit steps:
+// the least number of equal RKL2 cycles whose per-cycle stage count does not
+// exceed `max_stages_per_cycle`.
+struct MhdRkl2Plan {
+  std::int32_t cycles = 0;
+  std::int32_t stages_per_cycle = 0;
+  [[nodiscard]] std::int64_t totalStages() const noexcept {
+    return static_cast<std::int64_t>(cycles) * static_cast<std::int64_t>(stages_per_cycle);
+  }
+};
+[[nodiscard]] MhdRkl2Plan planRkl2(double ratio, std::int32_t max_stages_per_cycle);
+
 // ---------------------------------------------------------------------------
-// Non-ideal operators.
+// Non-ideal operators (CHUI-MHD-REF v1.0 section 8).
 // ---------------------------------------------------------------------------
 
 struct MhdStiffnessLimits {
@@ -194,158 +217,209 @@ struct MhdStiffnessLimits {
 };
 
 struct MhdTransportStageDiagnostics {
+  std::uint64_t explicit_diffusion_substeps = 0;
   std::uint64_t rkl_cycle_count = 0;
   std::uint64_t rkl_stage_count = 0;
   std::uint64_t hall_subcycle_count = 0;
   std::uint64_t hall_rejected_subcycle_count = 0;
   std::uint64_t coefficient_evaluations = 0;
-  double jacobi_heating_integral = 0.0;  // diagnostic only
+  // Discrete edge-integrated sum of J.E_ni / a (comoving volume), times the
+  // stage weight: a diagnostic of the physical Ohmic+ambipolar heating rate.
+  // Never added to the energy equation (the conservative Poynting flux carries
+  // it). The Hall part is reported separately and must vanish analytically.
+  double joule_heating_integral = 0.0;
+  double hall_work_integral = 0.0;
   double max_current_density = 0.0;
+  double min_diffusion_dt_code = 0.0;
+  double min_hall_dt_code = 0.0;
+
+  MhdTransportStageDiagnostics& operator+=(const MhdTransportStageDiagnostics& rhs) noexcept;
 };
 
-// Stage-local workspace for the non-ideal operators. All arrays are patch
-// sized; RKL/Hall subcycles reuse them and never multiply residency.
-struct MhdNonIdealWorkspace {
-  MhdEdgeEmfStorage emf_interval{};
-  MhdEdgeEmfStorage emf_stage{};
-  MhdDoubleArray current_x{};
-  MhdDoubleArray current_y{};
-  MhdDoubleArray current_z{};
-  MhdDoubleArray energy_stage{};
-  MhdDoubleArray energy_rhs{};
-  MhdDoubleArray phi_x_stage{};
-  MhdDoubleArray phi_y_stage{};
-  MhdDoubleArray phi_z_stage{};
+// The single owner of MHD unit transforms from comoving code state to the
+// physical cgs properties requested by coefficient providers:
+//   rho_phys = rho_c / a^3,  p_phys = p_c / a^3,  B_phys = B_c / a^2,
+//   T = mu m_p p_phys / (k_B rho_phys)  (calorically perfect gas),
+//   B_gauss = sqrt(4 pi) * B_LH,cgs with B_LH,cgs = B_code * sqrt(P_unit_cgs)
+// (normalized Lorentz-Heaviside code field; section 4.1). No other MHD module
+// introduces 4 pi or mu_0 factors.
+struct MhdPhysicalPropertyModel {
+  const core::UnitSystem* units = nullptr;
+  // Mean molecular weight of the gas in units of the proton mass. There is no
+  // default: the workflow must bind it from the authoritative composition
+  // closure; a non-positive value is rejected.
+  double mean_molecular_weight = 0.0;
+
+  void validate() const;
+  [[nodiscard]] MhdCellPhysicalProperties evaluate(double rho_comoving_code,
+                                                   double pressure_comoving_code,
+                                                   double b_comoving_magnitude_code,
+                                                   double scale_factor) const;
+  [[nodiscard]] double pressureUnitCgs() const;
+  [[nodiscard]] double fieldCodeToGauss(double b_physical_code) const;
+};
+
+enum class MhdNonIdealOperatorKind : std::uint8_t {
+  kDiffusion = 0,  // Ohmic + ambipolar (the D operator)
+  kHall = 1,       // Hall with whistler-HLL upwinding (the H operator)
+};
+
+// Non-ideal Poynting energy fluxes on the six patch-boundary planes (one
+// value per boundary face; tangential coordinates are the cyclic successors
+// of the normal axis). Reconciled from the deterministic owner like the gas
+// boundary fluxes so both sides of a shared face see the same flux.
+struct MhdBoundaryFaceEnergyFluxes {
+  std::size_t nx = 0;
+  std::size_t ny = 0;
+  std::size_t nz = 0;
+  std::array<std::array<MhdDoubleArray, 2>, 3> values{};
 
   void resize(const MhdPatchGeometry& geometry);
+  [[nodiscard]] double& at(std::size_t axis, std::size_t side, std::size_t t1,
+                           std::size_t t2) noexcept;
+  [[nodiscard]] double at(std::size_t axis, std::size_t side, std::size_t t1,
+                          std::size_t t2) const noexcept;
   [[nodiscard]] std::uint64_t ownedCapacityBytes() const noexcept;
 };
 
-// Non-ideal induction rate provider. Computes d(Phi)/dt and the conservative
-// non-ideal Poynting energy rate at a stage state. Coefficients are reevaluated
-// at every call from the supplied physical cell properties.
+// Patch-local non-ideal scratch (kScratchArena class). Stage counts never
+// multiply residency: the D/H integrators reuse these lanes for every stage.
+// To respect the PERF 512 B/active-cell phase+scratch cap, the non-ideal
+// operator does NOT own an EMF array or a Y_0 copy: it writes its EMF into the
+// level stepper's MhdStageWorkspace::emf and uses the stepper's stage-0
+// snapshot as Y_0 (the ideal and non-ideal phases are never co-live). Edge
+// currents are recomputed from the staggered field on demand (4 face reads)
+// instead of being stored.
+struct MhdNonIdealWorkspace {
+  std::size_t nx = 0;
+  std::size_t ny = 0;
+  std::size_t nz = 0;
+  // Cell coefficients in comoving code units on cells -1..n (one ghost layer).
+  MhdDoubleArray eta_ohmic_code;
+  MhdDoubleArray eta_hall_code;
+  MhdDoubleArray eta_ambipolar_code;
+  // Face Poynting energy fluxes on patch-boundary planes.
+  MhdBoundaryFaceEnergyFluxes boundary_energy{};
+  // Super-stepping lanes: Y_{j-2} faces+energy, L(Y_0) as EMF + energy rate.
+  std::array<MhdDoubleArray, 3> yjm2_faces{};
+  MhdDoubleArray yjm2_energy;
+  MhdEdgeEmfStorage emf_y0{};
+  MhdDoubleArray energy_rate_y0;
+  // Energy rate of the current stage (also used by explicit SSPRK2 / Hall).
+  MhdDoubleArray energy_rate_stage;
+
+  void resize(const MhdPatchGeometry& geometry, bool super_stepping_lanes);
+  [[nodiscard]] std::size_t coefficientIndex(std::ptrdiff_t i, std::ptrdiff_t j,
+                                             std::ptrdiff_t k) const noexcept {
+    return static_cast<std::size_t>(i + 1) +
+        (nx + 2U) * (static_cast<std::size_t>(j + 1) + (ny + 2U) * static_cast<std::size_t>(k + 1));
+  }
+  [[nodiscard]] std::uint64_t ownedCapacityBytes() const noexcept;
+};
+
+// Non-ideal rate kernels on one patch. Coefficients are re-evaluated from the
+// SUPPLIED stage state (the padded primitive cache with ghosts filled) at
+// every call; nothing is frozen across stages.
 class MhdNonIdealRateOperator {
  public:
   MhdNonIdealRateOperator(const MhdCoefficientProvider* provider,
-                          const core::UnitSystem* units,
+                          MhdPhysicalPropertyModel properties,
                           MhdStiffnessLimits limits,
                           bool enable_ohmic,
                           bool enable_hall,
                           bool enable_ambipolar);
 
-  // Ohmic + ambipolar (the D operator). Fills `emf_integral` with the
-  // *rate* edge EMF (per unit time) so the caller multiplies by its stage dt.
-  void computeDiffusionRate(const MhdPatchGeometry& geometry,
-                            std::span<const double> phi_x,
-                            std::span<const double> phi_y,
-                            std::span<const double> phi_z,
-                            std::span<const MhdCellPhysicalProperties> properties,
-                            double scale_factor,
-                            MhdEdgeEmfStorage& emf_rate,
-                            std::span<double> energy_rate_density) const;
-
-  // Hall (the H operator), whistler-expanded HLL induction EMF.
-  void computeHallRate(const MhdPatchGeometry& geometry,
-                       std::span<const double> phi_x,
-                       std::span<const double> phi_y,
-                       std::span<const double> phi_z,
-                       std::span<const MhdCellPhysicalProperties> properties,
-                       double scale_factor,
-                       MhdEdgeEmfStorage& emf_rate,
-                       std::span<double> energy_rate_density) const;
-
-  [[nodiscard]] double diffusionStableTimeStep(
-      const MhdPatchGeometry& geometry,
-      std::span<const MhdCellPhysicalProperties> properties,
-      double scale_factor,
-      const core::UnitSystem& units) const;
-
-  [[nodiscard]] double hallStableTimeStep(
-      const MhdPatchGeometry& geometry,
-      std::span<const MhdCellPhysicalProperties> properties,
-      double scale_factor,
-      const core::UnitSystem& units) const;
-
-  [[nodiscard]] MhdStiffnessLimits limits() const noexcept { return m_limits; }
-  [[nodiscard]] bool nonidealEnabled() const noexcept {
-    return m_enable_ohmic || m_enable_hall || m_enable_ambipolar;
+  [[nodiscard]] bool diffusionEnabled() const noexcept {
+    return m_enable_ohmic || m_enable_ambipolar;
   }
+  [[nodiscard]] bool hallEnabled() const noexcept { return m_enable_hall; }
+  [[nodiscard]] const MhdStiffnessLimits& limits() const noexcept { return m_limits; }
+
+  // Evaluate physical properties and provider coefficients on cells -1..n of
+  // the stage state and convert them exactly once to comoving code units
+  // (eta_code = eta_cgs * T_unit / L_unit^2 / a^2). Disabled terms are stored
+  // as exact zeros. Throws MHD_BAD_COEFFICIENT for an invalid/out-of-coverage
+  // coefficient, a closure-invalid cell, eta_O < 0 or eta_A < 0.
+  void evaluateCoefficients(const MhdPatchGeometry& geometry,
+                            const MhdPrimitivePatch& primitives,
+                            double scale_factor,
+                            MhdNonIdealWorkspace& workspace,
+                            MhdTransportStageDiagnostics& diagnostics) const;
+
+  // Explicit stability bounds from the evaluated coefficients (comoving code
+  // units, comoving spacings), CHUI-MHD-REF v1.0 sections 8.3-8.4:
+  //   dt_D = cfl_diffusion / [max(eta_O + eta_A) * sum_i dx_i^-2]
+  //   dt_H = cfl_hall / [pi * max|eta_H| * sum_i dx_i^-2]
+  // The Hall bound is the stricter of the diffusive-form bound
+  // 0.10/[max|eta_H| sum dx^-2] and the whistler-fan bound with grid Nyquist
+  // whistler speed c_w,i = pi |eta_H| / dx_i (sum_i c_w,i/dx_i), which is
+  // always smaller by pi. The ambipolar projection has unit operator norm, so
+  // eta_O + eta_A bounds the anisotropic operator spectrum. +infinity when
+  // the corresponding coefficients are exactly zero.
+  [[nodiscard]] double diffusionStableTimeStep(const MhdPatchGeometry& geometry,
+                                               const MhdNonIdealWorkspace& workspace) const;
+  [[nodiscard]] double hallStableTimeStep(const MhdPatchGeometry& geometry,
+                                          const MhdNonIdealWorkspace& workspace) const;
+
+  // Compatible edge current J = curl_x B_c from the padded staggered field
+  // (B_c = sqrt(a) B_eff), then the edge EMF of the requested operator:
+  //   D: E = eta_O J + eta_A (J - (J.b)b)
+  //   H: E = eta_H (J x b) + whistler-HLL upwinding
+  //        + (c_w,a/2)(B_b(+a) - B_b(-a)) - (c_w,b/2)(B_a(+b) - B_a(-b))
+  // with edge coefficients averaged from the four adjacent cells, b from the
+  // edge-averaged field regularized by B_reg = 1e-30 (code units), and
+  // reconstructed (PLM-MC) staggered fields at the edge. Output EMFs are edge
+  // line integrals per unit time (written to `emf`) with conducting-wall and
+  // periodic edge rules applied.
+  void computeEmf(MhdNonIdealOperatorKind kind,
+                  const MhdPatchGeometry& geometry,
+                  const MhdPatchBoundary& boundary,
+                  const MhdStaggeredFieldPatch& staggered,
+                  double scale_factor,
+                  const MhdNonIdealWorkspace& workspace,
+                  MhdEdgeEmfStorage& emf,
+                  MhdTransportStageDiagnostics& diagnostics) const;
+
+  // Conservative non-ideal Poynting energy flux F_n = (E_c x B_c)_n / a on
+  // every face, from the (reconciled) edge EMF in `emf` and the face-averaged
+  // cell field B_c. Interior faces apply weight * (-div_x F) directly into
+  // `energy_target`; boundary-plane fluxes are recorded in
+  // workspace.boundary_energy for owner reconciliation.
+  void applyEnergyFlux(const MhdPatchGeometry& geometry,
+                       const MhdPrimitivePatch& primitives,
+                       const MhdEdgeEmfStorage& emf,
+                       double scale_factor,
+                       double weight,
+                       MhdNonIdealWorkspace& workspace,
+                       std::span<double> energy_target) const;
 
  private:
-  void evaluateCoefficients(std::span<const MhdCellPhysicalProperties> properties,
-                            double scale_factor,
-                            std::vector<MhdTransportCoefficients>& out_code_units) const;
-  void computeEdgeCurrent(const MhdPatchGeometry& geometry,
-                          std::span<const double> phi_x,
-                          std::span<const double> phi_y,
-                          std::span<const double> phi_z,
-                          MhdDoubleArray& jx,
-                          MhdDoubleArray& jy,
-                          MhdDoubleArray& jz) const;
-
   const MhdCoefficientProvider* m_provider = nullptr;
-  const core::UnitSystem* m_units = nullptr;
+  MhdPhysicalPropertyModel m_properties{};
   MhdStiffnessLimits m_limits{};
   bool m_enable_ohmic = false;
   bool m_enable_hall = false;
   bool m_enable_ambipolar = false;
 };
 
-// SSPRK2 / RKL2 driver for the D operator. Updates face fluxes and the
-// conservative total-energy lane together; no artificial conductivity and no
-// hidden energy rescale.
-class MhdDiffusionIntegrator {
- public:
-  explicit MhdDiffusionIntegrator(MhdStiffnessLimits limits);
+// Apply reconciled boundary-plane Poynting energy fluxes:
+//   lower plane -> cell 0 gains +w F/dx_n; upper plane -> cell n-1 loses.
+void applyBoundaryEnergyFluxes(const MhdPatchGeometry& geometry,
+                               const MhdBoundaryFaceEnergyFluxes& fluxes,
+                               double weight,
+                               std::span<double> energy_target);
 
-  void integrate(const MhdNonIdealRateOperator& rate_operator,
-                 const MhdPatchGeometry& geometry,
-                 MhdNonIdealWorkspace& workspace,
-                 std::span<double> phi_x,
-                 std::span<double> phi_y,
-                 std::span<double> phi_z,
-                 std::span<double> total_energy_density,
-                 std::span<const MhdCellPhysicalProperties> properties,
-                 double scale_factor,
-                 double dt_code,
-                 MhdTransportStageDiagnostics& diagnostics) const;
-
-  [[nodiscard]] MhdStiffnessLimits limits() const noexcept { return m_limits; }
-
- private:
-  MhdStiffnessLimits m_limits;
-};
-
-// Explicit SSPRK2 Hall driver with bounded subcycling.
-class MhdHallIntegrator {
- public:
-  explicit MhdHallIntegrator(MhdStiffnessLimits limits);
-
-  void integrate(const MhdNonIdealRateOperator& rate_operator,
-                 const MhdPatchGeometry& geometry,
-                 MhdNonIdealWorkspace& workspace,
-                 std::span<double> phi_x,
-                 std::span<double> phi_y,
-                 std::span<double> phi_z,
-                 std::span<double> total_energy_density,
-                 std::span<const MhdCellPhysicalProperties> properties,
-                 double scale_factor,
-                 double dt_code,
-                 MhdTransportStageDiagnostics& diagnostics) const;
-
- private:
-  MhdStiffnessLimits m_limits;
-};
-
-// Non-ideal edge EMF from the constitutive law:
-//   E_O = eta_O J, E_H = eta_H (J x b_hat), E_A = eta_A (J - (J.b_hat)b_hat).
-// `b_hat` uses the regularized field direction; at exactly B=0 the Ohmic term
-// is well defined (J), Hall/ambipolar vanish in their physical limit and an
-// undefined coefficient table query is rejected before this function.
+// Non-ideal edge electric field from the constitutive law:
+//   E_O = eta_O J, E_H = eta_H (J x b_hat), E_A = eta_A (J - (J.b_hat) b_hat),
+// b_hat = B / max(|B|, b_regularization). At B = 0 b_hat = 0: the Hall term
+// vanishes and the ambipolar term reduces to eta_A J, so a provider must
+// supply its physical zero-field limit of eta_A (no direction is invented).
 [[nodiscard]] std::array<double, 3> nonIdealElectricField(
     const std::array<double, 3>& current_density_code,
     const std::array<double, 3>& magnetic_field_comoving,
-    const MhdTransportCoefficients& coefficients_code_units,
-    double scale_factor) noexcept;
+    double eta_ohmic_code,
+    double eta_hall_code,
+    double eta_ambipolar_code,
+    double b_regularization) noexcept;
 
 }  // namespace cosmosim::mhd

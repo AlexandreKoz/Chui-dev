@@ -284,6 +284,27 @@ void accountPatchSoa(MemoryReportBuilder& builder, const PatchSoa& patches) {
   addOwned(builder, MemorySubsystem::kGasHydro, MemoryLifetime::kPersistent, "patches.owning_rank", patches.owning_rank);
 }
 
+// Authoritative MHD face-integrated magnetic flux (empty and zero-byte for
+// MHD-disabled runs; CHUI-MHD-PERF v1.0 section 5, kCanonicalPersistent).
+void accountMagneticFaces(MemoryReportBuilder& builder, const MagneticFaceSoa& faces) {
+  // MHD-off runs keep a report identical to the pre-MHD layout (MP07).
+  if (faces.patches.capacity() == 0U && faces.face_flux_x_comoving.capacity() == 0U &&
+      faces.face_flux_y_comoving.capacity() == 0U && faces.face_flux_z_comoving.capacity() == 0U) {
+    return;
+  }
+  addOwnedWithClass(builder, MemorySubsystem::kGasHydro, MemoryLifetime::kPersistent,
+                    MemoryClass::kCanonicalPersistent, "mhd.face_flux_x_comoving",
+                    faces.face_flux_x_comoving);
+  addOwnedWithClass(builder, MemorySubsystem::kGasHydro, MemoryLifetime::kPersistent,
+                    MemoryClass::kCanonicalPersistent, "mhd.face_flux_y_comoving",
+                    faces.face_flux_y_comoving);
+  addOwnedWithClass(builder, MemorySubsystem::kGasHydro, MemoryLifetime::kPersistent,
+                    MemoryClass::kCanonicalPersistent, "mhd.face_flux_z_comoving",
+                    faces.face_flux_z_comoving);
+  addOwnedWithClass(builder, MemorySubsystem::kGasHydro, MemoryLifetime::kPersistent,
+                    MemoryClass::kCanonicalPersistent, "mhd.patch_records", faces.patches);
+}
+
 void accountAmrIdentityAndSynchronization(
     MemoryReportBuilder& builder,
     const SimulationState& state) {
@@ -486,6 +507,7 @@ MemoryReport collectSimulationMemoryReport(const SimulationState& state, const T
   accountBlackHoleSidecar(builder, state.black_holes);
   accountTracerSidecar(builder, state.tracers);
   accountPatchSoa(builder, state.patches);
+  accountMagneticFaces(builder, state.magnetic_faces);
   accountAmrIdentityAndSynchronization(builder, state);
   accountModulePayloads(builder, state.sidecars);
   // M01 (patch 50): the element/species/ion/dust/SGS composition sidecar is
