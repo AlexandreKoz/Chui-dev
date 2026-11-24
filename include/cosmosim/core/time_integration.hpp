@@ -44,6 +44,9 @@ enum class StageDataDomain : std::uint16_t {
   kOutputState = 1U << 6U,
   kRestartState = 1U << 7U,
   kDiagnostics = 1U << 8U,
+  // Authoritative face-integrated magnetic flux (and edge-EMF authority).
+  // Distinct from kMeshCells so no stage can hide magnetic write permission.
+  kMagneticFaces = 1U << 9U,
 };
 [[nodiscard]] constexpr StageDataDomain operator|(StageDataDomain lhs, StageDataDomain rhs) noexcept {
   return static_cast<StageDataDomain>(static_cast<std::uint16_t>(lhs) | static_cast<std::uint16_t>(rhs));
@@ -72,7 +75,7 @@ enum class StageActiveSetFamily : std::uint8_t {
   kRestartState = 7,
 };
 enum class StageSafety : std::uint8_t { kUnsafe = 0, kSafe = 1 };
-enum class StageSubsystem : std::uint8_t { kCore = 0, kGravity = 1, kHydro = 2, kSources = 3, kAnalysis = 4, kOutput = 5 };
+enum class StageSubsystem : std::uint8_t { kCore = 0, kGravity = 1, kHydro = 2, kSources = 3, kAnalysis = 4, kOutput = 5, kMhd = 6 };
 struct StageContract {
   IntegrationStage stage = IntegrationStage::kGravityKickPre;
   StageDataDomain required_inputs = StageDataDomain::kNone;

@@ -349,6 +349,52 @@ bool TracerParticleSidecar::isConsistent() const noexcept {
   return true;
 }
 
+bool MagneticFaceSoa::isConsistent() const noexcept {
+  if (patches.empty()) {
+    return face_flux_x_comoving.empty() && face_flux_y_comoving.empty() &&
+        face_flux_z_comoving.empty();
+  }
+  // Offsets are concatenation cursors; each record's slice must lie entirely
+  // inside its lane and the records must tile the lanes in order.
+  std::uint64_t expected_x = 0U;
+  std::uint64_t expected_y = 0U;
+  std::uint64_t expected_z = 0U;
+  for (const MagneticFacePatchRecord& patch : patches) {
+    if (patch.nx == 0U || patch.ny == 0U || patch.nz == 0U) {
+      return false;
+    }
+    if (!(patch.cell_width_x_comoving > 0.0) || !(patch.cell_width_y_comoving > 0.0) ||
+        !(patch.cell_width_z_comoving > 0.0)) {
+      return false;
+    }
+    if (!std::isfinite(patch.origin_x_comoving) || !std::isfinite(patch.origin_y_comoving) ||
+        !std::isfinite(patch.origin_z_comoving)) {
+      return false;
+    }
+    const std::uint64_t nx = patch.nx;
+    const std::uint64_t ny = patch.ny;
+    const std::uint64_t nz = patch.nz;
+    const std::uint64_t count_x = (nx + 1U) * ny * nz;
+    const std::uint64_t count_y = nx * (ny + 1U) * nz;
+    const std::uint64_t count_z = nx * ny * (nz + 1U);
+    if (patch.flux_x_offset != expected_x || patch.flux_y_offset != expected_y ||
+        patch.flux_z_offset != expected_z) {
+      return false;
+    }
+    if (count_x > std::numeric_limits<std::uint64_t>::max() - expected_x ||
+        count_y > std::numeric_limits<std::uint64_t>::max() - expected_y ||
+        count_z > std::numeric_limits<std::uint64_t>::max() - expected_z) {
+      return false;
+    }
+    expected_x += count_x;
+    expected_y += count_y;
+    expected_z += count_z;
+  }
+  return face_flux_x_comoving.size() == expected_x &&
+      face_flux_y_comoving.size() == expected_y &&
+      face_flux_z_comoving.size() == expected_z;
+}
+
 void PatchSoa::resize(std::size_t count) {
   (void)checkedLocalCount(count, kMaxLocalPatchCount, "AMR patch", "PatchSoa::resize");
   patch_id.resize(count);

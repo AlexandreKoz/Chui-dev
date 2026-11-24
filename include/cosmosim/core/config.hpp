@@ -57,6 +57,194 @@ enum class HydroDualEnergyConfigMode {
   kThermalFraction,
 };
 
+// CHUI-MHD-REF-v1 reference selectors. These are core-owned configuration
+// enums so core never includes an MHD header; the workflow maps them onto
+// cosmosim::mhd types. Defaults preserve the MHD-disabled hydro path exactly.
+enum class MhdReferenceProfile {
+  kIdeal,
+  kNonIdeal,
+};
+
+enum class MhdMagneticRepresentation {
+  kFaceFluxCt,
+};
+
+enum class MhdSpatialMethod {
+  kFiniteVolumeUnsplit,
+};
+
+enum class MhdReconstructionConfigMode {
+  kPlmMc,
+  kPpm,
+};
+
+enum class MhdRiemannSolverConfigMode {
+  kHlld,
+  kHlle,
+};
+
+enum class MhdRiemannFallbackConfigMode {
+  kHlle,
+};
+
+enum class MhdEmfSchemeConfigMode {
+  kUctHll,
+};
+
+enum class MhdTimeIntegratorConfigMode {
+  kSsprk2,
+};
+
+enum class MhdDivergencePolicyConfigMode {
+  kStrictCt,
+};
+
+enum class MhdPrecisionConfigMode {
+  kFloat64,
+};
+
+enum class MhdNonIdealIntegrationConfigMode {
+  kStrangDhihd,
+};
+
+enum class MhdDiffusionIntegratorConfigMode {
+  kAutoRkl2,
+};
+
+enum class MhdHallIntegratorConfigMode {
+  kExplicitHllSsprk2,
+};
+
+// `kNone` is an internal sentinel used only by the performance profile that
+// disables non-ideal transport; runnable non-ideal profiles always name a real
+// provider. It is serialized as `none` and is rejected when non-ideal is on.
+enum class MhdCoefficientProviderConfigMode {
+  kNone,
+  kConstant,
+  kTable,
+  kChemistry,
+};
+
+enum class MhdMagneticTransferConfigMode {
+  kTothRoeCompatible,
+};
+
+enum class MhdEmfRefluxConfigMode {
+  kCurl,
+};
+
+enum class MhdScienceBFieldConfigMode {
+  kDerivedCellCenter,
+};
+
+enum class MhdInitialFieldFormatConfigMode {
+  kFaceFlux,
+};
+
+enum class MhdInputProjectionConfigMode {
+  kReject,
+};
+
+enum class MhdPerformanceProfile {
+  kWorkstation48gibV01,
+  kClusterV01,
+  kGpu8gibV01,
+};
+
+// CHUI-MHD-REF-v1 sections 12 and CHUI-MHD-PERF-v1 section 17. Keys are flat
+// canonical `section.key` entries in the existing typed .param.txt registry;
+// there is no second configuration parser.
+struct MhdConfig {
+  bool enabled = false;
+  MhdReferenceProfile reference_profile = MhdReferenceProfile::kIdeal;
+  MhdMagneticRepresentation magnetic_representation =
+      MhdMagneticRepresentation::kFaceFluxCt;
+  MhdSpatialMethod spatial_method = MhdSpatialMethod::kFiniteVolumeUnsplit;
+  MhdReconstructionConfigMode reconstruction = MhdReconstructionConfigMode::kPpm;
+  MhdRiemannSolverConfigMode riemann_solver = MhdRiemannSolverConfigMode::kHlld;
+  MhdRiemannFallbackConfigMode riemann_fallback =
+      MhdRiemannFallbackConfigMode::kHlle;
+  MhdEmfSchemeConfigMode emf_scheme = MhdEmfSchemeConfigMode::kUctHll;
+  MhdTimeIntegratorConfigMode time_integrator = MhdTimeIntegratorConfigMode::kSsprk2;
+  MhdDivergencePolicyConfigMode divergence_policy =
+      MhdDivergencePolicyConfigMode::kStrictCt;
+  MhdPrecisionConfigMode precision = MhdPrecisionConfigMode::kFloat64;
+  double cfl_ideal = 0.30;
+  double cfl_diffusion = 0.15;
+  double cfl_hall = 0.10;
+  int max_step_retries = 8;
+  double fallback_fraction_limit = 1.0e-3;
+  double floor_energy_fraction_limit = 1.0e-8;
+  bool deterministic = true;
+
+  struct NonIdeal {
+    bool enabled = false;
+    bool ohmic_enabled = false;
+    bool ambipolar_enabled = false;
+    bool hall_enabled = false;
+    MhdNonIdealIntegrationConfigMode integration =
+        MhdNonIdealIntegrationConfigMode::kStrangDhihd;
+    MhdDiffusionIntegratorConfigMode diffusion_integrator =
+        MhdDiffusionIntegratorConfigMode::kAutoRkl2;
+    MhdHallIntegratorConfigMode hall_integrator =
+        MhdHallIntegratorConfigMode::kExplicitHllSsprk2;
+    int rkl_switch_ratio = 4;
+    int rkl_max_stages = 128;
+    MhdCoefficientProviderConfigMode coefficient_provider =
+        MhdCoefficientProviderConfigMode::kConstant;
+    std::string coefficient_table_path;
+    double eta_ohmic_phys_cgs = 0.0;
+    double eta_hall_phys_cgs = 0.0;
+    double eta_ambipolar_phys_cgs = 0.0;
+    std::string composition_id;
+    std::string grain_model_id;
+    std::string expected_table_sha256;
+  } nonideal;
+
+  struct Amr {
+    int refinement_ratio = 2;
+    MhdMagneticTransferConfigMode magnetic_transfer =
+        MhdMagneticTransferConfigMode::kTothRoeCompatible;
+    MhdEmfRefluxConfigMode emf_reflux = MhdEmfRefluxConfigMode::kCurl;
+    bool distributed_subcycling = false;
+    bool checkpoint_sync_only = true;
+  } amr;
+
+  struct Io {
+    MhdScienceBFieldConfigMode science_b_field =
+        MhdScienceBFieldConfigMode::kDerivedCellCenter;
+    bool checkpoint_face_flux = true;
+    MhdInitialFieldFormatConfigMode initial_field_format =
+        MhdInitialFieldFormatConfigMode::kFaceFlux;
+    MhdInputProjectionConfigMode input_projection =
+        MhdInputProjectionConfigMode::kReject;
+    bool output_divergence_diagnostics = true;
+  } io;
+
+  struct Performance {
+    MhdPerformanceProfile profile = MhdPerformanceProfile::kWorkstation48gibV01;
+    int patch_probe_size = 32;
+    std::uint64_t patch_tile_target_cells = 32768U;
+    int ppm_ghost_cells = 3;
+    int plm_ghost_cells = 2;
+    int active_batch_target_patches = 8;
+    std::uint64_t mhd_scratch_max_bytes_per_active_cell = 512U;
+    std::uint64_t mhd_comm_budget_mib_per_rank = 64U;
+    std::uint64_t mhd_comm_max_mib_per_rank = 128U;
+    std::uint64_t mhd_io_chunk_mib_per_rank = 8U;
+    std::int32_t hall_subcycle_cost_cap_per_level_interval = 4096;
+    std::int32_t rkl_stage_cost_cap_per_level_interval = 4096;
+    bool stage_arena_null_upstream = true;
+    bool track_rank_max_memory = true;
+    bool track_phase_high_water = true;
+    bool track_mpi_bytes = true;
+    bool record_time_to_accuracy = true;
+    bool optional_gpu_backend = false;
+    std::uint64_t gpu_device_target_mib = 6144U;
+    bool allow_untracked_allocations = false;
+  } performance;
+};
+
 // CHUI Part 3: stellar wind / pre-SN mechanical channel.
 enum class SspWindModelConfig {
   kNone,
@@ -1044,6 +1232,7 @@ struct SimulationConfig final {
   AnalysisConfig analysis;
   UnitsConfig units;
   ModeConfig mode;
+  MhdConfig mhd;
   CompatibilityConfig compatibility;
 
  private:
@@ -1129,6 +1318,34 @@ void writeNormalizedConfigSnapshot(
 [[nodiscard]] std::string hydroIntegrationModeToString(HydroIntegrationMode mode);
 [[nodiscard]] std::string hydroRiemannSolverModeToString(HydroRiemannSolverMode mode);
 [[nodiscard]] std::string hydroDualEnergyConfigModeToString(HydroDualEnergyConfigMode mode);
+[[nodiscard]] std::string mhdReferenceProfileToString(MhdReferenceProfile value);
+[[nodiscard]] std::string mhdMagneticRepresentationToString(MhdMagneticRepresentation value);
+[[nodiscard]] std::string mhdSpatialMethodToString(MhdSpatialMethod value);
+[[nodiscard]] std::string mhdReconstructionConfigModeToString(MhdReconstructionConfigMode value);
+[[nodiscard]] std::string mhdRiemannSolverConfigModeToString(MhdRiemannSolverConfigMode value);
+[[nodiscard]] std::string mhdRiemannFallbackConfigModeToString(MhdRiemannFallbackConfigMode value);
+[[nodiscard]] std::string mhdEmfSchemeConfigModeToString(MhdEmfSchemeConfigMode value);
+[[nodiscard]] std::string mhdTimeIntegratorConfigModeToString(MhdTimeIntegratorConfigMode value);
+[[nodiscard]] std::string mhdDivergencePolicyConfigModeToString(MhdDivergencePolicyConfigMode value);
+[[nodiscard]] std::string mhdPrecisionConfigModeToString(MhdPrecisionConfigMode value);
+[[nodiscard]] std::string mhdNonIdealIntegrationConfigModeToString(
+    MhdNonIdealIntegrationConfigMode value);
+[[nodiscard]] std::string mhdDiffusionIntegratorConfigModeToString(
+    MhdDiffusionIntegratorConfigMode value);
+[[nodiscard]] std::string mhdHallIntegratorConfigModeToString(
+    MhdHallIntegratorConfigMode value);
+[[nodiscard]] std::string mhdCoefficientProviderConfigModeToString(
+    MhdCoefficientProviderConfigMode value);
+[[nodiscard]] std::string mhdMagneticTransferConfigModeToString(
+    MhdMagneticTransferConfigMode value);
+[[nodiscard]] std::string mhdEmfRefluxConfigModeToString(MhdEmfRefluxConfigMode value);
+[[nodiscard]] std::string mhdScienceBFieldConfigModeToString(
+    MhdScienceBFieldConfigMode value);
+[[nodiscard]] std::string mhdInitialFieldFormatConfigModeToString(
+    MhdInitialFieldFormatConfigMode value);
+[[nodiscard]] std::string mhdInputProjectionConfigModeToString(
+    MhdInputProjectionConfigMode value);
+[[nodiscard]] std::string mhdPerformanceProfileToString(MhdPerformanceProfile value);
 [[nodiscard]] std::string amrRegridConfigModeToString(AmrRegridConfigMode mode);
 [[nodiscard]] std::string amrForceResolutionPolicyToString(AmrForceResolutionPolicy mode);
 [[nodiscard]] std::string v02ControlModeToString(V02ControlMode mode);

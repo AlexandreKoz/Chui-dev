@@ -354,6 +354,59 @@ struct PatchSoa {
   [[nodiscard]] bool isConsistent() const noexcept;
 };
 
+// Authoritative persistent face-integrated comoving magnetic flux for MHD runs.
+// This is a core-owned storage lane: it records shapes and bytes only, never an
+// MHD algorithm or a second cell-centred magnetic authority. The MHD module
+// (cosmosim::mhd) reads/writes it through documented offsets. A patch record is
+// keyed by (patch_id, geometry_generation); the flux lanes are concatenated per
+// axis with the offsets stored in each record. Empty for non-MHD runs.
+struct MagneticFacePatchRecord {
+  std::uint64_t patch_id = 0U;
+  std::uint64_t geometry_generation = 0U;
+  std::int32_t level = 0;
+  std::uint32_t nx = 0U;
+  std::uint32_t ny = 0U;
+  std::uint32_t nz = 0U;
+  double origin_x_comoving = 0.0;
+  double origin_y_comoving = 0.0;
+  double origin_z_comoving = 0.0;
+  double cell_width_x_comoving = 0.0;
+  double cell_width_y_comoving = 0.0;
+  double cell_width_z_comoving = 0.0;
+  std::uint64_t flux_x_offset = 0U;
+  std::uint64_t flux_y_offset = 0U;
+  std::uint64_t flux_z_offset = 0U;
+};
+
+struct MagneticFaceSoa {
+  // Schema contract identifier written to restart/snapshot provenance.
+  std::string contract = "chui_mhd_face_flux_v1";
+  // Optional SHA-256 of the coefficient/provider table used for the run.
+  std::string coefficient_table_sha256;
+  // Divergence diagnostic at the last committed step (dimensionless).
+  double divergence_max_normalized = 0.0;
+  std::vector<MagneticFacePatchRecord> patches;
+  // Flat authoritative flux lanes (comoving code units); sizes are inferred
+  // from the patch records and must match exactly.
+  AlignedVector<double> face_flux_x_comoving;
+  AlignedVector<double> face_flux_y_comoving;
+  AlignedVector<double> face_flux_z_comoving;
+
+  [[nodiscard]] bool empty() const noexcept {
+    return patches.empty() && face_flux_x_comoving.empty() &&
+        face_flux_y_comoving.empty() && face_flux_z_comoving.empty();
+  }
+  void clear() noexcept {
+    patches.clear();
+    face_flux_x_comoving.clear();
+    face_flux_y_comoving.clear();
+    face_flux_z_comoving.clear();
+    coefficient_table_sha256.clear();
+    divergence_max_normalized = 0.0;
+  }
+  [[nodiscard]] bool isConsistent() const noexcept;
+};
+
 struct SpeciesContainer {
   // Explicit species counts; used as an auditable ownership ledger.
   std::array<std::uint64_t, k_particle_species_count> count_by_species{};
@@ -938,6 +991,8 @@ class SimulationState {
   // synchronized from this map for particle-bound import/restart paths.
   GasCellIdentityMap gas_cell_identity;
   PatchSoa patches;
+  // Authoritative persistent MHD face-integrated flux (empty for non-MHD runs).
+  MagneticFaceSoa magnetic_faces;
   // Restart-authoritative AMR hydro deferred synchronization state.
   PendingFluxRegisterStore pending_flux_registers;
   // Restart-authoritative coarse temporal boundary intervals retained while

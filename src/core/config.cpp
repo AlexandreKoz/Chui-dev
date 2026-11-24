@@ -704,6 +704,173 @@ parseInitialConditionMissingFieldPolicy(
                     "' (expected off or thermal_fraction)");
 }
 
+[[nodiscard]] MhdReferenceProfile parseMhdReferenceProfile(const std::string& value) {
+  const std::string lower = toLower(trim(value));
+  if (lower == "mhd_ref_ideal_v01") return MhdReferenceProfile::kIdeal;
+  if (lower == "mhd_ref_nonideal_v01") return MhdReferenceProfile::kNonIdeal;
+  throw ConfigError("key 'mhd.reference_profile': invalid value '" + value +
+                    "' (expected mhd_ref_ideal_v01 or mhd_ref_nonideal_v01)");
+}
+
+[[nodiscard]] MhdMagneticRepresentation parseMhdMagneticRepresentation(
+    const std::string& value) {
+  const std::string lower = toLower(trim(value));
+  if (lower == "face_flux_ct") return MhdMagneticRepresentation::kFaceFluxCt;
+  throw ConfigError("key 'mhd.magnetic_representation': invalid value '" + value +
+                    "' (only face_flux_ct is supported; cell-centered authority is rejected)");
+}
+
+[[nodiscard]] MhdSpatialMethod parseMhdSpatialMethod(const std::string& value) {
+  const std::string lower = toLower(trim(value));
+  if (lower == "finite_volume_unsplit") return MhdSpatialMethod::kFiniteVolumeUnsplit;
+  throw ConfigError("key 'mhd.spatial_method': invalid value '" + value +
+                    "' (only finite_volume_unsplit is supported)");
+}
+
+[[nodiscard]] MhdReconstructionConfigMode parseMhdReconstructionConfigMode(
+    const std::string& value) {
+  const std::string lower = toLower(trim(value));
+  if (lower == "plm_mc") return MhdReconstructionConfigMode::kPlmMc;
+  if (lower == "ppm") return MhdReconstructionConfigMode::kPpm;
+  throw ConfigError("key 'mhd.reconstruction': invalid value '" + value +
+                    "' (expected plm_mc or ppm)");
+}
+
+[[nodiscard]] MhdRiemannSolverConfigMode parseMhdRiemannSolverConfigMode(
+    const std::string& value) {
+  const std::string lower = toLower(trim(value));
+  if (lower == "hlld") return MhdRiemannSolverConfigMode::kHlld;
+  if (lower == "hlle") return MhdRiemannSolverConfigMode::kHlle;
+  throw ConfigError("key 'mhd.riemann_solver': invalid value '" + value +
+                    "' (expected hlld or hlle)");
+}
+
+[[nodiscard]] MhdRiemannFallbackConfigMode parseMhdRiemannFallbackConfigMode(
+    const std::string& value) {
+  const std::string lower = toLower(trim(value));
+  if (lower == "hlle") return MhdRiemannFallbackConfigMode::kHlle;
+  throw ConfigError("key 'mhd.riemann_fallback': invalid value '" + value +
+                    "' (only hlle is supported)");
+}
+
+[[nodiscard]] MhdEmfSchemeConfigMode parseMhdEmfSchemeConfigMode(const std::string& value) {
+  const std::string lower = toLower(trim(value));
+  if (lower == "uct_hll") return MhdEmfSchemeConfigMode::kUctHll;
+  throw ConfigError("key 'mhd.emf_scheme': invalid value '" + value +
+                    "' (only uct_hll is supported)");
+}
+
+[[nodiscard]] MhdTimeIntegratorConfigMode parseMhdTimeIntegratorConfigMode(
+    const std::string& value) {
+  const std::string lower = toLower(trim(value));
+  if (lower == "ssprk2") return MhdTimeIntegratorConfigMode::kSsprk2;
+  throw ConfigError("key 'mhd.time_integrator': invalid value '" + value +
+                    "' (only ssprk2 is supported)");
+}
+
+[[nodiscard]] MhdDivergencePolicyConfigMode parseMhdDivergencePolicyConfigMode(
+    const std::string& value) {
+  const std::string lower = toLower(trim(value));
+  if (lower == "strict_ct") return MhdDivergencePolicyConfigMode::kStrictCt;
+  throw ConfigError("key 'mhd.divergence_policy': invalid value '" + value +
+                    "' (only strict_ct is supported)");
+}
+
+[[nodiscard]] MhdPrecisionConfigMode parseMhdPrecisionConfigMode(const std::string& value) {
+  const std::string lower = toLower(trim(value));
+  if (lower == "float64") return MhdPrecisionConfigMode::kFloat64;
+  throw ConfigError("key 'mhd.precision': invalid value '" + value +
+                    "' (only float64 is supported; no silent precision downgrade)");
+}
+
+[[nodiscard]] MhdNonIdealIntegrationConfigMode parseMhdNonIdealIntegrationConfigMode(
+    const std::string& value) {
+  const std::string lower = toLower(trim(value));
+  if (lower == "strang_d_h_i_h_d") return MhdNonIdealIntegrationConfigMode::kStrangDhihd;
+  throw ConfigError("key 'mhd_nonideal.integration': invalid value '" + value +
+                    "' (only strang_d_h_i_h_d is supported)");
+}
+
+[[nodiscard]] MhdDiffusionIntegratorConfigMode parseMhdDiffusionIntegratorConfigMode(
+    const std::string& value) {
+  const std::string lower = toLower(trim(value));
+  if (lower == "auto_rkl2") return MhdDiffusionIntegratorConfigMode::kAutoRkl2;
+  throw ConfigError("key 'mhd_nonideal.diffusion_integrator': invalid value '" + value +
+                    "' (only auto_rkl2 is supported)");
+}
+
+[[nodiscard]] MhdHallIntegratorConfigMode parseMhdHallIntegratorConfigMode(
+    const std::string& value) {
+  const std::string lower = toLower(trim(value));
+  if (lower == "explicit_hll_ssprk2") {
+    return MhdHallIntegratorConfigMode::kExplicitHllSsprk2;
+  }
+  throw ConfigError("key 'mhd_nonideal.hall_integrator': invalid value '" + value +
+                    "' (only explicit_hll_ssprk2 is supported)");
+}
+
+[[nodiscard]] MhdCoefficientProviderConfigMode parseMhdCoefficientProviderConfigMode(
+    const std::string& value) {
+  const std::string lower = toLower(trim(value));
+  if (lower == "constant") return MhdCoefficientProviderConfigMode::kConstant;
+  if (lower == "table") return MhdCoefficientProviderConfigMode::kTable;
+  if (lower == "chemistry") return MhdCoefficientProviderConfigMode::kChemistry;
+  throw ConfigError("key 'mhd_nonideal.coefficient_provider': invalid value '" + value +
+                    "' (expected constant, table, or chemistry)");
+}
+
+[[nodiscard]] MhdMagneticTransferConfigMode parseMhdMagneticTransferConfigMode(
+    const std::string& value) {
+  const std::string lower = toLower(trim(value));
+  if (lower == "toth_roe_compatible") {
+    return MhdMagneticTransferConfigMode::kTothRoeCompatible;
+  }
+  throw ConfigError("key 'mhd_amr.magnetic_transfer': invalid value '" + value +
+                    "' (only toth_roe_compatible is supported)");
+}
+
+[[nodiscard]] MhdEmfRefluxConfigMode parseMhdEmfRefluxConfigMode(const std::string& value) {
+  const std::string lower = toLower(trim(value));
+  if (lower == "curl") return MhdEmfRefluxConfigMode::kCurl;
+  throw ConfigError("key 'mhd_amr.emf_reflux': invalid value '" + value +
+                    "' (only curl is supported)");
+}
+
+[[nodiscard]] MhdScienceBFieldConfigMode parseMhdScienceBFieldConfigMode(
+    const std::string& value) {
+  const std::string lower = toLower(trim(value));
+  if (lower == "derived_cell_center") {
+    return MhdScienceBFieldConfigMode::kDerivedCellCenter;
+  }
+  throw ConfigError("key 'mhd_io.science_b_field': invalid value '" + value +
+                    "' (only derived_cell_center is supported)");
+}
+
+[[nodiscard]] MhdInitialFieldFormatConfigMode parseMhdInitialFieldFormatConfigMode(
+    const std::string& value) {
+  const std::string lower = toLower(trim(value));
+  if (lower == "face_flux") return MhdInitialFieldFormatConfigMode::kFaceFlux;
+  throw ConfigError("key 'mhd_io.initial_field_format': invalid value '" + value +
+                    "' (only face_flux is supported)");
+}
+
+[[nodiscard]] MhdInputProjectionConfigMode parseMhdInputProjectionConfigMode(
+    const std::string& value) {
+  const std::string lower = toLower(trim(value));
+  if (lower == "reject") return MhdInputProjectionConfigMode::kReject;
+  throw ConfigError("key 'mhd_io.input_projection': invalid value '" + value +
+                    "' (only reject is supported; no implicit divergence projection)");
+}
+
+[[nodiscard]] MhdPerformanceProfile parseMhdPerformanceProfile(const std::string& value) {
+  const std::string lower = toLower(trim(value));
+  if (lower == "workstation_48gib_v01") return MhdPerformanceProfile::kWorkstation48gibV01;
+  if (lower == "cluster_v01") return MhdPerformanceProfile::kClusterV01;
+  if (lower == "gpu_8gib_v01") return MhdPerformanceProfile::kGpu8gibV01;
+  throw ConfigError("key 'mhd_performance.profile': invalid value '" + value +
+                    "' (expected workstation_48gib_v01, cluster_v01, or gpu_8gib_v01)");
+}
+
 [[nodiscard]] SspWindModelConfig parseSspWindModelConfig(const std::string& value) {
   const std::string lower = toLower(trim(value));
   if (lower == "none") return SspWindModelConfig::kNone;
@@ -1818,6 +1985,71 @@ struct ConfigKeySpec {
       {"analysis.halo_include_stars", "true"},
       {"analysis.halo_include_black_holes", "true"},
       {"compatibility.allow_unknown_keys", "false"},
+      {"mhd.enabled", "false"},
+      {"mhd.reference_profile", "mhd_ref_ideal_v01"},
+      {"mhd.magnetic_representation", "face_flux_ct"},
+      {"mhd.spatial_method", "finite_volume_unsplit"},
+      {"mhd.reconstruction", "ppm"},
+      {"mhd.riemann_solver", "hlld"},
+      {"mhd.riemann_fallback", "hlle"},
+      {"mhd.emf_scheme", "uct_hll"},
+      {"mhd.time_integrator", "ssprk2"},
+      {"mhd.divergence_policy", "strict_ct"},
+      {"mhd.precision", "float64"},
+      {"mhd.cfl_ideal", "0.3"},
+      {"mhd.cfl_diffusion", "0.15"},
+      {"mhd.cfl_hall", "0.1"},
+      {"mhd.max_step_retries", "8"},
+      {"mhd.fallback_fraction_limit", "0.001"},
+      {"mhd.floor_energy_fraction_limit", "1e-8"},
+      {"mhd.deterministic", "true"},
+      {"mhd_nonideal.enabled", "false"},
+      {"mhd_nonideal.ohmic_enabled", "false"},
+      {"mhd_nonideal.ambipolar_enabled", "false"},
+      {"mhd_nonideal.hall_enabled", "false"},
+      {"mhd_nonideal.integration", "strang_d_h_i_h_d"},
+      {"mhd_nonideal.diffusion_integrator", "auto_rkl2"},
+      {"mhd_nonideal.hall_integrator", "explicit_hll_ssprk2"},
+      {"mhd_nonideal.rkl_switch_ratio", "4"},
+      {"mhd_nonideal.rkl_max_stages", "128"},
+      {"mhd_nonideal.coefficient_provider", "constant"},
+      {"mhd_nonideal.coefficient_table_path", ""},
+      {"mhd_nonideal.eta_ohmic_phys_cgs", "0"},
+      {"mhd_nonideal.eta_hall_phys_cgs", "0"},
+      {"mhd_nonideal.eta_ambipolar_phys_cgs", "0"},
+      {"mhd_nonideal.composition_id", ""},
+      {"mhd_nonideal.grain_model_id", ""},
+      {"mhd_nonideal.expected_table_sha256", ""},
+      {"mhd_amr.refinement_ratio", "2"},
+      {"mhd_amr.magnetic_transfer", "toth_roe_compatible"},
+      {"mhd_amr.emf_reflux", "curl"},
+      {"mhd_amr.distributed_subcycling", "false"},
+      {"mhd_amr.checkpoint_sync_only", "true"},
+      {"mhd_io.science_b_field", "derived_cell_center"},
+      {"mhd_io.checkpoint_face_flux", "true"},
+      {"mhd_io.initial_field_format", "face_flux"},
+      {"mhd_io.input_projection", "reject"},
+      {"mhd_io.output_divergence_diagnostics", "true"},
+      {"mhd_performance.profile", "workstation_48gib_v01"},
+      {"mhd_performance.patch_probe_size", "32"},
+      {"mhd_performance.patch_tile_target_cells", "32768"},
+      {"mhd_performance.ppm_ghost_cells", "3"},
+      {"mhd_performance.plm_ghost_cells", "2"},
+      {"mhd_performance.active_batch_target_patches", "8"},
+      {"mhd_performance.mhd_scratch_max_bytes_per_active_cell", "512"},
+      {"mhd_performance.mhd_comm_budget_mib_per_rank", "64"},
+      {"mhd_performance.mhd_comm_max_mib_per_rank", "128"},
+      {"mhd_performance.mhd_io_chunk_mib_per_rank", "8"},
+      {"mhd_performance.hall_subcycle_cost_cap_per_level_interval", "4096"},
+      {"mhd_performance.rkl_stage_cost_cap_per_level_interval", "4096"},
+      {"mhd_performance.stage_arena_null_upstream", "true"},
+      {"mhd_performance.track_rank_max_memory", "true"},
+      {"mhd_performance.track_phase_high_water", "true"},
+      {"mhd_performance.track_mpi_bytes", "true"},
+      {"mhd_performance.record_time_to_accuracy", "true"},
+      {"mhd_performance.optional_gpu_backend", "false"},
+      {"mhd_performance.gpu_device_target_mib", "6144"},
+      {"mhd_performance.allow_untracked_allocations", "false"},
   };
   return keys;
 }
@@ -2108,6 +2340,181 @@ void validatePart2BaryonicPhysics(const SimulationConfig& config) {
     throw ConfigError("fb_supernova_model=mechanical_resolved_unresolved consumes discrete SN events from a Part 2 stellar_population_model");
   }
 }
+
+namespace {
+
+// CHUI-MHD-REF-v1 section 12 and CHUI-MHD-PERF-v1 section 17 admission. Every
+// rule is explicit; an inconsistent magnetized profile never degrades into a
+// cheaper or non-magnetic path. MHD-disabled configurations are untouched.
+void validateMhdConfig(const MhdConfig& mhd) {
+  if (!mhd.enabled) {
+    if (mhd.nonideal.enabled || mhd.nonideal.ohmic_enabled ||
+        mhd.nonideal.ambipolar_enabled || mhd.nonideal.hall_enabled) {
+      throw ConfigError(
+          "mhd_nonideal.* requires mhd.enabled=true; non-ideal transport cannot "
+          "be requested on the non-magnetic hydro path");
+    }
+    return;
+  }
+  if (!(mhd.cfl_ideal > 0.0) || !(mhd.cfl_ideal < 1.0)) {
+    throw ConfigError("mhd.cfl_ideal must lie in (0,1)");
+  }
+  if (!(mhd.cfl_diffusion > 0.0) || !(mhd.cfl_diffusion < 1.0)) {
+    throw ConfigError("mhd.cfl_diffusion must lie in (0,1)");
+  }
+  if (!(mhd.cfl_hall > 0.0) || !(mhd.cfl_hall < 1.0)) {
+    throw ConfigError("mhd.cfl_hall must lie in (0,1)");
+  }
+  if (mhd.max_step_retries < 0 || mhd.max_step_retries > 8) {
+    throw ConfigError("mhd.max_step_retries must lie in [0,8]");
+  }
+  if (mhd.fallback_fraction_limit < 0.0 || mhd.fallback_fraction_limit > 1.0) {
+    throw ConfigError("mhd.fallback_fraction_limit must lie in [0,1]");
+  }
+  if (mhd.floor_energy_fraction_limit < 0.0) {
+    throw ConfigError("mhd.floor_energy_fraction_limit must be >= 0");
+  }
+  if (mhd.reference_profile == MhdReferenceProfile::kIdeal) {
+    if (mhd.nonideal.enabled || mhd.nonideal.ohmic_enabled ||
+        mhd.nonideal.ambipolar_enabled || mhd.nonideal.hall_enabled) {
+      throw ConfigError(
+          "mhd.reference_profile=mhd_ref_ideal_v01 requires mhd_nonideal.enabled=false "
+          "and all mhd_nonideal operator flags false");
+    }
+  } else {
+    if (!mhd.nonideal.enabled) {
+      throw ConfigError(
+          "mhd.reference_profile=mhd_ref_nonideal_v01 requires mhd_nonideal.enabled=true");
+    }
+    if (!mhd.nonideal.ohmic_enabled && !mhd.nonideal.ambipolar_enabled &&
+        !mhd.nonideal.hall_enabled) {
+      throw ConfigError(
+          "mhd_ref_nonideal_v01 requires at least one of ohmic_enabled, "
+          "ambipolar_enabled, or hall_enabled");
+    }
+  }
+  if (mhd.nonideal.enabled) {
+    switch (mhd.nonideal.coefficient_provider) {
+      case MhdCoefficientProviderConfigMode::kTable:
+        if (mhd.nonideal.coefficient_table_path.empty()) {
+          throw ConfigError(
+              "mhd_nonideal.coefficient_provider=table requires a nonempty "
+              "coefficient_table_path");
+        }
+        break;
+      case MhdCoefficientProviderConfigMode::kConstant:
+        if (!mhd.nonideal.coefficient_table_path.empty()) {
+          throw ConfigError(
+              "mhd_nonideal.coefficient_provider=constant refuses a nonempty "
+              "coefficient_table_path; mixed coefficient authority is not allowed");
+        }
+        break;
+      case MhdCoefficientProviderConfigMode::kChemistry:
+        throw ConfigError(
+            "mhd_nonideal.coefficient_provider=chemistry is not admitted: the live "
+            "chemisty system does not yet expose the complete charged-species, "
+            "collision-rate, charge-neutrality and grain property contract required "
+            "by CHUI-MHD-REF-v1");
+      case MhdCoefficientProviderConfigMode::kNone:
+        throw ConfigError(
+            "mhd_nonideal.enabled requires a real coefficient provider "
+            "(constant or table)");
+    }
+    if (!std::isfinite(mhd.nonideal.eta_ohmic_phys_cgs) ||
+        !std::isfinite(mhd.nonideal.eta_hall_phys_cgs) ||
+        !std::isfinite(mhd.nonideal.eta_ambipolar_phys_cgs)) {
+      throw ConfigError("mhd_nonideal physical diffusivities must be finite");
+    }
+    if (mhd.nonideal.eta_ohmic_phys_cgs < 0.0) {
+      throw ConfigError("mhd_nonideal.eta_ohmic_phys_cgs must be >= 0");
+    }
+    if (mhd.nonideal.eta_ambipolar_phys_cgs < 0.0) {
+      throw ConfigError("mhd_nonideal.eta_ambipolar_phys_cgs must be >= 0");
+    }
+    if (mhd.nonideal.rkl_switch_ratio < 1 || mhd.nonideal.rkl_max_stages < 2) {
+      throw ConfigError("mhd_nonideal RKL switch ratio/stage limits are invalid");
+    }
+  }
+  if (mhd.amr.refinement_ratio != 2) {
+    throw ConfigError("mhd_amr.refinement_ratio must be 2 in the reference implementation");
+  }
+  if (mhd.amr.distributed_subcycling) {
+    throw ConfigError(
+        "mhd_amr.distributed_subcycling=true is not admitted in this source pass; "
+        "MHD synchronized distributed AMR is the compulsory reference tier");
+  }
+  if (!mhd.amr.checkpoint_sync_only) {
+    throw ConfigError(
+        "mhd_amr.checkpoint_sync_only must be true: MHD checkpoints are written only "
+        "at globally agreed safe synchronization boundaries");
+  }
+  if (!mhd.io.checkpoint_face_flux) {
+    throw ConfigError(
+        "mhd_io.checkpoint_face_flux must be true for exact MHD restart authority");
+  }
+  const MhdConfig::Performance& perf = mhd.performance;
+  if (perf.patch_probe_size != 16 && perf.patch_probe_size != 32 &&
+      perf.patch_probe_size != 64) {
+    throw ConfigError("mhd_performance.patch_probe_size must be 16, 32, or 64");
+  }
+  if (perf.patch_tile_target_cells == 0U) {
+    throw ConfigError("mhd_performance.patch_tile_target_cells must be > 0");
+  }
+  if (perf.ppm_ghost_cells != 3) {
+    throw ConfigError("mhd_performance.ppm_ghost_cells must be 3");
+  }
+  if (perf.plm_ghost_cells != 2) {
+    throw ConfigError("mhd_performance.plm_ghost_cells must be 2");
+  }
+  if (perf.active_batch_target_patches < 1 || perf.active_batch_target_patches > 8) {
+    throw ConfigError("mhd_performance.active_batch_target_patches must lie in [1,8]");
+  }
+  if (perf.mhd_scratch_max_bytes_per_active_cell == 0U ||
+      perf.mhd_scratch_max_bytes_per_active_cell > 512U) {
+    throw ConfigError(
+        "mhd_performance.mhd_scratch_max_bytes_per_active_cell must lie in [1,512]");
+  }
+  if (perf.mhd_comm_budget_mib_per_rank == 0U ||
+      perf.mhd_comm_budget_mib_per_rank > perf.mhd_comm_max_mib_per_rank) {
+    throw ConfigError(
+        "mhd_performance communication budget must be positive and <= the declared maximum");
+  }
+  if (perf.mhd_comm_max_mib_per_rank > 128U) {
+    throw ConfigError("mhd_performance.mhd_comm_max_mib_per_rank must be <= 128");
+  }
+  if (perf.mhd_io_chunk_mib_per_rank == 0U) {
+    throw ConfigError("mhd_performance.mhd_io_chunk_mib_per_rank must be > 0");
+  }
+  if (perf.hall_subcycle_cost_cap_per_level_interval <= 0 ||
+      perf.rkl_stage_cost_cap_per_level_interval <= 0) {
+    throw ConfigError("mhd_performance RKL/Hall cost caps must be > 0");
+  }
+  if (!perf.stage_arena_null_upstream) {
+    throw ConfigError(
+        "mhd_performance.stage_arena_null_upstream must be true; temporary arenas "
+        "cannot escape to an upstream allocator");
+  }
+  if (!perf.track_rank_max_memory || !perf.track_phase_high_water ||
+      !perf.track_mpi_bytes) {
+    throw ConfigError(
+        "mhd_performance memory/MPI telemetry switches are mandatory for MHD runs");
+  }
+  if (perf.allow_untracked_allocations) {
+    throw ConfigError(
+        "mhd_performance.allow_untracked_allocations must be false for every MHD run");
+  }
+  if (perf.profile == MhdPerformanceProfile::kGpu8gibV01) {
+    if (!perf.optional_gpu_backend) {
+      throw ConfigError(
+          "mhd_performance.profile=gpu_8gib_v01 requires optional_gpu_backend=true");
+    }
+  }
+  if (perf.optional_gpu_backend && perf.gpu_device_target_mib == 0U) {
+    throw ConfigError("mhd_performance.gpu_device_target_mib must be > 0");
+  }
+}
+
+}  // namespace
 
 void validateConfig(const SimulationConfig& config) {
   if (config.schema_version != 1) {
@@ -2717,6 +3124,7 @@ void validateConfig(const SimulationConfig& config) {
     throw ConfigError("physics.tracer_min_host_mass_code must be >= 0");
   }
   validatePart2BaryonicPhysics(config);
+  validateMhdConfig(config.mhd);
   if (config.cosmology.box_size_x_mpc_comoving <= 0.0 ||
       config.cosmology.box_size_y_mpc_comoving <= 0.0 ||
       config.cosmology.box_size_z_mpc_comoving <= 0.0) {
@@ -3705,6 +4113,150 @@ class NormalizedConfigStream {
   stream << "halo_include_stars = " << (frozen.config.analysis.halo_include_stars ? "true" : "false") << '\n';
   stream << "halo_include_black_holes = " << (frozen.config.analysis.halo_include_black_holes ? "true" : "false")
          << '\n';
+  stream << "\n[mhd]\n";
+  stream << "enabled = " << (frozen.config.mhd.enabled ? "true" : "false") << '\n';
+  stream << "reference_profile = "
+         << mhdReferenceProfileToString(frozen.config.mhd.reference_profile) << '\n';
+  stream << "magnetic_representation = "
+         << mhdMagneticRepresentationToString(frozen.config.mhd.magnetic_representation)
+         << '\n';
+  stream << "spatial_method = "
+         << mhdSpatialMethodToString(frozen.config.mhd.spatial_method) << '\n';
+  stream << "reconstruction = "
+         << mhdReconstructionConfigModeToString(frozen.config.mhd.reconstruction) << '\n';
+  stream << "riemann_solver = "
+         << mhdRiemannSolverConfigModeToString(frozen.config.mhd.riemann_solver) << '\n';
+  stream << "riemann_fallback = "
+         << mhdRiemannFallbackConfigModeToString(frozen.config.mhd.riemann_fallback) << '\n';
+  stream << "emf_scheme = "
+         << mhdEmfSchemeConfigModeToString(frozen.config.mhd.emf_scheme) << '\n';
+  stream << "time_integrator = "
+         << mhdTimeIntegratorConfigModeToString(frozen.config.mhd.time_integrator) << '\n';
+  stream << "divergence_policy = "
+         << mhdDivergencePolicyConfigModeToString(frozen.config.mhd.divergence_policy) << '\n';
+  stream << "precision = "
+         << mhdPrecisionConfigModeToString(frozen.config.mhd.precision) << '\n';
+  stream << "cfl_ideal = " << bridge_number(frozen.config.mhd.cfl_ideal) << '\n';
+  stream << "cfl_diffusion = " << bridge_number(frozen.config.mhd.cfl_diffusion) << '\n';
+  stream << "cfl_hall = " << bridge_number(frozen.config.mhd.cfl_hall) << '\n';
+  stream << "max_step_retries = " << frozen.config.mhd.max_step_retries << '\n';
+  stream << "fallback_fraction_limit = "
+         << bridge_number(frozen.config.mhd.fallback_fraction_limit) << '\n';
+  stream << "floor_energy_fraction_limit = "
+         << bridge_number(frozen.config.mhd.floor_energy_fraction_limit) << '\n';
+  stream << "deterministic = " << (frozen.config.mhd.deterministic ? "true" : "false")
+         << '\n';
+  stream << "\n[mhd_nonideal]\n";
+  stream << "enabled = "
+         << (frozen.config.mhd.nonideal.enabled ? "true" : "false") << '\n';
+  stream << "ohmic_enabled = "
+         << (frozen.config.mhd.nonideal.ohmic_enabled ? "true" : "false") << '\n';
+  stream << "ambipolar_enabled = "
+         << (frozen.config.mhd.nonideal.ambipolar_enabled ? "true" : "false") << '\n';
+  stream << "hall_enabled = "
+         << (frozen.config.mhd.nonideal.hall_enabled ? "true" : "false") << '\n';
+  stream << "integration = "
+         << mhdNonIdealIntegrationConfigModeToString(
+                frozen.config.mhd.nonideal.integration)
+         << '\n';
+  stream << "diffusion_integrator = "
+         << mhdDiffusionIntegratorConfigModeToString(
+                frozen.config.mhd.nonideal.diffusion_integrator)
+         << '\n';
+  stream << "hall_integrator = "
+         << mhdHallIntegratorConfigModeToString(frozen.config.mhd.nonideal.hall_integrator)
+         << '\n';
+  stream << "rkl_switch_ratio = " << frozen.config.mhd.nonideal.rkl_switch_ratio << '\n';
+  stream << "rkl_max_stages = " << frozen.config.mhd.nonideal.rkl_max_stages << '\n';
+  stream << "coefficient_provider = "
+         << mhdCoefficientProviderConfigModeToString(
+                frozen.config.mhd.nonideal.coefficient_provider)
+         << '\n';
+  stream << "coefficient_table_path = "
+         << frozen.config.mhd.nonideal.coefficient_table_path << '\n';
+  stream << "eta_ohmic_phys_cgs = "
+         << bridge_number(frozen.config.mhd.nonideal.eta_ohmic_phys_cgs) << '\n';
+  stream << "eta_hall_phys_cgs = "
+         << bridge_number(frozen.config.mhd.nonideal.eta_hall_phys_cgs) << '\n';
+  stream << "eta_ambipolar_phys_cgs = "
+         << bridge_number(frozen.config.mhd.nonideal.eta_ambipolar_phys_cgs) << '\n';
+  stream << "composition_id = " << frozen.config.mhd.nonideal.composition_id << '\n';
+  stream << "grain_model_id = " << frozen.config.mhd.nonideal.grain_model_id << '\n';
+  stream << "expected_table_sha256 = "
+         << frozen.config.mhd.nonideal.expected_table_sha256 << '\n';
+  stream << "\n[mhd_amr]\n";
+  stream << "refinement_ratio = " << frozen.config.mhd.amr.refinement_ratio << '\n';
+  stream << "magnetic_transfer = "
+         << mhdMagneticTransferConfigModeToString(frozen.config.mhd.amr.magnetic_transfer)
+         << '\n';
+  stream << "emf_reflux = "
+         << mhdEmfRefluxConfigModeToString(frozen.config.mhd.amr.emf_reflux) << '\n';
+  stream << "distributed_subcycling = "
+         << (frozen.config.mhd.amr.distributed_subcycling ? "true" : "false") << '\n';
+  stream << "checkpoint_sync_only = "
+         << (frozen.config.mhd.amr.checkpoint_sync_only ? "true" : "false") << '\n';
+  stream << "\n[mhd_io]\n";
+  stream << "science_b_field = "
+         << mhdScienceBFieldConfigModeToString(frozen.config.mhd.io.science_b_field)
+         << '\n';
+  stream << "checkpoint_face_flux = "
+         << (frozen.config.mhd.io.checkpoint_face_flux ? "true" : "false") << '\n';
+  stream << "initial_field_format = "
+         << mhdInitialFieldFormatConfigModeToString(
+                frozen.config.mhd.io.initial_field_format)
+         << '\n';
+  stream << "input_projection = "
+         << mhdInputProjectionConfigModeToString(frozen.config.mhd.io.input_projection)
+         << '\n';
+  stream << "output_divergence_diagnostics = "
+         << (frozen.config.mhd.io.output_divergence_diagnostics ? "true" : "false")
+         << '\n';
+  stream << "\n[mhd_performance]\n";
+  stream << "profile = "
+         << mhdPerformanceProfileToString(frozen.config.mhd.performance.profile) << '\n';
+  stream << "patch_probe_size = " << frozen.config.mhd.performance.patch_probe_size
+         << '\n';
+  stream << "patch_tile_target_cells = "
+         << frozen.config.mhd.performance.patch_tile_target_cells << '\n';
+  stream << "ppm_ghost_cells = " << frozen.config.mhd.performance.ppm_ghost_cells << '\n';
+  stream << "plm_ghost_cells = " << frozen.config.mhd.performance.plm_ghost_cells << '\n';
+  stream << "active_batch_target_patches = "
+         << frozen.config.mhd.performance.active_batch_target_patches << '\n';
+  stream << "mhd_scratch_max_bytes_per_active_cell = "
+         << frozen.config.mhd.performance.mhd_scratch_max_bytes_per_active_cell << '\n';
+  stream << "mhd_comm_budget_mib_per_rank = "
+         << frozen.config.mhd.performance.mhd_comm_budget_mib_per_rank << '\n';
+  stream << "mhd_comm_max_mib_per_rank = "
+         << frozen.config.mhd.performance.mhd_comm_max_mib_per_rank << '\n';
+  stream << "mhd_io_chunk_mib_per_rank = "
+         << frozen.config.mhd.performance.mhd_io_chunk_mib_per_rank << '\n';
+  stream << "hall_subcycle_cost_cap_per_level_interval = "
+         << frozen.config.mhd.performance.hall_subcycle_cost_cap_per_level_interval
+         << '\n';
+  stream << "rkl_stage_cost_cap_per_level_interval = "
+         << frozen.config.mhd.performance.rkl_stage_cost_cap_per_level_interval << '\n';
+  stream << "stage_arena_null_upstream = "
+         << (frozen.config.mhd.performance.stage_arena_null_upstream ? "true" : "false")
+         << '\n';
+  stream << "track_rank_max_memory = "
+         << (frozen.config.mhd.performance.track_rank_max_memory ? "true" : "false")
+         << '\n';
+  stream << "track_phase_high_water = "
+         << (frozen.config.mhd.performance.track_phase_high_water ? "true" : "false")
+         << '\n';
+  stream << "track_mpi_bytes = "
+         << (frozen.config.mhd.performance.track_mpi_bytes ? "true" : "false") << '\n';
+  stream << "record_time_to_accuracy = "
+         << (frozen.config.mhd.performance.record_time_to_accuracy ? "true" : "false")
+         << '\n';
+  stream << "optional_gpu_backend = "
+         << (frozen.config.mhd.performance.optional_gpu_backend ? "true" : "false")
+         << '\n';
+  stream << "gpu_device_target_mib = "
+         << frozen.config.mhd.performance.gpu_device_target_mib << '\n';
+  stream << "allow_untracked_allocations = "
+         << (frozen.config.mhd.performance.allow_untracked_allocations ? "true" : "false")
+         << '\n';
   stream << "\n[compatibility]\n";
   stream << "allow_unknown_keys = "
          << (frozen.config.compatibility.allow_unknown_keys ? "true" : "false") << '\n';
@@ -4081,6 +4633,215 @@ class NormalizedConfigStream {
       requireString(entries, consumed, "numerics.hydro_dual_energy_eta",
                     defaultFor("numerics.hydro_dual_energy_eta")),
       "numerics.hydro_dual_energy_eta");
+  frozen.config.mhd.enabled = parseBool(
+      requireString(entries, consumed, "mhd.enabled", defaultFor("mhd.enabled")),
+      "mhd.enabled");
+  frozen.config.mhd.reference_profile = parseMhdReferenceProfile(requireString(
+      entries, consumed, "mhd.reference_profile", defaultFor("mhd.reference_profile")));
+  frozen.config.mhd.magnetic_representation = parseMhdMagneticRepresentation(requireString(
+      entries, consumed, "mhd.magnetic_representation",
+      defaultFor("mhd.magnetic_representation")));
+  frozen.config.mhd.spatial_method = parseMhdSpatialMethod(requireString(
+      entries, consumed, "mhd.spatial_method", defaultFor("mhd.spatial_method")));
+  frozen.config.mhd.reconstruction = parseMhdReconstructionConfigMode(requireString(
+      entries, consumed, "mhd.reconstruction", defaultFor("mhd.reconstruction")));
+  frozen.config.mhd.riemann_solver = parseMhdRiemannSolverConfigMode(requireString(
+      entries, consumed, "mhd.riemann_solver", defaultFor("mhd.riemann_solver")));
+  frozen.config.mhd.riemann_fallback = parseMhdRiemannFallbackConfigMode(requireString(
+      entries, consumed, "mhd.riemann_fallback", defaultFor("mhd.riemann_fallback")));
+  frozen.config.mhd.emf_scheme = parseMhdEmfSchemeConfigMode(requireString(
+      entries, consumed, "mhd.emf_scheme", defaultFor("mhd.emf_scheme")));
+  frozen.config.mhd.time_integrator = parseMhdTimeIntegratorConfigMode(requireString(
+      entries, consumed, "mhd.time_integrator", defaultFor("mhd.time_integrator")));
+  frozen.config.mhd.divergence_policy = parseMhdDivergencePolicyConfigMode(requireString(
+      entries, consumed, "mhd.divergence_policy", defaultFor("mhd.divergence_policy")));
+  frozen.config.mhd.precision = parseMhdPrecisionConfigMode(requireString(
+      entries, consumed, "mhd.precision", defaultFor("mhd.precision")));
+  frozen.config.mhd.cfl_ideal = parseFloating(
+      requireString(entries, consumed, "mhd.cfl_ideal", defaultFor("mhd.cfl_ideal")),
+      "mhd.cfl_ideal");
+  frozen.config.mhd.cfl_diffusion = parseFloating(
+      requireString(entries, consumed, "mhd.cfl_diffusion", defaultFor("mhd.cfl_diffusion")),
+      "mhd.cfl_diffusion");
+  frozen.config.mhd.cfl_hall = parseFloating(
+      requireString(entries, consumed, "mhd.cfl_hall", defaultFor("mhd.cfl_hall")),
+      "mhd.cfl_hall");
+  frozen.config.mhd.max_step_retries = parseNumber<int>(requireString(
+      entries, consumed, "mhd.max_step_retries", defaultFor("mhd.max_step_retries")),
+      "mhd.max_step_retries");
+  frozen.config.mhd.fallback_fraction_limit = parseFloating(
+      requireString(entries, consumed, "mhd.fallback_fraction_limit",
+                    defaultFor("mhd.fallback_fraction_limit")),
+      "mhd.fallback_fraction_limit");
+  frozen.config.mhd.floor_energy_fraction_limit = parseFloating(
+      requireString(entries, consumed, "mhd.floor_energy_fraction_limit",
+                    defaultFor("mhd.floor_energy_fraction_limit")),
+      "mhd.floor_energy_fraction_limit");
+  frozen.config.mhd.deterministic = parseBool(
+      requireString(entries, consumed, "mhd.deterministic", defaultFor("mhd.deterministic")),
+      "mhd.deterministic");
+  frozen.config.mhd.nonideal.enabled = parseBool(requireString(
+      entries, consumed, "mhd_nonideal.enabled", defaultFor("mhd_nonideal.enabled")),
+      "mhd_nonideal.enabled");
+  frozen.config.mhd.nonideal.ohmic_enabled = parseBool(requireString(
+      entries, consumed, "mhd_nonideal.ohmic_enabled",
+      defaultFor("mhd_nonideal.ohmic_enabled")), "mhd_nonideal.ohmic_enabled");
+  frozen.config.mhd.nonideal.ambipolar_enabled = parseBool(requireString(
+      entries, consumed, "mhd_nonideal.ambipolar_enabled",
+      defaultFor("mhd_nonideal.ambipolar_enabled")), "mhd_nonideal.ambipolar_enabled");
+  frozen.config.mhd.nonideal.hall_enabled = parseBool(requireString(
+      entries, consumed, "mhd_nonideal.hall_enabled",
+      defaultFor("mhd_nonideal.hall_enabled")), "mhd_nonideal.hall_enabled");
+  frozen.config.mhd.nonideal.integration = parseMhdNonIdealIntegrationConfigMode(requireString(
+      entries, consumed, "mhd_nonideal.integration",
+      defaultFor("mhd_nonideal.integration")));
+  frozen.config.mhd.nonideal.diffusion_integrator =
+      parseMhdDiffusionIntegratorConfigMode(requireString(
+          entries, consumed, "mhd_nonideal.diffusion_integrator",
+          defaultFor("mhd_nonideal.diffusion_integrator")));
+  frozen.config.mhd.nonideal.hall_integrator = parseMhdHallIntegratorConfigMode(requireString(
+      entries, consumed, "mhd_nonideal.hall_integrator",
+      defaultFor("mhd_nonideal.hall_integrator")));
+  frozen.config.mhd.nonideal.rkl_switch_ratio = parseNumber<int>(requireString(
+      entries, consumed, "mhd_nonideal.rkl_switch_ratio",
+      defaultFor("mhd_nonideal.rkl_switch_ratio")), "mhd_nonideal.rkl_switch_ratio");
+  frozen.config.mhd.nonideal.rkl_max_stages = parseNumber<int>(requireString(
+      entries, consumed, "mhd_nonideal.rkl_max_stages",
+      defaultFor("mhd_nonideal.rkl_max_stages")), "mhd_nonideal.rkl_max_stages");
+  frozen.config.mhd.nonideal.coefficient_provider =
+      parseMhdCoefficientProviderConfigMode(requireString(
+          entries, consumed, "mhd_nonideal.coefficient_provider",
+          defaultFor("mhd_nonideal.coefficient_provider")));
+  frozen.config.mhd.nonideal.coefficient_table_path = requireString(
+      entries, consumed, "mhd_nonideal.coefficient_table_path",
+      defaultFor("mhd_nonideal.coefficient_table_path"));
+  frozen.config.mhd.nonideal.eta_ohmic_phys_cgs = parseFloating(requireString(
+      entries, consumed, "mhd_nonideal.eta_ohmic_phys_cgs",
+      defaultFor("mhd_nonideal.eta_ohmic_phys_cgs")), "mhd_nonideal.eta_ohmic_phys_cgs");
+  frozen.config.mhd.nonideal.eta_hall_phys_cgs = parseFloating(requireString(
+      entries, consumed, "mhd_nonideal.eta_hall_phys_cgs",
+      defaultFor("mhd_nonideal.eta_hall_phys_cgs")), "mhd_nonideal.eta_hall_phys_cgs");
+  frozen.config.mhd.nonideal.eta_ambipolar_phys_cgs = parseFloating(requireString(
+      entries, consumed, "mhd_nonideal.eta_ambipolar_phys_cgs",
+      defaultFor("mhd_nonideal.eta_ambipolar_phys_cgs")),
+      "mhd_nonideal.eta_ambipolar_phys_cgs");
+  frozen.config.mhd.nonideal.composition_id = requireString(
+      entries, consumed, "mhd_nonideal.composition_id",
+      defaultFor("mhd_nonideal.composition_id"));
+  frozen.config.mhd.nonideal.grain_model_id = requireString(
+      entries, consumed, "mhd_nonideal.grain_model_id",
+      defaultFor("mhd_nonideal.grain_model_id"));
+  frozen.config.mhd.nonideal.expected_table_sha256 = requireString(
+      entries, consumed, "mhd_nonideal.expected_table_sha256",
+      defaultFor("mhd_nonideal.expected_table_sha256"));
+  frozen.config.mhd.amr.refinement_ratio = parseNumber<int>(requireString(
+      entries, consumed, "mhd_amr.refinement_ratio",
+      defaultFor("mhd_amr.refinement_ratio")), "mhd_amr.refinement_ratio");
+  frozen.config.mhd.amr.magnetic_transfer = parseMhdMagneticTransferConfigMode(requireString(
+      entries, consumed, "mhd_amr.magnetic_transfer",
+      defaultFor("mhd_amr.magnetic_transfer")));
+  frozen.config.mhd.amr.emf_reflux = parseMhdEmfRefluxConfigMode(requireString(
+      entries, consumed, "mhd_amr.emf_reflux", defaultFor("mhd_amr.emf_reflux")));
+  frozen.config.mhd.amr.distributed_subcycling = parseBool(requireString(
+      entries, consumed, "mhd_amr.distributed_subcycling",
+      defaultFor("mhd_amr.distributed_subcycling")), "mhd_amr.distributed_subcycling");
+  frozen.config.mhd.amr.checkpoint_sync_only = parseBool(requireString(
+      entries, consumed, "mhd_amr.checkpoint_sync_only",
+      defaultFor("mhd_amr.checkpoint_sync_only")), "mhd_amr.checkpoint_sync_only");
+  frozen.config.mhd.io.science_b_field = parseMhdScienceBFieldConfigMode(requireString(
+      entries, consumed, "mhd_io.science_b_field",
+      defaultFor("mhd_io.science_b_field")));
+  frozen.config.mhd.io.checkpoint_face_flux = parseBool(requireString(
+      entries, consumed, "mhd_io.checkpoint_face_flux",
+      defaultFor("mhd_io.checkpoint_face_flux")), "mhd_io.checkpoint_face_flux");
+  frozen.config.mhd.io.initial_field_format = parseMhdInitialFieldFormatConfigMode(requireString(
+      entries, consumed, "mhd_io.initial_field_format",
+      defaultFor("mhd_io.initial_field_format")));
+  frozen.config.mhd.io.input_projection = parseMhdInputProjectionConfigMode(requireString(
+      entries, consumed, "mhd_io.input_projection",
+      defaultFor("mhd_io.input_projection")));
+  frozen.config.mhd.io.output_divergence_diagnostics = parseBool(requireString(
+      entries, consumed, "mhd_io.output_divergence_diagnostics",
+      defaultFor("mhd_io.output_divergence_diagnostics")),
+      "mhd_io.output_divergence_diagnostics");
+  frozen.config.mhd.performance.profile = parseMhdPerformanceProfile(requireString(
+      entries, consumed, "mhd_performance.profile",
+      defaultFor("mhd_performance.profile")));
+  frozen.config.mhd.performance.patch_probe_size = parseNumber<int>(requireString(
+      entries, consumed, "mhd_performance.patch_probe_size",
+      defaultFor("mhd_performance.patch_probe_size")), "mhd_performance.patch_probe_size");
+  frozen.config.mhd.performance.patch_tile_target_cells = parseNumber<std::uint64_t>(
+      requireString(entries, consumed, "mhd_performance.patch_tile_target_cells",
+                    defaultFor("mhd_performance.patch_tile_target_cells")),
+      "mhd_performance.patch_tile_target_cells");
+  frozen.config.mhd.performance.ppm_ghost_cells = parseNumber<int>(requireString(
+      entries, consumed, "mhd_performance.ppm_ghost_cells",
+      defaultFor("mhd_performance.ppm_ghost_cells")), "mhd_performance.ppm_ghost_cells");
+  frozen.config.mhd.performance.plm_ghost_cells = parseNumber<int>(requireString(
+      entries, consumed, "mhd_performance.plm_ghost_cells",
+      defaultFor("mhd_performance.plm_ghost_cells")), "mhd_performance.plm_ghost_cells");
+  frozen.config.mhd.performance.active_batch_target_patches = parseNumber<int>(requireString(
+      entries, consumed, "mhd_performance.active_batch_target_patches",
+      defaultFor("mhd_performance.active_batch_target_patches")),
+      "mhd_performance.active_batch_target_patches");
+  frozen.config.mhd.performance.mhd_scratch_max_bytes_per_active_cell =
+      parseNumber<std::uint64_t>(requireString(
+          entries, consumed, "mhd_performance.mhd_scratch_max_bytes_per_active_cell",
+          defaultFor("mhd_performance.mhd_scratch_max_bytes_per_active_cell")),
+          "mhd_performance.mhd_scratch_max_bytes_per_active_cell");
+  frozen.config.mhd.performance.mhd_comm_budget_mib_per_rank = parseNumber<std::uint64_t>(
+      requireString(entries, consumed, "mhd_performance.mhd_comm_budget_mib_per_rank",
+                    defaultFor("mhd_performance.mhd_comm_budget_mib_per_rank")),
+      "mhd_performance.mhd_comm_budget_mib_per_rank");
+  frozen.config.mhd.performance.mhd_comm_max_mib_per_rank = parseNumber<std::uint64_t>(
+      requireString(entries, consumed, "mhd_performance.mhd_comm_max_mib_per_rank",
+                    defaultFor("mhd_performance.mhd_comm_max_mib_per_rank")),
+      "mhd_performance.mhd_comm_max_mib_per_rank");
+  frozen.config.mhd.performance.mhd_io_chunk_mib_per_rank = parseNumber<std::uint64_t>(
+      requireString(entries, consumed, "mhd_performance.mhd_io_chunk_mib_per_rank",
+                    defaultFor("mhd_performance.mhd_io_chunk_mib_per_rank")),
+      "mhd_performance.mhd_io_chunk_mib_per_rank");
+  frozen.config.mhd.performance.hall_subcycle_cost_cap_per_level_interval =
+      parseNumber<std::int32_t>(requireString(
+          entries, consumed, "mhd_performance.hall_subcycle_cost_cap_per_level_interval",
+          defaultFor("mhd_performance.hall_subcycle_cost_cap_per_level_interval")),
+          "mhd_performance.hall_subcycle_cost_cap_per_level_interval");
+  frozen.config.mhd.performance.rkl_stage_cost_cap_per_level_interval =
+      parseNumber<std::int32_t>(requireString(
+          entries, consumed, "mhd_performance.rkl_stage_cost_cap_per_level_interval",
+          defaultFor("mhd_performance.rkl_stage_cost_cap_per_level_interval")),
+          "mhd_performance.rkl_stage_cost_cap_per_level_interval");
+  frozen.config.mhd.performance.stage_arena_null_upstream = parseBool(requireString(
+      entries, consumed, "mhd_performance.stage_arena_null_upstream",
+      defaultFor("mhd_performance.stage_arena_null_upstream")),
+      "mhd_performance.stage_arena_null_upstream");
+  frozen.config.mhd.performance.track_rank_max_memory = parseBool(requireString(
+      entries, consumed, "mhd_performance.track_rank_max_memory",
+      defaultFor("mhd_performance.track_rank_max_memory")),
+      "mhd_performance.track_rank_max_memory");
+  frozen.config.mhd.performance.track_phase_high_water = parseBool(requireString(
+      entries, consumed, "mhd_performance.track_phase_high_water",
+      defaultFor("mhd_performance.track_phase_high_water")),
+      "mhd_performance.track_phase_high_water");
+  frozen.config.mhd.performance.track_mpi_bytes = parseBool(requireString(
+      entries, consumed, "mhd_performance.track_mpi_bytes",
+      defaultFor("mhd_performance.track_mpi_bytes")), "mhd_performance.track_mpi_bytes");
+  frozen.config.mhd.performance.record_time_to_accuracy = parseBool(requireString(
+      entries, consumed, "mhd_performance.record_time_to_accuracy",
+      defaultFor("mhd_performance.record_time_to_accuracy")),
+      "mhd_performance.record_time_to_accuracy");
+  frozen.config.mhd.performance.optional_gpu_backend = parseBool(requireString(
+      entries, consumed, "mhd_performance.optional_gpu_backend",
+      defaultFor("mhd_performance.optional_gpu_backend")),
+      "mhd_performance.optional_gpu_backend");
+  frozen.config.mhd.performance.gpu_device_target_mib = parseNumber<std::uint64_t>(
+      requireString(entries, consumed, "mhd_performance.gpu_device_target_mib",
+                    defaultFor("mhd_performance.gpu_device_target_mib")),
+      "mhd_performance.gpu_device_target_mib");
+  frozen.config.mhd.performance.allow_untracked_allocations = parseBool(requireString(
+      entries, consumed, "mhd_performance.allow_untracked_allocations",
+      defaultFor("mhd_performance.allow_untracked_allocations")),
+      "mhd_performance.allow_untracked_allocations");
   frozen.config.numerics.max_global_steps = parseNumber<int>(
       requireString(entries, consumed, "numerics.max_global_steps", "1024"),
       "numerics.max_global_steps");
@@ -5354,6 +6115,178 @@ std::string hydroDualEnergyConfigModeToString(HydroDualEnergyConfigMode mode) {
     case HydroDualEnergyConfigMode::kThermalFraction: return "thermal_fraction";
   }
   throw ConfigError("unhandled HydroDualEnergyConfigMode enum value during serialization");
+}
+
+std::string mhdReferenceProfileToString(MhdReferenceProfile value) {
+  switch (value) {
+    case MhdReferenceProfile::kIdeal: return "mhd_ref_ideal_v01";
+    case MhdReferenceProfile::kNonIdeal: return "mhd_ref_nonideal_v01";
+  }
+  throw ConfigError("unhandled MhdReferenceProfile enum value during serialization");
+}
+
+std::string mhdMagneticRepresentationToString(MhdMagneticRepresentation value) {
+  switch (value) {
+    case MhdMagneticRepresentation::kFaceFluxCt: return "face_flux_ct";
+  }
+  throw ConfigError(
+      "unhandled MhdMagneticRepresentation enum value during serialization");
+}
+
+std::string mhdSpatialMethodToString(MhdSpatialMethod value) {
+  switch (value) {
+    case MhdSpatialMethod::kFiniteVolumeUnsplit: return "finite_volume_unsplit";
+  }
+  throw ConfigError("unhandled MhdSpatialMethod enum value during serialization");
+}
+
+std::string mhdReconstructionConfigModeToString(MhdReconstructionConfigMode value) {
+  switch (value) {
+    case MhdReconstructionConfigMode::kPlmMc: return "plm_mc";
+    case MhdReconstructionConfigMode::kPpm: return "ppm";
+  }
+  throw ConfigError(
+      "unhandled MhdReconstructionConfigMode enum value during serialization");
+}
+
+std::string mhdRiemannSolverConfigModeToString(MhdRiemannSolverConfigMode value) {
+  switch (value) {
+    case MhdRiemannSolverConfigMode::kHlld: return "hlld";
+    case MhdRiemannSolverConfigMode::kHlle: return "hlle";
+  }
+  throw ConfigError(
+      "unhandled MhdRiemannSolverConfigMode enum value during serialization");
+}
+
+std::string mhdRiemannFallbackConfigModeToString(MhdRiemannFallbackConfigMode value) {
+  switch (value) {
+    case MhdRiemannFallbackConfigMode::kHlle: return "hlle";
+  }
+  throw ConfigError(
+      "unhandled MhdRiemannFallbackConfigMode enum value during serialization");
+}
+
+std::string mhdEmfSchemeConfigModeToString(MhdEmfSchemeConfigMode value) {
+  switch (value) {
+    case MhdEmfSchemeConfigMode::kUctHll: return "uct_hll";
+  }
+  throw ConfigError("unhandled MhdEmfSchemeConfigMode enum value during serialization");
+}
+
+std::string mhdTimeIntegratorConfigModeToString(MhdTimeIntegratorConfigMode value) {
+  switch (value) {
+    case MhdTimeIntegratorConfigMode::kSsprk2: return "ssprk2";
+  }
+  throw ConfigError(
+      "unhandled MhdTimeIntegratorConfigMode enum value during serialization");
+}
+
+std::string mhdDivergencePolicyConfigModeToString(MhdDivergencePolicyConfigMode value) {
+  switch (value) {
+    case MhdDivergencePolicyConfigMode::kStrictCt: return "strict_ct";
+  }
+  throw ConfigError(
+      "unhandled MhdDivergencePolicyConfigMode enum value during serialization");
+}
+
+std::string mhdPrecisionConfigModeToString(MhdPrecisionConfigMode value) {
+  switch (value) {
+    case MhdPrecisionConfigMode::kFloat64: return "float64";
+  }
+  throw ConfigError("unhandled MhdPrecisionConfigMode enum value during serialization");
+}
+
+std::string mhdNonIdealIntegrationConfigModeToString(
+    MhdNonIdealIntegrationConfigMode value) {
+  switch (value) {
+    case MhdNonIdealIntegrationConfigMode::kStrangDhihd:
+      return "strang_d_h_i_h_d";
+  }
+  throw ConfigError(
+      "unhandled MhdNonIdealIntegrationConfigMode enum value during serialization");
+}
+
+std::string mhdDiffusionIntegratorConfigModeToString(
+    MhdDiffusionIntegratorConfigMode value) {
+  switch (value) {
+    case MhdDiffusionIntegratorConfigMode::kAutoRkl2: return "auto_rkl2";
+  }
+  throw ConfigError(
+      "unhandled MhdDiffusionIntegratorConfigMode enum value during serialization");
+}
+
+std::string mhdHallIntegratorConfigModeToString(MhdHallIntegratorConfigMode value) {
+  switch (value) {
+    case MhdHallIntegratorConfigMode::kExplicitHllSsprk2:
+      return "explicit_hll_ssprk2";
+  }
+  throw ConfigError(
+      "unhandled MhdHallIntegratorConfigMode enum value during serialization");
+}
+
+std::string mhdCoefficientProviderConfigModeToString(
+    MhdCoefficientProviderConfigMode value) {
+  switch (value) {
+    case MhdCoefficientProviderConfigMode::kNone: return "none";
+    case MhdCoefficientProviderConfigMode::kConstant: return "constant";
+    case MhdCoefficientProviderConfigMode::kTable: return "table";
+    case MhdCoefficientProviderConfigMode::kChemistry: return "chemistry";
+  }
+  throw ConfigError(
+      "unhandled MhdCoefficientProviderConfigMode enum value during serialization");
+}
+
+std::string mhdMagneticTransferConfigModeToString(
+    MhdMagneticTransferConfigMode value) {
+  switch (value) {
+    case MhdMagneticTransferConfigMode::kTothRoeCompatible:
+      return "toth_roe_compatible";
+  }
+  throw ConfigError(
+      "unhandled MhdMagneticTransferConfigMode enum value during serialization");
+}
+
+std::string mhdEmfRefluxConfigModeToString(MhdEmfRefluxConfigMode value) {
+  switch (value) {
+    case MhdEmfRefluxConfigMode::kCurl: return "curl";
+  }
+  throw ConfigError(
+      "unhandled MhdEmfRefluxConfigMode enum value during serialization");
+}
+
+std::string mhdScienceBFieldConfigModeToString(MhdScienceBFieldConfigMode value) {
+  switch (value) {
+    case MhdScienceBFieldConfigMode::kDerivedCellCenter: return "derived_cell_center";
+  }
+  throw ConfigError(
+      "unhandled MhdScienceBFieldConfigMode enum value during serialization");
+}
+
+std::string mhdInitialFieldFormatConfigModeToString(
+    MhdInitialFieldFormatConfigMode value) {
+  switch (value) {
+    case MhdInitialFieldFormatConfigMode::kFaceFlux: return "face_flux";
+  }
+  throw ConfigError(
+      "unhandled MhdInitialFieldFormatConfigMode enum value during serialization");
+}
+
+std::string mhdInputProjectionConfigModeToString(MhdInputProjectionConfigMode value) {
+  switch (value) {
+    case MhdInputProjectionConfigMode::kReject: return "reject";
+  }
+  throw ConfigError(
+      "unhandled MhdInputProjectionConfigMode enum value during serialization");
+}
+
+std::string mhdPerformanceProfileToString(MhdPerformanceProfile value) {
+  switch (value) {
+    case MhdPerformanceProfile::kWorkstation48gibV01: return "workstation_48gib_v01";
+    case MhdPerformanceProfile::kClusterV01: return "cluster_v01";
+    case MhdPerformanceProfile::kGpu8gibV01: return "gpu_8gib_v01";
+  }
+  throw ConfigError(
+      "unhandled MhdPerformanceProfile enum value during serialization");
 }
 
 std::string sspWindModelConfigToString(SspWindModelConfig mode) {
