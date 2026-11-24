@@ -3791,6 +3791,16 @@ void writeRestartCheckpointHdf5(
   if (payload.persistent_state.simulation_state == nullptr || payload.integrator_state == nullptr || payload.scheduler == nullptr) {
     throw std::invalid_argument("restart write payload must include state, integrator_state, and scheduler");
   }
+  // CHUI-MHD amendment R1: a magnetized state must be written as
+  // cosmosim_restart_v26 with its /state/mhd face-flux authority. The v26
+  // pipeline is not wired into this writer yet (the /state/mhd codec lives in
+  // io/mhd_restart_state.hpp), so a non-empty magnetic state fails closed here
+  // rather than being silently dropped into a v25 checkpoint.
+  if (!payload.persistent_state.simulation_state->magnetic_faces.empty()) {
+    throw std::invalid_argument(
+        "MHD_RESTART_SCHEMA_MISMATCH: magnetized state requires restart schema v26 "
+        "(/state/mhd); the v26 writer is not wired into writeRestartCheckpointHdf5");
+  }
   validateContinuationMetadata(
       payload.normalized_config_text,
       payload.normalized_config_hash_hex,

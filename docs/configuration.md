@@ -955,3 +955,48 @@ shear and discrete events as captured increments) is compared as well.
 Results are published as `hydro.shadow_reference` at the acceptance barrier of
 the next step. This contract is uncompiled/unverified; see
 `docs/repair/chui_c04_rev5_cloud_source_closure.md`.
+
+## MHD (`[mhd]`, `[mhd_nonideal]`, `[mhd_amr]`, `[mhd_io]`, `[mhd_performance]`)
+
+Keys and defaults follow CHUI-MHD-REF-v1 section 12 and CHUI-MHD-PERF-v1
+section 17 (`docs/architecture/chui_mhd_architecture_specification_v01.md`,
+`docs/architecture/chui_mhd_memory_performance_specification_v01.md`).
+
+**Runtime status (source pass 01, unvalidated):** a configuration with
+`mhd.enabled = true` parses and validates, but the run is rejected at runtime
+capability admission with `MHD_UNSUPPORTED_PHYSICS` (capability
+`mhd_production_dispatch`) until the magnetized `kHydroUpdate` dispatch, the
+`cosmosim_restart_v26` writer/reader and the `chui_science_snapshot_v7`
+writer exist. MHD never silently runs as ordinary hydro.
+
+Compatibility rules:
+
+* With `mhd.enabled = false` (default) the normalized configuration contains no
+  `[mhd*]` section, so the normalized text and config hash are byte-identical
+  to the pre-MHD schema. Any MHD key that differs from its default on a
+  disabled run is rejected (it would otherwise be silently ignored).
+* `mhd_ref_ideal_v01` requires `mhd_nonideal.enabled = false` and all operator
+  flags false; `mhd_ref_nonideal_v01` requires `mhd_nonideal.enabled = true` and
+  at least one of `ohmic_enabled`, `ambipolar_enabled`, `hall_enabled`.
+* MHD requires `numerics.hydro_dual_energy = off` and is incompatible with
+  `physics.star_formation_model = effective_multiphase_tng_like` (no verified
+  MHD-EOS contract). `mhd_amr.distributed_subcycling = true` and
+  `mhd_performance.optional_gpu_backend = true` are rejected.
+* Coefficient providers: `constant` takes `eta_ohmic_phys_cgs >= 0`, signed
+  `eta_hall_phys_cgs`, `eta_ambipolar_phys_cgs >= 0` (cm^2/s, physical) and
+  refuses a table path; `table` requires `coefficient_table_path`,
+  `composition_id`, `grain_model_id` (optional `expected_table_sha256` pin) and
+  refuses the constant keys; `chemistry` is rejected (no validated
+  charged-carrier/collision/grain contract, amendment R5).
+* Transport table contract `chui_mhd_transport_table_v1` (HDF5): root attribute
+  `ContractId`; `/Axes/{LogDensityCgs, LogTemperatureK, LogMagneticFieldGauss}`
+  (float64, `Units` = `log10(g/cm^3)`, `log10(K)`, `log10(G)`),
+  `/Axes/{CompositionIds, GrainModelIds}` (strings),
+  `/{EtaOhmicCgs, EtaHallCgs, EtaAmbipolarCgs}` float64
+  `[nrho][nT][nB][ncomp][ngrain]` and `/BZeroLimit/{same}` float64
+  `[nrho][nT][ncomp][ngrain]`, all with `Units = cm^2/s`. Ohmic/ambipolar must be
+  finite and nonnegative, Hall finite; out-of-coverage queries are fatal.
+
+Example decks (rejected at admission, see their headers):
+`configs/cosmo_cube/cube_mhd_ref_v01.param.txt`,
+`configs/isolated_galaxy/disk_mhd_ref_v01.param.txt`.

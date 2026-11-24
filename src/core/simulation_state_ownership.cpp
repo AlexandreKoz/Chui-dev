@@ -126,7 +126,8 @@ bool SimulationState::validateOwnershipInvariantsImpl(
     OwnershipValidationWorkspace& scratch, bool use_bounded_id_scratch) const {
   if (!particles.isConsistent() || !particle_sidecar.isConsistent() || !cells.isConsistent() ||
       !gas_cells.isConsistent() || !patches.isConsistent() || !star_particles.isConsistent() ||
-      !black_holes.isConsistent() || !tracers.isConsistent()) {
+      !black_holes.isConsistent() || !tracers.isConsistent() ||
+      !magnetic_faces.isConsistent()) {
     return false;
   }
 

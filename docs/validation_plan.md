@@ -939,3 +939,17 @@ Additional campaign checks to run on top of the unit tests:
   `ssp_wind_table_accepted_approximations` in `sources.data_assumptions`.
 * Restart (owner, HDF5): a pre-patch-58 Part-2-disabled checkpoint resumes
   with the defaults; one with table physics active is refused.
+
+## MHD gates (CHUI-MHD-REF-v1 G/I/N, CHUI-MHD-PERF-v1 MP/BP) — source only
+
+Test sources (registered in CMake, NOT yet executed):
+`tests/unit/mhd/test_mhd_discrete_complex.cpp` (G02, CT signs, seeds, MP01/MP02/MP09),
+`tests/unit/mhd/test_mhd_riemann_reconstruction.cpp` (HLLD/HLLE, PLM/PPM),
+`tests/unit/mhd/test_mhd_memory_governance.cpp` (MP02/MP05/MP06/MP07/MP11),
+`tests/integration/test_mhd_ideal_reference.cpp` (G01, G03, G04, G05, I01, I03, I09),
+`tests/integration/test_mhd_nonideal_reference.cpp` (N01, N03, N04, N05, N06/N07 smoke, RKL2),
+`tests/integration/test_mhd_amr_mpi_restarts.cpp` (G07, register coverage, v26 codec, config/capability guards),
+benchmark runner `bench/mhd/bench_mhd_reference_suite.cpp` (BP01-BP10; external
+comparisons reported `not_evaluated`). Tolerances are the specification's; no
+gate has been run and no certification is claimed. Coverage map and gaps:
+`docs/architecture/chui_mhd_implementation_pass01_status.md`.

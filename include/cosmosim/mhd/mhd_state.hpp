@@ -6,6 +6,7 @@
 #include <memory>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "cosmosim/mhd/mhd_validation.hpp"
@@ -196,7 +197,7 @@ struct MhdFaceFluxView {
 };
 
 struct MhdFaceFluxMutableView {
-  MhdPatchGeometry* geometry = nullptr;
+  const MhdPatchGeometry* geometry = nullptr;
   std::span<double> phi_x;
   std::span<double> phi_y;
   std::span<double> phi_z;
@@ -217,19 +218,36 @@ struct MhdFaceFluxMutableView {
     std::uint64_t geometry_generation,
     int refinement_level) noexcept;
 
-// Runtime stage context shared by every MHD operator. `scale_factor` is the
-// stage value owned by the cosmological timeline; isolated runs use a=1,H=0.
+// Runtime stage context shared by every MHD operator. Scale factor and
+// Hubble rate are SUPPLIED by the authoritative cosmological timeline (MHD
+// never recomputes a(t)); isolated runs use a=1, H=0 at both endpoints.
+//   scale_factor / hubble_rate_code         : values at time_code (t_n)
+//   scale_factor_end / hubble_rate_end_code : values at time_code + dt_code
+// SSPRK2 stage 1 is evaluated at t_n and stage 2 at t_n + dt, so both
+// endpoints are required. `apply_expansion_source` selects whether the MHD
+// operator owns the comoving expansion source (m_dot=-H m, E_dot=-H(2K+3p+M))
+// inside its stages; the workflow sets it false when another owner already
+// applies the gas Hubble source so the drag is never applied twice.
 struct MhdStageContext {
   double dt_code = 0.0;
   double time_code = 0.0;
   double scale_factor = 1.0;
   double hubble_rate_code = 0.0;
+  double scale_factor_end = 1.0;
+  double hubble_rate_end_code = 0.0;
   int refinement_level = 0;
   std::uint64_t patch_id = 0U;
   std::uint64_t geometry_generation = 0U;
   std::uint32_t stage_ordinal = 0U;
   bool comoving_coordinates = false;
+  bool apply_expansion_source = true;
 };
+
+// Linear interpolation of the timeline-supplied endpoints at a fraction of
+// the interval. Used only for operator-split sub-intervals (D/H halves).
+[[nodiscard]] MhdStageContext subIntervalContext(const MhdStageContext& interval,
+                                                 double begin_fraction,
+                                                 double end_fraction) noexcept;
 
 // Conservation audit for one accepted MHD interval. All energies are comoving
 // code-unit volume integrals. Magnetic energy uses B_c^2/(2a).
@@ -256,21 +274,10 @@ class MhdDiagnosticSink {
   virtual void recordCounters(std::string_view counter, double value) = 0;
 };
 
-// Exact geometric storage formulas (CHUI-MHD-PERF v1.0 section 4).
-struct MhdPatchMemoryEstimate {
-  std::uint64_t face_flux_capacity_bytes = 0U;
-  std::uint64_t edge_emf_capacity_bytes = 0U;
-  std::uint64_t gas_trial_capacity_bytes = 0U;
-  std::uint64_t edge_current_capacity_bytes = 0U;
-  std::uint64_t rkl_cycle_extra_capacity_bytes = 0U;
-  std::uint64_t total_phase_scratch_bytes = 0U;
-  std::uint64_t total_canonical_persistent_bytes = 0U;
-};
-
-[[nodiscard]] MhdPatchMemoryEstimate estimatePatchMemory(const MhdPatchGeometry& geometry,
-                                                         std::size_t gas_lane_count,
-                                                         bool nonideal_enabled,
-                                                         std::int32_t rkl_max_stages);
+// Retained capacity in bytes of one MhdDoubleArray lane of `count` doubles
+// (64-byte rounded, the exact allocator request). Exact allocation accounting
+// for MHD stage state lives in cosmosim/mhd/mhd_memory.hpp.
+[[nodiscard]] std::uint64_t mhdAlignedLaneBytes(std::size_t count);
 
 // One-sided 512 B/active-real-cell engineering cap for MHD-owned phase-resident
 // plus scratch storage. Excludes persistent face flux and MPI staging.

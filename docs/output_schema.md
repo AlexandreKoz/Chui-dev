@@ -538,3 +538,26 @@ sidecar rather than reconstructing it from a science snapshot.
 Restart-only transient state (flux registers, temporal histories, Jacobians,
 staged deltas) is never exported to science snapshots; it lives in the
 checkpoint (`docs/restart_checkpointing.md`).
+
+## MHD schemas (CHUI-MHD-REF-v1 section 13, amendment R1/R6) — status
+
+* `cosmosim_restart_v25` remains the nonmagnetic dual-energy checkpoint and is
+  never reused for magnetic fields. The MHD checkpoint is
+  `cosmosim_restart_v26` with the authoritative group `/state/mhd`
+  (group `schema_version = 1`): `patch_id` uint64[P], `geometry_generation`
+  uint64[P], `refinement_level` uint8[P], `face_dims_xyz` uint32[P,3],
+  `patch_origin_comoving` / `cell_width_comoving` float64[P,3],
+  `face_offset_{x,y,z}` uint64[P+1] (exclusive prefix sums, `[0] = 0`),
+  `face_flux_{x,y,z}_comoving` float64; attributes `reference_contract`,
+  `coefficient_table_sha256`, `divergence_max_norm`, `scale_factor`,
+  `magnetic_units = code_comoving_lorentz_heaviside`, `face_flux_contract`.
+  The group codec (`io/mhd_restart_state.hpp`) writes flux lanes in <= 8 MiB
+  hyperslabs directly from the canonical lanes and validates every field
+  (shapes, offsets, finite values, unique ids, table SHA, scale factor,
+  recomputed discrete divergence) before returning a state. **Not yet wired**
+  into `writeRestartCheckpointHdf5`/the reader: a non-empty magnetic state makes
+  the v25 writer throw `MHD_RESTART_SCHEMA_MISMATCH` instead of writing v25.
+* `chui_science_snapshot_v6` is unchanged for MHD-off runs. The MHD science
+  schema `chui_science_snapshot_v7` (derived `PartType0/MagneticField` in
+  comoving normalized code units, `/MHD/Diagnostics`) is **not implemented**:
+  the snapshot writer throws for a magnetized state or `mhd.enabled = true`.

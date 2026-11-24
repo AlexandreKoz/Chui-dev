@@ -103,6 +103,22 @@ void validateStageContractShape(std::string_view callback_name, const StageContr
       contract.sync_requirements != StageSyncRequirement::kForceEvaluation) {
     throw std::invalid_argument(prefix + "must declare force-evaluation synchronization");
   }
+  // Magnetic face flux is a distinct authority (CHUI-MHD-REF v1.0 section
+  // 11.4): only the kHydroUpdate owner (hydro dispatching MHD, or the MHD
+  // subsystem itself) may mutate it, and the MHD subsystem owns no other
+  // stage. Source, gravity, analysis and output stages may at most read it.
+  const bool mutates_magnetic =
+      hasStageDataDomain(contract.mutated_state, StageDataDomain::kMagneticFaces) ||
+      hasStageDataDomain(contract.allowed_side_effects, StageDataDomain::kMagneticFaces);
+  if (mutates_magnetic &&
+      (contract.stage != IntegrationStage::kHydroUpdate ||
+       (contract.owner != StageSubsystem::kHydro && contract.owner != StageSubsystem::kMhd))) {
+    throw std::invalid_argument(
+        prefix + "may not mutate magnetic faces outside the kHydroUpdate hydro/MHD owner");
+  }
+  if (contract.owner == StageSubsystem::kMhd && contract.stage != IntegrationStage::kHydroUpdate) {
+    throw std::invalid_argument(prefix + "the MHD subsystem owns only kHydroUpdate");
+  }
 }
 
 void validateRuntimeStageContract(

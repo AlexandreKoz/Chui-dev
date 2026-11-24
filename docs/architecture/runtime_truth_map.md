@@ -700,3 +700,13 @@ bounds/moments publish a new build generation only when complete. P2 routing
 geometry continues to refresh from canonical current sources independently of
 ownership. Spatial work EMA and profiler rings are bounded derived diagnostics;
 spatial history is cold after restart and is not force truth.
+
+## MHD magnetic face flux (source pass 01, not production-dispatched)
+
+| Fact | Single live authority | Mirrors / scratch | Refresh / invalidation |
+|---|---|---|---|
+| Oriented comoving face flux `Phi = B_c A` | `SimulationState::magnetic_faces` (`core::MagneticFaceSoa`, `kCanonicalPersistent`), keyed by `(patch_id, geometry_generation)` | Patch-boundary faces are stored by both adjacent patches; `MhdLevelStepper` copies the deterministic owner's value (lowest patch_id, then lowest local index) after every stage | Rebound on regrid/migration (generation change); stale bindings throw `MHD_STALE_GEOMETRY` |
+| Cell-centred `B_c` / `B_eff = B_c/sqrt(a)` | none (derived) | `MhdPrimitivePatch` stage cache | Recomputed from faces at every stage; never persisted |
+| Total energy in MHD mode `E_c = rho e + K + B_c^2/(2a)` | MHD stage `MhdGasStateSoa` during an interval; at rest the canonical gas rows hold `(rho, u, e)` and `B_c` comes from the faces | Rollback / stage-0 images inside `MhdLevelStepper` | `storeMhdGasToState` recovers `e` with the accepted faces and `a`; no floor |
+| Edge EMF (stage rate and interval integral) | `MhdStageWorkspace::emf` (scratch) / stepper-owned integral (when requested) | none | Owner-reconciled per stage; released at interval end; never checkpointed |
+| AMR EMF reflux register | `MhdEmfRegister` (pre-declared, interval-bound) | none | Rejected if incomplete/stale/duplicate; drained before any checkpoint |

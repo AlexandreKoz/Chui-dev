@@ -3,13 +3,10 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
-#include <memory>
-#include <optional>
 #include <span>
 #include <string>
-#include <vector>
+#include <utility>
 
-#include "cosmosim/mhd/mhd_amr.hpp"
 #include "cosmosim/mhd/mhd_geometry.hpp"
 #include "cosmosim/mhd/mhd_induction.hpp"
 #include "cosmosim/mhd/mhd_riemann.hpp"
@@ -28,33 +25,44 @@ enum class MhdMagneticRepresentation : std::uint8_t { kFaceFluxCt = 0 };
 
 [[nodiscard]] std::string_view mhdReconstructionName(MhdReconstructionMode mode) noexcept;
 
+// Ghost depth required by each reconstruction (CHUI-MHD-REF v1.0 section 6.2):
+// PLM-MC needs cells i-1..i+1 for the face states of cell i and the face sweep
+// reconstructs cells -1..n, hence 2 ghost layers; bounded PPM needs i-2..i+2,
+// hence 3. The UCT-HLL builder needs 2 (MC corner slopes at cell -1).
+[[nodiscard]] constexpr std::size_t mhdGhostCells(MhdReconstructionMode mode) noexcept {
+  return mode == MhdReconstructionMode::kPpm ? 3U : 2U;
+}
+inline constexpr std::size_t k_mhd_staggered_tangential_ghost = 2U;
+
 struct MhdNumericsPolicy {
   MhdReconstructionMode reconstruction = MhdReconstructionMode::kPpm;
   MhdRiemann::Solver riemann = MhdRiemann::Solver::kHlld;
   MhdEmfScheme emf_scheme = MhdEmfScheme::kUctHll;
   MhdTimeIntegrator time_integrator = MhdTimeIntegrator::kSsprk2;
   MhdDivergencePolicy divergence_policy = MhdDivergencePolicy::kStrictCt;
+  // Calorically perfect gas. REF-v1 certification uses 5/3; the runtime
+  // adapter rejects any EOS whose MHD-compatible closure is not established.
   double gamma_adiabatic = k_mhd_gamma_default;
   double cfl_ideal = 0.30;
   std::int32_t max_step_retries = 8;
   double fallback_fraction_limit = 0.001;
   double floor_energy_fraction_limit = 1.0e-8;
-  // Audited legacy hydro floors, reused only for flux evaluation. Floor-added
-  // energy into the conserved state is counted separately.
-  double density_floor_code = 1.0e-10;
-  double pressure_floor_code = 1.0e-10;
+  // Post-step strict-CT divergence acceptance (G03 normalization).
+  double divergence_tolerance = 1.0e-11;
   bool deterministic = true;
   MhdStiffnessLimits stiffness{};
 
-  [[nodiscard]] std::size_t ghostCells() const noexcept {
-    return reconstruction == MhdReconstructionMode::kPpm ? 3U : 2U;
-  }
+  [[nodiscard]] std::size_t ghostCells() const noexcept { return mhdGhostCells(reconstruction); }
 };
 
-// Gas patch state owned by the caller (ultimately core::SimulationState). The
-// total-energy lane is thermal + kinetic + magnetic in MHD mode.
+// Gas patch state (comoving conserved). In MHD mode the energy lane is the
+// single authoritative total energy E_c = rho_c e + K_c + B_c^2/(2a); the
+// cell-centred B_c entering M_c is always re-derived from the authoritative
+// face fluxes, never stored here.
 class MhdGasStateSoa final {
  public:
+  static constexpr std::size_t k_lane_count = 6U;
+
   MhdGasStateSoa() = default;
   explicit MhdGasStateSoa(std::size_t cell_count);
   void resize(std::size_t cell_count);
@@ -73,14 +81,17 @@ class MhdGasStateSoa final {
   [[nodiscard]] std::span<const double> totalEnergy() const noexcept { return m_energy.span(); }
   [[nodiscard]] std::span<double> metalMass() noexcept { return m_metal.span(); }
   [[nodiscard]] std::span<const double> metalMass() const noexcept { return m_metal.span(); }
+  [[nodiscard]] std::span<double> lane(std::size_t index) noexcept;
+  [[nodiscard]] std::span<const double> lane(std::size_t index) const noexcept;
 
-  [[nodiscard]] MhdConservedState load(std::size_t cell) const noexcept;
-  void store(std::size_t cell, const MhdConservedState& state) noexcept;
+  // Gas lanes only (rho, m, E, metal density); the B lanes of the returned
+  // MhdConservedState are zero and must be filled from face fluxes.
+  [[nodiscard]] MhdConservedState loadGas(std::size_t cell) const noexcept;
+  void storeGas(std::size_t cell, const MhdConservedState& state) noexcept;
   void copyFrom(const MhdGasStateSoa& other);
-  void combineSsprk2(const MhdGasStateSoa& previous,
-                     const MhdGasStateSoa& first_stage,
-                     const MhdGasStateSoa& first_stage_rhs,
-                     double dt_code);
+  // this = alpha * lhs + beta * rhs (all lanes, cell-wise).
+  void assignLinearCombination(double alpha, const MhdGasStateSoa& lhs,
+                               double beta, const MhdGasStateSoa& rhs);
 
  private:
   MhdDoubleArray m_rho;
@@ -91,159 +102,158 @@ class MhdGasStateSoa final {
   MhdDoubleArray m_metal;
 };
 
-// Padded primitive cache. Ghost layers are filled from physical boundary kinds
-// (periodic wrap, open zero-gradient, reflecting conducting wall). It is
-// phase-local scratch and never an authority.
-struct MhdPrimitivePatch {
+// Numerical gas fluxes on the six patch-boundary face planes. A boundary face
+// flux is not applied by the patch sweep: the level stepper reconciles each
+// shared logical face from its deterministic owner (identical flux on both
+// sides, exact conservation) and then applies it. Storage is O(patch surface).
+struct MhdBoundaryFaceFluxes {
+  static constexpr std::size_t k_values_per_face = MhdGasStateSoa::k_lane_count;
   std::size_t nx = 0;
   std::size_t ny = 0;
   std::size_t nz = 0;
-  std::size_t ghost = 0;
-  std::size_t px = 0;
-  std::size_t py = 0;
-  std::size_t pz = 0;
+  // [axis][side]: side 0 = lower plane (face index 0), 1 = upper (index n).
+  std::array<std::array<MhdDoubleArray, 2>, 3> values{};
 
-  MhdDoubleArray rho;
-  MhdDoubleArray vx;
-  MhdDoubleArray vy;
-  MhdDoubleArray vz;
-  MhdDoubleArray pressure;
-  MhdDoubleArray bx;
-  MhdDoubleArray by;
-  MhdDoubleArray bz;
-  MhdDoubleArray metal;
-
-  void resize(std::size_t patch_nx, std::size_t patch_ny, std::size_t patch_nz,
-              std::size_t ghost_cells);
-  [[nodiscard]] std::size_t index(std::ptrdiff_t i, std::ptrdiff_t j,
-                                  std::ptrdiff_t k) const noexcept {
-    const auto pi = static_cast<std::size_t>(i + static_cast<std::ptrdiff_t>(ghost));
-    const auto pj = static_cast<std::size_t>(j + static_cast<std::ptrdiff_t>(ghost));
-    const auto pk = static_cast<std::size_t>(k + static_cast<std::ptrdiff_t>(ghost));
-    return pi + px * (pj + py * pk);
-  }
+  void resize(const MhdPatchGeometry& geometry);
+  [[nodiscard]] std::size_t faceCount(std::size_t axis) const noexcept;
+  // Tangential coordinates (t1, t2) are the cyclic successors of `axis`.
+  [[nodiscard]] double* at(std::size_t axis, std::size_t side, std::size_t t1,
+                           std::size_t t2) noexcept;
+  [[nodiscard]] const double* at(std::size_t axis, std::size_t side, std::size_t t1,
+                                 std::size_t t2) const noexcept;
   [[nodiscard]] std::uint64_t ownedCapacityBytes() const noexcept;
 };
 
-// Patch-local phase workspace. One instance per active patch/task; edges and
-// stage buffers are reused across SSPRK2/RKL/Hall subcycles.
-struct MhdStageWorkspace {
-  MhdPrimitivePatch primitives{};
-  MhdFaceSignalPatch signals{};
-  MhdEdgeEmfStorage emf_rate{};
-  MhdGasStateSoa gas_rhs{};
-  MhdDoubleArray phi_rhs_x{};
-  MhdDoubleArray phi_rhs_y{};
-  MhdDoubleArray phi_rhs_z{};
-  std::vector<MhdCellPhysicalProperties> cell_properties{};
-  std::vector<MhdTransportCoefficients> coefficient_cache{};
-  MhdNonIdealWorkspace nonideal{};
-
-  void resize(const MhdPatchGeometry& geometry,
-              MhdReconstructionMode reconstruction,
-              bool nonideal_enabled);
-  [[nodiscard]] std::uint64_t ownedCapacityBytes() const noexcept;
-};
-
-struct MhdAdvanceResult {
-  bool accepted = false;
-  double dt_used_code = 0.0;
-  std::int32_t retry_count = 0;
-  std::uint64_t face_count = 0U;
+struct MhdStageCounters {
+  std::uint64_t faces_solved = 0U;
   std::uint64_t hlle_fallback_faces = 0U;
   std::uint64_t first_order_faces = 0U;
-  double fallback_fraction = 0.0;
-  double floor_added_energy = 0.0;
-  double divergence_max_normalized = 0.0;
-  double divergence_normalizer = 0.0;
-  MhdConservationBudget budget{};
-  MhdTransportStageDiagnostics transport{};
-  std::uint64_t ideal_stage_evaluations = 0U;
-  std::uint32_t accepted_stage_ordinal = 0U;
+  std::uint64_t ppm_characteristic_fallback_cells = 0U;
+  std::uint64_t edges_built = 0U;
+
+  MhdStageCounters& operator+=(const MhdStageCounters& rhs) noexcept;
 };
 
-// The reference ideal + non-ideal stepped operator. All algorithms are selected
-// before the face loop (no per-face virtual dispatch or allocation).
+// Patch-local phase workspace. One instance per active patch; reused across
+// SSPRK2 stages, RKL stages and Hall subcycles (stage count never multiplies
+// residency). All lanes are MhdDoubleArray with retained capacity accounted
+// by ownedCapacityBytes().
+struct MhdStageWorkspace {
+  MhdPrimitivePatch primitives{};
+  MhdStaggeredFieldPatch staggered{};
+  MhdFaceSignalPatch signals{};
+  MhdEdgeEmfStorage emf{};
+  MhdBoundaryFaceFluxes boundary_fluxes{};
+
+  void resize(const MhdPatchGeometry& geometry, MhdReconstructionMode reconstruction);
+  [[nodiscard]] std::uint64_t ownedCapacityBytes() const noexcept;
+};
+
+// Bounded face states of one cell along one axis (characteristic PPM or
+// primitive PLM-MC). `lower`/`upper` are the cell's values at its lower and
+// upper faces in the global frame; magnetic lanes are B_eff.
+struct MhdCellFaceStates {
+  MhdPrimitiveState lower{};
+  MhdPrimitiveState upper{};
+};
+
+// Ideal-MHD reference patch kernels (CHUI-MHD-REF v1.0 section 6). There is no
+// per-face virtual dispatch or allocation; algorithm selection happens before
+// the face loops. These kernels never commit a step on their own: the
+// interval-level owner (MhdLevelStepper) holds the rollback image, the retry
+// policy and the shared-face/edge reconciliation.
 class MhdStepOperator {
  public:
   explicit MhdStepOperator(MhdNumericsPolicy policy = {});
 
   [[nodiscard]] const MhdNumericsPolicy& policy() const noexcept { return m_policy; }
 
-  // Advance one accepted interval. On failure the caller's gas/face state is
-  // restored to its pre-call value (the operator snapshots internally and never
-  // leaves a partially committed interval). Throws MhdError on an unrecoverable
-  // physics failure after the retry budget is exhausted.
-  [[nodiscard]] MhdAdvanceResult advance(const MhdPatchGeometry& geometry,
-                                         const MhdPatchBoundary& boundary,
-                                         MhdGasStateSoa& gas,
-                                         MhdFaceFluxMutableView faces,
-                                         const MhdStageContext& context,
-                                         const MhdCoefficientProvider* coefficient_provider,
-                                         MhdDiagnosticSink* diagnostics = nullptr);
+  // Recover interior primitives (B lanes = B_eff) and the interior staggered
+  // normal field B_eff from the gas state and authoritative face fluxes at the
+  // stage scale factor. Returns the number of inadmissible cells (rho<=0,
+  // thermal<=0, Z outside [0,1], or non-finite); no floor is applied.
+  [[nodiscard]] std::size_t recoverPrimitives(const MhdPatchGeometry& geometry,
+                                              const MhdGasStateSoa& gas,
+                                              const MhdFaceFluxView& faces,
+                                              double scale_factor,
+                                              MhdStageWorkspace& workspace) const;
 
-  // Ideal fast-magnetosonic CFL candidate for one patch.
+  // Fill ghost cells and staggered ghost rows for every patch side whose kind
+  // is physical (periodic self-wrap, open, conducting wall). kNeighborPatch
+  // sides must already have been filled by the level stepper.
+  static void fillPhysicalGhosts(const MhdPatchBoundary& boundary, MhdStageWorkspace& workspace);
+
+  // One SSPRK2 operator evaluation L(Y) at stage scale factor `a_stage` and
+  // Hubble rate `hubble_stage`, applied with `flux_weight` (= dt for stage 1,
+  // dt/2 for stage 2) into `gas_target`:
+  //   gas_target[cell] += flux_weight * ( -div(F)/a + S_expansion )
+  // for all INTERIOR faces; patch-boundary faces are recorded in
+  // workspace.boundary_fluxes for owner reconciliation. The UCT-HLL edge EMF
+  // rate is left in workspace.emf (not yet applied). Workspace primitives and
+  // staggered fields must hold the stage state with ghosts filled.
+  // Throws MhdError(kNonPositiveState) when no admissible flux exists at a
+  // face (HLLD -> HLLE -> first-order cell-average Rusanov all failed).
+  void evaluateIdealStage(const MhdPatchGeometry& geometry,
+                          const MhdPatchBoundary& boundary,
+                          double a_stage,
+                          double hubble_stage,
+                          bool apply_expansion_source,
+                          double flux_weight,
+                          MhdStageWorkspace& workspace,
+                          MhdGasStateSoa& gas_target,
+                          MhdStageCounters& counters) const;
+
+  // Apply the (reconciled) boundary-face gas fluxes:
+  //   lower plane f=0  -> cell 0       gains +w F/(a dx)
+  //   upper plane f=n  -> cell n-1     loses -w F/(a dx)
+  static void applyBoundaryFaceFluxes(const MhdPatchGeometry& geometry,
+                                      const MhdBoundaryFaceFluxes& fluxes,
+                                      double a_stage,
+                                      double flux_weight,
+                                      MhdGasStateSoa& gas_target);
+
+  // Fast-magnetosonic CFL candidate: dt <= cfl / max_cell sum_axis
+  // (|u_axis| + c_f,axis) / (a dx_axis) with physical signal speeds from
+  // (rho_c, p_c, B_eff). Throws MHD_NONPOSITIVE_STATE for an inadmissible cell
+  // (never silently skipped).
   [[nodiscard]] double estimateIdealTimeStep(const MhdPatchGeometry& geometry,
                                              const MhdGasStateSoa& gas,
                                              const MhdFaceFluxView& faces,
+                                             double scale_factor,
                                              double cfl) const;
 
-  // Primitive recovery used by the operator and by diagnostics.
-  [[nodiscard]] bool recoverPatchPrimitives(const MhdPatchGeometry& geometry,
-                                            const MhdGasStateSoa& gas,
-                                            const MhdFaceFluxView& faces,
-                                            double scale_factor,
-                                            MhdStageWorkspace& workspace,
-                                            std::size_t* nonpositive_cells = nullptr) const;
-
-  // Sum the conservative budget of a patch (thermal/kinetic/magnetic split).
+  // Conservative budget of a patch (comoving volume integrals; magnetic energy
+  // uses B_c^2/(2a) at the supplied scale factor).
   [[nodiscard]] MhdConservationBudget patchBudget(const MhdPatchGeometry& geometry,
                                                   const MhdGasStateSoa& gas,
                                                   const MhdFaceFluxView& faces,
                                                   double scale_factor) const;
 
-  // Fill the ghost primitive layers for a patch boundary. Exposed for tests.
-  static void fillGhostPrimitives(const MhdPatchGeometry& geometry,
-                                  const MhdPatchBoundary& boundary,
-                                  MhdPrimitivePatch& primitives);
+  // Characteristic PPM (bounded, Colella-Woodward limiting in the MHD
+  // primitive eigenbasis of the cell) or primitive PLM-MC face states of cell
+  // `cell` along `axis`. Returns false only for an inadmissible cell; a
+  // characteristic projection that is singular or yields a non-positive face
+  // density/pressure falls back to PLM-MC for that cell (counted).
+  [[nodiscard]] bool reconstructCell(const MhdPrimitivePatch& primitives,
+                                     const MhdIndex3& cell,
+                                     MhdAxis axis,
+                                     MhdCellFaceStates& states,
+                                     std::uint64_t* characteristic_fallbacks) const;
 
-  // One-dimensional reconstruction helpers used by the face sweep and tested
-  // directly. `c` is the cell value; the stencil runs along the face normal.
+  // Scalar one-dimensional limiters, exposed for unit tests. Both return
+  // {value at lower face, value at upper face} of the centre cell. PLM-MC uses
+  // only (c_minus, c, c_plus); scalar PPM uses all five values.
   [[nodiscard]] static std::pair<double, double> reconstructPlmMc(
-      double c_minus2, double c_minus, double c, double c_plus, double c_plus2,
-      bool face_is_upper) noexcept;
-  [[nodiscard]] static std::pair<double, double> reconstructPpm(
-      double c_minus2, double c_minus, double c, double c_plus, double c_plus2,
-      bool face_is_upper) noexcept;
+      double c_minus, double c, double c_plus) noexcept;
+  [[nodiscard]] static std::pair<double, double> reconstructPpmScalar(
+      double c_minus2, double c_minus, double c, double c_plus, double c_plus2) noexcept;
+
+  // Apply physical ghost rules to the padded primitive cache (exposed for
+  // tests): periodic wrap; open zero-gradient; conducting wall with odd
+  // wall-normal velocity, even wall-normal field and odd wall-tangential field.
+  static void fillGhostPrimitives(const MhdPatchBoundary& boundary, MhdPrimitivePatch& primitives);
 
  private:
-  void computeIdealRate(const MhdPatchGeometry& geometry,
-                        const MhdPatchBoundary& boundary,
-                        const MhdGasStateSoa& gas,
-                        std::span<const double> phi_x,
-                        std::span<const double> phi_y,
-                        std::span<const double> phi_z,
-                        const MhdStageContext& context,
-                        MhdStageWorkspace& workspace,
-                        std::span<double> phi_rhs_x,
-                        std::span<double> phi_rhs_y,
-                        std::span<double> phi_rhs_z,
-                        std::uint64_t* hlle_faces,
-                        std::uint64_t* first_order_faces) const;
-
-  void applyExpansionSourceHalf(std::span<double> rho,
-                                std::span<double> mx,
-                                std::span<double> my,
-                                std::span<double> mz,
-                                std::span<double> energy,
-                                const MhdPatchGeometry& geometry,
-                                std::span<const double> phi_x,
-                                std::span<const double> phi_y,
-                                std::span<const double> phi_z,
-                                double scale_factor,
-                                double hubble_rate_code,
-                                double dt_half_code) const;
-
   MhdNumericsPolicy m_policy;
 };
 

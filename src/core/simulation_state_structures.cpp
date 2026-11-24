@@ -371,12 +371,31 @@ bool MagneticFaceSoa::isConsistent() const noexcept {
         !std::isfinite(patch.origin_z_comoving)) {
       return false;
     }
+    // nx, ny, nz are uint32, so (n+1) fits in uint64 and every pairwise
+    // product of two factors < 2^33 fits; the triple product is checked.
     const std::uint64_t nx = patch.nx;
     const std::uint64_t ny = patch.ny;
     const std::uint64_t nz = patch.nz;
-    const std::uint64_t count_x = (nx + 1U) * ny * nz;
-    const std::uint64_t count_y = nx * (ny + 1U) * nz;
-    const std::uint64_t count_z = nx * ny * (nz + 1U);
+    const auto checked_triple = [](std::uint64_t a, std::uint64_t b, std::uint64_t c,
+                                   std::uint64_t& out) {
+      const std::uint64_t ab = a * b;
+      if (c != 0U && ab > std::numeric_limits<std::uint64_t>::max() / c) {
+        return false;
+      }
+      out = ab * c;
+      return true;
+    };
+    std::uint64_t count_x = 0U;
+    std::uint64_t count_y = 0U;
+    std::uint64_t count_z = 0U;
+    if (!checked_triple(nx + 1U, ny, nz, count_x) || !checked_triple(nx, ny + 1U, nz, count_y) ||
+        !checked_triple(nx, ny, nz + 1U, count_z)) {
+      return false;
+    }
+    if (!std::isfinite(patch.cell_width_x_comoving) || !std::isfinite(patch.cell_width_y_comoving) ||
+        !std::isfinite(patch.cell_width_z_comoving) || patch.level < 0) {
+      return false;
+    }
     if (patch.flux_x_offset != expected_x || patch.flux_y_offset != expected_y ||
         patch.flux_z_offset != expected_z) {
       return false;

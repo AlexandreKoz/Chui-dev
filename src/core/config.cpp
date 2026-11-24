@@ -2354,6 +2354,16 @@ void validateMhdConfig(const MhdConfig& mhd) {
           "mhd_nonideal.* requires mhd.enabled=true; non-ideal transport cannot "
           "be requested on the non-magnetic hydro path");
     }
+    // No inert keys: an MHD-disabled run must carry exactly the default MHD
+    // configuration. Any other value would be silently ignored and is also
+    // absent from the (predecessor-compatible) normalized text, so it is
+    // rejected here instead.
+    if (!(mhd == MhdConfig{})) {
+      throw ConfigError(
+          "mhd.enabled=false but one or more [mhd], [mhd_nonideal], [mhd_amr], "
+          "[mhd_io] or [mhd_performance] keys differ from their defaults; those "
+          "keys would have no effect. Remove them or set mhd.enabled=true");
+    }
     return;
   }
   if (!(mhd.cfl_ideal > 0.0) || !(mhd.cfl_ideal < 1.0)) {
@@ -3125,6 +3135,57 @@ void validateConfig(const SimulationConfig& config) {
   }
   validatePart2BaryonicPhysics(config);
   validateMhdConfig(config.mhd);
+  if (config.mhd.enabled) {
+    // CHUI-MHD-REF-v1 cross-subsystem admission. These combinations have no
+    // established MHD-compatible contract; they are rejected instead of being
+    // run with an inconsistent energy or EOS closure.
+    if (config.numerics.hydro_dual_energy != HydroDualEnergyConfigMode::kOff) {
+      throw ConfigError(
+          "mhd.enabled=true requires numerics.hydro_dual_energy=off: the reference MHD "
+          "total energy (thermal+kinetic+magnetic) is the single energy authority and the "
+          "existing dual-energy auxiliary has no magnetic-aware contract (REF section 6.3)");
+    }
+    if (config.physics.enable_star_formation &&
+        config.physics.star_formation_model == StarFormationModelKind::kEffectiveMultiphaseTngLike) {
+      throw ConfigError(
+          "mhd.enabled=true is incompatible with the effective multiphase ISM EOS until a "
+          "dedicated MHD-EOS verification gate exists (REF section 9)");
+    }
+    if (config.mhd.amr.distributed_subcycling && config.parallel.mpi_ranks_expected > 1) {
+      throw ConfigError(
+          "distributed recursive MHD AMR is not implemented; use mhd_amr.distributed_subcycling=false");
+    }
+    if (config.mhd.performance.optional_gpu_backend) {
+      throw ConfigError(
+          "mhd_performance.optional_gpu_backend=true is not admitted: no GPU MHD kernels exist "
+          "and there is no silent CPU fallback");
+    }
+    if (config.mhd.nonideal.enabled) {
+      const bool any_term = config.mhd.nonideal.ohmic_enabled ||
+          config.mhd.nonideal.ambipolar_enabled || config.mhd.nonideal.hall_enabled;
+      if (!any_term) {
+        throw ConfigError("mhd_nonideal.enabled=true requires at least one enabled term");
+      }
+      if (config.mhd.nonideal.coefficient_provider == MhdCoefficientProviderConfigMode::kTable &&
+          (config.mhd.nonideal.composition_id.empty() ||
+           config.mhd.nonideal.grain_model_id.empty())) {
+        throw ConfigError(
+            "mhd_nonideal.coefficient_provider=table requires composition_id and grain_model_id "
+            "(categorical table axes are exact-match and never defaulted)");
+      }
+      if (config.mhd.nonideal.coefficient_provider == MhdCoefficientProviderConfigMode::kTable &&
+          (config.mhd.nonideal.eta_ohmic_phys_cgs != 0.0 ||
+           config.mhd.nonideal.eta_hall_phys_cgs != 0.0 ||
+           config.mhd.nonideal.eta_ambipolar_phys_cgs != 0.0)) {
+        throw ConfigError(
+            "mhd_nonideal.coefficient_provider=table refuses eta_*_phys_cgs constants "
+            "(mixed coefficient authority)");
+      }
+    } else if (config.mhd.nonideal.ohmic_enabled || config.mhd.nonideal.ambipolar_enabled ||
+               config.mhd.nonideal.hall_enabled) {
+      throw ConfigError("mhd_nonideal operator flags require mhd_nonideal.enabled=true");
+    }
+  }
   if (config.cosmology.box_size_x_mpc_comoving <= 0.0 ||
       config.cosmology.box_size_y_mpc_comoving <= 0.0 ||
       config.cosmology.box_size_z_mpc_comoving <= 0.0) {
@@ -4113,6 +4174,13 @@ class NormalizedConfigStream {
   stream << "halo_include_stars = " << (frozen.config.analysis.halo_include_stars ? "true" : "false") << '\n';
   stream << "halo_include_black_holes = " << (frozen.config.analysis.halo_include_black_holes ? "true" : "false")
          << '\n';
+  // MHD sections are emitted ONLY for magnetized runs. An MHD-disabled run
+  // therefore produces normalized text (and config hash) byte-identical to the
+  // pre-MHD predecessor schema, preserving v25 restart config-hash admission
+  // for existing nonmagnetic checkpoints. Non-default MHD keys on a disabled
+  // run are rejected at parse time (see rejectInertMhdKeys), so omitting them
+  // here never hides a user-visible setting.
+  if (frozen.config.mhd.enabled) {
   stream << "\n[mhd]\n";
   stream << "enabled = " << (frozen.config.mhd.enabled ? "true" : "false") << '\n';
   stream << "reference_profile = "
@@ -4257,6 +4325,7 @@ class NormalizedConfigStream {
   stream << "allow_untracked_allocations = "
          << (frozen.config.mhd.performance.allow_untracked_allocations ? "true" : "false")
          << '\n';
+  }  // frozen.config.mhd.enabled
   stream << "\n[compatibility]\n";
   stream << "allow_unknown_keys = "
          << (frozen.config.compatibility.allow_unknown_keys ? "true" : "false") << '\n';

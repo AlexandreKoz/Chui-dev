@@ -752,3 +752,14 @@ bitwise.
 * Reproducibility impact (T02): under `amr_time_stepping = recursive_subcycling`
   element diffusion and SGS shear now integrate on AMR level clocks instead of
   the coarse halves, so recursive runs are not bit-comparable with patch 49.
+
+## MHD exact restart (status: codec only, fail-closed)
+
+The MHD checkpoint is `cosmosim_restart_v26` (amendment R1; v25 stays the
+nonmagnetic dual-energy schema). Its `/state/mhd` group codec exists in
+`src/io/mhd_restart_state.cpp`; see `docs/output_schema.md`. The v26
+writer/reader pipeline (collective publication, integrity readback,
+normalized-config-hash admission, same-rank-topology rule, safe-boundary
+deferral of MHD checkpoint requests) is not wired. Until it is, the v25 writer
+refuses any state whose `SimulationState::magnetic_faces` is non-empty, and no
+reader infers a magnetic state from a v25 checkpoint or a science snapshot.
