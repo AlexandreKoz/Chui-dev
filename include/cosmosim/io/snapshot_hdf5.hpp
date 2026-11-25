@@ -113,7 +113,29 @@ struct SnapshotWritePayload {
   std::array<std::uint64_t, 6> collective_file_row_offset{};
   bool collective_write_particle_softening = false;
   bool collective_write_particle_softening_override = false;
+  // chui_science_snapshot_v7 /MHD/Diagnostics (magnetized states only). A
+  // collective single file requires rank-agreed global values supplied by the
+  // caller (mhd_diagnostics_global=true); sharded members write their own
+  // rank-local values with DiagnosticsScope="file_member".
+  bool mhd_diagnostics_global = false;
+  double mhd_divergence_max_norm = 0.0;
+  double mhd_magnetic_energy_comoving = 0.0;
+  double mhd_scale_factor = 1.0;
 };
+
+// CHUI-MHD amendment R6: magnetized science output schema (v6 + derived
+// PartType0/MagneticField [B_comov, normalized code units], PartType0/
+// MagneticPressure and /MHD/Diagnostics). Never exact-restart authority.
+inline constexpr std::string_view k_science_snapshot_mhd_schema_name = "chui_science_snapshot_v7";
+inline constexpr std::uint32_t k_science_snapshot_mhd_schema_version = 7U;
+
+// Derived cell-centred B_comov (arithmetic mean of the two bordering face
+// fields per axis) of every gas row of `state`, evaluated from the
+// authoritative MagneticFaceSoa through the leaf patch geometry; written in
+// bounded chunks by the snapshot writer (no full-population mirror).
+// Returns the rank-local comoving magnetic energy sum B_c^2/(2a) V.
+[[nodiscard]] double mhdLocalMagneticEnergyComoving(const core::SimulationState& state,
+                                                    double scale_factor);
 
 struct SnapshotReadOptions {
   bool require_ids = true;

@@ -145,6 +145,17 @@ enum class MhdInputProjectionConfigMode {
   kReject,
 };
 
+// Fresh-start magnetic seed (CHUI-MHD-REF v1.0 section 10): every model is
+// Phi = Phi_uniform + C(A_edge) on the real patch topology; kNone requires a
+// magnetic state from a v26 checkpoint (fresh starts are rejected).
+enum class MhdInitialFieldSeedConfigMode {
+  kNone,
+  kUniform,
+  kFieldLoop,
+  kCircularAlfven,
+  kStochastic,
+};
+
 enum class MhdPerformanceProfile {
   kWorkstation48gibV01,
   kClusterV01,
@@ -221,6 +232,20 @@ struct MhdConfig {
     MhdInputProjectionConfigMode input_projection =
         MhdInputProjectionConfigMode::kReject;
     bool output_divergence_diagnostics = true;
+    // Fresh-start seed (comoving code units, B_c = a_initial^2 B_phys).
+    MhdInitialFieldSeedConfigMode initial_field_seed = MhdInitialFieldSeedConfigMode::kNone;
+    double initial_field_uniform_b_x_comoving = 0.0;
+    double initial_field_uniform_b_y_comoving = 0.0;
+    double initial_field_uniform_b_z_comoving = 0.0;
+    double initial_field_amplitude_comoving = 0.0;
+    // Loop radius (field_loop) or wavelength (circular_alfven), comoving.
+    double initial_field_length_comoving = 0.0;
+    double initial_field_center_x_comoving = 0.0;
+    double initial_field_center_y_comoving = 0.0;
+    double initial_field_center_z_comoving = 0.0;
+    std::uint64_t initial_field_random_seed = 0U;
+    int initial_field_k_max = 0;
+    double initial_field_spectral_index = 0.0;
     friend bool operator==(const Io&, const Io&) = default;
   } io;
 
@@ -1348,6 +1373,8 @@ void writeNormalizedConfigSnapshot(
 [[nodiscard]] std::string mhdEmfRefluxConfigModeToString(MhdEmfRefluxConfigMode value);
 [[nodiscard]] std::string mhdScienceBFieldConfigModeToString(
     MhdScienceBFieldConfigMode value);
+[[nodiscard]] std::string mhdInitialFieldSeedConfigModeToString(
+    MhdInitialFieldSeedConfigMode value);
 [[nodiscard]] std::string mhdInitialFieldFormatConfigModeToString(
     MhdInitialFieldFormatConfigMode value);
 [[nodiscard]] std::string mhdInputProjectionConfigModeToString(

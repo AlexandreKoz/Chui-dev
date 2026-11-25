@@ -56,6 +56,7 @@
 #include "workflows/internal/amr_geometry_assurance.hpp"
 #include "workflows/internal/particle_ghost_runtime.hpp"
 #include "workflows/internal/mpi_stage_collective_decision.hpp"
+#include "workflows/internal/mhd_runtime_bridge.hpp"
 #include "cosmosim/core/stage_transaction.hpp"
 
 #if COSMOSIM_ENABLE_MPI
@@ -787,6 +788,15 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime, public HydroShadowChro
         m_shadow(hydroShadowOptionsFromConfig(config), services.memory_governor),
         m_reconstruction(makeConfiguredReconstruction(config, {0.0, 0.0, 0.0})),
         m_riemann_solver(hydro::makeHydroRiemannSolver(hydroRiemannSolverKindFromConfig(config))) {
+    // CHUI-MHD-REF-v1: magnetized runs replace the hydro Godunov update of
+    // kHydroUpdate by the synchronized D/H/I/H/D interval (single owner);
+    // everything else of this owner (ghost refresh, composition, shadow-off,
+    // diagnostics) keeps its non-magnetic behaviour. Admission predicates
+    // live in runtime_capabilities.cpp (mhd_production_dispatch).
+    if (config.mhd.enabled) {
+      m_mhd = std::make_unique<internal::MhdRuntimeBridge>(config, services.mpi_context,
+                                                          services.memory_governor, m_units);
+    }
     // C04-05 / v10 §5.2: a refused MANDATORY reservation first reclaims the
     // optional shadow samples (local, no collective; only on this thread).
     if (m_memory_governor != nullptr && config.numerics.hydro_shadow_enabled) {
@@ -1097,6 +1107,48 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime, public HydroShadowChro
     }
     m_last_hydro_profile = {};
     m_last_amr_hydro_diagnostics = {};
+    if (m_mhd != nullptr) {
+      // Magnetized kHydroUpdate: production leaf-AMR topology is mandatory
+      // (a single-level leaf tiling is a valid hierarchy); the legacy
+      // fixed-Cartesian path has no face-flux authority and is refused.
+      if (production_amr_rank_count == 0U) {
+        throw std::runtime_error(
+            "MHD_UNSUPPORTED_PHYSICS: magnetized kHydroUpdate requires production AMR leaf "
+            "coverage with explicit patch geometry on every rank that owns gas");
+      }
+      if (context.state.cells.size() != 0U) {
+        context.state.requireGasCellIdentityMapCoversDenseRows("MHD hydro callback");
+      }
+      m_mhd->advance(context, magnetizedDomain(context.state), m_temperature_k_per_internal_energy_code);
+      // PERF section 13 telemetry into the existing counters.json registry
+      // (actual counts of the accepted interval; never estimates).
+      if (context.profiler_session != nullptr) {
+        const mhd::MhdLevelAdvanceResult& last = m_mhd->lastResult();
+        core::CounterRegistry& counters = context.profiler_session->counters();
+        counters.addCount("mhd_accepted_intervals", 1U);
+        counters.addCount("mhd_ideal_stage_count_attempted", last.ideal_stage_evaluations_attempted);
+        counters.addCount("mhd_ideal_stage_count_accepted", last.ideal_stage_evaluations_accepted);
+        counters.addCount("mhd_hlld_fallback_faces",
+                          last.ideal.hlle_fallback_faces + last.ideal.first_order_faces);
+        counters.addCount("mhd_faces_solved", last.ideal.faces_solved);
+        counters.addCount("mhd_hall_subcycle_count", last.transport.hall_subcycle_count);
+        counters.addCount("mhd_rkl_stage_count", last.transport.rkl_stage_count);
+        counters.addCount("mhd_rkl_cycle_count", last.transport.rkl_cycle_count);
+        counters.addCount("mhd_rejection_count", last.rejected_attempts);
+        counters.addCount("mhd_mpi_bytes_sent", last.mpi_bytes_sent);
+        counters.addCount("mhd_mpi_bytes_recv", last.mpi_bytes_received);
+        counters.addCount("mhd_ghost_prolongation_slope_fallbacks",
+                          last.ghost_prolongation_slope_fallbacks);
+        counters.setCount("mhd_phase_scratch_capacity_bytes", last.scratch_capacity_bytes);
+        counters.setCount("mhd_owned_capacity_bytes", m_mhd->ownedCapacityBytes());
+      }
+      // Same compatibility-mirror contract as the production AMR hydro path.
+      internal::synchronizeParentParticleCompatibilityMirrors(
+          context.state, m_current_world_rank, "MHD hydro-update gas compatibility mirror");
+      context.state.bumpGravitySourceGeneration();
+      finishHydroStageShadow();
+      return;
+    }
     m_last_floor_diagnostics = auditConfiguredHydroFloors(context.state);
 
     // Production AMR exchanges are collective.  Ranks with zero local cells
@@ -3990,6 +4042,44 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime, public HydroShadowChro
   // restart restore, IC materialization) re-runs the full proof before the
   // next ghost fill. Internal holes are never reinterpreted as physical
   // boundaries. Returns zero extents when no rank owns a populated patch.
+  // Global leaf-hierarchy domain for the magnetized path (same leaf-tiling
+  // proof and boundary authority as production AMR hydro).
+  [[nodiscard]] internal::MhdDomainSpec magnetizedDomain(const core::SimulationState& state) {
+    amr::ProductionAmrHydroOptions options{};
+    options.physical_boundary_kind = hydroBoundaryKindFromModePolicy(m_mode_policy.hydro_boundary);
+    options.periodic_box_extent_comoving = {m_config.cosmology.box_size_x_mpc_comoving,
+                                            m_config.cosmology.box_size_y_mpc_comoving,
+                                            m_config.cosmology.box_size_z_mpc_comoving};
+    const auto [origin, extent] =
+        globalAmrHierarchyDomain(state, options, "MHD leaf-hierarchy domain");
+    internal::MhdDomainSpec domain{};
+    domain.origin_comoving = origin;
+    domain.extent_comoving = extent;
+    domain.boundary = m_mode_policy.hydro_boundary;
+    return domain;
+  }
+
+ public:
+  double magnetizedStableTimeStep(core::SimulationState& state,
+                                  const core::IntegratorState& integrator,
+                                  bool cosmological) override {
+    if (m_mhd == nullptr) {
+      return std::numeric_limits<double>::infinity();
+    }
+    const std::uint64_t local_has_production_amr =
+        amr::hasProductionAmrHydroCoverage(state) ? 1ULL : 0ULL;
+    if (m_mpi_context.allreduceSumUint64(local_has_production_amr) == 0U) {
+      throw std::runtime_error(
+          "MHD_UNSUPPORTED_PHYSICS: magnetized runs require production AMR leaf coverage");
+    }
+    return m_mhd->stableTimeStep(state, integrator, magnetizedDomain(state), cosmological);
+  }
+
+  [[nodiscard]] std::uint64_t magnetizedOwnedCapacityBytes() const noexcept override {
+    return m_mhd != nullptr ? m_mhd->ownedCapacityBytes() : 0U;
+  }
+
+ private:
   [[nodiscard]] std::pair<std::array<double, 3>, std::array<double, 3>> globalAmrHierarchyDomain(
       const core::SimulationState& state,
       const amr::ProductionAmrHydroOptions& amr_options,
@@ -5869,6 +5959,9 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime, public HydroShadowChro
   std::vector<std::size_t> m_active_faces;
   std::unordered_set<std::size_t> m_remote_non_authority_faces;
   std::optional<HydroGeometryCacheKey> m_cached_geometry_key;
+  // CHUI-MHD-REF-v1 synchronized reference path (null for MHD-disabled runs:
+  // no MHD allocation exists then, MP07).
+  std::unique_ptr<internal::MhdRuntimeBridge> m_mhd;
 };
 }  // namespace
 
@@ -5878,13 +5971,13 @@ std::unique_ptr<HydroAmrRuntime> makeHydroAmrRuntime(
     const RuntimeServices& services,
     std::shared_ptr<const physics::EffectiveMultiphaseEosTable> effective_eos_table) {
   // Defense in depth for callers that bypass ReferenceWorkflow capability
-  // admission: this owner implements nonmagnetic hydro only and must never
-  // run a magnetized configuration as ordinary hydro.
+  // admission: the magnetized dispatch is constructed only for a
+  // configuration whose every MHD predicate is source-supported.
   if (config.mhd.enabled) {
-    throw std::invalid_argument(
-        "MHD_UNSUPPORTED_PHYSICS: makeHydroAmrRuntime has no magnetized kHydroUpdate "
-        "dispatch; mhd.enabled=true is rejected (see runtime capability "
-        "mhd_production_dispatch)");
+    const std::string refusal = mhdProductionDispatchRefusal(config, mode_policy);
+    if (!refusal.empty()) {
+      throw std::invalid_argument("MHD_UNSUPPORTED_PHYSICS: " + refusal);
+    }
   }
   return std::make_unique<HydroAmrRuntimeImpl>(
       config, mode_policy, services, std::move(effective_eos_table));

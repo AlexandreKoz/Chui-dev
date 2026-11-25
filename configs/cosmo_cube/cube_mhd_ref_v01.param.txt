@@ -1,8 +1,9 @@
 # CHUI-MHD-REF-v1 ideal reference example (mhd_ref_ideal_v01), cosmological
-# cube. STATUS: parses and validates as typed configuration, but the run is
-# REJECTED at runtime capability admission (MHD_UNSUPPORTED_PHYSICS,
-# capability mhd_production_dispatch) until the magnetized kHydroUpdate
-# dispatch, v26 restart and v7 snapshot are wired. The effective multiphase
+# cube. STATUS (pass 02): satisfies the synchronized CPU reference admission
+# predicates (runtime capability mhd_production_dispatch); source-implemented
+# and UNVALIDATED -- never executed in the source-only campaign. Requires
+# production AMR leaf coverage with explicit patch geometry (a static, 2:1
+# balanced leaf tiling; dynamic regrid is fail-closed). The effective multiphase
 # ISM EOS of the nonmagnetic cube is replaced by the legacy threshold model
 # because MHD + effective-EOS has no verified contract (REF section 9).
 # The initial magnetic face flux must come from a certified face-flux IC or
@@ -48,6 +49,8 @@ time_begin_code = 0.0
 time_end_code = 1.0
 max_global_steps = 2048
 hierarchical_max_rung = 0
+# The global-step transaction owns MHD interval retries (REF 6.2/8.5).
+global_step_max_retries = 8
 amr_max_level = 9
 gravity_softening = 3.0 kpc
 gravity_solver = treepm
@@ -76,6 +79,9 @@ write_restarts = true
 
 [parallel]
 mpi_ranks_expected = 1
+# Patch migration with magnetic face payloads is fail-closed in pass 02; a
+# multi-rank variant must keep runtime rebalancing disabled.
+decomposition_runtime_rebalance_enabled = false
 omp_threads = 1
 gpu_devices = 0
 deterministic_reduction = true
@@ -111,6 +117,11 @@ checkpoint_face_flux = true
 initial_field_format = face_flux
 input_projection = reject
 output_divergence_diagnostics = true
+# Fresh-start seed Phi = Phi_uniform + C(A) on the real leaf topology. The
+# amplitude is a deck choice in normalized Lorentz-Heaviside comoving code
+# units (B_c = a_initial^2 B_phys); it is not a physical calibration.
+initial_field_seed = uniform
+initial_field_uniform_b_z_comoving = 1.0e-6
 
 [mhd_performance]
 profile = workstation_48gib_v01

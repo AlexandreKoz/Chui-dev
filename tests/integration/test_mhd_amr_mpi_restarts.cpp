@@ -21,6 +21,8 @@
 #include "cosmosim/mhd/mhd_initial_conditions.hpp"
 #include "cosmosim/mhd/mhd_runtime_adapter.hpp"
 #include "cosmosim/workflows/runtime_capabilities.hpp"
+#include "cosmosim/workflows/hydro_amr_runtime.hpp"
+#include "cosmosim/core/simulation_mode.hpp"
 
 #if COSMOSIM_ENABLE_HDF5
 #include <hdf5.h>
@@ -417,9 +419,14 @@ void testConfigAndCapabilityAdmission() {
     rejected = true;
   }
   CHUI_REQUIRE(rejected);
+  // Pass 02: capability-specific admission (no blanket refusal).
+  // Negative: the global-step transaction must own MHD retries.
   const auto on = cosmosim::core::loadFrozenConfigFromString(
       std::string(k_baseline_config) + "\n[mhd]\nenabled = true\n", "mhd_on");
   CHUI_REQUIRE(on.normalized_text.find("[mhd]") != std::string::npos);
+  const std::string missing_retry_owner =
+      cosmosim::workflows::mhdProductionDispatchRefusal(on.config, cosmosim::core::ModePolicy{});
+  CHUI_REQUIRE(missing_retry_owner.find("global_step_max_retries") != std::string::npos);
   const auto report = cosmosim::workflows::buildRuntimeCapabilityReport(on.config);
   CHUI_REQUIRE(report.require("mhd_production_dispatch").requested);
   CHUI_REQUIRE(!report.require("mhd_production_dispatch").runtime_available);
@@ -432,8 +439,40 @@ void testConfigAndCapabilityAdmission() {
     rejected = false;  // a different (e.g. TreePM backend) refusal is not this guard
   }
   CHUI_REQUIRE(rejected);
+  // Positive: the synchronized CPU reference predicates hold.
+  std::string supported_text(k_baseline_config);
+  const std::size_t numerics = supported_text.find("[numerics]\n");
+  CHUI_REQUIRE(numerics != std::string::npos);
+  supported_text.insert(numerics + std::string("[numerics]\n").size(),
+                        "global_step_max_retries = 1\n");
+  supported_text += "\n[mhd]\nenabled = true\n";
+  const auto supported = cosmosim::core::loadFrozenConfigFromString(supported_text, "mhd_supported");
+  const std::string supported_refusal = cosmosim::workflows::mhdProductionDispatchRefusal(
+      supported.config, cosmosim::core::ModePolicy{});
+#if COSMOSIM_ENABLE_HDF5
+  CHUI_REQUIRE(supported_refusal.empty());
+  const auto supported_report = cosmosim::workflows::buildRuntimeCapabilityReport(supported.config);
+  CHUI_REQUIRE(supported_report.require("mhd_production_dispatch").runtime_available);
+  CHUI_REQUIRE(supported_report.require("mhd_production_dispatch").active);
+#else
+  CHUI_REQUIRE(supported_refusal.find("HDF5") != std::string::npos);
+#endif
+  // Negative: specific unsupported combinations keep failing closed.
+  std::string shadow_text = supported_text;
+  shadow_text.insert(numerics + std::string("[numerics]\n").size(), "hydro_shadow_enabled = true\n");
+  bool shadow_refused = false;
+  try {
+    const auto shadow = cosmosim::core::loadFrozenConfigFromString(shadow_text, "mhd_shadow");
+    shadow_refused = !cosmosim::workflows::mhdProductionDispatchRefusal(
+                          shadow.config, cosmosim::core::ModePolicy{})
+                          .empty();
+  } catch (const std::exception&) {
+    shadow_refused = true;  // rejected even earlier by typed config validation
+  }
+  CHUI_REQUIRE(shadow_refused);
   const auto off_report = cosmosim::workflows::buildRuntimeCapabilityReport(off.config);
   CHUI_REQUIRE(!off_report.require("mhd_production_dispatch").requested);
+  CHUI_REQUIRE(off_report.require("mhd_production_dispatch").runtime_available);
 }
 
 }  // namespace

@@ -96,6 +96,15 @@ void MhdDoubleArray::resize(std::size_t size, double fill_value) {
     }
     return;
   }
+  // Retained-capacity reuse (PERF section 5: capacities, not logical sizes,
+  // are the accounted quantity): a reusable batch workspace that serves
+  // patches of different shapes must not reallocate once it has grown to the
+  // largest admitted shape. Reused storage is fully re-filled.
+  if (m_data && size != 0U && allocatorSizeBytes(size) <= m_capacity) {
+    m_size = size;
+    std::fill_n(m_data.get(), m_size, fill_value);
+    return;
+  }
   MhdDoubleArray replacement(size, fill_value);
   swap(replacement);
 }

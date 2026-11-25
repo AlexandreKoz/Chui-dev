@@ -435,6 +435,8 @@ CosmologicalStepFactors CosmologicalTimeline::prepareStep(
     step.first_hubble_drag_factor = 1.0;
     step.second_hubble_drag_factor = 1.0;
     step.hubble_drag_factor = 1.0;
+    step.first_source_kick_factor_code = 0.5 * dt_time_code;
+    step.second_source_kick_factor_code = 0.5 * dt_time_code;
     return step;
   }
 
@@ -449,6 +451,12 @@ CosmologicalStepFactors CosmologicalTimeline::prepareStep(
   step.first_hubble_drag_factor = computeHubbleDragFactor(step.scale_factor_begin, step.scale_factor_midpoint);
   step.second_hubble_drag_factor = computeHubbleDragFactor(step.scale_factor_midpoint, step.scale_factor_end);
   step.hubble_drag_factor = computeHubbleDragFactor(step.scale_factor_begin, step.scale_factor_end);
+  step.first_source_kick_factor_code =
+      computeComovingSourceKickFactor(*m_background, step.scale_factor_begin, step.scale_factor_midpoint, 64) /
+      m_time_si_per_code;
+  step.second_source_kick_factor_code =
+      computeComovingSourceKickFactor(*m_background, step.scale_factor_midpoint, step.scale_factor_end, 64) /
+      m_time_si_per_code;
   return step;
 }
 
@@ -3545,6 +3553,31 @@ double computeComovingKickFactor(
   // multiplier.  For short steps it reduces to dt/a^2 in code units.
   return midpointIntegrateDriftLike(background, scale_factor_begin, scale_factor_end, midpoint_samples) /
       scale_factor_end;
+}
+
+double computeComovingSourceKickFactor(
+    const LambdaCdmBackground& background,
+    double scale_factor_begin,
+    double scale_factor_end,
+    std::uint32_t midpoint_samples) {
+  if (scale_factor_begin <= 0.0 || scale_factor_end <= 0.0) {
+    throw std::invalid_argument("scale factors must be positive for the source kick integral");
+  }
+  if (scale_factor_end < scale_factor_begin) {
+    throw std::invalid_argument("scale_factor_end must be >= scale_factor_begin");
+  }
+  const std::uint32_t samples = std::max<std::uint32_t>(midpoint_samples, 1U);
+  const double delta_a = (scale_factor_end - scale_factor_begin) / static_cast<double>(samples);
+  if (delta_a == 0.0) {
+    return 0.0;
+  }
+  // dt = da / (a H): integral dt / a^2 = integral da / (a^3 H(a)).
+  double accum = 0.0;
+  for (std::uint32_t i = 0; i < samples; ++i) {
+    const double a_mid = scale_factor_begin + (static_cast<double>(i) + 0.5) * delta_a;
+    accum += 1.0 / (a_mid * a_mid * a_mid * background.hubbleSi(a_mid));
+  }
+  return accum * delta_a;
 }
 
 double computeHubbleDragFactor(double scale_factor_begin, double scale_factor_end) {

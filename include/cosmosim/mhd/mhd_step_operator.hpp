@@ -178,6 +178,21 @@ class MhdStepOperator {
                                               double scale_factor,
                                               MhdStageWorkspace& workspace) const;
 
+  // Single-cell primitive recovery with exactly the arithmetic of
+  // recoverPrimitives (used by the level stepper to sample neighbour, finer
+  // and coarser leaves for ghost data). Returns false for an inadmissible
+  // state; never floors.
+  [[nodiscard]] bool recoverCellPrimitive(const MhdConservedState& gas,
+                                          const std::array<double, 3>& b_comoving,
+                                          double scale_factor,
+                                          MhdPrimitiveState& out) const noexcept;
+  // Cell-centred comoving field B_c from authoritative face fluxes
+  // (arithmetic mean of the two bordering face fields per axis).
+  [[nodiscard]] static std::array<double, 3> cellFieldFromFaces(
+      const MhdPatchGeometry& geometry, std::span<const double> phi_x,
+      std::span<const double> phi_y, std::span<const double> phi_z, std::size_t i,
+      std::size_t j, std::size_t k) noexcept;
+
   // Fill ghost cells and staggered ghost rows for every patch side whose kind
   // is physical (periodic self-wrap, open, conducting wall). kNeighborPatch
   // sides must already have been filled by the level stepper.

@@ -541,23 +541,41 @@ checkpoint (`docs/restart_checkpointing.md`).
 
 ## MHD schemas (CHUI-MHD-REF-v1 section 13, amendment R1/R6) — status
 
+Status: source-implemented in pass 02, UNVALIDATED (no build or run).
+
 * `cosmosim_restart_v25` remains the nonmagnetic dual-energy checkpoint and is
-  never reused for magnetic fields. The MHD checkpoint is
-  `cosmosim_restart_v26` with the authoritative group `/state/mhd`
-  (group `schema_version = 1`): `patch_id` uint64[P], `geometry_generation`
-  uint64[P], `refinement_level` uint8[P], `face_dims_xyz` uint32[P,3],
-  `patch_origin_comoving` / `cell_width_comoving` float64[P,3],
-  `face_offset_{x,y,z}` uint64[P+1] (exclusive prefix sums, `[0] = 0`),
-  `face_flux_{x,y,z}_comoving` float64; attributes `reference_contract`,
-  `coefficient_table_sha256`, `divergence_max_norm`, `scale_factor`,
+  never reused for magnetic fields; nonmagnetic states keep writing v25
+  unchanged. A state with a non-empty `SimulationState::magnetic_faces` is
+  written as `cosmosim_restart_v26` = the complete v25 layout plus the
+  authoritative group `/state/mhd` (group `schema_version = 1`): `patch_id`
+  uint64[P], `geometry_generation` uint64[P], `refinement_level` uint8[P],
+  `face_dims_xyz` uint32[P,3], `patch_origin_comoving` / `cell_width_comoving`
+  float64[P,3], `face_offset_{x,y,z}` uint64[P+1] (exclusive prefix sums,
+  `[0] = 0`), `face_flux_{x,y,z}_comoving` float64; attributes
+  `reference_contract = chui-mhd-ref-v1.0`, `coefficient_table_sha256`,
+  `divergence_max_norm`, `scale_factor`,
   `magnetic_units = code_comoving_lorentz_heaviside`, `face_flux_contract`.
-  The group codec (`io/mhd_restart_state.hpp`) writes flux lanes in <= 8 MiB
-  hyperslabs directly from the canonical lanes and validates every field
-  (shapes, offsets, finite values, unique ids, table SHA, scale factor,
-  recomputed discrete divergence) before returning a state. **Not yet wired**
-  into `writeRestartCheckpointHdf5`/the reader: a non-empty magnetic state makes
-  the v25 writer throw `MHD_RESTART_SCHEMA_MISMATCH` instead of writing v25.
-* `chui_science_snapshot_v6` is unchanged for MHD-off runs. The MHD science
-  schema `chui_science_snapshot_v7` (derived `PartType0/MagneticField` in
-  comoving normalized code units, `/MHD/Diagnostics`) is **not implemented**:
-  the snapshot writer throws for a magnetized state or `mhd.enabled = true`.
+* **Canonical dataset spelling (decision R-SPELL):** `face_flux_{x,y,z}_comoving`
+  (repository naming rulebook, amendment R4 precedence). REF 13.2's abbreviated
+  `face_flux_*_comov` is superseded; a file carrying it is rejected with
+  `MHD_RESTART_SCHEMA_MISMATCH` (no alias, no duplicate datasets).
+* The magnetic records and the three flux lanes are part of the canonical
+  payload SHA-256 (`sha256-canonical-le-v1`) of a v26 file. Flux lanes are
+  written and read in <= 8 MiB hyperslabs directly from/into the canonical
+  lanes; the per-rank patch table is bounded (`2^24`) and the candidate lanes are
+  admitted by the governor before allocation. `/state/mhd` in a pre-v26 file and
+  a v26 file without it are both rejected.
+* `chui_science_snapshot_v6` is unchanged for MHD-off runs. Magnetized runs write
+  `chui_science_snapshot_v7`: v6 plus `PartType0/MagneticField` (Nx3 float64,
+  derived cell-centred `B_comov = a^2 B_phys` in normalized code units,
+  attributes `Frame = Comoving`, `MagneticUnit = Code`, `Definition`),
+  `PartType0/MagneticPressure` (`B_c^2/(2a)`), header provenance attributes
+  `MhdSchemeVersion`, `MagneticUnits`, `MagneticFrame`, `InductionOperator`,
+  `EmfScheme`, `Reconstruction`, `NonidealIntegrator`, `CoefficientProvider`,
+  `CoefficientTableSha256`, `DiffusivityConvention`, and `/MHD/Diagnostics`
+  (`DiagnosticsScope` = `global` for a collective single file with rank-agreed
+  values, `file_member` for sharded members; `DivergenceMaxNorm`,
+  `MagneticEnergyComoving`, `ScaleFactor`, `ExactRestartAuthority = false`).
+  The field is derived in bounded chunks (no full-population mirror); native
+  values are never labelled as an external dialect's magnetic field. v7 is not
+  exact restart authority.

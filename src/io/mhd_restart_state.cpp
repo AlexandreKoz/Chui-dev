@@ -121,6 +121,49 @@ template <typename T>
   return values;
 }
 
+// Stream one face-flux lane directly into the candidate (final) storage in
+// hyperslabs of at most k_mhd_restart_chunk_bytes (MP08): shape and element
+// type are validated BEFORE the destination is sized; there is no
+// intermediate full-size copy.
+void readFluxLaneInto(hid_t group, const char* name, std::uint64_t expected_count,
+                      core::AlignedVector<double>& lane) {
+  if (H5Lexists(group, name, H5P_DEFAULT) <= 0) {
+    fail(std::string("missing dataset /state/mhd/") + name);
+  }
+  Handle dataset(H5Dopen2(group, name, H5P_DEFAULT), H5Dclose);
+  Handle space(H5Dget_space(dataset.get()), H5Sclose);
+  if (H5Sget_simple_extent_ndims(space.get()) != 1) {
+    fail(std::string("dataset ") + name + " must be one-dimensional");
+  }
+  hsize_t dims = 0;
+  H5Sget_simple_extent_dims(space.get(), &dims, nullptr);
+  if (dims != expected_count) {
+    fail(std::string("dataset ") + name + " length disagrees with the patch offset table");
+  }
+  Handle type(H5Dget_type(dataset.get()), H5Tclose);
+  if (H5Tget_size(type.get()) != sizeof(double) || H5Tget_class(type.get()) != H5T_FLOAT) {
+    fail(std::string("dataset ") + name + " has the wrong element type");
+  }
+  if (expected_count > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max())) {
+    fail(std::string("dataset ") + name + " exceeds the addressable size");
+  }
+  lane.resize(static_cast<std::size_t>(expected_count));
+  const std::uint64_t chunk = std::max<std::uint64_t>(1U, k_mhd_restart_chunk_bytes / sizeof(double));
+  for (std::uint64_t begin = 0; begin < expected_count; begin += chunk) {
+    const hsize_t start = begin;
+    const hsize_t count = std::min<std::uint64_t>(chunk, expected_count - begin);
+    Handle file_space(H5Dget_space(dataset.get()), H5Sclose);
+    if (H5Sselect_hyperslab(file_space.get(), H5S_SELECT_SET, &start, nullptr, &count, nullptr) < 0) {
+      fail(std::string("cannot select a hyperslab of ") + name);
+    }
+    Handle memory_space(H5Screate_simple(1, &count, nullptr), H5Sclose);
+    if (H5Dread(dataset.get(), H5T_NATIVE_DOUBLE, memory_space.get(), file_space.get(), H5P_DEFAULT,
+                lane.data() + begin) < 0) {
+      fail(std::string("cannot read dataset ") + name + " (truncated or corrupt)");
+    }
+  }
+}
+
 void writeStringAttribute(hid_t object, const char* name, const std::string& value) {
   Handle type(H5Tcopy(H5T_C_S1), H5Tclose);
   H5Tset_size(type.get(), std::max<std::size_t>(1U, value.size()));
@@ -339,6 +382,20 @@ core::MagneticFaceSoa readMhdRestartGroup(std::int64_t hdf5_file,
   if (count == 0U) {
     fail("magnetized checkpoint carries no patches");
   }
+  // Bound the patch table before allocating it (malicious/corrupt extents).
+  if (count > k_mhd_restart_max_patches_per_rank) {
+    fail("patch table exceeds the per-rank bound of the v26 schema");
+  }
+  // Canonical dataset spelling (pass-02 schema decision R-SPELL): the
+  // repository naming rulebook's _comoving suffix; REF section 13.2's
+  // abbreviated _comov spelling is not an accepted alias.
+  for (const char* superseded :
+       {"face_flux_x_comov", "face_flux_y_comov", "face_flux_z_comov"}) {
+    if (H5Lexists(group.get(), superseded, H5P_DEFAULT) > 0) {
+      fail(std::string("non-canonical dataset spelling /state/mhd/") + superseded +
+           " (canonical v26 names are face_flux_{x,y,z}_comoving)");
+    }
+  }
   const auto ids = readDataset<std::uint64_t>(group.get(), "patch_id", count, 1U);
   const auto generations = readDataset<std::uint64_t>(group.get(), "geometry_generation", count, 1U);
   const auto levels = readDataset<std::uint8_t>(group.get(), "refinement_level", count, 1U);
@@ -396,12 +453,9 @@ core::MagneticFaceSoa readMhdRestartGroup(std::int64_t hdf5_file,
     record.flux_y_offset = offset_y[index];
     record.flux_z_offset = offset_z[index];
   }
-  const auto flux_x = readDataset<double>(group.get(), "face_flux_x_comoving", cursor[0], 1U);
-  const auto flux_y = readDataset<double>(group.get(), "face_flux_y_comoving", cursor[1], 1U);
-  const auto flux_z = readDataset<double>(group.get(), "face_flux_z_comoving", cursor[2], 1U);
-  faces.face_flux_x_comoving.assign(flux_x.begin(), flux_x.end());
-  faces.face_flux_y_comoving.assign(flux_y.begin(), flux_y.end());
-  faces.face_flux_z_comoving.assign(flux_z.begin(), flux_z.end());
+  readFluxLaneInto(group.get(), "face_flux_x_comoving", cursor[0], faces.face_flux_x_comoving);
+  readFluxLaneInto(group.get(), "face_flux_y_comoving", cursor[1], faces.face_flux_y_comoving);
+  readFluxLaneInto(group.get(), "face_flux_z_comoving", cursor[2], faces.face_flux_z_comoving);
   if (!faces.isConsistent()) {
     fail("restored magnetic face state is inconsistent (geometry/offsets)");
   }

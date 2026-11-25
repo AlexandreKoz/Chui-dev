@@ -615,6 +615,27 @@ void MhdStepOperator::fillGhostPrimitives(const MhdPatchBoundary& boundary,
   }
 }
 
+bool MhdStepOperator::recoverCellPrimitive(const MhdConservedState& gas,
+                                           const std::array<double, 3>& b_comoving,
+                                           double scale_factor,
+                                           MhdPrimitiveState& out) const noexcept {
+  return recoverComoving(gas, b_comoving, scale_factor, m_policy.gamma_adiabatic, out);
+}
+
+std::array<double, 3> MhdStepOperator::cellFieldFromFaces(const MhdPatchGeometry& geometry,
+                                                          std::span<const double> phi_x,
+                                                          std::span<const double> phi_y,
+                                                          std::span<const double> phi_z,
+                                                          std::size_t i, std::size_t j,
+                                                          std::size_t k) noexcept {
+  return {0.5 * (phi_x[geometry.faceIndexX(i, j, k)] + phi_x[geometry.faceIndexX(i + 1U, j, k)]) /
+              geometry.faceAreaX(),
+          0.5 * (phi_y[geometry.faceIndexY(i, j, k)] + phi_y[geometry.faceIndexY(i, j + 1U, k)]) /
+              geometry.faceAreaY(),
+          0.5 * (phi_z[geometry.faceIndexZ(i, j, k)] + phi_z[geometry.faceIndexZ(i, j, k + 1U)]) /
+              geometry.faceAreaZ()};
+}
+
 void MhdStepOperator::fillPhysicalGhosts(const MhdPatchBoundary& boundary,
                                          MhdStageWorkspace& workspace) {
   fillGhostPrimitives(boundary, workspace.primitives);

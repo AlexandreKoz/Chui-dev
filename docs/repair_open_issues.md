@@ -1203,3 +1203,22 @@ Source only; nothing configured, compiled, run or certified. Detailed ledger:
   applies `-H m` and `-H(2K+3p)`; the MHD stage source adds `-H M_c`. The
   integration must route both through one owner (`apply_expansion_source`).
 * P1 — The compile viability of every new/changed file is unverified.
+
+## CHUI MHD production closure pass 02 (20261125) — open blockers
+
+Source only; nothing configured, compiled, run or certified. Ledger:
+`docs/architecture/chui_mhd_implementation_pass02_status.md`.
+
+* P0 — Compile viability of every pass-01/pass-02 file is unverified; no MHD
+  test has run. First owner action: configure, build, run the MHD CTest labels.
+* P1 — Dynamic regrid with magnetic transfer (`amr_production_regrid` +
+  `MhdAmrSynchronizer` prolong/restrict) and patch migration with magnetic face
+  payloads are not wired: `numerics.amr_regrid_mode=automatic` and multi-rank
+  runtime rebalancing are refused for MHD.
+* P1 — Distributed recursive MHD subcycling (tier `mhd_ref_amr_subcycled`) is
+  not implemented (fail closed).
+* P1 — Imported face-flux HDF5 initial conditions are not implemented; fresh
+  starts use the `[mhd_io] initial_field_seed` seeds.
+* P1 — The Tóth–Roe compatible-transfer equivalence claim for the ratio-2
+  prolongation (A13) and the table-provider memory admission (A10) remain open.
+* P2 — `counters.json`/profiler export of `MhdRuntimeTelemetry` is not wired.

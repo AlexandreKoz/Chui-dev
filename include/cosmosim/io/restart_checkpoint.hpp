@@ -35,6 +35,11 @@ struct RestartSchema {
 };
 
 [[nodiscard]] const RestartSchema& restartSchema();
+// Magnetized variant (CHUI-MHD amendment R1): cosmosim_restart_v26 = v25 plus
+// the authoritative /state/mhd face-flux group. Written only for states with a
+// non-empty MagneticFaceSoa; restartSchema() (v25) stays the nonmagnetic
+// current schema.
+[[nodiscard]] const RestartSchema& mhdRestartSchema();
 [[nodiscard]] bool isRestartSchemaCompatible(std::uint32_t file_schema_version);
 [[nodiscard]] const std::vector<std::string_view>& exactRestartCompletenessChecklist();
 

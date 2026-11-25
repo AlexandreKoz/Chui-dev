@@ -1254,9 +1254,167 @@ void testParentlessGasCellRestartRoundtrip() {
 
 }  // namespace
 
+// CHUI-MHD amendment R1 (pass 02, NOT_RUN): a magnetized state is written as
+// cosmosim_restart_v26 (= v25 + /state/mhd) and restored bitwise; the
+// nonmagnetic path keeps v25; corruption of the magnetic lanes is caught by
+// the canonical SHA-256; a non-canonical dataset spelling and an unsafe
+// boundary are refused.
+void testMagnetizedRestartV26() {
+#if COSMOSIM_ENABLE_HDF5
+  cosmosim::core::SimulationState state;
+  state.resizeParticles(0);
+  state.resizeCells(2);
+  state.resizePatches(1);
+  state.patches.patch_id[0] = 9200;
+  state.patches.level[0] = 0;
+  state.patches.first_cell[0] = 0;
+  state.patches.cell_count[0] = 2;
+  state.patches.extent_x_comoving[0] = 2.0;
+  state.patches.extent_y_comoving[0] = 1.0;
+  state.patches.extent_z_comoving[0] = 1.0;
+  state.patches.cell_dim_x[0] = 2;
+  state.patches.cell_dim_y[0] = 1;
+  state.patches.cell_dim_z[0] = 1;
+  state.patches.owning_rank[0] = 0;
+  state.cells.patch_index[0] = 0;
+  state.cells.patch_index[1] = 0;
+  state.cells.center_x_comoving = {0.5, 1.5};
+  state.cells.center_y_comoving = {0.5, 0.5};
+  state.cells.center_z_comoving = {0.5, 0.5};
+  state.cells.mass_code = {2.0, 3.0};
+  state.gas_cell_identity.assign({
+      {.gas_cell_id = 8201, .parent_particle_id = std::nullopt, .owning_patch_id = 9200, .local_cell_row = 0},
+      {.gas_cell_id = 8202, .parent_particle_id = std::nullopt, .owning_patch_id = 9200, .local_cell_row = 1},
+  });
+  state.gas_cells.gas_cell_id = {8201, 8202};
+  state.gas_cells.parent_particle_id = {0, 0};
+  state.gas_cells.velocity_x_peculiar = {0.0, 0.0};
+  state.gas_cells.velocity_y_peculiar = {0.0, 0.0};
+  state.gas_cells.velocity_z_peculiar = {0.0, 0.0};
+  state.gas_cells.density_code = {2.0, 3.0};
+  state.gas_cells.pressure_code = {1.0, 1.0};
+  state.gas_cells.internal_energy_code = {0.75, 0.5};
+  state.gas_cells.temperature_code = {1.0, 1.0};
+  state.gas_cells.sound_speed_code = {1.0, 1.0};
+  state.rebuildSpeciesIndex();
+  // One magnetic patch record (2x1x1 cells), uniform B_x = 0.3 (divergence free).
+  cosmosim::core::MagneticFacePatchRecord record{};
+  record.patch_id = 9200;
+  record.geometry_generation = 77;
+  record.level = 0;
+  record.nx = 2;
+  record.ny = 1;
+  record.nz = 1;
+  record.cell_width_x_comoving = 1.0;
+  record.cell_width_y_comoving = 1.0;
+  record.cell_width_z_comoving = 1.0;
+  state.magnetic_faces.patches = {record};
+  state.magnetic_faces.face_flux_x_comoving.assign(3U, 0.3);
+  state.magnetic_faces.face_flux_y_comoving.assign(4U, 0.0);
+  state.magnetic_faces.face_flux_z_comoving.assign(4U, 0.0);
+  CHUI_REQUIRE(state.magnetic_faces.isConsistent());
+  CHUI_REQUIRE(state.validateOwnershipInvariants());
+
+  cosmosim::core::IntegratorState integrator_state;
+  integrator_state.current_scale_factor = 0.5;
+  integrator_state.current_boundary_kind = cosmosim::core::StepBoundaryKind::kCheckpointPoint;
+  integrator_state.last_completed_boundary_kind = cosmosim::core::StepBoundaryKind::kCheckpointPoint;
+  integrator_state.last_completed_restart_safe = true;
+  integrator_state.step_index = 11;
+  cosmosim::core::HierarchicalTimeBinScheduler scheduler(0);
+  scheduler.reset(0, 0, 0);
+  auto gas_scheduler = makePayloadGasCellScheduler(state, scheduler);
+  cosmosim::io::RestartWritePayload payload;
+  fillRestartPayload(payload, state, integrator_state, scheduler, &gas_scheduler);
+
+  const std::filesystem::path path =
+      cosmosim::test_support::TestTempWorkspace::uniqueProcessLocalPath("cosmosim_restart_v26_mhd.hdf5");
+  cosmosim::io::writeRestartCheckpointHdf5(path, payload);
+  const auto restored = cosmosim::io::readRestartCheckpointHdf5(path);
+  CHUI_REQUIRE(restored.diagnostics.restart_schema_name == "cosmosim_restart_v26");
+  CHUI_REQUIRE(restored.diagnostics.restart_schema_version == 26U);
+  CHUI_REQUIRE(restored.payload_integrity_verified);
+  CHUI_REQUIRE(restored.state.magnetic_faces.patches.size() == 1U);
+  CHUI_REQUIRE(restored.state.magnetic_faces.patches[0].geometry_generation == 77U);
+  CHUI_REQUIRE(restored.state.magnetic_faces.face_flux_x_comoving ==
+               state.magnetic_faces.face_flux_x_comoving);
+  CHUI_REQUIRE(restored.state.magnetic_faces.face_flux_y_comoving ==
+               state.magnetic_faces.face_flux_y_comoving);
+  CHUI_REQUIRE(restored.state.magnetic_faces.face_flux_z_comoving ==
+               state.magnetic_faces.face_flux_z_comoving);
+
+  // Corruption of one magnetic flux value: canonical payload SHA-256 mismatch.
+  {
+    hid_t file = H5Fopen(path.string().c_str(), H5F_ACC_RDWR, H5P_DEFAULT);
+    CHUI_REQUIRE(file >= 0);
+    hid_t dataset = H5Dopen2(file, "/state/mhd/face_flux_x_comoving", H5P_DEFAULT);
+    CHUI_REQUIRE(dataset >= 0);
+    const std::array<double, 3> corrupted{0.3, 0.3000001, 0.3};
+    CHUI_REQUIRE(H5Dwrite(dataset, H5T_NATIVE_DOUBLE, H5S_ALL, H5S_ALL, H5P_DEFAULT,
+                          corrupted.data()) >= 0);
+    H5Dclose(dataset);
+    H5Fclose(file);
+    bool threw = false;
+    try {
+      (void)cosmosim::io::readRestartCheckpointHdf5(path);
+    } catch (const std::runtime_error&) {
+      threw = true;
+    }
+    CHUI_REQUIRE(threw);
+  }
+  // Non-canonical dataset spelling (_comov) is refused, never aliased.
+  {
+    cosmosim::io::writeRestartCheckpointHdf5(path, payload);
+    hid_t file = H5Fopen(path.string().c_str(), H5F_ACC_RDWR, H5P_DEFAULT);
+    CHUI_REQUIRE(file >= 0);
+    CHUI_REQUIRE(H5Lmove(file, "/state/mhd/face_flux_x_comoving", file,
+                         "/state/mhd/face_flux_x_comov", H5P_DEFAULT, H5P_DEFAULT) >= 0);
+    H5Fclose(file);
+    bool threw = false;
+    try {
+      (void)cosmosim::io::readRestartCheckpointHdf5(path);
+    } catch (const std::runtime_error&) {
+      threw = true;
+    }
+    CHUI_REQUIRE(threw);
+  }
+  // A v25 file must never carry /state/mhd: removing the magnetic state keeps
+  // the unchanged v25 schema.
+  {
+    cosmosim::core::SimulationState plain = state;
+    plain.magnetic_faces.clear();
+    cosmosim::io::RestartWritePayload plain_payload;
+    fillRestartPayload(plain_payload, plain, integrator_state, scheduler, &gas_scheduler);
+    cosmosim::io::writeRestartCheckpointHdf5(path, plain_payload);
+    const auto plain_restored = cosmosim::io::readRestartCheckpointHdf5(path);
+    CHUI_REQUIRE(plain_restored.diagnostics.restart_schema_version ==
+                 cosmosim::io::restartSchema().version);
+    CHUI_REQUIRE(plain_restored.state.magnetic_faces.empty());
+  }
+  // Unsafe boundary (open KDK step): refused before any file is published.
+  {
+    cosmosim::core::IntegratorState open_step = integrator_state;
+    open_step.inside_kdk_step = true;
+    cosmosim::io::RestartWritePayload unsafe_payload;
+    fillRestartPayload(unsafe_payload, state, open_step, scheduler, &gas_scheduler);
+    bool threw = false;
+    try {
+      cosmosim::io::writeRestartCheckpointHdf5(path, unsafe_payload);
+    } catch (const std::invalid_argument& error) {
+      threw = std::string(error.what()).find("MHD_RESTART_SCHEMA_MISMATCH") != std::string::npos;
+    } catch (const std::exception&) {
+      threw = true;  // an earlier generic boundary validation is also a refusal
+    }
+    CHUI_REQUIRE(threw);
+  }
+  std::filesystem::remove(path);
+#endif
+}
+
 int main() {
   testRestartRoundtrip();
   testRestartAfterReorderAndMigration();
   testParentlessGasCellRestartRoundtrip();
+  testMagnetizedRestartV26();
   return 0;
 }

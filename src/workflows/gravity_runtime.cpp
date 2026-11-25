@@ -2968,6 +2968,17 @@ class GravityRuntimeImpl final : public GravityRuntime {
     throw std::invalid_argument("gravity kick factor requested outside KDK kick stage");
   }
 
+  // Drag-free source kick for magnetized gas (MHD owns the expansion source).
+  [[nodiscard]] static double sourceKickFactorForStage(const core::StepContext& context) {
+    if (context.stage == core::IntegrationStage::kGravityKickPre) {
+      return context.timeline_step.first_source_kick_factor_code;
+    }
+    if (context.stage == core::IntegrationStage::kGravityKickPost) {
+      return context.timeline_step.second_source_kick_factor_code;
+    }
+    throw std::invalid_argument("source kick factor requested outside KDK kick stage");
+  }
+
   [[nodiscard]] static double hubbleDragFactorForStage(const core::StepContext& context) {
     if (context.stage == core::IntegrationStage::kGravityKickPre) {
       return context.timeline_step.first_hubble_drag_factor;
@@ -3032,6 +3043,42 @@ class GravityRuntimeImpl final : public GravityRuntime {
     state.gas_cells.sound_speed_code[cell_index] *= std::sqrt(thermal_drag);
   }
 
+  // Magnetized-gas KDK source kick (CHUI-MHD-REF 4.3/8.5 expansion ownership,
+  // pass-02 reconciliation R-EXP): the MHD ideal stage applies -H m_c and
+  // -H (2K_c + 3p_c + M_c) at its SSPRK2 stage endpoints, so this kick adds
+  // only the gravitational acceleration du = A * integral(dt/a^2). No Hubble
+  // drag and no adiabatic thermal scaling are applied here (that would be a
+  // second expansion owner). Gravitational work enters through the kinetic
+  // energy of the updated velocity when the MHD total energy is rebuilt from
+  // the gas lanes at the next kHydroUpdate.
+  static void applyMagnetizedGasCellSourceKick(
+      core::SimulationState& state,
+      std::uint32_t cell_index,
+      double accel_x_code,
+      double accel_y_code,
+      double accel_z_code,
+      double source_kick_factor_code) {
+    if (cell_index >= state.gas_cells.size()) {
+      throw std::out_of_range("magnetized gas kick cell index is outside GasCellSidecar");
+    }
+    if (!std::isfinite(source_kick_factor_code) || source_kick_factor_code < 0.0) {
+      throw std::invalid_argument("magnetized gas kick requires a finite source kick factor");
+    }
+    state.gas_cells.velocity_x_peculiar[cell_index] += source_kick_factor_code * accel_x_code;
+    state.gas_cells.velocity_y_peculiar[cell_index] += source_kick_factor_code * accel_y_code;
+    state.gas_cells.velocity_z_peculiar[cell_index] += source_kick_factor_code * accel_z_code;
+  }
+
+  void applyGasKick(core::StepContext& context, std::uint32_t cell_index, double ax, double ay,
+                    double az, double kick_factor, double hubble_drag) const {
+    if (m_config.mhd.enabled) {
+      applyMagnetizedGasCellSourceKick(context.state, cell_index, ax, ay, az,
+                                       sourceKickFactorForStage(context));
+      return;
+    }
+    applyGasCellKdkKick(context.state, cell_index, ax, ay, az, kick_factor, hubble_drag);
+  }
+
   void applyActiveKickFromFreshForce(core::StepContext& context) {
     const double kick_factor = kickFactorForStage(context);
     const double hubble_drag = hubbleDragFactorForStage(context);
@@ -3067,8 +3114,8 @@ class GravityRuntimeImpl final : public GravityRuntime {
       if (active_slot < 0) {
         continue;
       }
-      applyGasCellKdkKick(
-          context.state,
+      applyGasKick(
+          context,
           cell_index,
           m_active_accel_x[static_cast<std::size_t>(active_slot)],
           m_active_accel_y[static_cast<std::size_t>(active_slot)],
@@ -3199,8 +3246,8 @@ class GravityRuntimeImpl final : public GravityRuntime {
         throw std::runtime_error(
             "gas KDK cached kick rejected an invalid per-cell force row");
       }
-      applyGasCellKdkKick(
-          context.state,
+      applyGasKick(
+          context,
           cell_index,
           m_cell_accel_x[cell_index],
           m_cell_accel_y[cell_index],

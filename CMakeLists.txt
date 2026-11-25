@@ -651,6 +651,7 @@ add_library(cosmosim_mhd STATIC
   src/mhd/mhd_induction.cpp
   src/mhd/mhd_initial_conditions.cpp
   src/mhd/mhd_level_stepper.cpp
+  src/mhd/mhd_level_topology.cpp
   src/mhd/mhd_memory.cpp
   src/mhd/mhd_riemann.cpp
   src/mhd/mhd_runtime_adapter.cpp
@@ -671,6 +672,7 @@ add_library(cosmosim_workflows STATIC
   src/workflows/internal/gas_cell_ownership.cpp
   src/workflows/internal/migration_wire.cpp
   src/workflows/internal/amr_geometry_assurance.cpp
+  src/workflows/internal/mhd_runtime_bridge.cpp
   src/workflows/internal/gravity_force_endpoint.cpp
   src/workflows/migration_balance_runtime.cpp
   src/workflows/output_restart_runtime.cpp
@@ -726,6 +728,7 @@ endif()
 
 target_link_libraries(cosmosim_workflows
   PUBLIC
+    cosmosim_mhd
     cosmosim_analysis
     cosmosim_gravity
     cosmosim_hydro
@@ -1128,6 +1131,14 @@ if(COSMOSIM_ENABLE_TESTS)
   target_link_libraries(test_integration_mhd_amr_mpi_restarts PRIVATE
     cosmosim_mhd cosmosim_io cosmosim_workflows)
   add_test(NAME integration_mhd_amr_mpi_restarts COMMAND test_integration_mhd_amr_mpi_restarts)
+
+  # Pass 02 (NOT_RUN): synchronized leaf hierarchy, transactions and two-rank
+  # protocol equivalence through an in-process collective transport.
+  add_executable(test_integration_mhd_hierarchy_runtime
+    tests/integration/test_mhd_hierarchy_runtime.cpp)
+  target_link_libraries(test_integration_mhd_hierarchy_runtime PRIVATE cosmosim_mhd Threads::Threads)
+  add_test(NAME integration_mhd_hierarchy_runtime COMMAND test_integration_mhd_hierarchy_runtime)
+  set_tests_properties(integration_mhd_hierarchy_runtime PROPERTIES LABELS "mhd;integration")
   add_executable(test_unit_retained_capacity_transaction tests/unit/test_retained_capacity_transaction.cpp)
   target_link_libraries(test_unit_retained_capacity_transaction PRIVATE cosmosim_core)
   add_test(NAME unit_retained_capacity_transaction COMMAND test_unit_retained_capacity_transaction)

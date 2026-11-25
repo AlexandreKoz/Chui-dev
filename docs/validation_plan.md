@@ -953,3 +953,20 @@ benchmark runner `bench/mhd/bench_mhd_reference_suite.cpp` (BP01-BP10; external
 comparisons reported `not_evaluated`). Tolerances are the specification's; no
 gate has been run and no certification is claimed. Coverage map and gaps:
 `docs/architecture/chui_mhd_implementation_pass01_status.md`.
+
+Pass 02 additions (NOT_RUN): `tests/integration/test_mhd_hierarchy_runtime.cpp`
+(CTest `integration_mhd_hierarchy_runtime`, labels `mhd;integration`):
+non-uniform patch extents and nonzero domain origin equivalence, batch-size
+invariance, two-level leaf tiling closed-box conservation (G04, 1e-12) and
+strict CT (G03 per step), coarse-interface face consistency, uniform-state
+invariance across coarse/fine interfaces, read-only entry mirror refusal,
+external-retry atomicity with attempted/accepted counters, foreign late failure
+rollback, memory refusal before allocation (MP06), and two-rank / zero-patch-rank
+equivalence (G06 protocol) through an in-process collective transport (the same
+byte protocol the MPI transport carries; a real `mpiexec` run remains an owner
+build-and-run step). `tests/integration/test_restart_checkpoint_roundtrip.cpp`
+`testMagnetizedRestartV26` (G08: v26 roundtrip, magnetic-lane SHA-256
+corruption, `_comov` spelling refusal, v25 unchanged, unsafe-boundary refusal).
+`tests/integration/test_mhd_amr_mpi_restarts.cpp` now tests capability-specific
+admission (positive supported predicates, negative retry-owner and shadow cases)
+instead of a universal refusal. Ledger: `docs/architecture/chui_mhd_implementation_pass02_status.md`.

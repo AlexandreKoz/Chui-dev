@@ -960,6 +960,117 @@ void SnapshotReadResult::requireEvolutionReady() const {
   }
 }
 
+namespace {
+
+// Per-row derived B_comov from the authoritative face flux (v7). Holds only a
+// per-patch index (O(P)); values are computed chunk by chunk.
+class MhdSnapshotFieldSampler {
+ public:
+  explicit MhdSnapshotFieldSampler(const core::SimulationState& state) {
+    if (state.magnetic_faces.empty()) {
+      return;
+    }
+    if (!state.magnetic_faces.isConsistent()) {
+      throw std::runtime_error("MHD_INVALID_FIELD: inconsistent magnetic face state at output");
+    }
+    m_record_by_patch_row.assign(state.patches.size(), k_none);
+    for (std::size_t p = 0; p < state.patches.size(); ++p) {
+      if (state.patches.cell_count[p] == 0U) {
+        continue;
+      }
+      for (std::size_t r = 0; r < state.magnetic_faces.patches.size(); ++r) {
+        if (state.magnetic_faces.patches[r].patch_id == state.patches.patch_id[p]) {
+          m_record_by_patch_row[p] = r;
+          break;
+        }
+      }
+      if (m_record_by_patch_row[p] == k_none) {
+        throw std::runtime_error(
+            "MHD_STALE_GEOMETRY: gas leaf patch without a magnetic face record at output");
+      }
+    }
+  }
+
+  [[nodiscard]] std::array<double, 3> cellField(const core::SimulationState& state,
+                                                std::size_t row) const {
+    const std::size_t patch_row = state.cells.patch_index[row];
+    if (patch_row >= m_record_by_patch_row.size() || m_record_by_patch_row[patch_row] == k_none) {
+      throw std::runtime_error("MHD_STALE_GEOMETRY: gas row without a magnetic face record");
+    }
+    const core::MagneticFacePatchRecord& r =
+        state.magnetic_faces.patches[m_record_by_patch_row[patch_row]];
+    const std::array<double, 3> center{state.cells.center_x_comoving[row],
+                                       state.cells.center_y_comoving[row],
+                                       state.cells.center_z_comoving[row]};
+    const std::array<double, 3> origin{r.origin_x_comoving, r.origin_y_comoving, r.origin_z_comoving};
+    const std::array<double, 3> width{r.cell_width_x_comoving, r.cell_width_y_comoving,
+                                      r.cell_width_z_comoving};
+    const std::array<std::uint64_t, 3> n{r.nx, r.ny, r.nz};
+    std::array<std::uint64_t, 3> ijk{};
+    for (std::size_t axis = 0; axis < 3U; ++axis) {
+      const double position = (center[axis] - origin[axis]) / width[axis] - 0.5;
+      const double rounded = std::nearbyint(position);
+      if (std::abs(position - rounded) > 1.0e-6 || rounded < 0.0 ||
+          rounded >= static_cast<double>(n[axis])) {
+        throw std::runtime_error("MHD_STALE_GEOMETRY: gas cell centre outside its magnetic patch");
+      }
+      ijk[axis] = static_cast<std::uint64_t>(rounded);
+    }
+    const std::uint64_t i = ijk[0];
+    const std::uint64_t j = ijk[1];
+    const std::uint64_t k = ijk[2];
+    const double* px = state.magnetic_faces.face_flux_x_comoving.data() + r.flux_x_offset;
+    const double* py = state.magnetic_faces.face_flux_y_comoving.data() + r.flux_y_offset;
+    const double* pz = state.magnetic_faces.face_flux_z_comoving.data() + r.flux_z_offset;
+    const std::uint64_t nx = n[0];
+    const std::uint64_t ny = n[1];
+    return {0.5 * (px[i + (nx + 1U) * (j + ny * k)] + px[i + 1U + (nx + 1U) * (j + ny * k)]) /
+                (width[1] * width[2]),
+            0.5 * (py[i + nx * (j + (ny + 1U) * k)] + py[i + nx * (j + 1U + (ny + 1U) * k)]) /
+                (width[0] * width[2]),
+            0.5 * (pz[i + nx * (j + ny * k)] + pz[i + nx * (j + ny * (k + 1U))]) /
+                (width[0] * width[1])};
+  }
+
+ private:
+  static constexpr std::size_t k_none = static_cast<std::size_t>(-1);
+  std::vector<std::size_t> m_record_by_patch_row;
+};
+
+}  // namespace
+
+double mhdLocalMagneticEnergyComoving(const core::SimulationState& state, double scale_factor) {
+  if (state.magnetic_faces.empty()) {
+    return 0.0;
+  }
+  if (!(scale_factor > 0.0)) {
+    throw std::invalid_argument("magnetic energy requires a positive scale factor");
+  }
+  double energy = 0.0;
+  for (const core::MagneticFacePatchRecord& r : state.magnetic_faces.patches) {
+    const double* px = state.magnetic_faces.face_flux_x_comoving.data() + r.flux_x_offset;
+    const double* py = state.magnetic_faces.face_flux_y_comoving.data() + r.flux_y_offset;
+    const double* pz = state.magnetic_faces.face_flux_z_comoving.data() + r.flux_z_offset;
+    const double ax = r.cell_width_y_comoving * r.cell_width_z_comoving;
+    const double ay = r.cell_width_x_comoving * r.cell_width_z_comoving;
+    const double az = r.cell_width_x_comoving * r.cell_width_y_comoving;
+    const double volume = r.cell_width_x_comoving * r.cell_width_y_comoving * r.cell_width_z_comoving;
+    const std::uint64_t nx = r.nx;
+    const std::uint64_t ny = r.ny;
+    for (std::uint64_t k = 0; k < r.nz; ++k) {
+      for (std::uint64_t j = 0; j < ny; ++j) {
+        for (std::uint64_t i = 0; i < nx; ++i) {
+          const double bx = 0.5 * (px[i + (nx + 1U) * (j + ny * k)] + px[i + 1U + (nx + 1U) * (j + ny * k)]) / ax;
+          const double by = 0.5 * (py[i + nx * (j + (ny + 1U) * k)] + py[i + nx * (j + 1U + (ny + 1U) * k)]) / ay;
+          const double bz = 0.5 * (pz[i + nx * (j + ny * k)] + pz[i + nx * (j + ny * (k + 1U))]) / az;
+          energy += 0.5 * (bx * bx + by * by + bz * bz) / scale_factor * volume;
+        }
+      }
+    }
+  }
+  return energy;
+}
+
 void writeScienceSnapshotHdf5(
     const std::filesystem::path& output_path,
     const SnapshotWritePayload& payload,
@@ -973,13 +1084,26 @@ void writeScienceSnapshotHdf5(
   if (payload.state == nullptr || payload.config == nullptr) {
     throw std::runtime_error("snapshot writer requires non-null state and config");
   }
-  // CHUI-MHD amendment R6: MHD science output is chui_science_snapshot_v7 with
-  // derived PartType0/MagneticField; v6 must never silently omit a field.
-  if (!payload.state->magnetic_faces.empty() || payload.config->mhd.enabled) {
-    throw std::runtime_error(
-        "MHD_UNSUPPORTED_PHYSICS: magnetized science output requires snapshot schema v7, "
-        "which is not wired into writeScienceSnapshotHdf5");
+  // CHUI-MHD amendment R6: magnetized science output is chui_science_snapshot_v7
+  // with derived PartType0/MagneticField; v6 never silently omits a field.
+  // A magnetized config with an empty magnetic state, or a magnetic state on
+  // an MHD-disabled config, is inconsistent and refused.
+  const bool magnetized_snapshot = !payload.state->magnetic_faces.empty();
+  if (magnetized_snapshot != payload.config->mhd.enabled) {
+    const bool rank_without_gas = payload.config->mhd.enabled && payload.state->cells.size() == 0U;
+    if (!rank_without_gas) {
+      throw std::runtime_error(
+          "MHD_UNSUPPORTED_PHYSICS: magnetic state and mhd.enabled disagree; refusing to "
+          "write a v6 snapshot without the magnetic field or a v7 snapshot without MHD");
+    }
   }
+  if (payload.config->mhd.enabled && payload.collective_single_file &&
+      !payload.mhd_diagnostics_global) {
+    throw std::runtime_error(
+        "MHD_UNSUPPORTED_PHYSICS: a collective single-file v7 snapshot requires rank-agreed "
+        "MHD diagnostics (mhd_diagnostics_global)");
+  }
+  const MhdSnapshotFieldSampler mhd_sampler(*payload.state);
   if (policy.chunk_particle_count == 0) {
     throw std::runtime_error("chunk_particle_count must be > 0");
   }
@@ -1162,8 +1286,57 @@ void writeScienceSnapshotHdf5(
       header_group.get(),
       payload.collective_single_file ? global_count_by_type : count_by_type,
       global_count_by_type, mass_table, config, state, member, conversion);
-  writeScalarStringAttribute(header_group.get(), "CosmoSimSchemaName", schema.schema_name);
-  writeScalarUint32Attribute(header_group.get(), "CosmoSimSchemaVersion", schema.schema_version);
+  const bool write_v7 = payload.config->mhd.enabled;
+  writeScalarStringAttribute(header_group.get(), "CosmoSimSchemaName",
+                             write_v7 ? k_science_snapshot_mhd_schema_name : schema.schema_name);
+  writeScalarUint32Attribute(header_group.get(), "CosmoSimSchemaVersion",
+                             write_v7 ? k_science_snapshot_mhd_schema_version : schema.schema_version);
+  if (write_v7) {
+    // REF 13.1 provenance attributes of the magnetic science fields.
+    const core::MhdConfig& mhd = payload.config->mhd;
+    Hdf5Handle mhd_group(H5Gcreate2(file.get(), "/MHD", H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT));
+    Hdf5Handle diagnostics(
+        H5Gcreate2(mhd_group.get(), "Diagnostics", H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT));
+    if (!mhd_group.valid() || !diagnostics.valid()) {
+      throw std::runtime_error("failed creating /MHD/Diagnostics");
+    }
+    const double a_snapshot = payload.mhd_scale_factor > 0.0 ? payload.mhd_scale_factor
+                                                             : state.metadata.scale_factor;
+    const double divergence = payload.mhd_diagnostics_global
+        ? payload.mhd_divergence_max_norm
+        : state.magnetic_faces.divergence_max_normalized;
+    const double magnetic_energy = payload.mhd_diagnostics_global
+        ? payload.mhd_magnetic_energy_comoving
+        : mhdLocalMagneticEnergyComoving(state, a_snapshot);
+    writeScalarUint32Attribute(header_group.get(), "MhdSchemeVersion", 1U);
+    writeScalarStringAttribute(header_group.get(), "MagneticUnits", "code_comoving_lorentz_heaviside");
+    writeScalarStringAttribute(header_group.get(), "MagneticFrame", "Comoving");
+    writeScalarStringAttribute(header_group.get(), "InductionOperator", "face_flux_ct");
+    writeScalarStringAttribute(header_group.get(), "EmfScheme", "uct_hll");
+    writeScalarStringAttribute(
+        header_group.get(), "Reconstruction",
+        mhd.reconstruction == core::MhdReconstructionConfigMode::kPlmMc ? "plm_mc" : "ppm");
+    writeScalarStringAttribute(
+        header_group.get(), "NonidealIntegrator",
+        mhd.nonideal.enabled ? "strang_d_h_i_h_d/auto_rkl2/explicit_hll_ssprk2" : "none");
+    writeScalarStringAttribute(
+        header_group.get(), "CoefficientProvider",
+        !mhd.nonideal.enabled ? "none"
+        : mhd.nonideal.coefficient_provider == core::MhdCoefficientProviderConfigMode::kTable
+            ? "table"
+            : "constant");
+    writeScalarStringAttribute(header_group.get(), "CoefficientTableSha256",
+                               state.magnetic_faces.coefficient_table_sha256);
+    writeScalarStringAttribute(header_group.get(), "DiffusivityConvention",
+                               "eta_phys_cgs_converted_once_eta_comoving_eq_eta_phys_over_a2");
+    writeScalarStringAttribute(diagnostics.get(), "DiagnosticsScope",
+                               payload.mhd_diagnostics_global ? "global" : "file_member");
+    writeScalarDoubleAttribute(diagnostics.get(), "DivergenceMaxNorm", divergence);
+    writeScalarDoubleAttribute(diagnostics.get(), "MagneticEnergyComoving", magnetic_energy);
+    writeScalarDoubleAttribute(diagnostics.get(), "ScaleFactor", a_snapshot);
+    writeScalarStringAttribute(diagnostics.get(), "ExactRestartAuthority",
+                               "false (use cosmosim_restart_v26 /state/mhd)");
+  }
   writeScalarStringAttribute(
       header_group.get(), "CHUISnapshotDialect",
       internal::snapshotDialectLabel(write_dialect));
@@ -1447,6 +1620,17 @@ void writeScienceSnapshotHdf5(
         case internal::SnapshotFieldStorage::kUint8: add_u8(field.name); break;
       }
     });
+    std::optional<StreamingDataset> magnetic_field_ds;
+    if (type_index == 0U && payload.config->mhd.enabled) {
+      magnetic_field_ds.emplace(createStreamingDataset(
+          type_group.get(), "MagneticField", H5T_IEEE_F64LE, file_row_count, 3, policy));
+      writeScalarStringAttribute(magnetic_field_ds->handle.get(), "Frame", "Comoving");
+      writeScalarStringAttribute(magnetic_field_ds->handle.get(), "MagneticUnit", "Code");
+      writeScalarStringAttribute(magnetic_field_ds->handle.get(), "Definition",
+                                 "B_comov = a^2 B_phys, cell mean of the two bordering "
+                                 "face-flux fields per axis (derived, non-authoritative)");
+      add_double("MagneticPressure");
+    }
     if (type_index == 0U && policy.write_optional_pressure) {
       add_double("Pressure");
     }
@@ -1680,6 +1864,25 @@ void writeScienceSnapshotHdf5(
           d3[j] = conversion.starFormationRateCodeToStored(sfr_code);
         }
         write_base(offset, count);
+        if (magnetic_field_ds.has_value()) {
+          // Bounded staging: the chunk's derived B_comov rows only.
+          const double a_field = payload.mhd_scale_factor > 0.0 ? payload.mhd_scale_factor
+                                                                : state.metadata.scale_factor;
+          for (std::size_t j = 0; j < count; ++j) {
+            const std::array<double, 3> b = mhd_sampler.cellField(state, offset + j);
+            coords[j * 3U + 0U] = b[0];
+            coords[j * 3U + 1U] = b[1];
+            coords[j * 3U + 2U] = b[2];
+            d7[j] = 0.5 * (b[0] * b[0] + b[1] * b[1] + b[2] * b[2]) / a_field;
+          }
+          writeStreamingChunk(*magnetic_field_ds, H5T_NATIVE_DOUBLE, coords.data(),
+                              file_row_base + offset, count);
+          write_double_extra("MagneticPressure", d7.data(), offset, count);
+          // Restore the gas pressure staging overwritten above.
+          for (std::size_t j = 0; j < count; ++j) {
+            d7[j] = conversion.pressureComovingToStored(state.gas_cells.pressure_code[offset + j]);
+          }
+        }
         write_double_extra("InternalEnergy", d0.data(), offset, count);
         write_double_extra("Density", d1.data(), offset, count);
         write_double_extra("Metallicity", d2.data(), offset, count);

@@ -753,13 +753,33 @@ bitwise.
   element diffusion and SGS shear now integrate on AMR level clocks instead of
   the coarse halves, so recursive runs are not bit-comparable with patch 49.
 
-## MHD exact restart (status: codec only, fail-closed)
+## MHD exact restart (status: source-implemented pass 02, UNVALIDATED)
 
 The MHD checkpoint is `cosmosim_restart_v26` (amendment R1; v25 stays the
-nonmagnetic dual-energy schema). Its `/state/mhd` group codec exists in
-`src/io/mhd_restart_state.cpp`; see `docs/output_schema.md`. The v26
-writer/reader pipeline (collective publication, integrity readback,
-normalized-config-hash admission, same-rank-topology rule, safe-boundary
-deferral of MHD checkpoint requests) is not wired. Until it is, the v25 writer
-refuses any state whose `SimulationState::magnetic_faces` is non-empty, and no
-reader infers a magnetic state from a v25 checkpoint or a science snapshot.
+nonmagnetic dual-energy schema and is written byte-for-byte as before for
+nonmagnetic states). `writeRestartCheckpointHdf5` selects v26 exactly when
+`SimulationState::magnetic_faces` is non-empty, writes `/state/mhd` after the
+state group, includes the magnetic records and flux lanes in the canonical
+payload SHA-256, and records v26 in the restart diagnostics; the write-time
+streaming verifier expects v26 for magnetized payloads.
+
+* **Safe boundaries only.** A magnetized checkpoint is refused
+  (`MHD_RESTART_SCHEMA_MISMATCH`) if the state carries pending AMR flux
+  registers, coarse temporal histories or an open KDK step. The synchronized
+  MHD path reconciles coarse/fine records, edges and faces inside every stage,
+  so it never leaves such state between steps: every accepted step boundary is
+  MHD-safe, and checkpoints are written only at the existing output boundary.
+* **Reader.** `readRestartCheckpointHdf5` accepts v26, admits the flux lanes via
+  the governor, and restores `/state/mhd` through the fully validating codec
+  (contract, units, offsets, counts, finiteness, per-patch discrete divergence,
+  scale factor against the restored `/integrator` timeline). A v25 file never
+  yields a magnetic state.
+* **Runtime admission after restart.** The MHD runtime bridge re-validates the
+  restored records against the restored leaf topology (patch ids, geometry
+  generations derived from (level, lattice origin, extents), shapes, spacing,
+  origins) and the configured provider's table SHA-256 before first use, and
+  never reseeds a restored field. Exact restart requires the same MPI rank
+  topology (rank-sharded files; per-rank `/state/mhd`).
+* **Normalized config hash:** the existing continuation-metadata checks apply;
+  the `[mhd*]` normalized text (including the pass-02 `initial_field_*` keys)
+  is part of the hash for magnetized runs.

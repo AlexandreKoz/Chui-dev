@@ -377,21 +377,45 @@ void testRetryAndRollback() {
         return w;
       },
       {0.0, 0.0, 0.0}, {}, 1.0, k_gamma);
-  MhdLevelStepper stepper = level.makeStepper(MhdNumericsPolicy{});
-  MhdStageContext interval = cosmosim::mhd::test::isolatedInterval(0.0, 1.0);
-  const double cfl_dt = stepper.estimateStableTimeStep(interval, {});
-  interval.dt_code = 100.0 * cfl_dt;
-  const MhdConservationBudget begin = stepper.levelBudget(1.0);
-  try {
-    const MhdLevelAdvanceResult result = stepper.advance(interval, {});
-    if (result.accepted) {
-      CHUI_REQUIRE(result.retry_count > 0);
-      CHUI_REQUIRE(result.dt_accepted_code <= 0.5 * interval.dt_code);
+  // Pass 02: the production (default) retry mode is kExternal: a rejected
+  // interval commits nothing and returns the retry to its owner.
+  {
+    MhdLevelStepper stepper = level.makeStepper(MhdNumericsPolicy{});
+    MhdStageContext interval = cosmosim::mhd::test::isolatedInterval(0.0, 1.0);
+    const double cfl_dt = stepper.estimateStableTimeStep(interval, {});
+    interval.dt_code = 100.0 * cfl_dt;
+    const MhdConservationBudget begin = stepper.levelBudget(1.0);
+    try {
+      const MhdLevelAdvanceResult result = stepper.advance(interval, {});
+      if (!result.accepted) {
+        CHUI_REQUIRE(result.dt_suggested_code == 0.5 * interval.dt_code);
+        const MhdConservationBudget after = stepper.levelBudget(1.0);
+        CHUI_REQUIRE(after.mass == begin.mass && after.energy_total == begin.energy_total);
+      }
+    } catch (const MhdError& error) {
+      CHUI_REQUIRE(error.code() == MhdErrorCode::kNonPositiveState);
     }
-  } catch (const MhdError& error) {
-    CHUI_REQUIRE(error.code() == MhdErrorCode::kNonPositiveState);
-    const MhdConservationBudget after = stepper.levelBudget(1.0);
-    CHUI_REQUIRE(after.mass == begin.mass && after.energy_total == begin.energy_total);
+  }
+  // Standalone kInternalTimeline mode (constant timeline): internal halving.
+  {
+    MhdLevelStepperConfig config{};
+    config.retry_mode = MhdRetryMode::kInternalTimeline;
+    MhdLevelStepper stepper = level.makeStepper(MhdNumericsPolicy{}, config);
+    MhdStageContext interval = cosmosim::mhd::test::isolatedInterval(0.0, 1.0);
+    const double cfl_dt = stepper.estimateStableTimeStep(interval, {});
+    interval.dt_code = 100.0 * cfl_dt;
+    const MhdConservationBudget begin = stepper.levelBudget(1.0);
+    try {
+      const MhdLevelAdvanceResult result = stepper.advance(interval, {});
+      if (result.accepted) {
+        CHUI_REQUIRE(result.retry_count > 0);
+        CHUI_REQUIRE(result.dt_accepted_code <= 0.5 * interval.dt_code);
+      }
+    } catch (const MhdError& error) {
+      CHUI_REQUIRE(error.code() == MhdErrorCode::kNonPositiveState);
+      const MhdConservationBudget after = stepper.levelBudget(1.0);
+      CHUI_REQUIRE(after.mass == begin.mass && after.energy_total == begin.energy_total);
+    }
   }
 }
 
