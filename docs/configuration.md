@@ -962,12 +962,48 @@ Keys and defaults follow CHUI-MHD-REF-v1 section 12 and CHUI-MHD-PERF-v1
 section 17 (`docs/architecture/chui_mhd_architecture_specification_v01.md`,
 `docs/architecture/chui_mhd_memory_performance_specification_v01.md`).
 
-**Runtime status (source pass 01, unvalidated):** a configuration with
-`mhd.enabled = true` parses and validates, but the run is rejected at runtime
-capability admission with `MHD_UNSUPPORTED_PHYSICS` (capability
-`mhd_production_dispatch`) until the magnetized `kHydroUpdate` dispatch, the
-`cosmosim_restart_v26` writer/reader and the `chui_science_snapshot_v7`
-writer exist. MHD never silently runs as ordinary hydro.
+**Runtime status (source pass 02, UNVALIDATED, never executed):** the
+synchronized CPU reference path is source-implemented: `kHydroUpdate` runs the
+D/H/I/H/D interval over the production leaf-AMR tiling (MPI halo/EMF/record
+exchange, global-step retry ownership), with `cosmosim_restart_v26` and
+`chui_science_snapshot_v7`. `mhd.enabled = true` is admitted only when every
+predicate of `workflows::mhdProductionDispatchRefusal` holds; otherwise the run
+is rejected at capability admission with the precise `MHD_UNSUPPORTED_PHYSICS`
+reason. Required/refused combinations:
+
+| Predicate | Requirement |
+|---|---|
+| `numerics.global_step_max_retries` | `>= 1` (the global-step transaction owns MHD retries) |
+| `numerics.hierarchical_max_rung` | `0` (one synchronized interval for all leaves) |
+| `numerics.amr_time_stepping`, `mhd_amr.distributed_subcycling` | `synchronized`, `false` (tier `mhd_ref_amr_subcycled` not implemented) |
+| `numerics.amr_regrid_mode` | `off` (magnetic regrid transfer not wired; static 2:1 balanced leaf tiling) |
+| `parallel.decomposition_runtime_rebalance_enabled` with `mpi_ranks_expected > 1` | `false` (magnetic migration payloads not wired) |
+| `numerics.hydro_shadow_enabled` | `false` |
+| `mhd_performance.optional_gpu_backend` | `false` |
+| `mhd_nonideal.coefficient_provider` | `constant` or `table` (`chemistry` refused) |
+| Build | `COSMOSIM_ENABLE_HDF5=ON` (v26/v7 are the only magnetic IO authorities) |
+
+The run also requires production AMR leaf coverage with explicit patch geometry
+(a single-level tiling is a valid hierarchy); the legacy fixed-Cartesian path is
+refused at the first `kHydroUpdate`. MHD never silently runs as ordinary hydro.
+
+Fresh-start magnetic seed (`[mhd_io]`, normalized only when `mhd.enabled`):
+
+| Key | Default | Meaning |
+|---|---|---|
+| `initial_field_seed` | `none` | `none` (a v26 checkpoint must supply the field; a fresh start fails closed), `uniform`, `field_loop`, `circular_alfven`, `stochastic` |
+| `initial_field_uniform_b_{x,y,z}_comoving` | `0` | Uniform net-flux part `B_c` (normalized code units, `B_c = a_initial^2 B_phys`) |
+| `initial_field_amplitude_comoving` | `0` | Vector-potential mode amplitude |
+| `initial_field_length_comoving` | `0` | Loop radius (`field_loop`) or wavelength (`circular_alfven`); must be `> 0` for those seeds |
+| `initial_field_center_{x,y,z}_comoving` | `0` | Loop centre |
+| `initial_field_random_seed` | `0` | SplitMix64 seed of the stochastic seed |
+| `initial_field_k_max` | `0` | Stochastic modes `|k| <= k_max (2 pi / L)`, must lie in `[1,64]` for `stochastic` |
+| `initial_field_spectral_index` | `0` | Stochastic amplitude spectral index |
+
+Every seed is `Phi = Phi_uniform + C(A_edge)` on the real leaf topology
+(divergence-free by construction, checked against `mhd` strict-CT tolerance);
+a restored v26 field is never reseeded. Cell-centred IC fields are never
+projected into face flux (`mhd_io.input_projection = reject`).
 
 Compatibility rules:
 
@@ -997,6 +1033,6 @@ Compatibility rules:
   `[nrho][nT][ncomp][ngrain]`, all with `Units = cm^2/s`. Ohmic/ambipolar must be
   finite and nonnegative, Hall finite; out-of-coverage queries are fatal.
 
-Example decks (rejected at admission, see their headers):
+Example decks (satisfy the admission predicates; UNVALIDATED, see headers):
 `configs/cosmo_cube/cube_mhd_ref_v01.param.txt`,
 `configs/isolated_galaxy/disk_mhd_ref_v01.param.txt`.

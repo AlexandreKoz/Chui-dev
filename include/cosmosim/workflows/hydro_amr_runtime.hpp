@@ -2,7 +2,9 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <memory>
+#include <string>
 
 #include "cosmosim/core/time_integration.hpp"
 #include "cosmosim/hydro/hydro_core_solver.hpp"
@@ -61,7 +63,20 @@ class HydroAmrRuntime {
   [[nodiscard]] virtual std::uint64_t
   directedAmrPatchCellRecordsReceived() const noexcept = 0;
   [[nodiscard]] virtual core::MemoryReport memoryReport() const = 0;
+  // COLLECTIVE MHD timestep candidate (fast-magnetosonic CFL plus non-ideal
+  // cost bounds, rank-global). +infinity for MHD-disabled runs.
+  [[nodiscard]] virtual double magnetizedStableTimeStep(core::SimulationState& /*state*/,
+                                                        const core::IntegratorState& /*integrator*/,
+                                                        bool /*cosmological*/) {
+    return std::numeric_limits<double>::infinity();
+  }
+  [[nodiscard]] virtual std::uint64_t magnetizedOwnedCapacityBytes() const noexcept { return 0U; }
 };
+
+// Empty when every MHD admission predicate of the synchronized CPU reference
+// path holds for `config`; otherwise the precise refusal (MHD_UNSUPPORTED_*).
+[[nodiscard]] std::string mhdProductionDispatchRefusal(const core::SimulationConfig& config,
+                                                       const core::ModePolicy& mode_policy);
 
 [[nodiscard]] std::unique_ptr<HydroAmrRuntime> makeHydroAmrRuntime(
     const core::SimulationConfig& config,

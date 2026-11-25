@@ -1198,3 +1198,33 @@ source-only campaign). Ledger: `docs/architecture/chui_mhd_implementation_pass01
   synchronized same-level, same-rank MHD interval (rollback image, retries,
   owner reconciliation of shared faces/edges). Multi-level, multi-rank and
   recursive magnetized stepping are rejected, not emulated.
+
+## CHUI MHD production closure pass 02 — 20261125
+
+Source only; NOT configured, compiled or run. Ledger:
+`docs/architecture/chui_mhd_implementation_pass02_status.md`.
+
+* Dependency: `cosmosim_workflows` links `cosmosim_mhd` (PUBLIC). `mhd` still
+  depends on `core` only; MPI reaches MHD only through the `MhdHaloTransport`
+  interface implemented in `workflows/internal/mhd_runtime_bridge.cpp` on top of
+  `parallel::exchangeBoundedAlltoallBytes`. No dependency-boundary exception.
+* Expansion ownership (R-EXP): for magnetized runs the MHD ideal stage owns
+  `-H m_c` and `-H(2K_c+3p_c+M_c)`; the gas KDK kick of magnetized runs uses the
+  new drag-free quadrature `core::computeComovingSourceKickFactor`
+  (`integral dt/a^2`) and applies no drag/thermal scaling. The existing timeline
+  contract for particles and nonmagnetized gas is unchanged; the two new
+  `CosmologicalStepFactors` fields are step-local and not persisted.
+* Retry ownership: the MHD stepper never commits a shortened interval in
+  production (`MhdRetryMode::kExternal`); the existing global-step transaction
+  (`numerics.global_step_max_retries >= 1`, required at admission) retries the
+  whole step.
+* Synchronized leaf AMR (R-SYNC): per-stage coarse/fine record/edge/face
+  overrides from the fine side replace end-of-interval registers; no MHD
+  register outlives a stage. Distributed recursive subcycling stays fail-closed.
+* Schema: magnetized checkpoints are `cosmosim_restart_v26` (= v25 + `/state/mhd`),
+  canonical dataset spelling `face_flux_*_comoving` (R-SPELL); magnetized science
+  output is `chui_science_snapshot_v7`. v25/v6 nonmagnetic behaviour unchanged.
+* Reproducibility impact: MHD-off runs are unaffected (no MHD allocation, same
+  kick factors, same schemas, same normalized text). Magnetized runs are
+  deterministic for a fixed `batch_patches` and rank topology (stable owner keys,
+  slot-ordered reductions, rank-ordered sums).

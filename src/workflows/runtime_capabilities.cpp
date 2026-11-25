@@ -1,11 +1,14 @@
 #include "cosmosim/workflows/runtime_capabilities.hpp"
+#include "cosmosim/workflows/hydro_amr_runtime.hpp"
 
 #include "cosmosim/core/build_config.hpp"
 #include "cosmosim/core/openmp_runtime.hpp"
+#include "cosmosim/core/simulation_mode.hpp"
 #include "cosmosim/gravity/pm_solver.hpp"
 #include "cosmosim/io/ic_reader.hpp"
 
 #include <fstream>
+#include <string>
 #include <stdexcept>
 
 namespace cosmosim::workflows {
@@ -314,46 +317,54 @@ RuntimeCapabilityReport buildRuntimeCapabilityReport(
                  core::AnalysisConfig::DiagnosticsExecutionPolicy::kAllIncludingProvisional,
        .detail = "Only diagnostics explicitly marked provisional remain gated behind the opt-in policy."},
   };
-  // CHUI-MHD-REF-v1 capabilities. Source-level kernels exist in src/mhd but
-  // the production kHydroUpdate dispatch, MHD stage-wide halo/EMF ownership,
-  // v26 restart and v7 snapshot writers are not wired. Every magnetized mode
-  // is therefore reported truthfully and rejected at admission by
-  // validateRequestedRuntimeCapabilities; mhd.enabled=false is unaffected.
-  // See docs/architecture/chui_mhd_implementation_pass01_status.md.
+  // CHUI-MHD-REF-v1 capabilities (pass 02). The synchronized CPU reference
+  // path (leaf AMR, MPI, D/H/I/H/D, v26/v7 IO) is source-implemented and
+  // UNVALIDATED; it is admitted only when every predicate of
+  // mhdProductionDispatchRefusal() holds, otherwise the precise refusal is
+  // reported. Status stays provisional, never certified.
+  // See docs/architecture/chui_mhd_implementation_pass02_status.md.
   const bool mhd_requested = config.mhd.enabled;
   const bool mhd_nonideal_requested = config.mhd.enabled && config.mhd.nonideal.enabled;
+  const std::string mhd_refusal =
+      mhd_requested ? mhdProductionDispatchRefusal(config, core::ModePolicy{}) : std::string();
+  const bool mhd_dispatch_available = mhd_requested && mhd_refusal.empty();
   report.capabilities.push_back(
       {.name = "mhd_ideal_reference_kernels",
        .status = RuntimeCapabilityStatus::kProvisional,
        .requested = mhd_requested, .compiled = true, .dependency_available = true,
-       .runtime_available = false, .active = false,
+       .runtime_available = true, .active = mhd_dispatch_available,
        .implementation_maturity = RuntimeImplementationMaturity::kReference,
        .scientific_maturity = RuntimeScientificMaturity::kProvisional,
        .scalability = RuntimeScalabilityClass::kNotApplicable,
-       .detail = "Patch-level SSPRK2/PLM-MC/PPM/HLLD/HLLE/UCT-HLL/CT kernels are source-"
-                 "implemented in cosmosim_mhd (unvalidated, not executed). They are not "
-                 "reachable from the production workflow."});
+       .detail = "SSPRK2/PLM-MC/PPM/HLLD/HLLE/UCT-HLL/CT kernels in cosmosim_mhd "
+                 "(source-implemented, UNVALIDATED, NOT_RUN)."});
   report.capabilities.push_back(
       {.name = "mhd_production_dispatch",
-       .status = RuntimeCapabilityStatus::kUnsupported,
-       .requested = mhd_requested, .compiled = false, .dependency_available = true,
-       .runtime_available = false, .active = false,
+       .status = mhd_requested && !mhd_refusal.empty() ? RuntimeCapabilityStatus::kUnsupported
+                                                       : RuntimeCapabilityStatus::kProvisional,
+       .requested = mhd_requested, .compiled = true, .dependency_available = true,
+       .runtime_available = !mhd_requested || mhd_dispatch_available,
+       .active = mhd_dispatch_available,
        .scientific_maturity = RuntimeScientificMaturity::kProvisional,
-       .detail = "kHydroUpdate has no magnetized dispatch: MagneticFaceSoa lifecycle, "
-                 "stage-wide multi-patch/MPI face and edge ownership, gas+magnetic energy "
-                 "authority in SimulationState, regrid/migration transfer, v26 restart and "
-                 "v7 snapshot are not production-integrated. mhd.enabled=true fails closed "
-                 "rather than silently running nonmagnetic hydro."});
+       .detail = mhd_requested && !mhd_refusal.empty()
+           ? mhd_refusal
+           : std::string("Synchronized CPU reference MHD in kHydroUpdate: leaf-AMR "
+                         "same-level/coarse-fine ownership, MPI halo/EMF exchange, "
+                         "global-step retry ownership, v26 restart and v7 snapshot "
+                         "(source-implemented, UNVALIDATED, NOT_RUN).")});
   report.capabilities.push_back(
       {.name = "mhd_nonideal_transport",
-       .status = RuntimeCapabilityStatus::kUnsupported,
+       .status = RuntimeCapabilityStatus::kProvisional,
        .requested = mhd_nonideal_requested, .compiled = true, .dependency_available = true,
-       .runtime_available = false, .active = false,
+       .runtime_available = !mhd_nonideal_requested ||
+           (mhd_dispatch_available &&
+            config.mhd.nonideal.coefficient_provider !=
+                core::MhdCoefficientProviderConfigMode::kChemistry),
+       .active = mhd_nonideal_requested && mhd_dispatch_available,
        .implementation_maturity = RuntimeImplementationMaturity::kReference,
        .scientific_maturity = RuntimeScientificMaturity::kProvisional,
-       .detail = "Patch-level Ohmic/ambipolar (SSPRK2/RKL2) and Hall-HLL (SSPRK2) operators "
-                 "with D/H/I/H/D Strang composition are source-implemented; no production "
-                 "dispatch exists."});
+       .detail = "Ohmic/ambipolar (SSPRK2/RKL2) and Hall-HLL (SSPRK2) with D/H/I/H/D Strang "
+                 "composition; constant and verified-table providers only (UNVALIDATED)."});
   report.capabilities.push_back(
       {.name = "mhd_chemistry_coefficient_provider",
        .status = RuntimeCapabilityStatus::kUnsupported,
@@ -394,6 +405,59 @@ RuntimeCapabilityReport buildRuntimeCapabilityReport(
   return report;
 }
 
+std::string mhdProductionDispatchRefusal(const core::SimulationConfig& config,
+                                         const core::ModePolicy& mode_policy) {
+  (void)mode_policy;  // periodic, open and reflecting (conducting) walls are all supported
+  if (!config.mhd.enabled) {
+    return {};
+  }
+  const core::MhdConfig& mhd = config.mhd;
+  if (mhd.performance.optional_gpu_backend) {
+    return "mhd_performance.optional_gpu_backend=true: no GPU MHD kernels exist and there is "
+           "no silent CPU fallback";
+  }
+  if (mhd.amr.distributed_subcycling ||
+      config.numerics.amr_time_stepping == core::AmrTimeSteppingConfigMode::kRecursiveSubcycling) {
+    return "magnetized recursive/distributed AMR subcycling (tier mhd_ref_amr_subcycled) is not "
+           "implemented: magnetic temporal face histories and coupled EMF subcycling do not "
+           "exist; use numerics.amr_time_stepping=synchronized and "
+           "mhd_amr.distributed_subcycling=false";
+  }
+  if (mhd.nonideal.enabled &&
+      mhd.nonideal.coefficient_provider == core::MhdCoefficientProviderConfigMode::kChemistry) {
+    return "mhd_nonideal.coefficient_provider=chemistry: no validated charged-carrier/"
+           "collision/grain contract exists (amendment R5); use constant or a verified table";
+  }
+  if (config.numerics.hierarchical_max_rung != 0) {
+    return "numerics.hierarchical_max_rung must be 0: the MHD reference advances every leaf "
+           "with one synchronized global interval";
+  }
+  if (config.numerics.global_step_max_retries < 1) {
+    return "numerics.global_step_max_retries must be >= 1: the global-step transaction is the "
+           "owner of MHD interval retries (the MHD stepper never commits a shortened interval "
+           "on its own)";
+  }
+  if (config.numerics.amr_regrid_mode != core::AmrRegridConfigMode::kOff) {
+    return "numerics.amr_regrid_mode must be off: magnetic face transfer is not wired into "
+           "amr_production_regrid in this source pass (static leaf hierarchies only)";
+  }
+  if (config.parallel.mpi_ranks_expected > 1 &&
+      config.parallel.decomposition_runtime_rebalance_enabled) {
+    return "parallel.decomposition_runtime_rebalance_enabled must be false for multi-rank MHD: "
+           "patch migration with magnetic face payloads is not wired in this source pass";
+  }
+  if (config.numerics.hydro_shadow_enabled) {
+    return "numerics.hydro_shadow_enabled must be false: the hydro shadow reference compares "
+           "nonmagnetic Godunov updates";
+  }
+#if !COSMOSIM_ENABLE_HDF5
+  return "MHD requires an HDF5-enabled build: cosmosim_restart_v26 and snapshot v7 are the only "
+         "magnetic restart/output authorities";
+#else
+  return {};
+#endif
+}
+
 void validateRequestedRuntimeCapabilities(
     const core::SimulationConfig& config,
     const RuntimeCapabilityReport& report) {
@@ -418,8 +482,9 @@ void validateRequestedRuntimeCapabilities(
         report.require("distributed_metal_diffusion").detail);
   }
   if (config.mhd.enabled) {
-    // Fail-closed MHD admission perimeter. This guard is NOT an
-    // implementation; it stays until mhd_production_dispatch is wired.
+    // Capability-specific MHD admission (pass 02): every unsupported
+    // topology/IO/provider/backend/source/EOS combination is refused before
+    // any initial-condition materialization with its precise reason.
     const auto reject_mhd = [&](std::string_view name) {
       const RuntimeCapability& capability = report.require(name);
       if (capability.requested && !capability.runtime_available) {
@@ -433,6 +498,10 @@ void validateRequestedRuntimeCapabilities(
     reject_mhd("mhd_chemistry_coefficient_provider");
     reject_mhd("mhd_nonideal_transport");
     reject_mhd("mhd_production_dispatch");
+    const std::string refusal = mhdProductionDispatchRefusal(config, core::ModePolicy{});
+    if (!refusal.empty()) {
+      throw std::invalid_argument("MHD_UNSUPPORTED_PHYSICS: " + refusal);
+    }
   }
   if (config.numerics.gravity_solver == core::GravitySolver::kTreePm) {
     gravity::requireTreePmSupportOrThrow(

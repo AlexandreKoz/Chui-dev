@@ -562,6 +562,18 @@ bool maybeWriteOutputs(
     snapshot_payload.set_member.has_global_part_count = true;
     snapshot_payload.set_member.generation_id = generation_id;
     snapshot_payload.collective_single_file = collective_single_file;
+    if (config.mhd.enabled) {
+      // chui_science_snapshot_v7 diagnostics. Collective single files carry
+      // rank-agreed global values (every rank reaches this point).
+      snapshot_payload.mhd_scale_factor = integrator_state.current_scale_factor;
+      if (collective_single_file) {
+        snapshot_payload.mhd_diagnostics_global = true;
+        snapshot_payload.mhd_divergence_max_norm = -services.mpi_context.allreduceMinDouble(
+            -state.magnetic_faces.divergence_max_normalized);
+        snapshot_payload.mhd_magnetic_energy_comoving = services.mpi_context.allreduceSumDouble(
+            io::mhdLocalMagneticEnergyComoving(state, integrator_state.current_scale_factor));
+      }
+    }
     if (collective_single_file) {
       for (std::size_t type = 0; type < 6U; ++type) {
         snapshot_payload.collective_file_row_offset[type] =
@@ -903,8 +915,11 @@ bool maybeWriteOutputs(
         .scale_factor = integrator_state.current_scale_factor,
         .message = "restart checkpoint written and streaming-verified",
         .payload = {{"path", report.restart_path.string()},
-                    {"restart_schema", io::restartSchema().name},
-                    {"restart_schema_version", std::to_string(io::restartSchema().version)},
+                    {"restart_schema", state.magnetic_faces.empty() ? io::restartSchema().name
+                                                                    : io::mhdRestartSchema().name},
+                    {"restart_schema_version",
+                     std::to_string(state.magnetic_faces.empty() ? io::restartSchema().version
+                                                                 : io::mhdRestartSchema().version)},
                     {"boundary_kind", std::string(core::stepBoundaryKindName(integrator_state.last_completed_boundary_kind))},
                     {"scheduler_current_tick", std::to_string(scheduler.currentTick())},
                     {"scheduler_max_bin", std::to_string(scheduler.maxBin())},

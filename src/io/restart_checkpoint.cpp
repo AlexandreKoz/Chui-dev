@@ -31,6 +31,7 @@
 #include "cosmosim/core/build_config.hpp"
 #include "cosmosim/core/config.hpp"
 #include "cosmosim/io/io_contract.hpp"
+#include "cosmosim/io/mhd_restart_state.hpp"
 #include "io/internal/transactional_file.hpp"
 
 #if COSMOSIM_ENABLE_HDF5
@@ -56,6 +57,12 @@ constexpr std::uint32_t k_restart_schema_v22 = 22;
 constexpr std::uint32_t k_restart_schema_v23 = 23;
 constexpr std::uint32_t k_restart_schema_v24 = 24;
 constexpr std::uint32_t k_restart_schema_v25 = 25;
+// CHUI-MHD amendment R1: the magnetized variant of the v25 layout. Identical to
+// v25 plus the authoritative /state/mhd face-flux group (io/mhd_restart_state).
+// Written ONLY for states with a non-empty MagneticFaceSoa; nonmagnetic states
+// keep writing v25 byte-for-byte as before.
+constexpr std::uint32_t k_restart_schema_v26 = 26;
+constexpr std::string_view k_restart_schema_name_v26 = "cosmosim_restart_v26";
 // Per-group layout identities, versioned independently of the outer restart
 // schema. /state/amr_pending_flux_registers has carried group schema 2 since
 // it was introduced (the v22 metal flux lanes are optional by presence) and
@@ -785,7 +792,24 @@ void validateFileKindAttribute(
   }
 }
 
+void validateRestartCheckpointSchema(hid_t file, std::uint32_t schema_version);
+
+void requireMhdGroupForSchema(hid_t file, std::uint32_t schema_version) {
+  const bool has_mhd = H5Lexists(file, "/state", H5P_DEFAULT) > 0 &&
+      H5Lexists(file, "/state/mhd", H5P_DEFAULT) > 0;
+  if (schema_version >= k_restart_schema_v26 && !has_mhd) {
+    throw std::runtime_error(
+        "MHD_RESTART_SCHEMA_MISMATCH: cosmosim_restart_v26 requires the /state/mhd group");
+  }
+  if (schema_version < k_restart_schema_v26 && has_mhd) {
+    throw std::runtime_error(
+        "MHD_RESTART_SCHEMA_MISMATCH: /state/mhd is present in a pre-v26 checkpoint "
+        "(a v25 checkpoint is MHD-disabled by definition)");
+  }
+}
+
 void validateRestartCheckpointSchema(hid_t file, std::uint32_t schema_version) {
+  requireMhdGroupForSchema(file, schema_version);
   const auto& shared_names = sharedIoContractNames();
   validateFileKindAttribute(file, shared_names.restart_checkpoint_file_kind, "restart reader");
 
@@ -2728,8 +2752,14 @@ GravityForceCachePersistentView makeGravityForceCachePersistentView(
       .hierarchical_nearest_pair_r2_comoving = cache.hierarchical_nearest_pair_r2_comoving};
 }
 
+const RestartSchema& mhdRestartSchema() {
+  static const RestartSchema schema{std::string(k_restart_schema_name_v26), k_restart_schema_v26};
+  return schema;
+}
+
 bool isRestartSchemaCompatible(std::uint32_t file_schema_version) {
   return file_schema_version == restartSchema().version ||
+      file_schema_version == k_restart_schema_v26 ||
       file_schema_version == k_restart_schema_v24 ||
       file_schema_version == k_restart_schema_v23 ||
       file_schema_version == k_restart_schema_v22 ||
@@ -2778,7 +2808,8 @@ RestartIntegrityDigests restartPayloadIntegrityDigestsImpl(
     bool include_star_formation_v22,
     bool include_hierarchical_endpoint_v24,
     bool include_dual_energy_history_v25,
-    core::MemoryGovernor* memory_governor = nullptr) {
+    core::MemoryGovernor* memory_governor = nullptr,
+    bool include_mhd_v26 = false) {
   if (payload.persistent_state.simulation_state == nullptr || payload.integrator_state == nullptr || payload.scheduler == nullptr) {
     throw std::invalid_argument("restart payload must provide state, integrator_state, and scheduler");
   }
@@ -3125,6 +3156,35 @@ RestartIntegrityDigests restartPayloadIntegrityDigestsImpl(
         }
       }
     }
+  }
+
+  if (include_mhd_v26) {
+    // v26 /state/mhd: patch records, offsets and the three face-flux lanes
+    // are part of the canonical payload digest (exact-restart authority).
+    const core::MagneticFaceSoa& faces = state.magnetic_faces;
+    append_string(faces.contract);
+    append_string(faces.coefficient_table_sha256);
+    append_u64(static_cast<std::uint64_t>(faces.patches.size()));
+    for (const core::MagneticFacePatchRecord& record : faces.patches) {
+      append_u64(record.patch_id);
+      append_u64(record.geometry_generation);
+      append_u64(static_cast<std::uint64_t>(static_cast<std::int64_t>(record.level)));
+      append_u64(record.nx);
+      append_u64(record.ny);
+      append_u64(record.nz);
+      append_u64(std::bit_cast<std::uint64_t>(record.origin_x_comoving));
+      append_u64(std::bit_cast<std::uint64_t>(record.origin_y_comoving));
+      append_u64(std::bit_cast<std::uint64_t>(record.origin_z_comoving));
+      append_u64(std::bit_cast<std::uint64_t>(record.cell_width_x_comoving));
+      append_u64(std::bit_cast<std::uint64_t>(record.cell_width_y_comoving));
+      append_u64(std::bit_cast<std::uint64_t>(record.cell_width_z_comoving));
+      append_u64(record.flux_x_offset);
+      append_u64(record.flux_y_offset);
+      append_u64(record.flux_z_offset);
+    }
+    append_any_vec(faces.face_flux_x_comoving);
+    append_any_vec(faces.face_flux_y_comoving);
+    append_any_vec(faces.face_flux_z_comoving);
   }
 
   append_any_vec(state.star_particles.particle_index);
@@ -3791,15 +3851,21 @@ void writeRestartCheckpointHdf5(
   if (payload.persistent_state.simulation_state == nullptr || payload.integrator_state == nullptr || payload.scheduler == nullptr) {
     throw std::invalid_argument("restart write payload must include state, integrator_state, and scheduler");
   }
-  // CHUI-MHD amendment R1: a magnetized state must be written as
-  // cosmosim_restart_v26 with its /state/mhd face-flux authority. The v26
-  // pipeline is not wired into this writer yet (the /state/mhd codec lives in
-  // io/mhd_restart_state.hpp), so a non-empty magnetic state fails closed here
-  // rather than being silently dropped into a v25 checkpoint.
-  if (!payload.persistent_state.simulation_state->magnetic_faces.empty()) {
+  // CHUI-MHD amendment R1: a magnetized state is written as
+  // cosmosim_restart_v26 (= v25 + /state/mhd); a nonmagnetic state keeps the
+  // unchanged v25 schema. MHD checkpoints are written only at globally safe
+  // synchronization boundaries: the synchronized MHD path never leaves pending
+  // flux registers, temporal histories or partial stages between steps, so a
+  // magnetized state carrying any of them is refused (no partial authority).
+  const bool magnetized = !payload.persistent_state.simulation_state->magnetic_faces.empty();
+  const RestartSchema& write_schema = magnetized ? mhdRestartSchema() : restartSchema();
+  if (magnetized &&
+      (!payload.persistent_state.simulation_state->pending_flux_registers.empty() ||
+       !payload.persistent_state.simulation_state->amr_temporal_boundary_history.empty() ||
+       payload.integrator_state->inside_kdk_step)) {
     throw std::invalid_argument(
-        "MHD_RESTART_SCHEMA_MISMATCH: magnetized state requires restart schema v26 "
-        "(/state/mhd); the v26 writer is not wired into writeRestartCheckpointHdf5");
+        "MHD_RESTART_SCHEMA_MISMATCH: a magnetized checkpoint was requested at an unsafe "
+        "boundary (pending flux registers, temporal histories or an open KDK step)");
   }
   validateContinuationMetadata(
       payload.normalized_config_text,
@@ -3882,13 +3948,13 @@ void writeRestartCheckpointHdf5(
 
   const RestartIntegrityDigests integrity =
       restartPayloadIntegrityDigestsImpl(payload, true, true, true, true, true, true, true, true, true,
-                                        policy.memory_governor);
+                                        policy.memory_governor, magnetized);
 
   const auto& shared_names = sharedIoContractNames();
   writeScalarStringAttribute(
       file.get(), shared_names.file_kind_attribute, std::string(shared_names.restart_checkpoint_file_kind));
-  writeScalarStringAttribute(file.get(), "restart_schema_name", restartSchema().name);
-  writeScalarU32Attribute(file.get(), "restart_schema_version", restartSchema().version);
+  writeScalarStringAttribute(file.get(), "restart_schema_name", write_schema.name);
+  writeScalarU32Attribute(file.get(), "restart_schema_version", write_schema.version);
   writeScalarStringAttribute(file.get(), "normalized_config_hash_hex", payload.normalized_config_hash_hex);
   writeScalarStringAttribute(file.get(), "payload_integrity_hash_hex", hexU64(integrity.legacy_fnv1a));
   writeScalarU64Attribute(file.get(), "payload_integrity_hash", integrity.legacy_fnv1a);
@@ -3904,6 +3970,18 @@ void writeRestartCheckpointHdf5(
       core::serializeProvenanceRecord(payload.provenance));
 
   writeStateGroup(file.get(), *payload.persistent_state.simulation_state);
+  if (magnetized) {
+    // v26 /state/mhd: streamed from the canonical lanes in <= 8 MiB hyperslabs.
+    MhdRestartGroupMetadata mhd_metadata{};
+    mhd_metadata.reference_contract = std::string(k_mhd_restart_reference_contract);
+    mhd_metadata.coefficient_table_sha256 =
+        payload.persistent_state.simulation_state->magnetic_faces.coefficient_table_sha256;
+    mhd_metadata.divergence_max_norm =
+        payload.persistent_state.simulation_state->magnetic_faces.divergence_max_normalized;
+    mhd_metadata.scale_factor = payload.integrator_state->current_scale_factor;
+    writeMhdRestartGroup(static_cast<std::int64_t>(file.get()),
+                         payload.persistent_state.simulation_state->magnetic_faces, mhd_metadata);
+  }
 
   Hdf5Handle integrator_group(openOrCreateGroup(file.get(), "/integrator"));
   writeScalarF64Attribute(integrator_group.get(), "current_time_code", payload.integrator_state->current_time_code);
@@ -4021,6 +4099,8 @@ void writeRestartCheckpointHdf5(
       gas_cell_scheduler_state_for_validation,
       payload.output_cadence_state,
       payload.stochastic_state);
+  restart_diagnostics.restart_schema_name = write_schema.name;
+  restart_diagnostics.restart_schema_version = write_schema.version;
   if (uniform_particle_scheduler) {
     restart_diagnostics.scheduler_current_tick = payload.scheduler->currentTick();
     restart_diagnostics.scheduler_max_bin = payload.scheduler->maxBin();
@@ -4340,8 +4420,14 @@ RestartVerificationResult verifyRestartCheckpointHdf5(
     validateFileKindAttribute(file.get(), sharedIoContractNames().restart_checkpoint_file_kind, "restart verifier");
     result.schema_name = readScalarStringAttribute(file.get(), "restart_schema_name");
     result.schema_version = readScalarU32Attribute(file.get(), "restart_schema_version");
-    if (result.schema_name != restartSchema().name || result.schema_version != restartSchema().version) {
-      throw std::runtime_error("write-time restart verifier requires the current restart schema");
+    const bool expected_magnetized = expected.persistent_state.simulation_state != nullptr &&
+        !expected.persistent_state.simulation_state->magnetic_faces.empty();
+    const RestartSchema& expected_schema = expected_magnetized ? mhdRestartSchema() : restartSchema();
+    if (result.schema_name != expected_schema.name ||
+        result.schema_version != expected_schema.version) {
+      throw std::runtime_error(
+          "write-time restart verifier requires the current restart schema (v25 nonmagnetic, "
+          "v26 magnetized)");
     }
     validateRestartCheckpointSchema(file.get(), result.schema_version);
     const auto require_u32_attr = [&](hid_t loc, std::string_view key, std::uint32_t expected_value, std::string_view field) {
@@ -4745,7 +4831,8 @@ RestartVerificationResult verifyRestartCheckpointHdf5(
     verifyDistributedRestartStateChunked(file.get(), expected.distributed_gravity_state, w, result);
 
     const RestartIntegrityDigests expected_integrity = restartPayloadIntegrityDigestsImpl(
-        expected, true, true, true, true, true, true, true, true, true, policy.memory_governor);
+        expected, true, true, true, true, true, true, true, true, true, policy.memory_governor,
+        expected_magnetized);
     result.legacy_payload_hash = readScalarU64Attribute(file.get(), "payload_integrity_hash");
     result.payload_sha256_hex = readScalarStringAttribute(file.get(), "payload_integrity_sha256_hex");
     if (result.legacy_payload_hash != expected_integrity.legacy_fnv1a ||
@@ -4761,8 +4848,8 @@ RestartVerificationResult verifyRestartCheckpointHdf5(
       scheduler_active_count += expected.scheduler->isElementActive(static_cast<std::uint32_t>(i)) ? 1ULL : 0ULL;
       scheduler_pending_count += expected.scheduler->pendingBinIndex(static_cast<std::uint32_t>(i)) != core::HierarchicalTimeBinScheduler::k_unset_pending_bin ? 1ULL : 0ULL;
     }
-    if (result.diagnostics.restart_schema_name != restartSchema().name ||
-        result.diagnostics.restart_schema_version != restartSchema().version ||
+    if (result.diagnostics.restart_schema_name != expected_schema.name ||
+        result.diagnostics.restart_schema_version != expected_schema.version ||
         result.diagnostics.step_index != expected.integrator_state->step_index ||
         result.diagnostics.scheduler_current_tick != expected.scheduler->currentTick() ||
         result.diagnostics.scheduler_max_bin != expected.scheduler->maxBin() ||
@@ -4812,6 +4899,8 @@ RestartReadResult readRestartCheckpointHdf5(
   const std::uint32_t schema_version = readScalarU32Attribute(file.get(), "restart_schema_version");
   const bool current_schema =
       schema_name == restartSchema().name && schema_version == restartSchema().version;
+  const bool magnetized_v26_schema =
+      schema_name == k_restart_schema_name_v26 && schema_version == k_restart_schema_v26;
   const bool legacy_v14_schema =
       schema_name == k_restart_schema_name_v14 && schema_version == k_restart_schema_v14;
   const bool legacy_v15_schema =
@@ -4832,7 +4921,8 @@ RestartReadResult readRestartCheckpointHdf5(
       schema_name == k_restart_schema_name_v23 && schema_version == k_restart_schema_v23;
   const bool legacy_v24_schema =
       schema_name == k_restart_schema_name_v24 && schema_version == k_restart_schema_v24;
-  if ((!current_schema && !legacy_v14_schema && !legacy_v15_schema && !legacy_v16_schema &&
+  if ((!current_schema && !magnetized_v26_schema && !legacy_v14_schema && !legacy_v15_schema &&
+       !legacy_v16_schema &&
        !legacy_v17_schema && !legacy_v18_schema && !legacy_v19_schema && !legacy_v20_schema &&
        !legacy_v21_schema && !legacy_v23_schema && !legacy_v24_schema) ||
       !isRestartSchemaCompatible(schema_version)) {
@@ -4898,6 +4988,59 @@ RestartReadResult readRestartCheckpointHdf5(
   result.integrator_state.last_first_hubble_drag_factor = readScalarF64Attribute(integrator_group.get(), "last_first_hubble_drag_factor");
   result.integrator_state.last_second_hubble_drag_factor = readScalarF64Attribute(integrator_group.get(), "last_second_hubble_drag_factor");
   result.integrator_state.step_index = readScalarU64Attribute(integrator_group.get(), "step_index");
+  if (schema_version >= k_restart_schema_v26) {
+    // Magnetic authority: fully validated into a fresh MagneticFaceSoa
+    // (contract, units, offsets, counts, finiteness, per-patch divergence,
+    // scale factor against the restored timeline). The table SHA-256 and the
+    // leaf topology/generations are re-admitted against the configured
+    // provider and the restored patches by the MHD runtime before first use;
+    // a pre-v26 file never yields a magnetic state.
+    Hdf5Handle mhd_group(H5Gopen2(file.get(), "/state/mhd", H5P_DEFAULT));
+    if (!mhd_group.valid()) {
+      throw std::runtime_error("MHD_RESTART_SCHEMA_MISMATCH: cannot open /state/mhd");
+    }
+    // Governed candidate admission of the three flux lanes BEFORE allocation
+    // (dimensions read from the dataset headers; the patch table is bounded
+    // inside the codec).
+    core::MemoryReservation mhd_candidate_reservation;
+    if (policy.memory_governor != nullptr) {
+      std::uint64_t mhd_bytes = 0U;
+      for (const char* lane : {"face_flux_x_comoving", "face_flux_y_comoving", "face_flux_z_comoving"}) {
+        if (H5Lexists(mhd_group.get(), lane, H5P_DEFAULT) <= 0) {
+          throw std::runtime_error(std::string("MHD_RESTART_SCHEMA_MISMATCH: missing /state/mhd/") + lane);
+        }
+        Hdf5Handle dataset(H5Dopen2(mhd_group.get(), lane, H5P_DEFAULT));
+        Hdf5Handle space(H5Dget_space(dataset.get()));
+        hsize_t extent = 0;
+        if (H5Sget_simple_extent_ndims(space.get()) != 1 ||
+            H5Sget_simple_extent_dims(space.get(), &extent, nullptr) < 0) {
+          throw std::runtime_error(std::string("MHD_RESTART_SCHEMA_MISMATCH: malformed /state/mhd/") + lane);
+        }
+        if (static_cast<std::uint64_t>(extent) >
+            std::numeric_limits<std::uint64_t>::max() / sizeof(double)) {
+          throw std::runtime_error("MHD_RESTART_SCHEMA_MISMATCH: flux lane extent overflows");
+        }
+        mhd_bytes = core::checkedMemoryBytesAdd(
+            mhd_bytes, static_cast<std::uint64_t>(extent) * sizeof(double),
+            "MHD restart candidate bytes");
+      }
+      if (mhd_bytes != 0U) {
+        mhd_candidate_reservation = policy.memory_governor->reserve(
+            core::MemoryClass::kPhaseResident, mhd_bytes, "restart.readback.mhd_face_flux");
+        mhd_candidate_reservation.commit();
+      }
+    }
+    MhdRestartExpectation expectation{};
+    expectation.reference_contract = std::string(k_mhd_restart_reference_contract);
+    expectation.coefficient_table_sha256 =
+        readScalarStringAttribute(mhd_group.get(), "coefficient_table_sha256");
+    expectation.scale_factor = result.integrator_state.current_scale_factor;
+    result.state.magnetic_faces = readMhdRestartGroup(
+        static_cast<std::int64_t>(file.get()), expectation, nullptr);
+  } else if (!result.state.magnetic_faces.empty()) {
+    throw std::runtime_error(
+        "MHD_RESTART_SCHEMA_MISMATCH: a pre-v26 checkpoint produced a magnetic state");
+  }
   result.integrator_state.scheme =
       static_cast<core::TimeStepScheme>(readScalarU32Attribute(integrator_group.get(), "scheme"));
   result.integrator_state.current_boundary_kind =
@@ -5061,7 +5204,9 @@ RestartReadResult readRestartCheckpointHdf5(
           schema_version >= k_restart_schema_v21,
           schema_version >= k_restart_schema_v22,
           schema_version >= k_restart_schema_v24,
-          schema_version >= k_restart_schema_v25);
+          schema_version >= k_restart_schema_v25,
+          nullptr,
+          schema_version >= k_restart_schema_v26);
   if (computed_integrity.legacy_fnv1a != result.payload_hash ||
       hexU64(computed_integrity.legacy_fnv1a) != result.payload_hash_hex) {
     throw std::runtime_error("restart legacy payload integrity hash mismatch");

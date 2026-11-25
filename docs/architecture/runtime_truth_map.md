@@ -701,7 +701,22 @@ geometry continues to refresh from canonical current sources independently of
 ownership. Spatial work EMA and profiler rings are bounded derived diagnostics;
 spatial history is cold after restart and is not force truth.
 
-## MHD magnetic face flux (source pass 01, not production-dispatched)
+## MHD magnetic face flux (source pass 02: production-dispatched, UNVALIDATED)
+
+Pass-02 changes to the table below: shared same-level faces, edges, gas and
+Poynting boundary records are reconciled across local and remote patches by
+the deterministic owner (lowest `(patch_id, local coordinates)`); coarse/fine
+interface records, edges and faces take the fine-side values every stage (fine
+side authoritative, leaf tiling). The edge EMF stage rate lives in a
+per-patch level-resident lane of `MhdLevelStepper` (batch workspaces are
+tile-local scratch). The MHD conserved gas copy is a per-interval staging of
+`MhdRuntimeBridge` (`kPhaseResident`), loaded from `GasCellSidecar` at
+`kHydroUpdate` begin and stored back only after collective acceptance; derived
+pressure/sound speed/temperature are refreshed by
+`hydro::refreshGasThermodynamicCell`. For magnetized runs the MHD ideal stage is
+the single owner of the expansion source; the gas KDK kick adds only the
+drag-free gravity term (`first/second_source_kick_factor_code`).
+
 
 | Fact | Single live authority | Mirrors / scratch | Refresh / invalidation |
 |---|---|---|---|

@@ -854,6 +854,18 @@ parseInitialConditionMissingFieldPolicy(
                     "' (only face_flux is supported)");
 }
 
+[[nodiscard]] MhdInitialFieldSeedConfigMode parseMhdInitialFieldSeedConfigMode(
+    const std::string& value) {
+  const std::string lower = toLower(trim(value));
+  if (lower == "none") return MhdInitialFieldSeedConfigMode::kNone;
+  if (lower == "uniform") return MhdInitialFieldSeedConfigMode::kUniform;
+  if (lower == "field_loop") return MhdInitialFieldSeedConfigMode::kFieldLoop;
+  if (lower == "circular_alfven") return MhdInitialFieldSeedConfigMode::kCircularAlfven;
+  if (lower == "stochastic") return MhdInitialFieldSeedConfigMode::kStochastic;
+  throw ConfigError("key 'mhd_io.initial_field_seed': invalid value '" + value +
+                    "' (expected none|uniform|field_loop|circular_alfven|stochastic)");
+}
+
 [[nodiscard]] MhdInputProjectionConfigMode parseMhdInputProjectionConfigMode(
     const std::string& value) {
   const std::string lower = toLower(trim(value));
@@ -2030,6 +2042,18 @@ struct ConfigKeySpec {
       {"mhd_io.initial_field_format", "face_flux"},
       {"mhd_io.input_projection", "reject"},
       {"mhd_io.output_divergence_diagnostics", "true"},
+      {"mhd_io.initial_field_seed", "none"},
+      {"mhd_io.initial_field_uniform_b_x_comoving", "0"},
+      {"mhd_io.initial_field_uniform_b_y_comoving", "0"},
+      {"mhd_io.initial_field_uniform_b_z_comoving", "0"},
+      {"mhd_io.initial_field_amplitude_comoving", "0"},
+      {"mhd_io.initial_field_length_comoving", "0"},
+      {"mhd_io.initial_field_center_x_comoving", "0"},
+      {"mhd_io.initial_field_center_y_comoving", "0"},
+      {"mhd_io.initial_field_center_z_comoving", "0"},
+      {"mhd_io.initial_field_random_seed", "0"},
+      {"mhd_io.initial_field_k_max", "0"},
+      {"mhd_io.initial_field_spectral_index", "0"},
       {"mhd_performance.profile", "workstation_48gib_v01"},
       {"mhd_performance.patch_probe_size", "32"},
       {"mhd_performance.patch_tile_target_cells", "32768"},
@@ -2461,6 +2485,39 @@ void validateMhdConfig(const MhdConfig& mhd) {
   if (!mhd.io.checkpoint_face_flux) {
     throw ConfigError(
         "mhd_io.checkpoint_face_flux must be true for exact MHD restart authority");
+  }
+  {
+    const MhdConfig::Io& io = mhd.io;
+    for (const double value :
+         {io.initial_field_uniform_b_x_comoving, io.initial_field_uniform_b_y_comoving,
+          io.initial_field_uniform_b_z_comoving, io.initial_field_amplitude_comoving,
+          io.initial_field_length_comoving, io.initial_field_center_x_comoving,
+          io.initial_field_center_y_comoving, io.initial_field_center_z_comoving,
+          io.initial_field_spectral_index}) {
+      if (!std::isfinite(value)) {
+        throw ConfigError("mhd_io.initial_field_* values must be finite");
+      }
+    }
+    switch (io.initial_field_seed) {
+      case MhdInitialFieldSeedConfigMode::kNone:
+      case MhdInitialFieldSeedConfigMode::kUniform:
+        break;
+      case MhdInitialFieldSeedConfigMode::kFieldLoop:
+      case MhdInitialFieldSeedConfigMode::kCircularAlfven:
+        if (!(io.initial_field_length_comoving > 0.0)) {
+          throw ConfigError(
+              "mhd_io.initial_field_length_comoving must be > 0 (loop radius or wavelength)");
+        }
+        break;
+      case MhdInitialFieldSeedConfigMode::kStochastic:
+        if (io.initial_field_k_max < 1 || io.initial_field_k_max > 64) {
+          throw ConfigError("mhd_io.initial_field_k_max must lie in [1,64] for the stochastic seed");
+        }
+        break;
+    }
+    if (io.initial_field_k_max < 0) {
+      throw ConfigError("mhd_io.initial_field_k_max must be >= 0");
+    }
   }
   const MhdConfig::Performance& perf = mhd.performance;
   if (perf.patch_probe_size != 16 && perf.patch_probe_size != 32 &&
@@ -4279,6 +4336,31 @@ class NormalizedConfigStream {
   stream << "output_divergence_diagnostics = "
          << (frozen.config.mhd.io.output_divergence_diagnostics ? "true" : "false")
          << '\n';
+  {
+    const MhdConfig::Io& io = frozen.config.mhd.io;
+    stream << "initial_field_seed = "
+           << mhdInitialFieldSeedConfigModeToString(io.initial_field_seed) << '\n';
+    stream << "initial_field_uniform_b_x_comoving = "
+           << bridge_number(io.initial_field_uniform_b_x_comoving) << '\n';
+    stream << "initial_field_uniform_b_y_comoving = "
+           << bridge_number(io.initial_field_uniform_b_y_comoving) << '\n';
+    stream << "initial_field_uniform_b_z_comoving = "
+           << bridge_number(io.initial_field_uniform_b_z_comoving) << '\n';
+    stream << "initial_field_amplitude_comoving = "
+           << bridge_number(io.initial_field_amplitude_comoving) << '\n';
+    stream << "initial_field_length_comoving = "
+           << bridge_number(io.initial_field_length_comoving) << '\n';
+    stream << "initial_field_center_x_comoving = "
+           << bridge_number(io.initial_field_center_x_comoving) << '\n';
+    stream << "initial_field_center_y_comoving = "
+           << bridge_number(io.initial_field_center_y_comoving) << '\n';
+    stream << "initial_field_center_z_comoving = "
+           << bridge_number(io.initial_field_center_z_comoving) << '\n';
+    stream << "initial_field_random_seed = " << io.initial_field_random_seed << '\n';
+    stream << "initial_field_k_max = " << io.initial_field_k_max << '\n';
+    stream << "initial_field_spectral_index = "
+           << bridge_number(io.initial_field_spectral_index) << '\n';
+  }
   stream << "\n[mhd_performance]\n";
   stream << "profile = "
          << mhdPerformanceProfileToString(frozen.config.mhd.performance.profile) << '\n';
@@ -4833,6 +4915,32 @@ class NormalizedConfigStream {
       entries, consumed, "mhd_io.output_divergence_diagnostics",
       defaultFor("mhd_io.output_divergence_diagnostics")),
       "mhd_io.output_divergence_diagnostics");
+  {
+    MhdConfig::Io& io = frozen.config.mhd.io;
+    const auto number = [&](std::string_view key) {
+      const std::string name(key);
+      return parseFloating(requireString(entries, consumed, name, defaultFor(name)), name);
+    };
+    io.initial_field_seed = parseMhdInitialFieldSeedConfigMode(requireString(
+        entries, consumed, "mhd_io.initial_field_seed", defaultFor("mhd_io.initial_field_seed")));
+    io.initial_field_uniform_b_x_comoving = number("mhd_io.initial_field_uniform_b_x_comoving");
+    io.initial_field_uniform_b_y_comoving = number("mhd_io.initial_field_uniform_b_y_comoving");
+    io.initial_field_uniform_b_z_comoving = number("mhd_io.initial_field_uniform_b_z_comoving");
+    io.initial_field_amplitude_comoving = number("mhd_io.initial_field_amplitude_comoving");
+    io.initial_field_length_comoving = number("mhd_io.initial_field_length_comoving");
+    io.initial_field_center_x_comoving = number("mhd_io.initial_field_center_x_comoving");
+    io.initial_field_center_y_comoving = number("mhd_io.initial_field_center_y_comoving");
+    io.initial_field_center_z_comoving = number("mhd_io.initial_field_center_z_comoving");
+    io.initial_field_random_seed = parseNumber<std::uint64_t>(
+        requireString(entries, consumed, "mhd_io.initial_field_random_seed",
+                      defaultFor("mhd_io.initial_field_random_seed")),
+        "mhd_io.initial_field_random_seed");
+    io.initial_field_k_max = parseNumber<int>(
+        requireString(entries, consumed, "mhd_io.initial_field_k_max",
+                      defaultFor("mhd_io.initial_field_k_max")),
+        "mhd_io.initial_field_k_max");
+    io.initial_field_spectral_index = number("mhd_io.initial_field_spectral_index");
+  }
   frozen.config.mhd.performance.profile = parseMhdPerformanceProfile(requireString(
       entries, consumed, "mhd_performance.profile",
       defaultFor("mhd_performance.profile")));
@@ -6329,6 +6437,17 @@ std::string mhdScienceBFieldConfigModeToString(MhdScienceBFieldConfigMode value)
   }
   throw ConfigError(
       "unhandled MhdScienceBFieldConfigMode enum value during serialization");
+}
+
+std::string mhdInitialFieldSeedConfigModeToString(MhdInitialFieldSeedConfigMode value) {
+  switch (value) {
+    case MhdInitialFieldSeedConfigMode::kNone: return "none";
+    case MhdInitialFieldSeedConfigMode::kUniform: return "uniform";
+    case MhdInitialFieldSeedConfigMode::kFieldLoop: return "field_loop";
+    case MhdInitialFieldSeedConfigMode::kCircularAlfven: return "circular_alfven";
+    case MhdInitialFieldSeedConfigMode::kStochastic: return "stochastic";
+  }
+  throw ConfigError("unhandled MhdInitialFieldSeedConfigMode enum value during serialization");
 }
 
 std::string mhdInitialFieldFormatConfigModeToString(

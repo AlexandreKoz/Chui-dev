@@ -26,10 +26,12 @@ namespace cosmosim::io {
 // divergence_max_norm (float64), scale_factor (float64),
 // magnetic_units = "code_comoving_lorentz_heaviside", face_flux_contract.
 //
-// STATUS: codec only. writeRestartCheckpointHdf5 still fails closed for a
-// magnetized state; wiring this group into the v26 writer/reader pipeline
-// (collective MPI publication, integrity readback, config-hash admission) is
-// recorded as open work in docs/architecture/chui_mhd_implementation_pass01_status.md.
+// STATUS (pass 02): wired into writeRestartCheckpointHdf5 /
+// readRestartCheckpointHdf5 as the magnetized schema cosmosim_restart_v26
+// (= v25 + this group, covered by the canonical payload SHA-256). Flux lanes
+// are written and read in <= 8 MiB hyperslabs directly from / into the
+// canonical lanes. Canonical dataset spelling: face_flux_{x,y,z}_comoving
+// (REF 13.2 "_comov" is rejected, not aliased). UNVALIDATED (NOT_RUN).
 
 inline constexpr std::string_view k_mhd_restart_schema_name = "cosmosim_restart_v26";
 inline constexpr std::uint32_t k_mhd_restart_schema_version = 26U;
@@ -37,6 +39,10 @@ inline constexpr std::uint32_t k_mhd_restart_group_schema_version = 1U;
 inline constexpr std::string_view k_mhd_restart_magnetic_units = "code_comoving_lorentz_heaviside";
 // Bounded HDF5 staging per rank (CHUI-MHD-PERF v1.0 section 12, MP08).
 inline constexpr std::uint64_t k_mhd_restart_chunk_bytes = 8ULL * 1024ULL * 1024ULL;
+// Sanity bound on the per-rank patch table checked before any allocation.
+inline constexpr std::uint64_t k_mhd_restart_max_patches_per_rank = 16777216ULL;
+// Numerical reference contract written to /state/mhd/@reference_contract.
+inline constexpr std::string_view k_mhd_restart_reference_contract = "chui-mhd-ref-v1.0";
 
 struct MhdRestartGroupMetadata {
   std::string reference_contract;

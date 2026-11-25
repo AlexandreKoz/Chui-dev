@@ -1,5 +1,10 @@
 # CHUÍ MHD — implementation ledger, pass 01 (continuation campaign)
 
+> Superseded for current status by
+> `docs/architecture/chui_mhd_implementation_pass02_status.md` (pass 02:
+> production dispatch, leaf-AMR/MPI stepper, v26/v7). This file is kept as the
+> pass-01 record.
+
 **Status vocabulary:** `IMPLEMENTED_UNVALIDATED`, `PARTIAL`, `FAIL_CLOSED`,
 `NOT_IMPLEMENTED`, `NOT_APPLICABLE`. Nothing here is `PASSED` or `CERTIFIED`.
 **No configure, build, test, benchmark or simulation was run in this

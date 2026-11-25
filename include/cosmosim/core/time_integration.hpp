@@ -247,6 +247,16 @@ struct CosmologicalStepFactors {
   double first_hubble_drag_factor = 1.0;
   double second_hubble_drag_factor = 1.0;
   double hubble_drag_factor = 1.0;
+  // Drag-free gravity source quadrature integral(dt / a^2) of each half-step,
+  // used ONLY for gas cells of magnetized runs (CHUI-MHD expansion ownership
+  // reconciliation, docs/architecture/chui_mhd_implementation_pass02_status.md
+  // section R-EXP): there the MHD ideal stage owns the full expansion source
+  // -H m_c, -H (2K_c + 3p_c + M_c), so the gas KDK kick must add only
+  // du = A * integral(dt/a^2) and must not reuse the drag-weighted
+  // (1/a_end) integral(dt/a). Particles and nonmagnetized gas keep the
+  // existing drag + kick factors. Step-local; not persisted.
+  double first_source_kick_factor_code = 0.0;
+  double second_source_kick_factor_code = 0.0;
 };
 
 class CosmologicalTimeline {
@@ -584,6 +594,16 @@ class StepOrchestrator {
 
 // Kick prefactor for comoving acceleration terms proportional to 1/a.
 [[nodiscard]] double computeComovingKickFactor(
+    const LambdaCdmBackground& background,
+    double scale_factor_begin,
+    double scale_factor_end,
+    std::uint32_t midpoint_samples = 16);
+
+// Drag-free gravity source quadrature integral_{t(a0)}^{t(a1)} dt / a^2 =
+// integral da / (a^3 H(a)) (SI seconds), for du/dt = A/a^2 when the Hubble
+// drag -H u is owned by a different operator (magnetized gas; see
+// CosmologicalStepFactors::first_source_kick_factor_code).
+[[nodiscard]] double computeComovingSourceKickFactor(
     const LambdaCdmBackground& background,
     double scale_factor_begin,
     double scale_factor_end,

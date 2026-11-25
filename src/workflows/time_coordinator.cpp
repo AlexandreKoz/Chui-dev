@@ -1248,6 +1248,21 @@ void TimeCoordinator::runRungZeroSegment(
     }
     m_services.mpi_context.rethrowCollectivePreparationFailure(
         local_timestep_failure, "global timestep candidate selection");
+    if (config.mhd.enabled) {
+      // CHUI-MHD-REF 8.5: the authoritative scheduler includes the rank-global
+      // fast-magnetosonic CFL and the non-ideal Hall/RKL cost-bound candidates
+      // BEFORE any KDK or source work of the step (collective; zero-work ranks
+      // participate). The candidate never mutates canonical state.
+      const double mhd_dt = m_hydro_amr.magnetizedStableTimeStep(
+          state, integrator_state, cosmology_background != nullptr);
+      if (!(mhd_dt > 0.0) || std::isnan(mhd_dt)) {
+        throw std::runtime_error("MHD timestep candidate is not positive");
+      }
+      if (mhd_dt < local_physical_dt) {
+        local_physical_dt = mhd_dt;
+        m_last_timestep_limiter.criterion = "mhd_fast_magnetosonic_or_nonideal";
+      }
+    }
     double accepted_dt = m_services.mpi_context.allreduceMinDouble(local_physical_dt);
     {
       // G1.2: record the limiting criterion and AMR level of this decision

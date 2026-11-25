@@ -1,9 +1,9 @@
 # CHUI-MHD-REF-v1 non-ideal reference example (mhd_ref_nonideal_v01),
 # isolated disk, constant-coefficient provider for controlled numerical
 # comparison (NOT a claim of realistic galactic microphysics, REF 8.1).
-# STATUS: parses and validates, but is REJECTED at runtime capability
-# admission (mhd_nonideal_transport / mhd_production_dispatch) until the
-# magnetized dispatch is wired. A table-provider variant requires a real,
+# STATUS (pass 02): satisfies the synchronized CPU reference admission
+# predicates; source-implemented and UNVALIDATED (never executed in the
+# source-only campaign). A table-provider variant requires a real,
 # validated HDF5 table (contract chui_mhd_transport_table_v1) whose SHA-256 is
 # pinned; no such physical table is distributed with the repository.
 schema_version = 1
@@ -47,6 +47,8 @@ time_begin_code = 0.0
 time_end_code = 1.0
 max_global_steps = 3000
 hierarchical_max_rung = 0
+# The global-step transaction owns MHD interval retries (REF 6.2/8.5).
+global_step_max_retries = 8
 amr_max_level = 11
 gravity_softening = 0.05 kpc
 treepm_pm_grid = 32
@@ -66,6 +68,9 @@ write_restarts = true
 
 [parallel]
 mpi_ranks_expected = 1
+# Patch migration with magnetic face payloads is fail-closed in pass 02; a
+# multi-rank variant must keep runtime rebalancing disabled.
+decomposition_runtime_rebalance_enabled = false
 omp_threads = 1
 gpu_devices = 0
 deterministic_reduction = true
@@ -98,6 +103,18 @@ eta_ambipolar_phys_cgs = 2.0e20
 [mhd_amr]
 distributed_subcycling = false
 checkpoint_sync_only = true
+
+[mhd_io]
+science_b_field = derived_cell_center
+checkpoint_face_flux = true
+initial_field_format = face_flux
+input_projection = reject
+output_divergence_diagnostics = true
+# Fresh-start seed Phi = Phi_uniform + C(A) on the real leaf topology. The
+# amplitude is a deck choice in normalized Lorentz-Heaviside comoving code
+# units; it is not a physical calibration.
+initial_field_seed = uniform
+initial_field_uniform_b_z_comoving = 1.0e-6
 
 [mhd_performance]
 profile = workstation_48gib_v01

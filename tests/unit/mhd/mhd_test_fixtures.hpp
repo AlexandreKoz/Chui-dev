@@ -2,7 +2,8 @@
 
 // Shared deterministic fixtures for the CHUI-MHD-REF-v1 test sources.
 // NOT EXECUTED in the source-only campaign; see
-// docs/architecture/chui_mhd_implementation_pass01_status.md.
+// docs/architecture/chui_mhd_implementation_pass01_status.md and
+// docs/architecture/chui_mhd_implementation_pass02_status.md.
 
 #include <array>
 #include <cmath>
@@ -116,8 +117,13 @@ class TestLevel {
     }
   }
 
+  // Guaranteed copy elision: MhdLevelStepper is neither copyable nor movable.
   [[nodiscard]] MhdLevelStepper makeStepper(const MhdNumericsPolicy& policy) const {
     return MhdLevelStepper(policy, m_domain, m_bindings);
+  }
+  [[nodiscard]] MhdLevelStepper makeStepper(const MhdNumericsPolicy& policy,
+                                            const MhdLevelStepperConfig& config) const {
+    return MhdLevelStepper(policy, m_domain, m_bindings, {}, config);
   }
 
   [[nodiscard]] std::size_t patchCount() const noexcept { return m_bindings.size(); }
