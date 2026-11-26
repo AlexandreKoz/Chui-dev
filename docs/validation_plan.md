@@ -970,3 +970,20 @@ corruption, `_comov` spelling refusal, v25 unchanged, unsafe-boundary refusal).
 `tests/integration/test_mhd_amr_mpi_restarts.cpp` now tests capability-specific
 admission (positive supported predicates, negative retry-owner and shadow cases)
 instead of a universal refusal. Ledger: `docs/architecture/chui_mhd_implementation_pass02_status.md`.
+
+## CHUI-RT-BH-AGN-REF-v1 gates V01–V09 (pass 01: sources written, NOT RUN)
+
+Test sources (registered, label `rt_bh_agn`): `unit_rt_bh_agn_config`,
+`unit_source_transaction`, `unit_bh_agn_numerics`, `unit_radiation_core`,
+`integration_bh_engine_interval`; benchmark driver
+`bench_rt_transport_throughput`. Proposed numerical targets (master §8) are
+targets, not results. Planned commands for the execution campaign:
+
+```bash
+cmake --preset cpu-only-debug
+cmake --build --preset build-cpu-debug
+ctest --preset test-cpu-debug -L rt_bh_agn --output-on-failure
+```
+
+Gate-by-gate status (written / not written) is in
+`docs/architecture/chui_rt_bh_agn_implementation_pass01_status.md` §6.

@@ -1228,3 +1228,19 @@ Source only; NOT configured, compiled or run. Ledger:
   kick factors, same schemas, same normalized text). Magnetized runs are
   deterministic for a fixed `batch_patches` and rank topology (stable owner keys,
   slot-ordered reductions, rank-ordered sums).
+
+## 2026-11-26 — CHUI-RT-BH-AGN-REF-v1 pass 01 (source only, unvalidated)
+
+* New library `cosmosim_radiation` (depends on `cosmosim_core` and
+  `cosmosim_physics`; core never includes it); BH engine and AGN channels in
+  `cosmosim_physics` (`physics/black_hole/`, `physics/agn/`); workflow bridge
+  `src/workflows/internal/rt_bh_agn_bridge.*`.
+* Core additions: `RadiationMomentSoa` storage lane (shapes and bytes only, MHD
+  face-flux precedent) and `config_rt_bh_agn.hpp` typed options (no physics in
+  core).
+* Additive extension of the thermochemistry interface (amendment A5) — no
+  second network, defaults unchanged.
+* Restart schema `cosmosim_restart_v27`; module sidecar `chui_bh_engine_v1`.
+* Full decision list: `docs/architecture/chui_rt_bh_agn_compatibility_amendment_v01.md`.
+* Reproducibility impact: disabled runs byte-identical config text/hash and
+  unchanged schemas; enabled runs deterministic by stable-ID ordering.

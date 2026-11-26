@@ -1,0 +1,22 @@
+# CHUI-RT-BH-AGN-REF-v1 validation deck (pass 01; NOT RUN): grey M1 reference
+# radiation hydrodynamics (Marshak / thermal relaxation class, V02). The
+# constant opacity is a REFERENCE-ONLY idealized model (not an astrophysical
+# opacity); radiative cooling is owned by the RT exchange, so the
+# thermochemistry cooling is disabled to avoid duplicate cooling.
+schema_version = 1
+
+[mode]
+mode = isolated_galaxy
+
+[physics]
+enable_cooling = false
+rt_enabled = true
+rt_spectral_profile = grey
+rt_integrator = imex_pd_ars
+rt_c_fraction = 1.0
+rt_cfl = 0.3
+rt_opacity_model = constant_reference
+rt_constant_absorption_cm2_g = 0.4
+rt_constant_scattering_cm2_g = 0.0
+rt_allow_reference_models = true
+rt_boundary = outflow

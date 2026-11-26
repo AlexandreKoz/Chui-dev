@@ -528,3 +528,17 @@ configuration: `wall_ms`, `cells_per_s`, `faces_per_s`, `riemann_solves`,
 Compare methods by error at fixed wall time; sweep batch_cells (e.g. 512,
 2048, 8192, 16384) as candidates. Targets (not claims): <= 5% overhead of the
 default path versus pre-Part-1 with advanced options disabled. NOT RUN.
+
+## CHUI-RT-BH-AGN-REF-v1 counters (pass 01, no measurements)
+
+Diagnostics are compact report structs, not per-element strings:
+`BhEngineIntervalReport` (requested/withdrawn/unmet mass, disk substeps,
+kernel/torque inadequacy, mergers, DF applications, transaction residual),
+`AgnInjectionReport` (held events by reason, injected budgets, refinement
+requests, energy-closure residual, lobe imbalance), `RadiationIntervalReport`
+(substeps, retries, Newton iterations, first-order fallbacks, HLL fallback
+faces, emitted/outflow/redshift-leaked energy, RSLA invariant residual).
+Canonical RT bytes follow `4 G 8 N` (`radiationCanonicalBytes`); the moment
+lanes appear in the memory report as `rt.*` (absent when disabled).
+`bench/bench_rt_transport_throughput.cpp` prints cell-group updates per second;
+no speedup or capacity claim is made.

@@ -1036,3 +1036,29 @@ Compatibility rules:
 Example decks (satisfy the admission predicates; UNVALIDATED, see headers):
 `configs/cosmo_cube/cube_mhd_ref_v01.param.txt`,
 `configs/isolated_galaxy/disk_mhd_ref_v01.param.txt`.
+
+## CHUI-RT-BH-AGN-REF-v1 options (pass 01, source only, UNVALIDATED)
+
+Typed structs `PhysicsConfig::rt`, `PhysicsConfig::bh_engine`,
+`PhysicsConfig::agn` (`include/cosmosim/core/config_rt_bh_agn.hpp`). All keys
+live in `[physics]`. Full key table, units and refusal reasons:
+`docs/rt_bh_agn.md`; compatibility mapping: amendment A1 in
+`docs/architecture/chui_rt_bh_agn_compatibility_amendment_v01.md`.
+
+* Disabled defaults (`rt_enabled = false`, `bh_engine_model = legacy_host_cell`,
+  `agn_feedback_model = legacy_thermal_host`) leave the normalized text and the
+  config hash byte-identical to the predecessor schema: the new blocks are
+  emitted only when the corresponding model is enabled, and any non-default
+  value on a disabled model is rejected as an inert key.
+* Admission refuses (with the reason in the error): P1 backends/models
+  (`rt_transport != m1`, `bh_supply_model = resolved_flux`, `bh_spin_model`,
+  `bh_accretion_state_model`, `agn_magnetic_injection`, `agn_nozzle`),
+  `rt_opacity_model = photoionization` (reconciliation not wired),
+  `rt_stellar_sources` (no luminosity provider), `broad_uv_ir`/`agn_hard`
+  profiles, RT with MPI > 1 / regrid / recursive subcycling / MHD, reduced c
+  in cosmological modes, torque supply without an explicit `bh_torque_epsilon`,
+  winds without disk-wind mass loading, velocities outside the declared
+  nonrelativistic domain, legacy-only BH keys with `reference_v1`.
+* Example decks: `configs/rt_bh_agn/isolated_cluster_reference_bh_agn.param.txt`,
+  `configs/rt_bh_agn/grey_rhd_reference_rt.param.txt` (uncalibrated; exercise
+  code paths only).

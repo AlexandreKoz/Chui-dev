@@ -1,0 +1,34 @@
+# CHUI-RT-BH-AGN-REF-v1 validation deck (pass 01; NOT RUN, no calibration).
+# Cluster cooling-flow style reference BH engine + AGN channels (V08). Every
+# efficiency below is an explicit, UNCALIBRATED science input chosen only to
+# exercise the code path; it is not a recommended or validated value.
+schema_version = 1
+
+[mode]
+mode = isolated_cluster
+
+[physics]
+enable_black_hole_agn = true
+bh_engine_model = reference_v1
+bh_supply_model = bondi
+bh_kernel_radius_min_kpc_phys = 0.5
+bh_kernel_radius_max_kpc_phys = 4.0
+bh_kernel_target_gas_mass_code = 1.0e8
+bh_disk_model = scalar_reservoir
+bh_disk_viscous_time_years = 1.0e7
+bh_disk_wind_loading = 1.0
+bh_mass_ledger = relativistic_defect
+bh_eddington_cap = reference_rate
+bh_dynamics_model = unresolved_chandrasekhar
+bh_merger_model = bound_pair
+agn_feedback_model = channels_v1
+agn_thermal_mode = continuous
+agn_thermal_efficiency = 0.005
+agn_wind_efficiency = 0.002
+agn_wind_velocity_km_s = 3000
+agn_jet_efficiency = 0.01
+agn_jet_velocity_km_s = 10000
+agn_jet_half_opening_deg = 15
+agn_radiation_coupling = none
+agn_refinement_enabled = true
+agn_refinement_injection_cells = 8

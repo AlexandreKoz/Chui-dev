@@ -579,3 +579,21 @@ Status: source-implemented in pass 02, UNVALIDATED (no build or run).
   The field is derived in bounded chunks (no full-population mirror); native
   values are never labelled as an external dialect's magnetic field. v7 is not
   exact restart authority.
+
+## CHUI-RT-BH-AGN-REF-v1 (pass 01, UNVALIDATED)
+
+* Restart `cosmosim_restart_v27` = v25 layout + `/state/radiation` (group
+  schema 1): attributes `contract = chui_rt_m1_moments_v1`, `spectral_profile`,
+  `spectral_definition_sha256`, `group_count`, `c_hat_over_c`, `scale_factor`,
+  `moment_units = code_comoving_a4_physical_group_edges`; datasets
+  `group_edges_ev`, `patch_id`, `geometry_generation`, `value_offset`,
+  `refinement_level`, `cell_dims_xyz[P,3]`, `patch_origin_comoving[P,3]`,
+  `cell_width_comoving[P,3]`, `energy_density_comoving`, `flux_{x,y,z}_comoving`
+  (group-major per record). Included in the canonical payload digest. Written
+  only for radiation-enabled states; v25/v26 unchanged; v27 never carries
+  `/state/mhd`.
+* BH engine state: module sidecar block `chui_bh_engine_v1` (schema 1,
+  particle-indexed, `BlackHoleEngineRecord` byte layout) persisted generically
+  with the other module blocks; no outer schema bump.
+* Science snapshots: no new datasets in pass 01 (radiation fields and engine
+  lanes are not exported yet; gap). Canonical GADGET/AREPO names unchanged.
