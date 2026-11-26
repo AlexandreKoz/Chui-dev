@@ -24,7 +24,9 @@
 // This header contains no physics model; it is the explicit transform table
 // required by B03 so that every module states its conversions in one place.
 
+#include <array>
 #include <cmath>
+#include <cstddef>
 #include <stdexcept>
 
 #include "cosmosim/core/constants.hpp"
@@ -121,5 +123,36 @@ inline constexpr double k_electron_volt_si = 1.602176634e-19;
 inline constexpr double k_planck_constant_si = 6.62607015e-34;
 inline constexpr double k_boltzmann_constant_si = 1.380649e-23;
 inline constexpr double k_radiation_constant_si = 7.565733250280007e-16;  // 4 sigma_SB / c [J m^-3 K^-4]
+
+}  // namespace cosmosim::physics
+
+namespace cosmosim::physics {
+
+// Minimum-image displacement in STORED (comoving for cosmological runs)
+// coordinates; proper offsets are frame.properLength(delta).
+struct PeriodicBox {
+  std::array<double, 3> extent{0.0, 0.0, 0.0};
+  bool periodic = false;
+  [[nodiscard]] std::array<double, 3> delta(const std::array<double, 3>& from,
+                                            const std::array<double, 3>& to) const noexcept {
+    std::array<double, 3> d{to[0] - from[0], to[1] - from[1], to[2] - from[2]};
+    if (periodic) {
+      for (std::size_t a = 0; a < 3; ++a) {
+        if (extent[a] > 0.0) d[a] -= extent[a] * std::round(d[a] / extent[a]);
+      }
+    }
+    return d;
+  }
+  [[nodiscard]] std::array<double, 3> wrap(std::array<double, 3> p) const noexcept {
+    if (periodic) {
+      for (std::size_t a = 0; a < 3; ++a) {
+        if (extent[a] > 0.0) {
+          p[a] -= extent[a] * std::floor(p[a] / extent[a]);
+        }
+      }
+    }
+    return p;
+  }
+};
 
 }  // namespace cosmosim::physics

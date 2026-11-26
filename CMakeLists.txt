@@ -595,7 +595,17 @@ add_library(cosmosim_physics STATIC
   src/physics/stellar_population.cpp
   src/physics/supernova_feedback.cpp
   src/physics/source_interval.cpp
-  src/physics/source_transaction.cpp)
+  src/physics/source_transaction.cpp
+  src/physics/black_hole/bh_engine_state.cpp
+  src/physics/black_hole/bh_supply.cpp
+  src/physics/black_hole/bh_disk.cpp
+  src/physics/black_hole/bh_budget.cpp
+  src/physics/black_hole/bh_dynamics.cpp
+  src/physics/black_hole/bh_merger.cpp
+  src/physics/black_hole/bh_spin.cpp
+  src/physics/black_hole/bh_neighborhood.cpp
+  src/physics/black_hole/bh_engine.cpp
+  src/physics/black_hole/bh_seed_provider.cpp)
 add_library(cosmosim_io STATIC
   src/io/internal/io_contract.cpp
   src/io/transactional_file.cpp
