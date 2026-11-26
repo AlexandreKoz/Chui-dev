@@ -141,4 +141,24 @@ struct BhSupplyEstimate {
 [[nodiscard]] BhSupplyEstimate estimateBhSupply(const BhKernelStatistics& stats, const BhSupplyInputs& inputs,
                                                 const ProperFrameContext& frame);
 
+// P1-BH01 resolved supply: inward and net mass flux through a moving
+// spherical control surface S_r of radius r0 estimated from the cells whose
+// centres lie in the shell [r0 - dr/2, r0 + dr/2] (embedded volume quadrature,
+// proper units): Mdot_in = sum_i m_i max(-(v_i - v_s) . n_i, 0) / dr,
+// Mdot_net = -sum_i m_i (v_i - v_s) . n_i / dr; v_s includes the Hubble flow
+// of the proper surface when cosmological. Measurement only: debiting uses
+// the accepted withdrawal. P1: admission refuses bh_supply_model=resolved_flux.
+struct BhResolvedFluxSample {
+  double mass_code = 0.0;
+  double radius_proper = 0.0;
+  double radial_velocity_relative = 0.0;  // (v - v_surface) . n
+};
+struct BhResolvedFlux {
+  double inward_rate_code = 0.0;
+  double net_rate_code = 0.0;
+  std::uint64_t samples = 0U;
+};
+[[nodiscard]] BhResolvedFlux resolvedControlSurfaceFlux(const BhResolvedFluxSample* samples, std::size_t count,
+                                                        double shell_radius_proper, double shell_width_proper) noexcept;
+
 }  // namespace cosmosim::physics

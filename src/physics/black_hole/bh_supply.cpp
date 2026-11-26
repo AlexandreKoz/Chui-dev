@@ -206,4 +206,18 @@ BhSupplyEstimate estimateBhSupply(const BhKernelStatistics& s, const BhSupplyInp
   return out;
 }
 
+BhResolvedFlux resolvedControlSurfaceFlux(const BhResolvedFluxSample* samples, std::size_t count, double r0,
+                                          double dr) noexcept {
+  BhResolvedFlux out;
+  if (!(dr > 0.0) || samples == nullptr) return out;
+  for (std::size_t i = 0; i < count; ++i) {
+    const BhResolvedFluxSample& s = samples[i];
+    if (std::abs(s.radius_proper - r0) > 0.5 * dr) continue;
+    out.inward_rate_code += s.mass_code * std::max(-s.radial_velocity_relative, 0.0) / dr;
+    out.net_rate_code += -s.mass_code * s.radial_velocity_relative / dr;
+    ++out.samples;
+  }
+  return out;
+}
+
 }  // namespace cosmosim::physics

@@ -120,4 +120,11 @@ BlackHoleEngineRecord mergeBlackHoleEngineRecords(const BlackHoleEngineRecord& s
   return m;
 }
 
+double petersCircularInspiralTime(double a, double m1, double m2, double g, double c) noexcept {
+  if (!(a > 0.0) || !(m1 > 0.0) || !(m2 > 0.0) || !(g > 0.0) || !(c > 0.0)) return 0.0;
+  const double c5 = c * c * c * c * c;
+  const double a4 = a * a * a * a;
+  return 5.0 / 256.0 * c5 * a4 / (g * g * g * m1 * m2 * (m1 + m2));
+}
+
 }  // namespace cosmosim::physics

@@ -67,4 +67,11 @@ struct BhMergerCriteria {
                                                                 const BlackHoleEngineRecord& absorbed,
                                                                 std::uint64_t absorbed_id);
 
+// P1-BH03 (binary delay building block): Peters (1964) circular-orbit GW
+// inspiral time t = (5/256) c^5 a^4 / (G^3 m1 m2 (m1 + m2)). Eccentric
+// enhancement, stellar/gas hardening and NR remnant/recoil fits are NOT
+// implemented (no pinned fits; FAIL_CLOSED for binary-delay admission).
+[[nodiscard]] double petersCircularInspiralTime(double separation, double m1, double m2, double newton_g,
+                                                double speed_of_light) noexcept;
+
 }  // namespace cosmosim::physics
