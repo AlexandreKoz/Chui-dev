@@ -70,3 +70,10 @@ BH seeding is also a gas-to-BH transaction. An eligible host must contain more t
 The implementation now closes the local mass/frame/energy-unit defects identified by the 2026-08 scientific workflow audit. This is **implementation closure, not empirical calibration**. Quantitative BH/AGN science still requires Bondi/Eddington unit tests in the configured code-unit system, convergence/calibration studies, and multi-rank ownership tests for host-cell migration and seeding.
 
 The current baseline is host-cell local; it does not yet implement kernel-weighted accretion from a resolved gas neighbourhood, BH repositioning, BH mergers, or a separately tracked swallowed-metal reservoir. Those are explicit future model extensions rather than hidden behaviour.
+
+## Reference engine (CHUI-RT-BH-AGN-REF-v1)
+
+This legacy module is preserved unchanged as `physics.bh_engine_model =
+legacy_host_cell` (default). The reference engine, disk reservoir, ledgers,
+mergers, seeding and AGN channels are documented in `docs/rt_bh_agn.md`; the
+two never run for the same source interval.

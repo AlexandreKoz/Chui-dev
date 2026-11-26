@@ -488,6 +488,7 @@ add_library(cosmosim_core STATIC
   src/core/version.cpp
   src/core/module_registry.cpp
   src/core/config.cpp
+  src/core/config_rt_bh_agn.cpp
   src/core/provenance.cpp
   src/core/cuda_runtime.cpp
   src/core/cosmology.cpp
@@ -593,7 +594,20 @@ add_library(cosmosim_physics STATIC
   src/physics/ism_dust_sgs.cpp
   src/physics/stellar_population.cpp
   src/physics/supernova_feedback.cpp
-  src/physics/source_interval.cpp)
+  src/physics/source_interval.cpp
+  src/physics/source_transaction.cpp
+  src/physics/black_hole/bh_engine_state.cpp
+  src/physics/black_hole/bh_supply.cpp
+  src/physics/black_hole/bh_disk.cpp
+  src/physics/black_hole/bh_budget.cpp
+  src/physics/black_hole/bh_dynamics.cpp
+  src/physics/black_hole/bh_merger.cpp
+  src/physics/black_hole/bh_spin.cpp
+  src/physics/black_hole/bh_neighborhood.cpp
+  src/physics/black_hole/bh_engine.cpp
+  src/physics/black_hole/bh_seed_provider.cpp
+  src/physics/agn/agn_injection.cpp
+  src/physics/agn/agn_magnetic.cpp)
 add_library(cosmosim_io STATIC
   src/io/internal/io_contract.cpp
   src/io/transactional_file.cpp
@@ -660,6 +674,23 @@ add_library(cosmosim_mhd STATIC
   src/mhd/mhd_transport.cpp
   src/mhd/mhd_validation.cpp)
 
+# CHUI-RT-BH-AGN-REF-v1 radiative transfer module (multigroup M1, PD-ARS IMEX,
+# matter coupling, cosmological edge transfer, AMR operators, AGN sources and
+# P1 angular backends). Depends on cosmosim_core and cosmosim_physics (the
+# thermochemistry authority and the BH engine store); core never includes it.
+# Source-implemented and unvalidated (docs/architecture/
+# chui_rt_bh_agn_implementation_pass01_status.md).
+add_library(cosmosim_radiation STATIC
+  src/radiation/radiation_closure.cpp
+  src/radiation/radiation_spectrum.cpp
+  src/radiation/radiation_transport.cpp
+  src/radiation/radiation_matter_coupling.cpp
+  src/radiation/radiation_cosmology.cpp
+  src/radiation/radiation_runtime.cpp
+  src/radiation/radiation_amr.cpp
+  src/radiation/radiation_sources.cpp
+  src/radiation/radiation_angular.cpp)
+
 add_library(cosmosim_workflows STATIC
   src/workflows/analysis_runtime.cpp
   src/workflows/gravity_runtime.cpp
@@ -673,6 +704,7 @@ add_library(cosmosim_workflows STATIC
   src/workflows/internal/migration_wire.cpp
   src/workflows/internal/amr_geometry_assurance.cpp
   src/workflows/internal/mhd_runtime_bridge.cpp
+  src/workflows/internal/rt_bh_agn_bridge.cpp
   src/workflows/internal/gravity_force_endpoint.cpp
   src/workflows/migration_balance_runtime.cpp
   src/workflows/output_restart_runtime.cpp
@@ -691,6 +723,7 @@ add_library(cosmosim_workflows STATIC
 
 set(COSMOSIM_MODULE_LIBS
   cosmosim_mhd
+  cosmosim_radiation
   cosmosim_gravity
   cosmosim_hydro
   cosmosim_amr
@@ -726,8 +759,11 @@ if(COSMOSIM_STRICT_IO_WARNINGS)
   endif()
 endif()
 
+target_link_libraries(cosmosim_radiation PUBLIC cosmosim_physics)
+
 target_link_libraries(cosmosim_workflows
   PUBLIC
+    cosmosim_radiation
     cosmosim_mhd
     cosmosim_analysis
     cosmosim_gravity
@@ -795,6 +831,7 @@ target_link_libraries(cosmosim_all
 
 set_target_properties(cosmosim_core PROPERTIES EXPORT_NAME core)
 set_target_properties(cosmosim_mhd PROPERTIES EXPORT_NAME mhd)
+set_target_properties(cosmosim_radiation PROPERTIES EXPORT_NAME radiation)
 set_target_properties(cosmosim_gravity PROPERTIES EXPORT_NAME gravity)
 set_target_properties(cosmosim_hydro PROPERTIES EXPORT_NAME hydro)
 set_target_properties(cosmosim_amr PROPERTIES EXPORT_NAME amr)
@@ -807,6 +844,7 @@ set_target_properties(cosmosim_all PROPERTIES EXPORT_NAME all)
 
 add_library(CosmoSim::core ALIAS cosmosim_core)
 add_library(CosmoSim::mhd ALIAS cosmosim_mhd)
+add_library(CosmoSim::radiation ALIAS cosmosim_radiation)
 add_library(CosmoSim::gravity ALIAS cosmosim_gravity)
 add_library(CosmoSim::hydro ALIAS cosmosim_hydro)
 add_library(CosmoSim::amr ALIAS cosmosim_amr)
@@ -825,6 +863,7 @@ set(COSMOSIM_INSTALL_CMAKEDIR "${CMAKE_INSTALL_LIBDIR}/cmake/CosmoSim")
 set(COSMOSIM_INSTALL_TARGETS
   cosmosim_core
   cosmosim_mhd
+  cosmosim_radiation
   cosmosim_gravity
   cosmosim_hydro
   cosmosim_amr
@@ -1317,6 +1356,14 @@ if(COSMOSIM_ENABLE_TESTS)
   target_link_libraries(test_unit_black_hole_agn PRIVATE cosmosim_all)
   add_test(NAME unit_black_hole_agn COMMAND test_unit_black_hole_agn)
 
+  # CHUI-RT-BH-AGN-REF-v1 pass-01 verification sources (written, NOT RUN).
+  foreach(cosmosim_rt_bh_agn_unit IN ITEMS rt_bh_agn_config source_transaction bh_agn_numerics radiation_core)
+    add_executable(test_unit_${cosmosim_rt_bh_agn_unit} tests/unit/test_${cosmosim_rt_bh_agn_unit}.cpp)
+    target_link_libraries(test_unit_${cosmosim_rt_bh_agn_unit} PRIVATE cosmosim_all)
+    add_test(NAME unit_${cosmosim_rt_bh_agn_unit} COMMAND test_unit_${cosmosim_rt_bh_agn_unit})
+    cosmosim_append_test_labels(unit_${cosmosim_rt_bh_agn_unit} rt_bh_agn unit)
+  endforeach()
+
   add_executable(test_unit_stellar_evolution tests/unit/test_stellar_evolution.cpp)
   target_link_libraries(test_unit_stellar_evolution PRIVATE cosmosim_all)
   target_compile_definitions(test_unit_stellar_evolution PRIVATE COSMOSIM_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
@@ -1443,6 +1490,10 @@ if(COSMOSIM_ENABLE_TESTS)
   add_executable(test_integration_black_hole_agn_toy tests/integration/test_black_hole_agn_toy.cpp)
   target_link_libraries(test_integration_black_hole_agn_toy PRIVATE cosmosim_all)
   add_test(NAME integration_black_hole_agn_toy COMMAND test_integration_black_hole_agn_toy)
+  add_executable(test_integration_bh_engine_interval tests/integration/test_bh_engine_interval.cpp)
+  target_link_libraries(test_integration_bh_engine_interval PRIVATE cosmosim_all)
+  add_test(NAME integration_bh_engine_interval COMMAND test_integration_bh_engine_interval)
+  cosmosim_append_test_labels(integration_bh_engine_interval rt_bh_agn integration)
   add_executable(test_integration_stellar_feedback_box tests/integration/test_stellar_feedback_box.cpp)
   target_link_libraries(test_integration_stellar_feedback_box PRIVATE cosmosim_all)
   add_test(NAME integration_stellar_feedback_box COMMAND test_integration_stellar_feedback_box)
@@ -3014,6 +3065,8 @@ if(COSMOSIM_ENABLE_BENCHMARKS)
   target_link_libraries(bench_effective_multiphase_ism PRIVATE cosmosim_all)
   add_executable(bench_black_hole_agn_sparse_update bench/bench_black_hole_agn_sparse_update.cpp)
   target_link_libraries(bench_black_hole_agn_sparse_update PRIVATE cosmosim_all)
+  add_executable(bench_rt_transport_throughput bench/bench_rt_transport_throughput.cpp)
+  target_link_libraries(bench_rt_transport_throughput PRIVATE cosmosim_all)
   add_executable(bench_stellar_feedback_deposition bench/bench_stellar_feedback_deposition.cpp)
   target_link_libraries(bench_stellar_feedback_deposition PRIVATE cosmosim_all)
   add_executable(bench_tracer_update bench/bench_tracer_update.cpp)

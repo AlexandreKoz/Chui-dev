@@ -34,6 +34,9 @@ SourceLedger& SourceLedger::operator+=(const SourceLedger& rhs) {
   metal_ion_co_transfer_nuclei += rhs.metal_ion_co_transfer_nuclei;
   metal_ion_normalization_residual = std::max(metal_ion_normalization_residual, rhs.metal_ion_normalization_residual);
   metal_ion_inventory_residual = std::max(metal_ion_inventory_residual, rhs.metal_ion_inventory_residual);
+  for (std::size_t k = 0; k < transported_photoionizations.size(); ++k) {
+    transported_photoionizations[k] += rhs.transported_photoionizations[k];
+  }
   dust_to_gas_transfer_code += rhs.dust_to_gas_transfer_code;
   gas_to_dust_transfer_code += rhs.gas_to_dust_transfer_code;
   cells += rhs.cells;

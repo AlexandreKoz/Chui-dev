@@ -783,3 +783,21 @@ streaming verifier expects v26 for magnetized payloads.
 * **Normalized config hash:** the existing continuation-metadata checks apply;
   the `[mhd*]` normalized text (including the pass-02 `initial_field_*` keys)
   is part of the hash for magnetized runs.
+
+## CHUI-RT-BH-AGN-REF-v1 (pass 01, UNVALIDATED)
+
+* Radiation-enabled states write `cosmosim_restart_v27` (see
+  `docs/output_schema.md`); the reader requires `/state/radiation` for v27 and
+  refuses it for every other version; `/state/mhd` is now required only for
+  v26 and refused for v25/v27. Radiation checkpoints are refused at unsafe
+  boundaries (pending flux registers, temporal histories, open KDK step). The
+  restored scale factor must match the radiation group's.
+* Radiation-MHD has no restart schema (refused at admission and in the writer).
+* `chui_bh_engine_v1` pending feedback budgets, disk state and cumulative
+  ledgers are restart truth through the module sidecar; source-interval
+  cursors are the existing SourceRuntime interval sequence.
+* Restart with a changed RT spectral definition fails (hash mismatch at the
+  first RT interval). Restart across regrid/migration with RT is refused
+  (records must match the leaf tiling).
+* Reproducibility: disabled runs unchanged; reference-engine runs depend on
+  deterministic ordering by stable IDs (sorted plans, rank-ordered replies).

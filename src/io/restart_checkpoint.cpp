@@ -63,6 +63,15 @@ constexpr std::uint32_t k_restart_schema_v25 = 25;
 // keep writing v25 byte-for-byte as before.
 constexpr std::uint32_t k_restart_schema_v26 = 26;
 constexpr std::string_view k_restart_schema_name_v26 = "cosmosim_restart_v26";
+// CHUI-RT-BH-AGN-REF-v1 amendment A3: the radiation variant of the v25
+// layout. Identical to v25 plus the authoritative /state/radiation group
+// (multigroup M1 moments, comoving a^4 convention). Written ONLY for states
+// with a non-empty RadiationMomentSoa; never combined with /state/mhd
+// (radiation-MHD is refused at admission). Nonradiative states keep v25/v26
+// byte-for-byte.
+constexpr std::uint32_t k_restart_schema_v27 = 27;
+constexpr std::string_view k_restart_schema_name_v27 = "cosmosim_restart_v27";
+constexpr std::uint32_t k_radiation_restart_group_schema = 1U;
 // Per-group layout identities, versioned independently of the outer restart
 // schema. /state/amr_pending_flux_registers has carried group schema 2 since
 // it was introduced (the v22 metal flux lanes are optional by presence) and
@@ -797,14 +806,22 @@ void validateRestartCheckpointSchema(hid_t file, std::uint32_t schema_version);
 void requireMhdGroupForSchema(hid_t file, std::uint32_t schema_version) {
   const bool has_mhd = H5Lexists(file, "/state", H5P_DEFAULT) > 0 &&
       H5Lexists(file, "/state/mhd", H5P_DEFAULT) > 0;
-  if (schema_version >= k_restart_schema_v26 && !has_mhd) {
+  if (schema_version == k_restart_schema_v26 && !has_mhd) {
     throw std::runtime_error(
         "MHD_RESTART_SCHEMA_MISMATCH: cosmosim_restart_v26 requires the /state/mhd group");
   }
-  if (schema_version < k_restart_schema_v26 && has_mhd) {
+  if (schema_version != k_restart_schema_v26 && has_mhd) {
     throw std::runtime_error(
-        "MHD_RESTART_SCHEMA_MISMATCH: /state/mhd is present in a pre-v26 checkpoint "
-        "(a v25 checkpoint is MHD-disabled by definition)");
+        "MHD_RESTART_SCHEMA_MISMATCH: /state/mhd is present in a non-v26 checkpoint "
+        "(v25 and v27 checkpoints are MHD-disabled by definition)");
+  }
+  const bool has_radiation = H5Lexists(file, "/state", H5P_DEFAULT) > 0 &&
+      H5Lexists(file, "/state/radiation", H5P_DEFAULT) > 0;
+  if (schema_version == k_restart_schema_v27 && !has_radiation) {
+    throw std::runtime_error("RT_RESTART_SCHEMA_MISMATCH: cosmosim_restart_v27 requires the /state/radiation group");
+  }
+  if (schema_version != k_restart_schema_v27 && has_radiation) {
+    throw std::runtime_error("RT_RESTART_SCHEMA_MISMATCH: /state/radiation is present in a non-v27 checkpoint");
   }
 }
 
@@ -1998,6 +2015,118 @@ void validateAmrTemporalBoundaryHistoryForRestart(const core::SimulationState& s
   }
 }
 
+void writeRadiationRestartGroup(hid_t root, const core::RadiationMomentSoa& rad) {
+  if (!rad.isConsistent()) throw std::runtime_error("RT_RESTART_SCHEMA_MISMATCH: inconsistent radiation state");
+  Hdf5Handle state_group(openOrCreateGroup(root, "/state"));
+  Hdf5Handle g(openOrCreateGroup(state_group.get(), "radiation"));
+  writeScalarU32Attribute(g.get(), "schema_version", k_radiation_restart_group_schema);
+  writeScalarStringAttribute(g.get(), "contract", rad.contract);
+  writeScalarStringAttribute(g.get(), "spectral_profile", rad.spectral_profile);
+  writeScalarStringAttribute(g.get(), "spectral_definition_sha256", rad.spectral_definition_sha256);
+  writeScalarU32Attribute(g.get(), "group_count", rad.group_count);
+  writeScalarF64Attribute(g.get(), "c_hat_over_c", rad.c_hat_over_c);
+  writeScalarF64Attribute(g.get(), "scale_factor", rad.scale_factor);
+  writeScalarStringAttribute(g.get(), "moment_units", "code_comoving_a4_physical_group_edges");
+  writeDataset1d(g.get(), "group_edges_ev", H5T_IEEE_F64LE, H5T_NATIVE_DOUBLE, rad.group_edges_ev);
+  const std::size_t n = rad.patches.size();
+  std::vector<std::uint64_t> id(n), gen(n), offset(n);
+  std::vector<std::int32_t> level(n);
+  std::vector<std::uint32_t> dims(3 * n);
+  std::vector<double> origin(3 * n), width(3 * n);
+  for (std::size_t i = 0; i < n; ++i) {
+    const core::RadiationPatchRecord& r = rad.patches[i];
+    id[i] = r.patch_id;
+    gen[i] = r.geometry_generation;
+    offset[i] = r.value_offset;
+    level[i] = r.level;
+    dims[3 * i] = r.nx;
+    dims[3 * i + 1] = r.ny;
+    dims[3 * i + 2] = r.nz;
+    origin[3 * i] = r.origin_x_comoving;
+    origin[3 * i + 1] = r.origin_y_comoving;
+    origin[3 * i + 2] = r.origin_z_comoving;
+    width[3 * i] = r.cell_width_x_comoving;
+    width[3 * i + 1] = r.cell_width_y_comoving;
+    width[3 * i + 2] = r.cell_width_z_comoving;
+  }
+  writeDataset1d(g.get(), "patch_id", H5T_STD_U64LE, H5T_NATIVE_UINT64, id);
+  writeDataset1d(g.get(), "geometry_generation", H5T_STD_U64LE, H5T_NATIVE_UINT64, gen);
+  writeDataset1d(g.get(), "value_offset", H5T_STD_U64LE, H5T_NATIVE_UINT64, offset);
+  writeDataset1d(g.get(), "refinement_level", H5T_STD_I32LE, H5T_NATIVE_INT32, level);
+  writeDataset1d(g.get(), "cell_dims_xyz", H5T_STD_U32LE, H5T_NATIVE_UINT32, dims);
+  writeDataset1d(g.get(), "patch_origin_comoving", H5T_IEEE_F64LE, H5T_NATIVE_DOUBLE, origin);
+  writeDataset1d(g.get(), "cell_width_comoving", H5T_IEEE_F64LE, H5T_NATIVE_DOUBLE, width);
+  writeDataset1d(g.get(), "energy_density_comoving", H5T_IEEE_F64LE, H5T_NATIVE_DOUBLE, rad.energy_density_comoving);
+  writeDataset1d(g.get(), "flux_x_comoving", H5T_IEEE_F64LE, H5T_NATIVE_DOUBLE, rad.flux_x_comoving);
+  writeDataset1d(g.get(), "flux_y_comoving", H5T_IEEE_F64LE, H5T_NATIVE_DOUBLE, rad.flux_y_comoving);
+  writeDataset1d(g.get(), "flux_z_comoving", H5T_IEEE_F64LE, H5T_NATIVE_DOUBLE, rad.flux_z_comoving);
+}
+
+[[nodiscard]] core::RadiationMomentSoa readRadiationRestartGroup(hid_t file, double expected_scale_factor) {
+  Hdf5Handle g(openRequiredGroup(file, "/state/radiation"));
+  if (readScalarU32Attribute(g.get(), "schema_version") != k_radiation_restart_group_schema) {
+    throw std::runtime_error("RT_RESTART_SCHEMA_MISMATCH: unsupported /state/radiation group schema");
+  }
+  core::RadiationMomentSoa rad;
+  rad.contract = readScalarStringAttribute(g.get(), "contract");
+  if (rad.contract != "chui_rt_m1_moments_v1") {
+    throw std::runtime_error("RT_RESTART_SCHEMA_MISMATCH: unknown radiation contract '" + rad.contract + "'");
+  }
+  if (readScalarStringAttribute(g.get(), "moment_units") != "code_comoving_a4_physical_group_edges") {
+    throw std::runtime_error("RT_RESTART_SCHEMA_MISMATCH: radiation moment unit convention differs");
+  }
+  rad.spectral_profile = readScalarStringAttribute(g.get(), "spectral_profile");
+  rad.spectral_definition_sha256 = readScalarStringAttribute(g.get(), "spectral_definition_sha256");
+  rad.group_count = readScalarU32Attribute(g.get(), "group_count");
+  rad.c_hat_over_c = readScalarF64Attribute(g.get(), "c_hat_over_c");
+  rad.scale_factor = readScalarF64Attribute(g.get(), "scale_factor");
+  if (!(std::abs(rad.scale_factor - expected_scale_factor) <= 1.0e-12 * std::max(1.0, std::abs(expected_scale_factor)))) {
+    throw std::runtime_error("RT_RESTART_SCHEMA_MISMATCH: radiation scale factor differs from the restored timeline");
+  }
+  rad.group_edges_ev = readDataset1d<double>(g.get(), "group_edges_ev", H5T_NATIVE_DOUBLE);
+  const auto id = readDataset1d<std::uint64_t>(g.get(), "patch_id", H5T_NATIVE_UINT64);
+  const auto gen = readDataset1d<std::uint64_t>(g.get(), "geometry_generation", H5T_NATIVE_UINT64);
+  const auto offset = readDataset1d<std::uint64_t>(g.get(), "value_offset", H5T_NATIVE_UINT64);
+  const auto level = readDataset1d<std::int32_t>(g.get(), "refinement_level", H5T_NATIVE_INT32);
+  const auto dims = readDataset1d<std::uint32_t>(g.get(), "cell_dims_xyz", H5T_NATIVE_UINT32);
+  const auto origin = readDataset1d<double>(g.get(), "patch_origin_comoving", H5T_NATIVE_DOUBLE);
+  const auto width = readDataset1d<double>(g.get(), "cell_width_comoving", H5T_NATIVE_DOUBLE);
+  const std::size_t n = id.size();
+  if (gen.size() != n || offset.size() != n || level.size() != n || dims.size() != 3 * n || origin.size() != 3 * n ||
+      width.size() != 3 * n) {
+    throw std::runtime_error("RT_RESTART_SCHEMA_MISMATCH: radiation patch table shapes disagree");
+  }
+  for (std::size_t i = 0; i < n; ++i) {
+    core::RadiationPatchRecord r;
+    r.patch_id = id[i];
+    r.geometry_generation = gen[i];
+    r.value_offset = offset[i];
+    r.level = level[i];
+    r.nx = dims[3 * i];
+    r.ny = dims[3 * i + 1];
+    r.nz = dims[3 * i + 2];
+    r.origin_x_comoving = origin[3 * i];
+    r.origin_y_comoving = origin[3 * i + 1];
+    r.origin_z_comoving = origin[3 * i + 2];
+    r.cell_width_x_comoving = width[3 * i];
+    r.cell_width_y_comoving = width[3 * i + 1];
+    r.cell_width_z_comoving = width[3 * i + 2];
+    rad.patches.push_back(r);
+  }
+  rad.energy_density_comoving = readDataset1dAligned<double>(g.get(), "energy_density_comoving", H5T_NATIVE_DOUBLE);
+  rad.flux_x_comoving = readDataset1dAligned<double>(g.get(), "flux_x_comoving", H5T_NATIVE_DOUBLE);
+  rad.flux_y_comoving = readDataset1dAligned<double>(g.get(), "flux_y_comoving", H5T_NATIVE_DOUBLE);
+  rad.flux_z_comoving = readDataset1dAligned<double>(g.get(), "flux_z_comoving", H5T_NATIVE_DOUBLE);
+  if (!rad.isConsistent()) throw std::runtime_error("RT_RESTART_SCHEMA_MISMATCH: restored radiation state inconsistent");
+  for (const auto* lane : {&rad.energy_density_comoving, &rad.flux_x_comoving, &rad.flux_y_comoving,
+                           &rad.flux_z_comoving}) {
+    for (const double v : *lane) {
+      if (!std::isfinite(v)) throw std::runtime_error("RT_RESTART_SCHEMA_MISMATCH: non-finite radiation moment");
+    }
+  }
+  return rad;
+}
+
 void writeStateGroup(hid_t root, const core::SimulationState& state) {
   Hdf5Handle state_group(openOrCreateGroup(root, "/state"));
   Hdf5Handle particles_group(openOrCreateGroup(state_group.get(), "particles"));
@@ -2752,6 +2881,11 @@ GravityForceCachePersistentView makeGravityForceCachePersistentView(
       .hierarchical_nearest_pair_r2_comoving = cache.hierarchical_nearest_pair_r2_comoving};
 }
 
+const RestartSchema& radiationRestartSchema() {
+  static const RestartSchema schema{std::string(k_restart_schema_name_v27), k_restart_schema_v27};
+  return schema;
+}
+
 const RestartSchema& mhdRestartSchema() {
   static const RestartSchema schema{std::string(k_restart_schema_name_v26), k_restart_schema_v26};
   return schema;
@@ -2760,6 +2894,7 @@ const RestartSchema& mhdRestartSchema() {
 bool isRestartSchemaCompatible(std::uint32_t file_schema_version) {
   return file_schema_version == restartSchema().version ||
       file_schema_version == k_restart_schema_v26 ||
+      file_schema_version == k_restart_schema_v27 ||
       file_schema_version == k_restart_schema_v24 ||
       file_schema_version == k_restart_schema_v23 ||
       file_schema_version == k_restart_schema_v22 ||
@@ -2809,7 +2944,8 @@ RestartIntegrityDigests restartPayloadIntegrityDigestsImpl(
     bool include_hierarchical_endpoint_v24,
     bool include_dual_energy_history_v25,
     core::MemoryGovernor* memory_governor = nullptr,
-    bool include_mhd_v26 = false) {
+    bool include_mhd_v26 = false,
+    bool include_radiation_v27 = false) {
   if (payload.persistent_state.simulation_state == nullptr || payload.integrator_state == nullptr || payload.scheduler == nullptr) {
     throw std::invalid_argument("restart payload must provide state, integrator_state, and scheduler");
   }
@@ -3155,6 +3291,41 @@ RestartIntegrityDigests restartPayloadIntegrityDigestsImpl(
           append_u64(canonical_bits(cell.end_internal_energy_density_comoving));
         }
       }
+    }
+  }
+
+  if (include_radiation_v27) {
+    // v27 /state/radiation: spectral identity, records and the four moment
+    // lanes are part of the canonical payload digest (exact-restart authority).
+    const core::RadiationMomentSoa& rad = state.radiation;
+    append_string(rad.contract);
+    append_string(rad.spectral_profile);
+    append_string(rad.spectral_definition_sha256);
+    append_u64(rad.group_count);
+    append_u64(std::bit_cast<std::uint64_t>(rad.c_hat_over_c));
+    append_u64(std::bit_cast<std::uint64_t>(rad.scale_factor));
+    append_u64(static_cast<std::uint64_t>(rad.group_edges_ev.size()));
+    for (const double e : rad.group_edges_ev) append_u64(std::bit_cast<std::uint64_t>(e));
+    append_u64(static_cast<std::uint64_t>(rad.patches.size()));
+    for (const core::RadiationPatchRecord& r : rad.patches) {
+      append_u64(r.patch_id);
+      append_u64(r.geometry_generation);
+      append_u64(static_cast<std::uint64_t>(static_cast<std::int64_t>(r.level)));
+      append_u64(r.nx);
+      append_u64(r.ny);
+      append_u64(r.nz);
+      append_u64(std::bit_cast<std::uint64_t>(r.origin_x_comoving));
+      append_u64(std::bit_cast<std::uint64_t>(r.origin_y_comoving));
+      append_u64(std::bit_cast<std::uint64_t>(r.origin_z_comoving));
+      append_u64(std::bit_cast<std::uint64_t>(r.cell_width_x_comoving));
+      append_u64(std::bit_cast<std::uint64_t>(r.cell_width_y_comoving));
+      append_u64(std::bit_cast<std::uint64_t>(r.cell_width_z_comoving));
+      append_u64(r.value_offset);
+    }
+    for (const auto* lane : {&rad.energy_density_comoving, &rad.flux_x_comoving, &rad.flux_y_comoving,
+                             &rad.flux_z_comoving}) {
+      append_u64(static_cast<std::uint64_t>(lane->size()));
+      for (const double v : *lane) append_u64(std::bit_cast<std::uint64_t>(v));
     }
   }
 
@@ -3858,7 +4029,21 @@ void writeRestartCheckpointHdf5(
   // flux registers, temporal histories or partial stages between steps, so a
   // magnetized state carrying any of them is refused (no partial authority).
   const bool magnetized = !payload.persistent_state.simulation_state->magnetic_faces.empty();
-  const RestartSchema& write_schema = magnetized ? mhdRestartSchema() : restartSchema();
+  const bool radiated = !payload.persistent_state.simulation_state->radiation.empty();
+  if (magnetized && radiated) {
+    throw std::invalid_argument(
+        "RT_RESTART_SCHEMA_MISMATCH: radiation-MHD states have no restart schema (refused at admission)");
+  }
+  if (radiated &&
+      (!payload.persistent_state.simulation_state->pending_flux_registers.empty() ||
+       !payload.persistent_state.simulation_state->amr_temporal_boundary_history.empty() ||
+       payload.integrator_state->inside_kdk_step)) {
+    throw std::invalid_argument(
+        "RT_RESTART_SCHEMA_MISMATCH: a radiation checkpoint was requested at an unsafe boundary (only fully "
+        "synchronized commit boundaries are admitted)");
+  }
+  const RestartSchema& write_schema =
+      radiated ? radiationRestartSchema() : (magnetized ? mhdRestartSchema() : restartSchema());
   if (magnetized &&
       (!payload.persistent_state.simulation_state->pending_flux_registers.empty() ||
        !payload.persistent_state.simulation_state->amr_temporal_boundary_history.empty() ||
@@ -3948,7 +4133,7 @@ void writeRestartCheckpointHdf5(
 
   const RestartIntegrityDigests integrity =
       restartPayloadIntegrityDigestsImpl(payload, true, true, true, true, true, true, true, true, true,
-                                        policy.memory_governor, magnetized);
+                                        policy.memory_governor, magnetized, radiated);
 
   const auto& shared_names = sharedIoContractNames();
   writeScalarStringAttribute(
@@ -3981,6 +4166,9 @@ void writeRestartCheckpointHdf5(
     mhd_metadata.scale_factor = payload.integrator_state->current_scale_factor;
     writeMhdRestartGroup(static_cast<std::int64_t>(file.get()),
                          payload.persistent_state.simulation_state->magnetic_faces, mhd_metadata);
+  }
+  if (radiated) {
+    writeRadiationRestartGroup(file.get(), payload.persistent_state.simulation_state->radiation);
   }
 
   Hdf5Handle integrator_group(openOrCreateGroup(file.get(), "/integrator"));
@@ -4422,7 +4610,11 @@ RestartVerificationResult verifyRestartCheckpointHdf5(
     result.schema_version = readScalarU32Attribute(file.get(), "restart_schema_version");
     const bool expected_magnetized = expected.persistent_state.simulation_state != nullptr &&
         !expected.persistent_state.simulation_state->magnetic_faces.empty();
-    const RestartSchema& expected_schema = expected_magnetized ? mhdRestartSchema() : restartSchema();
+    const bool expected_radiated = expected.persistent_state.simulation_state != nullptr &&
+        !expected.persistent_state.simulation_state->radiation.empty();
+    const RestartSchema& expected_schema = expected_radiated
+        ? radiationRestartSchema()
+        : (expected_magnetized ? mhdRestartSchema() : restartSchema());
     if (result.schema_name != expected_schema.name ||
         result.schema_version != expected_schema.version) {
       throw std::runtime_error(
@@ -4832,7 +5024,7 @@ RestartVerificationResult verifyRestartCheckpointHdf5(
 
     const RestartIntegrityDigests expected_integrity = restartPayloadIntegrityDigestsImpl(
         expected, true, true, true, true, true, true, true, true, true, policy.memory_governor,
-        expected_magnetized);
+        expected_magnetized, expected_radiated);
     result.legacy_payload_hash = readScalarU64Attribute(file.get(), "payload_integrity_hash");
     result.payload_sha256_hex = readScalarStringAttribute(file.get(), "payload_integrity_sha256_hex");
     if (result.legacy_payload_hash != expected_integrity.legacy_fnv1a ||
@@ -4901,6 +5093,8 @@ RestartReadResult readRestartCheckpointHdf5(
       schema_name == restartSchema().name && schema_version == restartSchema().version;
   const bool magnetized_v26_schema =
       schema_name == k_restart_schema_name_v26 && schema_version == k_restart_schema_v26;
+  const bool radiation_v27_schema =
+      schema_name == k_restart_schema_name_v27 && schema_version == k_restart_schema_v27;
   const bool legacy_v14_schema =
       schema_name == k_restart_schema_name_v14 && schema_version == k_restart_schema_v14;
   const bool legacy_v15_schema =
@@ -4921,7 +5115,7 @@ RestartReadResult readRestartCheckpointHdf5(
       schema_name == k_restart_schema_name_v23 && schema_version == k_restart_schema_v23;
   const bool legacy_v24_schema =
       schema_name == k_restart_schema_name_v24 && schema_version == k_restart_schema_v24;
-  if ((!current_schema && !magnetized_v26_schema && !legacy_v14_schema && !legacy_v15_schema &&
+  if ((!current_schema && !magnetized_v26_schema && !radiation_v27_schema && !legacy_v14_schema && !legacy_v15_schema &&
        !legacy_v16_schema &&
        !legacy_v17_schema && !legacy_v18_schema && !legacy_v19_schema && !legacy_v20_schema &&
        !legacy_v21_schema && !legacy_v23_schema && !legacy_v24_schema) ||
@@ -4988,7 +5182,10 @@ RestartReadResult readRestartCheckpointHdf5(
   result.integrator_state.last_first_hubble_drag_factor = readScalarF64Attribute(integrator_group.get(), "last_first_hubble_drag_factor");
   result.integrator_state.last_second_hubble_drag_factor = readScalarF64Attribute(integrator_group.get(), "last_second_hubble_drag_factor");
   result.integrator_state.step_index = readScalarU64Attribute(integrator_group.get(), "step_index");
-  if (schema_version >= k_restart_schema_v26) {
+  if (schema_version == k_restart_schema_v27) {
+    result.state.radiation = readRadiationRestartGroup(file.get(), result.integrator_state.current_scale_factor);
+  }
+  if (schema_version == k_restart_schema_v26) {
     // Magnetic authority: fully validated into a fresh MagneticFaceSoa
     // (contract, units, offsets, counts, finiteness, per-patch divergence,
     // scale factor against the restored timeline). The table SHA-256 and the
@@ -5206,7 +5403,8 @@ RestartReadResult readRestartCheckpointHdf5(
           schema_version >= k_restart_schema_v24,
           schema_version >= k_restart_schema_v25,
           nullptr,
-          schema_version >= k_restart_schema_v26);
+          schema_version == k_restart_schema_v26,
+          schema_version == k_restart_schema_v27);
   if (computed_integrity.legacy_fnv1a != result.payload_hash ||
       hexU64(computed_integrity.legacy_fnv1a) != result.payload_hash_hex) {
     throw std::runtime_error("restart legacy payload integrity hash mismatch");

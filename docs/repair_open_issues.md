@@ -1222,3 +1222,12 @@ Source only; nothing configured, compiled, run or certified. Ledger:
 * P1 — The Tóth–Roe compatible-transfer equivalence claim for the ratio-2
   prolongation (A13) and the table-provider memory admission (A10) remain open.
 * P2 — `counters.json`/profiler export of `MhdRuntimeTelemetry` is not wired.
+
+## CHUI-RT-BH-AGN-REF-v1 pass 01 open issues (2026-11-26)
+
+Severity-ranked gap ledger: `docs/architecture/chui_rt_bh_agn_implementation_pass01_status.md` §7.
+Headline blockers: no compile/test evidence; photoionization RT reconciliation
+not wired (FAIL_CLOSED); multi-rank RT halo exchange missing (FAIL_CLOSED);
+RT regrid/migration missing (FAIL_CLOSED); distributed seeding provider
+missing (FAIL_CLOSED); BH merger/DF rank-local only; particle removal on merger
+vs. workflow ownership ledger not audited.

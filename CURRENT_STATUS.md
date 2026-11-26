@@ -1,5 +1,20 @@
 # Current repository status
 
+## RT / BH / AGN bulk implementation, pass 01 — 2026-11-26
+
+**SOURCE ONLY — NOT BUILT, NOT TESTED, NOT VALIDATED.**
+
+Added in source (branch `claude/funny-volta-bcqf37`):
+
+* reference BH engine (`physics.bh_engine_model = reference_v1`): neighbourhood Bondi/torque supply, conservative withdrawal, scalar disk reservoir, legacy/relativistic ledgers, unresolved friction, bound-pair mergers, single-rank halo seeding;
+* AGN channels (thermal, kicks, bipolar jets, mass-loaded winds) on conservative transactions;
+* multigroup M1 radiation module with PD-ARS IMEX, restart schema v27;
+* P1 building blocks (Kerr/BZ, rays/VET/Monte Carlo, CT magnetic injection), refused at admission.
+
+Defaults are unchanged (legacy BH, RT off). Photoionization RT, stellar RT sources, multi-rank RT and distributed seeding are FAIL_CLOSED.
+See the [pass-01 ledger](docs/architecture/chui_rt_bh_agn_implementation_pass01_status.md).
+
+
 ## Final data and closure, pass 2 — 2026-11-04
 
 **SOURCE ONLY — CHUI NOT BUILT OR RUN.**

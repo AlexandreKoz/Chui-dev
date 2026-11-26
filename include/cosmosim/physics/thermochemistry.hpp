@@ -96,6 +96,22 @@ struct ThermochemistryConfig {
   MetalIonElementSet metal_ion_elements{};
 };
 
+// CHUI-RT-BH-AGN-REF-v1 amendment A5: local photo-rates of the TRANSPORTED
+// radiation field (RT moments of the ionizing groups, frozen over the
+// chemistry interval). Additive to the (shielded) UV background, which stays
+// the chemistry-owned external field: the two are disjoint BY ORIGIN (RT
+// transports only local stellar/AGN sources; admission
+// physics.rt_uvb_policy). gamma in s^-1, heat in erg s^-1 per absorber.
+struct TransportedPhotoRates {
+  bool present = false;
+  double gamma_hi_s = 0.0;
+  double gamma_hei_s = 0.0;
+  double gamma_heii_s = 0.0;
+  double heat_hi_erg_s = 0.0;
+  double heat_hei_erg_s = 0.0;
+  double heat_heii_erg_s = 0.0;
+};
+
 struct ThermochemistryCellInput {
   double mass_density_cgs = 1.0e-24;               // proper, gas + dust
   double specific_internal_energy_erg_g = 1.0e12;  // thermal
@@ -113,6 +129,7 @@ struct ThermochemistryCellInput {
   // ladder charge minus the NL97 C+ charge already carried by kCII).
   std::array<double, k_metal_ion_stage_capacity> metal_ion_stage_cm3{};
   double metal_ion_electron_cm3 = 0.0;
+  TransportedPhotoRates transported_photo{};
 };
 
 struct ThermochemistryCellOutput {

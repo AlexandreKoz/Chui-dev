@@ -407,6 +407,67 @@ struct MagneticFaceSoa {
   [[nodiscard]] bool isConsistent() const noexcept;
 };
 
+// CHUI-RT-BH-AGN-REF-v1 (RT01, amendment A3): authoritative persistent
+// radiation moments for on-the-fly multigroup M1 transport. Core-owned
+// storage lane only (shapes and bytes; no RT algorithm). One record per
+// authoritative LEAF patch, keyed by (patch_id, geometry_generation); cell
+// order inside a record equals the hydro patch cell order (local index
+// ix + nx (iy + ny iz)), so RT cell c of a record couples to gas row
+// PatchSoa::first_cell + c without a map. Lanes are group-major per patch:
+//   value(record, g, c) = lane[record.value_offset + g * ncell + c].
+// Stored convention: comoving moment densities E_comov = a^4 E_phys,
+// F_comov = a^4 F_phys at PHYSICAL group edges (RT companion section 4);
+// scale_factor records the a of the last commit. fp64 only. Empty (zero
+// bytes) when radiation is disabled. Covered parents, ghosts and stage
+// copies are never stored here.
+struct RadiationPatchRecord {
+  std::uint64_t patch_id = 0U;
+  std::uint64_t geometry_generation = 0U;
+  std::int32_t level = 0;
+  std::uint32_t nx = 0U;
+  std::uint32_t ny = 0U;
+  std::uint32_t nz = 0U;
+  double origin_x_comoving = 0.0;
+  double origin_y_comoving = 0.0;
+  double origin_z_comoving = 0.0;
+  double cell_width_x_comoving = 0.0;
+  double cell_width_y_comoving = 0.0;
+  double cell_width_z_comoving = 0.0;
+  std::uint64_t value_offset = 0U;  // into each lane; slice length group_count * nx * ny * nz
+};
+
+struct RadiationMomentSoa {
+  std::string contract = "chui_rt_m1_moments_v1";
+  std::string spectral_profile;      // e.g. "ionizing3"
+  std::string spectral_definition_sha256;  // hash of edges + within-group shape + quadrature
+  std::uint32_t group_count = 0U;
+  std::vector<double> group_edges_ev;  // group_count + 1 physical edges (empty for grey)
+  double c_hat_over_c = 1.0;
+  double scale_factor = 1.0;
+  std::vector<RadiationPatchRecord> patches;
+  AlignedVector<double> energy_density_comoving;
+  AlignedVector<double> flux_x_comoving;
+  AlignedVector<double> flux_y_comoving;
+  AlignedVector<double> flux_z_comoving;
+
+  [[nodiscard]] bool empty() const noexcept {
+    return patches.empty() && energy_density_comoving.empty() && flux_x_comoving.empty() &&
+        flux_y_comoving.empty() && flux_z_comoving.empty();
+  }
+  void clear() noexcept {
+    patches.clear();
+    energy_density_comoving.clear();
+    flux_x_comoving.clear();
+    flux_y_comoving.clear();
+    flux_z_comoving.clear();
+    group_edges_ev.clear();
+    spectral_profile.clear();
+    spectral_definition_sha256.clear();
+    group_count = 0U;
+  }
+  [[nodiscard]] bool isConsistent() const noexcept;
+};
+
 struct SpeciesContainer {
   // Explicit species counts; used as an auditable ownership ledger.
   std::array<std::uint64_t, k_particle_species_count> count_by_species{};
@@ -993,6 +1054,8 @@ class SimulationState {
   PatchSoa patches;
   // Authoritative persistent MHD face-integrated flux (empty for non-MHD runs).
   MagneticFaceSoa magnetic_faces;
+  // Authoritative persistent RT moments (empty unless physics.rt_enabled).
+  RadiationMomentSoa radiation;
   // Restart-authoritative AMR hydro deferred synchronization state.
   PendingFluxRegisterStore pending_flux_registers;
   // Restart-authoritative coarse temporal boundary intervals retained while
