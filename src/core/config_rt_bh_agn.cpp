@@ -318,6 +318,9 @@ void validateAgn(const SimulationConfig& config) {
           "physics.agn_max_velocity_c_fraction must lie in (0, 0.3] (declared nonrelativistic domain)");
   const double c_km_s = 299792.458;
   if (agn.wind_efficiency > 0.0) {
+    require(p.bh_engine.disk_wind_loading > 0.0,
+            "physics.agn_wind_efficiency > 0 requires a mass origin: physics.bh_disk_wind_loading > 0 (winds are "
+            "loaded with disk-wind mass; entrainment of ambient gas is the kick/jet channel, never new mass)");
     require(finitePositive(agn.wind_velocity_km_s), "a wind channel requires physics.agn_wind_velocity_km_s > 0");
     require(agn.wind_velocity_km_s <= agn.max_velocity_c_fraction * c_km_s,
             "physics.agn_wind_velocity_km_s exceeds the declared nonrelativistic domain (rejected, never capped)");

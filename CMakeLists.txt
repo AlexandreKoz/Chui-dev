@@ -605,7 +605,8 @@ add_library(cosmosim_physics STATIC
   src/physics/black_hole/bh_spin.cpp
   src/physics/black_hole/bh_neighborhood.cpp
   src/physics/black_hole/bh_engine.cpp
-  src/physics/black_hole/bh_seed_provider.cpp)
+  src/physics/black_hole/bh_seed_provider.cpp
+  src/physics/agn/agn_injection.cpp)
 add_library(cosmosim_io STATIC
   src/io/internal/io_contract.cpp
   src/io/transactional_file.cpp
