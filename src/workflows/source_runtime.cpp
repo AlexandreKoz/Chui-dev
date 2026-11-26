@@ -58,6 +58,7 @@
 #include "workflows/internal/gas_cell_ownership.hpp"
 #include "workflows/internal/mpi_stage_collective_decision.hpp"
 #include "workflows/internal/particle_id_registry.hpp"
+#include "workflows/internal/rt_bh_agn_bridge.hpp"
 #include "workflows/internal/distributed_element_diffusion.hpp"
 #include "workflows/internal/metal_diffusion_topology.hpp"
 #include "workflows/internal/runtime_stage_resource_access.hpp"
@@ -1123,9 +1124,26 @@ class SourceRuntimeImpl final : public SourceRuntime {
         throw std::invalid_argument(
             "physics.bh_enable_seeding=true requires physics.enable_black_hole_agn=true");
       }
+      // CHUI-RT-BH-AGN-REF-v1 (BH01): the reference engine has an explicit,
+      // admitted provider (physics.bh_seed_model=halo_fof_serial, single rank);
+      // the legacy callback still has none and stays fail-closed.
+      if (config.physics.bh_engine.model == core::BhEngineModelConfig::kReferenceV1 &&
+          config.physics.bh_engine.seed_model == core::BhSeedModelConfig::kHaloFofSerial) {
+        if (mpi_context.isEnabled() && mpi_context.worldSize() > 1) {
+          throw std::runtime_error(
+              "physics.bh_seed_model=halo_fof_serial is a single-rank provider; distributed BH seeding has no "
+              "bounded authoritative halo provider and remains fail-closed");
+        }
+      } else {
       throw std::runtime_error(
           "BH seeding requested, but ReferenceWorkflow has no authoritative halo/candidate provider; "
           "disable bh_enable_seeding or supply a production candidate provider before claiming seeding support");
+      }
+    }
+    if (config.physics.bh_engine.model == core::BhEngineModelConfig::kReferenceV1 || config.physics.rt.enabled) {
+      m_rt_bh_agn = std::make_unique<internal::RtBhAgnSourceBridge>(
+          config, units, mpi_context, boxExtentForRtBhAgnBridge(config),
+          mode_policy.hydro_boundary == core::BoundaryCondition::kPeriodic);
     }
 
     const double hubble_si = config.cosmology.hubble_param *
@@ -2615,7 +2633,13 @@ class SourceRuntimeImpl final : public SourceRuntime {
       executeStellarEvolutionAndEnrichment(context, source_evaluation_scale_factor);
     }
     physics::BlackHoleAgnStepReport black_hole_report{};
-    if (m_bh_enabled) {
+    // CHUI-RT-BH-AGN-REF-v1: exactly one BH owner per interval. The reference
+    // engine (bridge) replaces the legacy callback; RT-only runs keep the
+    // legacy BH path (if enabled) followed by the bridge's RT interval.
+    bool rt_bh_agn_gas_mutated = false;
+    std::vector<std::uint32_t> rt_bh_agn_touched_rows;
+    const bool reference_bh_engine = m_rt_bh_agn != nullptr && m_rt_bh_agn->engineEnabled();
+    if (m_bh_enabled && !reference_bh_engine) {
       black_hole_report = m_black_hole.apply(
           context.state,
           {},
@@ -2625,7 +2649,39 @@ class SourceRuntimeImpl final : public SourceRuntime {
           context.integrator_state.step_index,
           &m_particle_id_registry);
     }
-    if (black_hole_report.counters.gas_mass_removed_code > 0.0) {
+    if (m_rt_bh_agn != nullptr) {
+      buildOwnedLeafCellMetadata(context);
+      internal::RtBhAgnEpochInputs bridge_inputs;
+      bridge_inputs.time_begin_code = plan.coarse_time_begin_code;
+      bridge_inputs.time_end_code = plan.event_time_code;
+      bridge_inputs.scale_factor_begin = m_is_cosmological ? scaleFactorAtPhysicalFraction(context, 0.0) : 1.0;
+      bridge_inputs.scale_factor_end = source_evaluation_scale_factor;
+      bridge_inputs.cosmological = m_is_cosmological && context.cosmology_background != nullptr;
+      if (bridge_inputs.cosmological) {
+        bridge_inputs.physical_seconds = context.cosmology_background->cosmicTimeIntervalSi(
+            bridge_inputs.scale_factor_begin, bridge_inputs.scale_factor_end);
+        bridge_inputs.hubble_begin_si = context.cosmology_background->hubbleSi(bridge_inputs.scale_factor_begin);
+        bridge_inputs.hubble_end_si = context.cosmology_background->hubbleSi(bridge_inputs.scale_factor_end);
+      } else {
+        bridge_inputs.physical_seconds = plan.event_dt_code * m_units.timeSiPerCode();
+      }
+      bridge_inputs.step_index = context.integrator_state.step_index;
+      bridge_inputs.interval_index = m_source_interval.sequence;
+      bridge_inputs.owned_leaf_mask = m_owned_leaf_mask;
+      bridge_inputs.particle_scheduler = context.particle_scheduler;
+      bridge_inputs.id_precommit = &m_particle_id_registry;
+      internal::RtBhAgnEpochReport bridge_report = m_rt_bh_agn->executeDiscreteEpoch(context.state, bridge_inputs);
+      rt_bh_agn_gas_mutated = bridge_report.gas_mutated;
+      rt_bh_agn_touched_rows = std::move(bridge_report.touched_gas_rows);
+      black_hole_report.seeded_particle_ids.insert(black_hole_report.seeded_particle_ids.end(),
+                                                   bridge_report.seeded_particle_ids.begin(),
+                                                   bridge_report.seeded_particle_ids.end());
+      if (!bridge_report.removed_particle_ids.empty() || bridge_report.particle_mass_mutated) {
+        internal::synchronizeParentParticleCompatibilityMirrors(
+            context.state, m_world_rank, "SourceRuntime reference BH engine / AGN");
+      }
+    }
+    if (black_hole_report.counters.gas_mass_removed_code > 0.0 || rt_bh_agn_gas_mutated) {
       // Generic gas particles are compatibility mirrors only. Keep them coherent
       // for I/O/legacy consumers after the authoritative gas->BH transaction.
       internal::synchronizeParentParticleCompatibilityMirrors(
@@ -2649,7 +2705,8 @@ class SourceRuntimeImpl final : public SourceRuntime {
             current_tick + 1U);
       }
     }
-    if (star_formation_mutated_gas || black_hole_report.counters.gas_mass_removed_code > 0.0) {
+    if (star_formation_mutated_gas || black_hole_report.counters.gas_mass_removed_code > 0.0 ||
+        rt_bh_agn_gas_mutated) {
       // Audit F4 (density-changing sources): star formation and BH accretion
       // change gas density, which changes the effective-EOS pressure and
       // signal speed (and the ideal-gas pressure cache). Star formation
@@ -2672,6 +2729,23 @@ class SourceRuntimeImpl final : public SourceRuntime {
               hydro::temperatureKelvinPerInternalEnergyCode(5.0 / 3.0, m_units.velocity_si_per_code)};
       if (black_hole_report.counters.gas_mass_removed_code > 0.0) {
         (void)hydro::refreshAllGasThermodynamics(context.state, policy);
+      } else if (rt_bh_agn_gas_mutated) {
+        // The reference engine / AGN / RT report their exact touched rows:
+        // refresh the union with the star-formation rows (specific internal
+        // energy may have changed: use the current value as the touch base
+        // with a full recompute through the closure).
+        star_formation_touched_rows.insert(star_formation_touched_rows.end(), rt_bh_agn_touched_rows.begin(),
+                                           rt_bh_agn_touched_rows.end());
+        std::sort(star_formation_touched_rows.begin(), star_formation_touched_rows.end());
+        star_formation_touched_rows.erase(
+            std::unique(star_formation_touched_rows.begin(), star_formation_touched_rows.end()),
+            star_formation_touched_rows.end());
+        std::vector<hydro::GasThermodynamicTouch> touches;
+        touches.reserve(star_formation_touched_rows.size());
+        for (const std::uint32_t row : star_formation_touched_rows) {
+          touches.push_back(hydro::GasThermodynamicTouch{.cell_row = row, .internal_energy_before_code = 0.0});
+        }
+        (void)hydro::refreshGasThermodynamics(context.state, touches, policy);
       } else {
         std::sort(star_formation_touched_rows.begin(), star_formation_touched_rows.end());
         star_formation_touched_rows.erase(
@@ -5497,6 +5571,13 @@ class SourceRuntimeImpl final : public SourceRuntime {
   physics::MetalDiffusionModel m_metal_diffusion;
   physics::StellarFeedbackModuleState m_stellar_feedback_state;
   physics::BlackHoleAgnModel m_black_hole;
+  // CHUI-RT-BH-AGN-REF-v1 reference engine / AGN channels / RT (null when
+  // every new model is disabled: zero cost, legacy behaviour unchanged).
+  std::unique_ptr<internal::RtBhAgnSourceBridge> m_rt_bh_agn;
+  [[nodiscard]] static std::array<double, 3> boxExtentForRtBhAgnBridge(const core::SimulationConfig& config) {
+    return {config.cosmology.box_size_x_mpc_comoving, config.cosmology.box_size_y_mpc_comoving,
+            config.cosmology.box_size_z_mpc_comoving};
+  }
   core::PhysicsConfig m_physics_config{};
   physics::BaryonicDataProducts m_baryonic_data{};
   std::unique_ptr<physics::ThermochemistryOperator> m_thermochemistry;

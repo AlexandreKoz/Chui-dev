@@ -704,6 +704,7 @@ add_library(cosmosim_workflows STATIC
   src/workflows/internal/migration_wire.cpp
   src/workflows/internal/amr_geometry_assurance.cpp
   src/workflows/internal/mhd_runtime_bridge.cpp
+  src/workflows/internal/rt_bh_agn_bridge.cpp
   src/workflows/internal/gravity_force_endpoint.cpp
   src/workflows/migration_balance_runtime.cpp
   src/workflows/output_restart_runtime.cpp
