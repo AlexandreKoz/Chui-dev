@@ -305,6 +305,25 @@ void accountMagneticFaces(MemoryReportBuilder& builder, const MagneticFaceSoa& f
                     MemoryClass::kCanonicalPersistent, "mhd.patch_records", faces.patches);
 }
 
+void accountRadiationMoments(MemoryReportBuilder& builder, const RadiationMomentSoa& rad) {
+  // RT-off runs keep a report identical to the pre-RT layout (disabled cost 0).
+  if (rad.patches.capacity() == 0U && rad.energy_density_comoving.capacity() == 0U &&
+      rad.flux_x_comoving.capacity() == 0U && rad.flux_y_comoving.capacity() == 0U &&
+      rad.flux_z_comoving.capacity() == 0U) {
+    return;
+  }
+  addOwnedWithClass(builder, MemorySubsystem::kGasHydro, MemoryLifetime::kPersistent,
+                    MemoryClass::kCanonicalPersistent, "rt.energy_density_comoving", rad.energy_density_comoving);
+  addOwnedWithClass(builder, MemorySubsystem::kGasHydro, MemoryLifetime::kPersistent,
+                    MemoryClass::kCanonicalPersistent, "rt.flux_x_comoving", rad.flux_x_comoving);
+  addOwnedWithClass(builder, MemorySubsystem::kGasHydro, MemoryLifetime::kPersistent,
+                    MemoryClass::kCanonicalPersistent, "rt.flux_y_comoving", rad.flux_y_comoving);
+  addOwnedWithClass(builder, MemorySubsystem::kGasHydro, MemoryLifetime::kPersistent,
+                    MemoryClass::kCanonicalPersistent, "rt.flux_z_comoving", rad.flux_z_comoving);
+  addOwnedWithClass(builder, MemorySubsystem::kGasHydro, MemoryLifetime::kPersistent,
+                    MemoryClass::kCanonicalPersistent, "rt.patch_records", rad.patches);
+}
+
 void accountAmrIdentityAndSynchronization(
     MemoryReportBuilder& builder,
     const SimulationState& state) {
@@ -508,6 +527,7 @@ MemoryReport collectSimulationMemoryReport(const SimulationState& state, const T
   accountTracerSidecar(builder, state.tracers);
   accountPatchSoa(builder, state.patches);
   accountMagneticFaces(builder, state.magnetic_faces);
+  accountRadiationMoments(builder, state.radiation);
   accountAmrIdentityAndSynchronization(builder, state);
   accountModulePayloads(builder, state.sidecars);
   // M01 (patch 50): the element/species/ion/dust/SGS composition sidecar is

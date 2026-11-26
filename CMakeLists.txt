@@ -673,6 +673,23 @@ add_library(cosmosim_mhd STATIC
   src/mhd/mhd_transport.cpp
   src/mhd/mhd_validation.cpp)
 
+# CHUI-RT-BH-AGN-REF-v1 radiative transfer module (multigroup M1, PD-ARS IMEX,
+# matter coupling, cosmological edge transfer, AMR operators, AGN sources and
+# P1 angular backends). Depends on cosmosim_core and cosmosim_physics (the
+# thermochemistry authority and the BH engine store); core never includes it.
+# Source-implemented and unvalidated (docs/architecture/
+# chui_rt_bh_agn_implementation_pass01_status.md).
+add_library(cosmosim_radiation STATIC
+  src/radiation/radiation_closure.cpp
+  src/radiation/radiation_spectrum.cpp
+  src/radiation/radiation_transport.cpp
+  src/radiation/radiation_matter_coupling.cpp
+  src/radiation/radiation_cosmology.cpp
+  src/radiation/radiation_runtime.cpp
+  src/radiation/radiation_amr.cpp
+  src/radiation/radiation_sources.cpp
+  src/radiation/radiation_angular.cpp)
+
 add_library(cosmosim_workflows STATIC
   src/workflows/analysis_runtime.cpp
   src/workflows/gravity_runtime.cpp
@@ -704,6 +721,7 @@ add_library(cosmosim_workflows STATIC
 
 set(COSMOSIM_MODULE_LIBS
   cosmosim_mhd
+  cosmosim_radiation
   cosmosim_gravity
   cosmosim_hydro
   cosmosim_amr
@@ -739,8 +757,11 @@ if(COSMOSIM_STRICT_IO_WARNINGS)
   endif()
 endif()
 
+target_link_libraries(cosmosim_radiation PUBLIC cosmosim_physics)
+
 target_link_libraries(cosmosim_workflows
   PUBLIC
+    cosmosim_radiation
     cosmosim_mhd
     cosmosim_analysis
     cosmosim_gravity
@@ -808,6 +829,7 @@ target_link_libraries(cosmosim_all
 
 set_target_properties(cosmosim_core PROPERTIES EXPORT_NAME core)
 set_target_properties(cosmosim_mhd PROPERTIES EXPORT_NAME mhd)
+set_target_properties(cosmosim_radiation PROPERTIES EXPORT_NAME radiation)
 set_target_properties(cosmosim_gravity PROPERTIES EXPORT_NAME gravity)
 set_target_properties(cosmosim_hydro PROPERTIES EXPORT_NAME hydro)
 set_target_properties(cosmosim_amr PROPERTIES EXPORT_NAME amr)
@@ -820,6 +842,7 @@ set_target_properties(cosmosim_all PROPERTIES EXPORT_NAME all)
 
 add_library(CosmoSim::core ALIAS cosmosim_core)
 add_library(CosmoSim::mhd ALIAS cosmosim_mhd)
+add_library(CosmoSim::radiation ALIAS cosmosim_radiation)
 add_library(CosmoSim::gravity ALIAS cosmosim_gravity)
 add_library(CosmoSim::hydro ALIAS cosmosim_hydro)
 add_library(CosmoSim::amr ALIAS cosmosim_amr)
@@ -838,6 +861,7 @@ set(COSMOSIM_INSTALL_CMAKEDIR "${CMAKE_INSTALL_LIBDIR}/cmake/CosmoSim")
 set(COSMOSIM_INSTALL_TARGETS
   cosmosim_core
   cosmosim_mhd
+  cosmosim_radiation
   cosmosim_gravity
   cosmosim_hydro
   cosmosim_amr

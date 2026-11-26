@@ -150,6 +150,10 @@ void validateRadiation(const SimulationConfig& config) {
           "physics.rt_newton_max_iterations must lie in [1, 1000]");
   require(rt.max_retries <= 8U, "physics.rt_max_retries must lie in [0, 8]");
   if (rt.opacity_model == RtOpacityModelConfig::kConstantReference) {
+    require(!config.physics.enable_cooling,
+            "physics.rt_opacity_model=constant_reference couples gas and radiation through LTE emission/absorption "
+            "(the radiative cooling of the reference RHD problem); physics.enable_cooling must be false to avoid "
+            "duplicate cooling");
     require(rt.allow_reference_models,
             "physics.rt_opacity_model=constant_reference is REFERENCE ONLY; set physics.rt_allow_reference_models="
             "true to admit it for idealized tests");
@@ -159,6 +163,12 @@ void validateRadiation(const SimulationConfig& config) {
   } else {
     require(rt.constant_absorption_cm2_g == 0.0 && rt.constant_scattering_cm2_g == 0.0,
             "physics.rt_constant_* opacities are only meaningful with physics.rt_opacity_model=constant_reference");
+    require(false,
+            "physics.rt_opacity_model=photoionization: the RT-side frozen-species absorption, transported photo-rate "
+            "provider and chemistry photoionization counters exist (amendment A5), but the per-row reconciliation "
+            "of RT-absorbed photon energy against the chemistry-integrated photoionizations is not yet wired into "
+            "BaryonicSourceStage; without it one absorption event would not create identical matter/radiation "
+            "debit and credit (FAIL_CLOSED, pass 01)");
     require(networkThermochemistry(config.physics),
             "physics.rt_opacity_model=photoionization requires a species-evolving thermochemistry backend "
             "(fixed_hybrid or fixed_detailed): opacities are sigma_g n_species of the chemistry authority");
@@ -175,6 +185,9 @@ void validateRadiation(const SimulationConfig& config) {
             "physics.rt_source_blackbody_temperature_k must be > 0 and physics.rt_source_power_law_index finite");
   }
   if (rt.stellar_sources) {
+    require(false,
+            "physics.rt_stellar_sources: no age/metallicity-dependent stellar ionizing-luminosity provider exists in "
+            "the stellar-population authority (the SED-table schema carries a spectral shape only); FAIL_CLOSED");
     require(config.physics.enable_star_formation, "physics.rt_stellar_sources requires star formation");
     if (rt.source_shape == RtSourceShapeConfig::kSedTable) {
       require(!rt.stellar_sed_table_path.empty() && rt.stellar_sed_table_sha256.size() == 64U,
@@ -201,6 +214,15 @@ void validateRadiation(const SimulationConfig& config) {
               "sources only, disjoint by origin) or disable the UVB");
     }
   }
+  require(config.parallel.mpi_ranks_expected <= 1,
+          "physics.rt_enabled=true with more than one MPI rank: the RT ghost/halo exchange across ranks is not "
+          "implemented in pass 01 (single-rank level-synchronous transport only; FAIL_CLOSED)");
+  require(config.numerics.amr_regrid_mode == AmrRegridConfigMode::kOff,
+          "physics.rt_enabled=true requires numerics.amr_regrid_mode=off: radiation moments are not yet carried "
+          "through regrid/migration transactions (FAIL_CLOSED)");
+  require(config.numerics.amr_time_stepping == AmrTimeSteppingConfigMode::kSynchronized,
+          "physics.rt_enabled=true requires numerics.amr_time_stepping=synchronized (level-synchronous RT; no "
+          "falsely supported asynchronous mode)");
   require(!config.mhd.enabled,
           "physics.rt_enabled=true with mhd.enabled=true: radiation-MHD coupling (radiation pressure on "
           "magnetized gas, Lorentz-Heaviside energy reconciliation) is outside the MHD reference scope and not "

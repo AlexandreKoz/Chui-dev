@@ -349,6 +349,34 @@ bool TracerParticleSidecar::isConsistent() const noexcept {
   return true;
 }
 
+bool RadiationMomentSoa::isConsistent() const noexcept {
+  if (patches.empty()) {
+    return energy_density_comoving.empty() && flux_x_comoving.empty() && flux_y_comoving.empty() &&
+        flux_z_comoving.empty();
+  }
+  if (group_count == 0U || !(c_hat_over_c > 0.0) || c_hat_over_c > 1.0 || !(scale_factor > 0.0)) return false;
+  if (!group_edges_ev.empty() && group_edges_ev.size() != static_cast<std::size_t>(group_count) + 1U) return false;
+  for (std::size_t g = 1; g < group_edges_ev.size(); ++g) {
+    if (!(group_edges_ev[g] > group_edges_ev[g - 1U])) return false;
+  }
+  std::uint64_t expected = 0U;
+  for (const RadiationPatchRecord& patch : patches) {
+    if (patch.nx == 0U || patch.ny == 0U || patch.nz == 0U) return false;
+    if (!(patch.cell_width_x_comoving > 0.0) || !(patch.cell_width_y_comoving > 0.0) ||
+        !(patch.cell_width_z_comoving > 0.0)) {
+      return false;
+    }
+    if (patch.value_offset != expected) return false;
+    const std::uint64_t cells = static_cast<std::uint64_t>(patch.nx) * patch.ny;
+    if (patch.nz != 0U && cells > std::numeric_limits<std::uint64_t>::max() / patch.nz) return false;
+    const std::uint64_t ncell = cells * patch.nz;
+    if (ncell > std::numeric_limits<std::uint64_t>::max() / group_count) return false;
+    expected += ncell * group_count;
+  }
+  return energy_density_comoving.size() == expected && flux_x_comoving.size() == expected &&
+      flux_y_comoving.size() == expected && flux_z_comoving.size() == expected;
+}
+
 bool MagneticFaceSoa::isConsistent() const noexcept {
   if (patches.empty()) {
     return face_flux_x_comoving.empty() && face_flux_y_comoving.empty() &&
