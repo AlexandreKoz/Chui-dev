@@ -250,6 +250,11 @@ ThermochemistryCellInput ThermochemistryOperator::cellInputForTag(const core::Si
     const double amu = chemicalSpeciesInfo(static_cast<ChemicalSpecies>(s)).mass_amu;
     input.species_cm3[s] = species_mass / mass * input.mass_density_cgs / (amu * k_amu_g);
   }
+  if (m_config.transported_photo_rates != nullptr) {
+    // Amendment A5: transported (RT) photo-rates of this row, frozen over the
+    // accepted chemistry interval (single thermochemistry authority).
+    input.transported_photo = m_config.transported_photo_rates->ratesForRow(state, row);
+  }
   return input;
 }
 
@@ -596,6 +601,7 @@ ThermochemistryRowResult ThermochemistryOperator::advanceRow(const core::Simulat
   result.ledger.thermal_energy_delta_erg *= volume_cm3;
   result.ledger.metal_ion_potential_delta_erg *= volume_cm3;
   result.ledger.metal_ion_co_transfer_nuclei *= volume_cm3;
+  for (double& events : result.ledger.transported_photoionizations) events *= volume_cm3;
 
   ThermochemistryStagedRow& staged = result.staged;
   staged.row = row;

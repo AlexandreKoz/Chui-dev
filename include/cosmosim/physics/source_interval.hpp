@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <stdexcept>
 #include <string>
@@ -90,6 +91,14 @@ struct SourceLedger {
   // max relative mismatch of sum_k (ion-stage nuclei) vs (element - CO)
   // nuclei after staging (dimensionless; round-off only when consistent).
   double metal_ion_inventory_residual = 0.0;
+  // CHUI-RT-BH-AGN-REF-v1 amendment A5: photoionization events driven by the
+  // TRANSPORTED radiation field (RT), integrated by the thermochemistry
+  // authority over the accepted interval with the backward-Euler-consistent
+  // end-of-substep abundances (H I, He I, He II; volume-integrated counts
+  // after the operator's volume scaling). The RT matter coupler uses these
+  // counts to debit exactly the absorbed photon energy (single authority, no
+  // duplicate photoheating). Zero when no transported rates are supplied.
+  std::array<double, 3> transported_photoionizations{};
   double dust_to_gas_transfer_code = 0.0;   // + = solids returned to gas
   double gas_to_dust_transfer_code = 0.0;   // + = gas locked into solids
   std::uint64_t cells = 0U;

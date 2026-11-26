@@ -273,6 +273,16 @@ RateEnvironment ThermochemistrySolver::environment(const ThermochemistryCellInpu
     env.heat_hei_erg_s = uvb.heat_hei_erg_s * shield;
     env.heat_heii_erg_s = uvb.heat_heii_erg_s * shield;
   }
+  if (input.transported_photo.present) {
+    // Transported (RT) local field: additive, never self-shielded again (RT
+    // attenuation already is the shielding of the transported photons).
+    env.gamma_hi_s += input.transported_photo.gamma_hi_s;
+    env.gamma_hei_s += input.transported_photo.gamma_hei_s;
+    env.gamma_heii_s += input.transported_photo.gamma_heii_s;
+    env.heat_hi_erg_s += input.transported_photo.heat_hi_erg_s;
+    env.heat_hei_erg_s += input.transported_photo.heat_hei_erg_s;
+    env.heat_heii_erg_s += input.transported_photo.heat_heii_erg_s;
+  }
   return env;
 }
 
@@ -674,6 +684,13 @@ void ThermochemistrySolver::advanceCell(const ThermochemistryCellInput& input, d
         t = temperature_of(n, u);
       } else if (m_config.backend == ThermochemistryBackend::kEquilibriumPrimordial) {
         t = equilibrium_temperature(u, n);
+      }
+      if (network && input.transported_photo.present) {
+        // Amendment A5: transported-field photoionization events per unit
+        // volume, consistent with the backward-Euler end-of-substep state.
+        ledger.transported_photoionizations[0] += h * input.transported_photo.gamma_hi_s * n[idx(S::kHI)];
+        ledger.transported_photoionizations[1] += h * input.transported_photo.gamma_hei_s * n[idx(S::kHeI)];
+        ledger.transported_photoionizations[2] += h * input.transported_photo.gamma_heii_s * n[idx(S::kHeII)];
       }
       if (m_config.backend != ThermochemistryBackend::kAnalyticReference) {
         const CoolingHeatingTerms terms = coolingHeating(input, n, t);

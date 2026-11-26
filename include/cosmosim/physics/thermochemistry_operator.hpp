@@ -118,6 +118,16 @@ struct ChemistryShadowReport {
   double max_relative_ion_potential_difference = 0.0;    // stored potential
 };
 
+// CHUI-RT-BH-AGN-REF-v1 amendment A5: non-owning provider of transported
+// photo-rates per gas row (implemented by the radiation matter coupler from
+// the canonical RT moments). Null when RT is disabled (no cost).
+class TransportedPhotoRateProvider {
+ public:
+  virtual ~TransportedPhotoRateProvider() = default;
+  [[nodiscard]] virtual TransportedPhotoRates ratesForRow(const core::SimulationState& state,
+                                                          std::uint32_t row) const = 0;
+};
+
 struct ThermochemistryOperatorConfig {
   ThermochemistryConfig solver{};
   ThermochemistryUnitBridge units{};
@@ -129,6 +139,7 @@ struct ThermochemistryOperatorConfig {
   double milky_way_dust_to_gas = 0.01;
   ChemistryAdaptiveConfig adaptive{};
   ChemistryShadowConfig shadow{};
+  const TransportedPhotoRateProvider* transported_photo_rates = nullptr;
 };
 
 // Staged per-row result (bounded: one record per processed row).
@@ -200,6 +211,11 @@ class ThermochemistryOperator {
   // shadow disagreement of the previous accepted step, identically on every
   // rank, and persists it (restart-reproducible). b = 0 is the Part 2 model.
   void setGlobalPromotionBias(double bias);
+  // Amendment A5: bind (or clear with nullptr) the transported photo-rate
+  // provider; the provider must outlive every advanceRow call.
+  void setTransportedPhotoRateProvider(const TransportedPhotoRateProvider* provider) noexcept {
+    m_config.transported_photo_rates = provider;
+  }
   [[nodiscard]] double globalPromotionBias() const noexcept { return m_promotion_bias; }
 
   [[nodiscard]] const ThermochemistrySolver& solver() const noexcept { return m_solver; }
