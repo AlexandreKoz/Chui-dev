@@ -488,6 +488,7 @@ add_library(cosmosim_core STATIC
   src/core/version.cpp
   src/core/module_registry.cpp
   src/core/config.cpp
+  src/core/config_rt_bh_agn.cpp
   src/core/provenance.cpp
   src/core/cuda_runtime.cpp
   src/core/cosmology.cpp
@@ -593,7 +594,8 @@ add_library(cosmosim_physics STATIC
   src/physics/ism_dust_sgs.cpp
   src/physics/stellar_population.cpp
   src/physics/supernova_feedback.cpp
-  src/physics/source_interval.cpp)
+  src/physics/source_interval.cpp
+  src/physics/source_transaction.cpp)
 add_library(cosmosim_io STATIC
   src/io/internal/io_contract.cpp
   src/io/transactional_file.cpp

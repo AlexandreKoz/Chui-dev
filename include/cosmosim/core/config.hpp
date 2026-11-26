@@ -8,6 +8,7 @@
 #include <string>
 #include <vector>
 
+#include "cosmosim/core/config_rt_bh_agn.hpp"
 #include "cosmosim/core/particle_species.hpp"
 
 namespace cosmosim::core {
@@ -1019,6 +1020,12 @@ struct PhysicsConfig {
   // Patch 58: explicit data-coverage / compatibility policies (see enums).
   SspYieldTableCoverageConfig ssp_yield_table_coverage = SspYieldTableCoverageConfig::kReject;
   SspWindTableCompatibilityConfig ssp_wind_table_compatibility = SspWindTableCompatibilityConfig::kStrict;
+  // CHUI-RT-BH-AGN-REF-v1 (config_rt_bh_agn.hpp): typed radiation, advanced
+  // BH engine and AGN feedback options (physics.rt_*, physics.bh_*,
+  // physics.agn_*). Defaults reproduce the predecessor behaviour.
+  RadiationTransportConfig rt;
+  BlackHoleEngineConfig bh_engine;
+  AgnFeedbackConfig agn;
 };
 
 enum class ScienceSnapshotLayout : std::uint8_t {

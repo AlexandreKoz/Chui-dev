@@ -1,4 +1,6 @@
 #include "cosmosim/core/config.hpp"
+#include "core/internal/config_rt_bh_agn_tables.hpp"
+#include "core/internal/config_rt_bh_agn_validation.hpp"
 
 #include <algorithm>
 #include <array>
@@ -1849,6 +1851,77 @@ struct ConfigKeySpec {
       {"physics.bh_thomson_cross_section_si", "6.6524587321e-29"},
       {"physics.bh_newton_g_si", "6.67430e-11"},
       {"physics.bh_speed_of_light_si", "2.99792458e8"},
+      {"physics.rt_enabled", "false"},
+      {"physics.rt_transport", "m1"},
+      {"physics.rt_integrator", "imex_pd_ars"},
+      {"physics.rt_spectral_profile", "ionizing3"},
+      {"physics.rt_spectrum_upper_edge_ev", "0.0"},
+      {"physics.rt_c_fraction", "1.0"},
+      {"physics.rt_cfl", "0.3"},
+      {"physics.rt_max_subcycles", "4096"},
+      {"physics.rt_riemann_solver", "hll"},
+      {"physics.rt_reconstruction", "plm_mc"},
+      {"physics.rt_newton_relative_tolerance", "1.0e-10"},
+      {"physics.rt_newton_max_iterations", "32"},
+      {"physics.rt_max_retries", "8"},
+      {"physics.rt_opacity_model", "photoionization"},
+      {"physics.rt_constant_absorption_cm2_g", "0.0"},
+      {"physics.rt_constant_scattering_cm2_g", "0.0"},
+      {"physics.rt_allow_reference_models", "false"},
+      {"physics.rt_boundary", "periodic"},
+      {"physics.rt_stellar_sources", "false"},
+      {"physics.rt_agn_sources", "false"},
+      {"physics.rt_source_shape", "sed_table"},
+      {"physics.rt_stellar_sed_table_path", ""},
+      {"physics.rt_stellar_sed_table_sha256", ""},
+      {"physics.rt_agn_sed_table_path", ""},
+      {"physics.rt_agn_sed_table_sha256", ""},
+      {"physics.rt_source_blackbody_temperature_k", "1.0e5"},
+      {"physics.rt_source_power_law_index", "1.5"},
+      {"physics.rt_uvb_policy", "reject_overlap"},
+      {"physics.bh_engine_model", "legacy_host_cell"},
+      {"physics.bh_supply_model", "bondi_torque"},
+      {"physics.bh_angular_suppression_c_visc", "0.0"},
+      {"physics.bh_phase_temperature_split_k", "1.0e5"},
+      {"physics.bh_torque_epsilon", "0.0"},
+      {"physics.bh_kernel_radius_min_kpc_phys", "0.0"},
+      {"physics.bh_kernel_radius_max_kpc_phys", "0.0"},
+      {"physics.bh_kernel_target_gas_mass_code", "0.0"},
+      {"physics.bh_kernel_min_cells", "8"},
+      {"physics.bh_torque_min_samples", "32"},
+      {"physics.bh_disk_model", "scalar_reservoir"},
+      {"physics.bh_disk_viscous_time_years", "0.0"},
+      {"physics.bh_disk_wind_loading", "0.0"},
+      {"physics.bh_disk_max_relative_bh_mass_change", "0.01"},
+      {"physics.bh_mass_ledger", "legacy_newtonian"},
+      {"physics.bh_eddington_cap", "reference_rate"},
+      {"physics.bh_eddington_reference_efficiency", "0.1"},
+      {"physics.bh_dynamics_model", "none"},
+      {"physics.bh_df_neighbor_count", "64"},
+      {"physics.bh_df_timestep_eta", "0.1"},
+      {"physics.bh_merger_model", "none"},
+      {"physics.bh_merger_radius_softening_factor", "2.0"},
+      {"physics.bh_seed_model", "none"},
+      {"physics.bh_seed_cadence_steps", "1"},
+      {"physics.bh_spin_model", "none"},
+      {"physics.bh_accretion_state_model", "none"},
+      {"physics.agn_feedback_model", "legacy_thermal_host"},
+      {"physics.agn_thermal_mode", "continuous"},
+      {"physics.agn_thermal_efficiency", "0.0"},
+      {"physics.agn_thermal_delta_t_k", "0.0"},
+      {"physics.agn_kick_efficiency", "0.0"},
+      {"physics.agn_wind_efficiency", "0.0"},
+      {"physics.agn_wind_velocity_km_s", "0.0"},
+      {"physics.agn_jet_efficiency", "0.0"},
+      {"physics.agn_jet_velocity_km_s", "0.0"},
+      {"physics.agn_jet_half_opening_deg", "15.0"},
+      {"physics.agn_max_velocity_c_fraction", "0.1"},
+      {"physics.agn_radiation_coupling", "none"},
+      {"physics.agn_local_empirical_fraction", "0.0"},
+      {"physics.agn_refinement_enabled", "false"},
+      {"physics.agn_refinement_injection_cells", "8.0"},
+      {"physics.agn_magnetic_injection", "false"},
+      {"physics.agn_nozzle", "false"},
       {"physics.enable_tracers", "false"},
       {"physics.tracer_track_mass", "true"},
       {"physics.tracer_min_host_mass_code", "0.0"},
@@ -3191,6 +3264,7 @@ void validateConfig(const SimulationConfig& config) {
     throw ConfigError("physics.tracer_min_host_mass_code must be >= 0");
   }
   validatePart2BaryonicPhysics(config);
+  internal::validateRtBhAgnConfig(config);
   validateMhdConfig(config.mhd);
   if (config.mhd.enabled) {
     // CHUI-MHD-REF-v1 cross-subsystem admission. These combinations have no
@@ -4031,6 +4105,87 @@ class NormalizedConfigStream {
   stream << "bh_thomson_cross_section_si = " << frozen.config.physics.bh_thomson_cross_section_si << '\n';
   stream << "bh_newton_g_si = " << frozen.config.physics.bh_newton_g_si << '\n';
   stream << "bh_speed_of_light_si = " << frozen.config.physics.bh_speed_of_light_si << '\n';
+  // RT/BH-engine/AGN blocks are emitted only when the corresponding model is
+  // enabled, so disabled runs keep byte-identical normalized text and config
+  // hash (restart admission of existing checkpoints unchanged); non-default
+  // values on a disabled model are rejected by validateRtBhAgnConfig.
+  if (frozen.config.physics.rt.enabled) {
+    stream << "rt_enabled = " << (frozen.config.physics.rt.enabled ? "true" : "false") << '\n';
+    stream << "rt_transport = " << rtTransportConfigToString(frozen.config.physics.rt.transport) << '\n';
+    stream << "rt_integrator = " << rtIntegratorConfigToString(frozen.config.physics.rt.integrator) << '\n';
+    stream << "rt_spectral_profile = " << rtSpectralProfileConfigToString(frozen.config.physics.rt.spectral_profile) << '\n';
+    stream << "rt_spectrum_upper_edge_ev = " << frozen.config.physics.rt.spectrum_upper_edge_ev << '\n';
+    stream << "rt_c_fraction = " << frozen.config.physics.rt.c_fraction << '\n';
+    stream << "rt_cfl = " << frozen.config.physics.rt.cfl << '\n';
+    stream << "rt_max_subcycles = " << frozen.config.physics.rt.max_subcycles << '\n';
+    stream << "rt_riemann_solver = " << rtRiemannSolverConfigToString(frozen.config.physics.rt.riemann_solver) << '\n';
+    stream << "rt_reconstruction = " << rtReconstructionConfigToString(frozen.config.physics.rt.reconstruction) << '\n';
+    stream << "rt_newton_relative_tolerance = " << frozen.config.physics.rt.newton_relative_tolerance << '\n';
+    stream << "rt_newton_max_iterations = " << frozen.config.physics.rt.newton_max_iterations << '\n';
+    stream << "rt_max_retries = " << frozen.config.physics.rt.max_retries << '\n';
+    stream << "rt_opacity_model = " << rtOpacityModelConfigToString(frozen.config.physics.rt.opacity_model) << '\n';
+    stream << "rt_constant_absorption_cm2_g = " << frozen.config.physics.rt.constant_absorption_cm2_g << '\n';
+    stream << "rt_constant_scattering_cm2_g = " << frozen.config.physics.rt.constant_scattering_cm2_g << '\n';
+    stream << "rt_allow_reference_models = " << (frozen.config.physics.rt.allow_reference_models ? "true" : "false") << '\n';
+    stream << "rt_boundary = " << rtBoundaryConfigToString(frozen.config.physics.rt.boundary) << '\n';
+    stream << "rt_stellar_sources = " << (frozen.config.physics.rt.stellar_sources ? "true" : "false") << '\n';
+    stream << "rt_agn_sources = " << (frozen.config.physics.rt.agn_sources ? "true" : "false") << '\n';
+    stream << "rt_source_shape = " << rtSourceShapeConfigToString(frozen.config.physics.rt.source_shape) << '\n';
+    stream << "rt_stellar_sed_table_path = " << frozen.config.physics.rt.stellar_sed_table_path << '\n';
+    stream << "rt_stellar_sed_table_sha256 = " << frozen.config.physics.rt.stellar_sed_table_sha256 << '\n';
+    stream << "rt_agn_sed_table_path = " << frozen.config.physics.rt.agn_sed_table_path << '\n';
+    stream << "rt_agn_sed_table_sha256 = " << frozen.config.physics.rt.agn_sed_table_sha256 << '\n';
+    stream << "rt_source_blackbody_temperature_k = " << frozen.config.physics.rt.source_blackbody_temperature_k << '\n';
+    stream << "rt_source_power_law_index = " << frozen.config.physics.rt.source_power_law_index << '\n';
+    stream << "rt_uvb_policy = " << rtUvbPolicyConfigToString(frozen.config.physics.rt.uvb_policy) << '\n';
+  }
+  if (frozen.config.physics.bh_engine.model != BhEngineModelConfig::kLegacyHostCell) {
+    stream << "bh_engine_model = " << bhEngineModelConfigToString(frozen.config.physics.bh_engine.model) << '\n';
+    stream << "bh_supply_model = " << bhSupplyModelConfigToString(frozen.config.physics.bh_engine.supply_model) << '\n';
+    stream << "bh_angular_suppression_c_visc = " << frozen.config.physics.bh_engine.angular_suppression_c_visc << '\n';
+    stream << "bh_phase_temperature_split_k = " << frozen.config.physics.bh_engine.phase_temperature_split_k << '\n';
+    stream << "bh_torque_epsilon = " << frozen.config.physics.bh_engine.torque_epsilon << '\n';
+    stream << "bh_kernel_radius_min_kpc_phys = " << frozen.config.physics.bh_engine.kernel_radius_min_kpc_phys << '\n';
+    stream << "bh_kernel_radius_max_kpc_phys = " << frozen.config.physics.bh_engine.kernel_radius_max_kpc_phys << '\n';
+    stream << "bh_kernel_target_gas_mass_code = " << frozen.config.physics.bh_engine.kernel_target_gas_mass_code << '\n';
+    stream << "bh_kernel_min_cells = " << frozen.config.physics.bh_engine.kernel_min_cells << '\n';
+    stream << "bh_torque_min_samples = " << frozen.config.physics.bh_engine.torque_min_samples << '\n';
+    stream << "bh_disk_model = " << bhDiskModelConfigToString(frozen.config.physics.bh_engine.disk_model) << '\n';
+    stream << "bh_disk_viscous_time_years = " << frozen.config.physics.bh_engine.disk_viscous_time_years << '\n';
+    stream << "bh_disk_wind_loading = " << frozen.config.physics.bh_engine.disk_wind_loading << '\n';
+    stream << "bh_disk_max_relative_bh_mass_change = " << frozen.config.physics.bh_engine.disk_max_relative_bh_mass_change << '\n';
+    stream << "bh_mass_ledger = " << bhMassLedgerConfigToString(frozen.config.physics.bh_engine.mass_ledger) << '\n';
+    stream << "bh_eddington_cap = " << bhEddingtonCapConfigToString(frozen.config.physics.bh_engine.eddington_cap) << '\n';
+    stream << "bh_eddington_reference_efficiency = " << frozen.config.physics.bh_engine.eddington_reference_efficiency << '\n';
+    stream << "bh_dynamics_model = " << bhDynamicsModelConfigToString(frozen.config.physics.bh_engine.dynamics_model) << '\n';
+    stream << "bh_df_neighbor_count = " << frozen.config.physics.bh_engine.df_neighbor_count << '\n';
+    stream << "bh_df_timestep_eta = " << frozen.config.physics.bh_engine.df_timestep_eta << '\n';
+    stream << "bh_merger_model = " << bhMergerModelConfigToString(frozen.config.physics.bh_engine.merger_model) << '\n';
+    stream << "bh_merger_radius_softening_factor = " << frozen.config.physics.bh_engine.merger_radius_softening_factor << '\n';
+    stream << "bh_seed_model = " << bhSeedModelConfigToString(frozen.config.physics.bh_engine.seed_model) << '\n';
+    stream << "bh_seed_cadence_steps = " << frozen.config.physics.bh_engine.seed_cadence_steps << '\n';
+    stream << "bh_spin_model = " << bhSpinModelConfigToString(frozen.config.physics.bh_engine.spin_model) << '\n';
+    stream << "bh_accretion_state_model = " << bhAccretionStateModelConfigToString(frozen.config.physics.bh_engine.accretion_state_model) << '\n';
+  }
+  if (frozen.config.physics.agn.model != AgnFeedbackModelConfig::kLegacyThermalHost) {
+    stream << "agn_feedback_model = " << agnFeedbackModelConfigToString(frozen.config.physics.agn.model) << '\n';
+    stream << "agn_thermal_mode = " << agnThermalModeConfigToString(frozen.config.physics.agn.thermal_mode) << '\n';
+    stream << "agn_thermal_efficiency = " << frozen.config.physics.agn.thermal_efficiency << '\n';
+    stream << "agn_thermal_delta_t_k = " << frozen.config.physics.agn.thermal_delta_t_k << '\n';
+    stream << "agn_kick_efficiency = " << frozen.config.physics.agn.kick_efficiency << '\n';
+    stream << "agn_wind_efficiency = " << frozen.config.physics.agn.wind_efficiency << '\n';
+    stream << "agn_wind_velocity_km_s = " << frozen.config.physics.agn.wind_velocity_km_s << '\n';
+    stream << "agn_jet_efficiency = " << frozen.config.physics.agn.jet_efficiency << '\n';
+    stream << "agn_jet_velocity_km_s = " << frozen.config.physics.agn.jet_velocity_km_s << '\n';
+    stream << "agn_jet_half_opening_deg = " << frozen.config.physics.agn.jet_half_opening_deg << '\n';
+    stream << "agn_max_velocity_c_fraction = " << frozen.config.physics.agn.max_velocity_c_fraction << '\n';
+    stream << "agn_radiation_coupling = " << agnRadiationCouplingConfigToString(frozen.config.physics.agn.radiation_coupling) << '\n';
+    stream << "agn_local_empirical_fraction = " << frozen.config.physics.agn.local_empirical_fraction << '\n';
+    stream << "agn_refinement_enabled = " << (frozen.config.physics.agn.refinement_enabled ? "true" : "false") << '\n';
+    stream << "agn_refinement_injection_cells = " << frozen.config.physics.agn.refinement_injection_cells << '\n';
+    stream << "agn_magnetic_injection = " << (frozen.config.physics.agn.magnetic_injection ? "true" : "false") << '\n';
+    stream << "agn_nozzle = " << (frozen.config.physics.agn.nozzle ? "true" : "false") << '\n';
+  }
   stream << "enable_tracers = " << (frozen.config.physics.enable_tracers ? "true" : "false") << '\n';
   stream << "tracer_track_mass = " << (frozen.config.physics.tracer_track_mass ? "true" : "false") << '\n';
   stream << "tracer_min_host_mass_code = " << frozen.config.physics.tracer_min_host_mass_code << '\n';
@@ -5534,6 +5689,84 @@ class NormalizedConfigStream {
   frozen.config.physics.bh_speed_of_light_si = parseFloating(
       requireString(entries, consumed, "physics.bh_speed_of_light_si", "2.99792458e8"),
       "physics.bh_speed_of_light_si");
+  // CHUI-RT-BH-AGN-REF-v1 typed options (config_rt_bh_agn.hpp).
+  frozen.config.physics.rt.enabled = parseBool(requireString(entries, consumed, "physics.rt_enabled", defaultFor("physics.rt_enabled")), "physics.rt_enabled");
+  frozen.config.physics.rt.transport = internal::parseRtBhAgnChoice(requireString(entries, consumed, "physics.rt_transport", defaultFor("physics.rt_transport")), "physics.rt_transport", internal::k_rt_transport_config_names);
+  frozen.config.physics.rt.integrator = internal::parseRtBhAgnChoice(requireString(entries, consumed, "physics.rt_integrator", defaultFor("physics.rt_integrator")), "physics.rt_integrator", internal::k_rt_integrator_config_names);
+  frozen.config.physics.rt.spectral_profile = internal::parseRtBhAgnChoice(requireString(entries, consumed, "physics.rt_spectral_profile", defaultFor("physics.rt_spectral_profile")), "physics.rt_spectral_profile", internal::k_rt_spectral_profile_config_names);
+  frozen.config.physics.rt.spectrum_upper_edge_ev = parseFloating(requireString(entries, consumed, "physics.rt_spectrum_upper_edge_ev", defaultFor("physics.rt_spectrum_upper_edge_ev")), "physics.rt_spectrum_upper_edge_ev");
+  frozen.config.physics.rt.c_fraction = parseFloating(requireString(entries, consumed, "physics.rt_c_fraction", defaultFor("physics.rt_c_fraction")), "physics.rt_c_fraction");
+  frozen.config.physics.rt.cfl = parseFloating(requireString(entries, consumed, "physics.rt_cfl", defaultFor("physics.rt_cfl")), "physics.rt_cfl");
+  frozen.config.physics.rt.max_subcycles = parseNumber<std::uint32_t>(requireString(entries, consumed, "physics.rt_max_subcycles", defaultFor("physics.rt_max_subcycles")), "physics.rt_max_subcycles");
+  frozen.config.physics.rt.riemann_solver = internal::parseRtBhAgnChoice(requireString(entries, consumed, "physics.rt_riemann_solver", defaultFor("physics.rt_riemann_solver")), "physics.rt_riemann_solver", internal::k_rt_riemann_solver_config_names);
+  frozen.config.physics.rt.reconstruction = internal::parseRtBhAgnChoice(requireString(entries, consumed, "physics.rt_reconstruction", defaultFor("physics.rt_reconstruction")), "physics.rt_reconstruction", internal::k_rt_reconstruction_config_names);
+  frozen.config.physics.rt.newton_relative_tolerance = parseFloating(requireString(entries, consumed, "physics.rt_newton_relative_tolerance", defaultFor("physics.rt_newton_relative_tolerance")), "physics.rt_newton_relative_tolerance");
+  frozen.config.physics.rt.newton_max_iterations = parseNumber<std::uint32_t>(requireString(entries, consumed, "physics.rt_newton_max_iterations", defaultFor("physics.rt_newton_max_iterations")), "physics.rt_newton_max_iterations");
+  frozen.config.physics.rt.max_retries = parseNumber<std::uint32_t>(requireString(entries, consumed, "physics.rt_max_retries", defaultFor("physics.rt_max_retries")), "physics.rt_max_retries");
+  frozen.config.physics.rt.opacity_model = internal::parseRtBhAgnChoice(requireString(entries, consumed, "physics.rt_opacity_model", defaultFor("physics.rt_opacity_model")), "physics.rt_opacity_model", internal::k_rt_opacity_model_config_names);
+  frozen.config.physics.rt.constant_absorption_cm2_g = parseFloating(requireString(entries, consumed, "physics.rt_constant_absorption_cm2_g", defaultFor("physics.rt_constant_absorption_cm2_g")), "physics.rt_constant_absorption_cm2_g");
+  frozen.config.physics.rt.constant_scattering_cm2_g = parseFloating(requireString(entries, consumed, "physics.rt_constant_scattering_cm2_g", defaultFor("physics.rt_constant_scattering_cm2_g")), "physics.rt_constant_scattering_cm2_g");
+  frozen.config.physics.rt.allow_reference_models = parseBool(requireString(entries, consumed, "physics.rt_allow_reference_models", defaultFor("physics.rt_allow_reference_models")), "physics.rt_allow_reference_models");
+  frozen.config.physics.rt.boundary = internal::parseRtBhAgnChoice(requireString(entries, consumed, "physics.rt_boundary", defaultFor("physics.rt_boundary")), "physics.rt_boundary", internal::k_rt_boundary_config_names);
+  frozen.config.physics.rt.stellar_sources = parseBool(requireString(entries, consumed, "physics.rt_stellar_sources", defaultFor("physics.rt_stellar_sources")), "physics.rt_stellar_sources");
+  frozen.config.physics.rt.agn_sources = parseBool(requireString(entries, consumed, "physics.rt_agn_sources", defaultFor("physics.rt_agn_sources")), "physics.rt_agn_sources");
+  frozen.config.physics.rt.source_shape = internal::parseRtBhAgnChoice(requireString(entries, consumed, "physics.rt_source_shape", defaultFor("physics.rt_source_shape")), "physics.rt_source_shape", internal::k_rt_source_shape_config_names);
+  frozen.config.physics.rt.stellar_sed_table_path = requireString(entries, consumed, "physics.rt_stellar_sed_table_path", defaultFor("physics.rt_stellar_sed_table_path"));
+  frozen.config.physics.rt.stellar_sed_table_sha256 = requireString(entries, consumed, "physics.rt_stellar_sed_table_sha256", defaultFor("physics.rt_stellar_sed_table_sha256"));
+  frozen.config.physics.rt.agn_sed_table_path = requireString(entries, consumed, "physics.rt_agn_sed_table_path", defaultFor("physics.rt_agn_sed_table_path"));
+  frozen.config.physics.rt.agn_sed_table_sha256 = requireString(entries, consumed, "physics.rt_agn_sed_table_sha256", defaultFor("physics.rt_agn_sed_table_sha256"));
+  frozen.config.physics.rt.source_blackbody_temperature_k = parseFloating(requireString(entries, consumed, "physics.rt_source_blackbody_temperature_k", defaultFor("physics.rt_source_blackbody_temperature_k")), "physics.rt_source_blackbody_temperature_k");
+  frozen.config.physics.rt.source_power_law_index = parseFloating(requireString(entries, consumed, "physics.rt_source_power_law_index", defaultFor("physics.rt_source_power_law_index")), "physics.rt_source_power_law_index");
+  frozen.config.physics.rt.uvb_policy = internal::parseRtBhAgnChoice(requireString(entries, consumed, "physics.rt_uvb_policy", defaultFor("physics.rt_uvb_policy")), "physics.rt_uvb_policy", internal::k_rt_uvb_policy_config_names);
+  frozen.config.physics.bh_engine.model = internal::parseRtBhAgnChoice(requireString(entries, consumed, "physics.bh_engine_model", defaultFor("physics.bh_engine_model")), "physics.bh_engine_model", internal::k_bh_engine_model_config_names);
+  frozen.config.physics.bh_engine.supply_model = internal::parseRtBhAgnChoice(requireString(entries, consumed, "physics.bh_supply_model", defaultFor("physics.bh_supply_model")), "physics.bh_supply_model", internal::k_bh_supply_model_config_names);
+  frozen.config.physics.bh_engine.angular_suppression_c_visc = parseFloating(requireString(entries, consumed, "physics.bh_angular_suppression_c_visc", defaultFor("physics.bh_angular_suppression_c_visc")), "physics.bh_angular_suppression_c_visc");
+  frozen.config.physics.bh_engine.phase_temperature_split_k = parseFloating(requireString(entries, consumed, "physics.bh_phase_temperature_split_k", defaultFor("physics.bh_phase_temperature_split_k")), "physics.bh_phase_temperature_split_k");
+  frozen.config.physics.bh_engine.torque_epsilon = parseFloating(requireString(entries, consumed, "physics.bh_torque_epsilon", defaultFor("physics.bh_torque_epsilon")), "physics.bh_torque_epsilon");
+  frozen.config.physics.bh_engine.kernel_radius_min_kpc_phys = parseFloating(requireString(entries, consumed, "physics.bh_kernel_radius_min_kpc_phys", defaultFor("physics.bh_kernel_radius_min_kpc_phys")), "physics.bh_kernel_radius_min_kpc_phys");
+  frozen.config.physics.bh_engine.kernel_radius_max_kpc_phys = parseFloating(requireString(entries, consumed, "physics.bh_kernel_radius_max_kpc_phys", defaultFor("physics.bh_kernel_radius_max_kpc_phys")), "physics.bh_kernel_radius_max_kpc_phys");
+  frozen.config.physics.bh_engine.kernel_target_gas_mass_code = parseFloating(requireString(entries, consumed, "physics.bh_kernel_target_gas_mass_code", defaultFor("physics.bh_kernel_target_gas_mass_code")), "physics.bh_kernel_target_gas_mass_code");
+  frozen.config.physics.bh_engine.kernel_min_cells = parseNumber<std::uint32_t>(requireString(entries, consumed, "physics.bh_kernel_min_cells", defaultFor("physics.bh_kernel_min_cells")), "physics.bh_kernel_min_cells");
+  frozen.config.physics.bh_engine.torque_min_samples = parseNumber<std::uint32_t>(requireString(entries, consumed, "physics.bh_torque_min_samples", defaultFor("physics.bh_torque_min_samples")), "physics.bh_torque_min_samples");
+  frozen.config.physics.bh_engine.disk_model = internal::parseRtBhAgnChoice(requireString(entries, consumed, "physics.bh_disk_model", defaultFor("physics.bh_disk_model")), "physics.bh_disk_model", internal::k_bh_disk_model_config_names);
+  frozen.config.physics.bh_engine.disk_viscous_time_years = parseFloating(requireString(entries, consumed, "physics.bh_disk_viscous_time_years", defaultFor("physics.bh_disk_viscous_time_years")), "physics.bh_disk_viscous_time_years");
+  frozen.config.physics.bh_engine.disk_wind_loading = parseFloating(requireString(entries, consumed, "physics.bh_disk_wind_loading", defaultFor("physics.bh_disk_wind_loading")), "physics.bh_disk_wind_loading");
+  frozen.config.physics.bh_engine.disk_max_relative_bh_mass_change = parseFloating(requireString(entries, consumed, "physics.bh_disk_max_relative_bh_mass_change", defaultFor("physics.bh_disk_max_relative_bh_mass_change")), "physics.bh_disk_max_relative_bh_mass_change");
+  frozen.config.physics.bh_engine.mass_ledger = internal::parseRtBhAgnChoice(requireString(entries, consumed, "physics.bh_mass_ledger", defaultFor("physics.bh_mass_ledger")), "physics.bh_mass_ledger", internal::k_bh_mass_ledger_config_names);
+  frozen.config.physics.bh_engine.eddington_cap = internal::parseRtBhAgnChoice(requireString(entries, consumed, "physics.bh_eddington_cap", defaultFor("physics.bh_eddington_cap")), "physics.bh_eddington_cap", internal::k_bh_eddington_cap_config_names);
+  frozen.config.physics.bh_engine.eddington_reference_efficiency = parseFloating(requireString(entries, consumed, "physics.bh_eddington_reference_efficiency", defaultFor("physics.bh_eddington_reference_efficiency")), "physics.bh_eddington_reference_efficiency");
+  frozen.config.physics.bh_engine.dynamics_model = internal::parseRtBhAgnChoice(requireString(entries, consumed, "physics.bh_dynamics_model", defaultFor("physics.bh_dynamics_model")), "physics.bh_dynamics_model", internal::k_bh_dynamics_model_config_names);
+  frozen.config.physics.bh_engine.df_neighbor_count = parseNumber<std::uint32_t>(requireString(entries, consumed, "physics.bh_df_neighbor_count", defaultFor("physics.bh_df_neighbor_count")), "physics.bh_df_neighbor_count");
+  frozen.config.physics.bh_engine.df_timestep_eta = parseFloating(requireString(entries, consumed, "physics.bh_df_timestep_eta", defaultFor("physics.bh_df_timestep_eta")), "physics.bh_df_timestep_eta");
+  frozen.config.physics.bh_engine.merger_model = internal::parseRtBhAgnChoice(requireString(entries, consumed, "physics.bh_merger_model", defaultFor("physics.bh_merger_model")), "physics.bh_merger_model", internal::k_bh_merger_model_config_names);
+  frozen.config.physics.bh_engine.merger_radius_softening_factor = parseFloating(requireString(entries, consumed, "physics.bh_merger_radius_softening_factor", defaultFor("physics.bh_merger_radius_softening_factor")), "physics.bh_merger_radius_softening_factor");
+  frozen.config.physics.bh_engine.seed_model = internal::parseRtBhAgnChoice(requireString(entries, consumed, "physics.bh_seed_model", defaultFor("physics.bh_seed_model")), "physics.bh_seed_model", internal::k_bh_seed_model_config_names);
+  frozen.config.physics.bh_engine.seed_cadence_steps = parseNumber<std::uint32_t>(requireString(entries, consumed, "physics.bh_seed_cadence_steps", defaultFor("physics.bh_seed_cadence_steps")), "physics.bh_seed_cadence_steps");
+  frozen.config.physics.bh_engine.spin_model = internal::parseRtBhAgnChoice(requireString(entries, consumed, "physics.bh_spin_model", defaultFor("physics.bh_spin_model")), "physics.bh_spin_model", internal::k_bh_spin_model_config_names);
+  frozen.config.physics.bh_engine.accretion_state_model = internal::parseRtBhAgnChoice(requireString(entries, consumed, "physics.bh_accretion_state_model", defaultFor("physics.bh_accretion_state_model")), "physics.bh_accretion_state_model", internal::k_bh_accretion_state_model_config_names);
+  frozen.config.physics.agn.model = internal::parseRtBhAgnChoice(requireString(entries, consumed, "physics.agn_feedback_model", defaultFor("physics.agn_feedback_model")), "physics.agn_feedback_model", internal::k_agn_feedback_model_config_names);
+  frozen.config.physics.agn.thermal_mode = internal::parseRtBhAgnChoice(requireString(entries, consumed, "physics.agn_thermal_mode", defaultFor("physics.agn_thermal_mode")), "physics.agn_thermal_mode", internal::k_agn_thermal_mode_config_names);
+  frozen.config.physics.agn.thermal_efficiency = parseFloating(requireString(entries, consumed, "physics.agn_thermal_efficiency", defaultFor("physics.agn_thermal_efficiency")), "physics.agn_thermal_efficiency");
+  frozen.config.physics.agn.thermal_delta_t_k = parseFloating(requireString(entries, consumed, "physics.agn_thermal_delta_t_k", defaultFor("physics.agn_thermal_delta_t_k")), "physics.agn_thermal_delta_t_k");
+  frozen.config.physics.agn.kick_efficiency = parseFloating(requireString(entries, consumed, "physics.agn_kick_efficiency", defaultFor("physics.agn_kick_efficiency")), "physics.agn_kick_efficiency");
+  frozen.config.physics.agn.wind_efficiency = parseFloating(requireString(entries, consumed, "physics.agn_wind_efficiency", defaultFor("physics.agn_wind_efficiency")), "physics.agn_wind_efficiency");
+  frozen.config.physics.agn.wind_velocity_km_s = parseFloating(requireString(entries, consumed, "physics.agn_wind_velocity_km_s", defaultFor("physics.agn_wind_velocity_km_s")), "physics.agn_wind_velocity_km_s");
+  frozen.config.physics.agn.jet_efficiency = parseFloating(requireString(entries, consumed, "physics.agn_jet_efficiency", defaultFor("physics.agn_jet_efficiency")), "physics.agn_jet_efficiency");
+  frozen.config.physics.agn.jet_velocity_km_s = parseFloating(requireString(entries, consumed, "physics.agn_jet_velocity_km_s", defaultFor("physics.agn_jet_velocity_km_s")), "physics.agn_jet_velocity_km_s");
+  frozen.config.physics.agn.jet_half_opening_deg = parseFloating(requireString(entries, consumed, "physics.agn_jet_half_opening_deg", defaultFor("physics.agn_jet_half_opening_deg")), "physics.agn_jet_half_opening_deg");
+  frozen.config.physics.agn.max_velocity_c_fraction = parseFloating(requireString(entries, consumed, "physics.agn_max_velocity_c_fraction", defaultFor("physics.agn_max_velocity_c_fraction")), "physics.agn_max_velocity_c_fraction");
+  frozen.config.physics.agn.radiation_coupling = internal::parseRtBhAgnChoice(requireString(entries, consumed, "physics.agn_radiation_coupling", defaultFor("physics.agn_radiation_coupling")), "physics.agn_radiation_coupling", internal::k_agn_radiation_coupling_config_names);
+  frozen.config.physics.agn.local_empirical_fraction = parseFloating(requireString(entries, consumed, "physics.agn_local_empirical_fraction", defaultFor("physics.agn_local_empirical_fraction")), "physics.agn_local_empirical_fraction");
+  frozen.config.physics.agn.refinement_enabled = parseBool(requireString(entries, consumed, "physics.agn_refinement_enabled", defaultFor("physics.agn_refinement_enabled")), "physics.agn_refinement_enabled");
+  frozen.config.physics.agn.refinement_injection_cells = parseFloating(requireString(entries, consumed, "physics.agn_refinement_injection_cells", defaultFor("physics.agn_refinement_injection_cells")), "physics.agn_refinement_injection_cells");
+  frozen.config.physics.agn.magnetic_injection = parseBool(requireString(entries, consumed, "physics.agn_magnetic_injection", defaultFor("physics.agn_magnetic_injection")), "physics.agn_magnetic_injection");
+  frozen.config.physics.agn.nozzle = parseBool(requireString(entries, consumed, "physics.agn_nozzle", defaultFor("physics.agn_nozzle")), "physics.agn_nozzle");
+  if (frozen.config.physics.bh_engine.model != BhEngineModelConfig::kLegacyHostCell &&
+      (entries.contains("physics.bh_epsilon_f") || entries.contains("physics.bh_feedback_coupling_efficiency"))) {
+    throw ConfigError(
+        "physics.bh_epsilon_f and physics.bh_feedback_coupling_efficiency are legacy_host_cell-only keys; with "
+        "physics.bh_engine_model=reference_v1 the AGN channel efficiencies physics.agn_* own the feedback budget");
+  }
   frozen.config.physics.enable_tracers = parseBool(
       requireString(entries, consumed, "physics.enable_tracers", "false"),
       "physics.enable_tracers");
