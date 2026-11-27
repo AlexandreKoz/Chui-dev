@@ -1231,3 +1231,9 @@ not wired (FAIL_CLOSED); multi-rank RT halo exchange missing (FAIL_CLOSED);
 RT regrid/migration missing (FAIL_CLOSED); distributed seeding provider
 missing (FAIL_CLOSED); BH merger/DF rank-local only; particle removal on merger
 vs. workflow ownership ledger not audited.
+
+## CHUI-EXT-PHYS-REF-v1 pass 01 open items (2026-11-27)
+
+The individual, severity-ranked gap list of the extended-physics campaign is maintained in
+`docs/architecture/chui_extended_physics_implementation_pass01_status.md` §6 (nothing was
+compiled or run; every new test is NOT_RUN).

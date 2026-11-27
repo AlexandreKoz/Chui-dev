@@ -1,0 +1,9 @@
+# Synthetic 8-station layout (NOT a real telescope): name E N U in metres.
+S0 0 0 0
+S1 35 10 0
+S2 -20 60 0
+S3 80 -45 0
+S4 -110 -30 0
+S5 150 95 0
+S6 -60 -140 0
+S7 210 -10 0

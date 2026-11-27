@@ -1,0 +1,47 @@
+# CHUI-EXT-PHYS-REF-v1 validation deck (pass 01; NOT RUN): DMO box with the N03
+# Newtonian linear-response neutrino source on the periodic PM operator.
+# REQUIRES external Newtonian-gauge CLASS transfer files at z = 10 and z = 8
+# (format class_tk, with t_cdm/t_b/t_ncdm[0] columns) placed next to this
+# deck (they must bracket z_begin = 9: the initial state is interpolated,
+# never extrapolated; <p>/(m c) = 0.053 at a = 0.1 for 0.1 eV); replace both SHA-256 values by the digests of YOUR files (the loader
+# verifies them; nothing is bundled). response_k range must cover the PM mesh
+# wavenumbers in h/Mpc (fundamental 2 pi/L to sqrt(3) pi N/L).
+# Gate VN: neutrino-induced P(k) suppression vs CLASS (1% on converged scales,
+# denominator = no-neutrino run with identical Omega_m), rank/restart equivalence.
+schema_version = 1
+
+[mode]
+mode = cosmo_cube
+
+[cosmology]
+omega_matter = 0.315
+omega_lambda = 0.68494556227208325
+omega_baryon = 0.049
+hubble_param = 0.674
+radiation_background = photons_neutrinos
+t_cmb0_k = 2.7255
+n_ur = 0.0
+ncdm_masses_ev = 0.1, 0.1, 0.1
+ncdm_temperature_ratio = 0.71611
+box_size = 500.0
+
+[numerics]
+a_begin = 0.1
+a_end = 1.0
+treepm_pm_grid = 128
+
+[neutrinos]
+method = linear_response
+table_format = class_tk
+table_gauge = newtonian
+table_paths = class_newtonian_z10_tk.dat, class_newtonian_z8_tk.dat
+table_sha256 = 0000000000000000000000000000000000000000000000000000000000000000, 0000000000000000000000000000000000000000000000000000000000000000
+table_redshifts = 10, 8
+response_k_bins = 64
+response_history_capacity = 4096
+response_max_mean_velocity_c = 0.1
+response_k_min_h_mpc = 0.005
+response_k_max_h_mpc = 3.0
+
+[output]
+run_name = ext_phys_neutrino_linear_response_dmo

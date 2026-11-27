@@ -987,3 +987,22 @@ ctest --preset test-cpu-debug -L rt_bh_agn --output-on-failure
 
 Gate-by-gate status (written / not written) is in
 `docs/architecture/chui_rt_bh_agn_implementation_pass01_status.md` §6.
+
+## CHUI-EXT-PHYS-REF-v1 verification sources (pass 01; ALL NOT_RUN, NOT_QUALIFIED)
+
+| Gate | Registered test (label `ext_phys`) | Test IDs |
+|---|---|---|
+| V00 / VI | `unit_extended_physics_config`, `unit_cosmological_background` (config parts) | EXT-I02-T01/T02, EXT-S01-T02/T04 |
+| VN | `unit_cosmological_background`, `unit_neutrino_methods`, `unit_spectral_data` | EXT-N01-T01/T02, EXT-S01-T01/T03, EXT-N02-T01, EXT-N03-T01..T06, EXT-N04-T01, EXT-N05-T01 |
+| VR | `unit_rhd_reference_backends` | EXT-R03-T01..T03, EXT-R04-T01, EXT-R05-T01, EXT-F02-T01 |
+| VCR | `unit_cosmic_ray_transport` | EXT-CR01-T01, CR02-T01..T04, CR03-T01, CR04-T01/T02, CR05-T01, CR06-T01 |
+| VL / VC / VRA | `unit_observables_kernels`, `unit_spectral_data`, `unit_lightcone_geometry` | EXT-L01-T01..T03, L02-T01, C01-T01, C02-T01, C03-T01, RA01-T01/T02, RA03/RA04-T01, RA03-T02, RA05-T01, S03-T01..T05 |
+| VO | `unit_instrument_rime` | EXT-O05-T01..T06, EXT-O01-T01 |
+
+Expected values, norms and tolerances are documented per test in
+`docs/architecture/chui_extended_physics_numerical_contracts_pass01.md`. Planned commands
+(execution campaign): `cmake --preset cpu-only-debug`, `cmake --build --preset build-cpu-debug`,
+`ctest --preset test-cpu-debug -L ext_phys --output-on-failure`, then the full suite for
+disabled-path regression. Integrated cross-code comparisons (CLASS P(k) suppression,
+Strömgren with stellar sources, Nyx forest statistics, RASCAS/COLT slabs, POLARIS, OSKAR,
+pyuvsim) are named but not authored as runnable tests (no reference data acquired).

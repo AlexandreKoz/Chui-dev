@@ -198,6 +198,7 @@ The implementation is SoA-oriented and separates canonical scientific state from
 | Power-spectrum scientific validation/convergence | **Pending** |
 | 512³ production qualification | **Not certified** |
 | Full-physics production certification | **Not certified** |
+| Extended physics (neutrinos, observables, instruments, CR kernels; pass 01) | **Source only, not built or run** — see [ledger](docs/architecture/chui_extended_physics_implementation_pass01_status.md) |
 
 The authoritative current status, including environment-specific validation evidence and blockers, is [`CURRENT_STATUS.md`](CURRENT_STATUS.md).
 

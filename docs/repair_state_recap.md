@@ -2671,3 +2671,11 @@ of stale tests that no longer compiled or ran.
 Compiled and tested in this session (`cpu-only-debug` full CTest,
 `pm-hdf5-fftw-debug` gravity/hierarchical gates, Release benchmark accuracy
 matrix). Exact results: [campaign record](repair/treepm_performance_campaign_20261015.md).
+
+## CHUI-EXT-PHYS-REF-v1 pass 01 (2026-11-27)
+
+Source-only extended-physics campaign on `feature/extended_physics_bulk_pass01` (not merged):
+background authority with massive neutrinos, transfer-ratio/linear-response PM neutrino source,
+spectral/lightcone services, RT reference backends and stellar sources, CR kernels (runtime
+refused), observables and instruments pipeline. Status ledger:
+`docs/architecture/chui_extended_physics_implementation_pass01_status.md`.

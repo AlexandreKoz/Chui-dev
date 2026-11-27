@@ -1,0 +1,34 @@
+# CHUI-EXT-PHYS-REF-v1 validation deck (pass 01; NOT RUN): DMO cosmological box
+# with the S01/N01 relativistic background (photons, 2.0328 massless species and
+# one 0.06 eV Fermi-Dirac eigenstate). Perturbations are explicitly neglected
+# (neutrinos.method = background_only). omega_matter INCLUDES the present
+# massive-neutrino density (CLASS convention); omega_lambda closes exactly:
+# 1 - 0.315 - Omega_gamma - Omega_ur for T_cmb0 = 2.7255 K, h = 0.674
+# (strict closure; the loader reports the required value if it differs).
+# Gate VN: compare H(a) and Omega_ncdm(a) against a CLASS run with identical
+# inputs (external reference; not bundled).
+schema_version = 1
+
+[mode]
+mode = cosmo_cube
+
+[cosmology]
+omega_matter = 0.315
+omega_lambda = 0.684920430346181
+omega_baryon = 0.049
+hubble_param = 0.674
+radiation_background = photons_neutrinos
+t_cmb0_k = 2.7255
+n_ur = 2.0328
+ncdm_masses_ev = 0.06
+ncdm_temperature_ratio = 0.71611
+
+[numerics]
+a_begin = 0.02
+a_end = 1.0
+
+[neutrinos]
+method = background_only
+
+[output]
+run_name = ext_phys_neutrino_background_dmo
