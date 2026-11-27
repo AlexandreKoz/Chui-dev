@@ -709,10 +709,8 @@ ReferenceWorkflowReport ReferenceWorkflowRunner::runImpl(
         restoring_from_restart,
         report.ic_manifest_path);
 
-    core::CosmologyBackgroundConfig background_config;
-    background_config.hubble_param = config.cosmology.hubble_param;
-    background_config.omega_matter = config.cosmology.omega_matter;
-    background_config.omega_lambda = config.cosmology.omega_lambda;
+    // S01: single construction path (relativistic species included when enabled).
+    const core::CosmologyBackgroundConfig background_config = core::cosmologyBackgroundConfigFromSimulation(config);
     const std::optional<core::LambdaCdmBackground> background = mode_policy.cosmological_comoving_frame
         ? std::optional<core::LambdaCdmBackground>(core::LambdaCdmBackground(background_config))
         : std::nullopt;

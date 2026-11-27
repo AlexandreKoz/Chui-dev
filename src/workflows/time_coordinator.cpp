@@ -537,11 +537,8 @@ enum class SchedulerElementFamily {
       config.units.coordinate_frame == core::CoordinateFrame::kComoving &&
       integrator_state.current_scale_factor > 0.0 &&
       config.cosmology.hubble_param > 0.0) {
-    core::CosmologyBackgroundConfig background_config;
-    background_config.hubble_param = config.cosmology.hubble_param;
-    background_config.omega_matter = config.cosmology.omega_matter;
-    background_config.omega_lambda = config.cosmology.omega_lambda;
-    const core::LambdaCdmBackground background(background_config);
+    // S01: single construction path (relativistic species included when enabled).
+    const core::LambdaCdmBackground background(core::cosmologyBackgroundConfigFromSimulation(config));
     cosmology_dt = core::computeCosmologyExpansionTimeStep(
         background,
         integrator_state.current_scale_factor,

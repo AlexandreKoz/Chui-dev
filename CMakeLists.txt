@@ -489,6 +489,8 @@ add_library(cosmosim_core STATIC
   src/core/module_registry.cpp
   src/core/config.cpp
   src/core/config_rt_bh_agn.cpp
+  src/core/config_extended_physics.cpp
+  src/core/config_extended_physics_sections.cpp
   src/core/provenance.cpp
   src/core/cuda_runtime.cpp
   src/core/cosmology.cpp
@@ -1357,6 +1359,15 @@ if(COSMOSIM_ENABLE_TESTS)
   add_test(NAME unit_black_hole_agn COMMAND test_unit_black_hole_agn)
 
   # CHUI-RT-BH-AGN-REF-v1 pass-01 verification sources (written, NOT RUN).
+  # CHUI-EXT-PHYS-REF-v1 unit/reference test sources (NOT RUN in source-only pass 01).
+  foreach(cosmosim_ext_phys_unit IN ITEMS cosmological_background)
+    add_executable(test_unit_${cosmosim_ext_phys_unit} tests/unit/test_${cosmosim_ext_phys_unit}.cpp)
+    target_link_libraries(test_unit_${cosmosim_ext_phys_unit} PRIVATE cosmosim_all)
+    target_compile_definitions(test_unit_${cosmosim_ext_phys_unit} PRIVATE COSMOSIM_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
+    add_test(NAME unit_${cosmosim_ext_phys_unit} COMMAND test_unit_${cosmosim_ext_phys_unit})
+    cosmosim_append_test_labels(unit_${cosmosim_ext_phys_unit} ext_phys unit)
+  endforeach()
+
   foreach(cosmosim_rt_bh_agn_unit IN ITEMS rt_bh_agn_config source_transaction bh_agn_numerics radiation_core)
     add_executable(test_unit_${cosmosim_rt_bh_agn_unit} tests/unit/test_${cosmosim_rt_bh_agn_unit}.cpp)
     target_link_libraries(test_unit_${cosmosim_rt_bh_agn_unit} PRIVATE cosmosim_all)
