@@ -29,6 +29,7 @@
 #include "cosmosim/core/cuda_runtime.hpp"
 #include "cosmosim/core/memory_accounting.hpp"
 #include "cosmosim/core/memory_governor.hpp"
+#include "cosmosim/neutrinos/neutrino_linear_response.hpp"
 #include "cosmosim/core/openmp_runtime.hpp"
 #include "cosmosim/workflows/runtime_module_registry.hpp"
 #include "cosmosim/core/time_scheduler.hpp"
@@ -598,6 +599,13 @@ class GravityRuntimeImpl final : public GravityRuntime {
         config.parallel.zoom_high_res_allgather_limit_bytes;
     m_pm_assignment_scheme = treePmAssignmentSchemeName(config.numerics.treepm_assignment_scheme);
     m_pm_backend = gravity::PmSolver::fftBackendName();
+    // CHUI-EXT-PHYS-REF-v1 N03: admitted massive-neutrino long-range source
+    // (transfer_ratio or linear_response). Tables are loaded and verified here
+    // (SHA-256, gauge, redshift, eigenstates, k coverage); the engine is a
+    // pure PM spectral hook, so no duplicate PM engine exists.
+    m_neutrino_source = neutrinos::NeutrinoSpectralSource::fromConfig(
+        config, &services.mpi_context, services.memory_governor);
+    m_tree_pm_options.pm_options.spectral_source_hook = m_neutrino_source.get();
     if (m_runtime_topology.usesCuda()) {
       m_pm_backend += "+cuda_cic";
     }
@@ -2357,6 +2365,12 @@ class GravityRuntimeImpl final : public GravityRuntime {
 
         .species_policy = m_tree_pm_species_softening,
     };
+    // N03: restore the authoritative linear-response history on first use
+    // after a restart (whole-block module sidecar, replicated on all ranks).
+    if (m_neutrino_source != nullptr && !m_neutrino_source_restored) {
+      static_cast<void>(m_neutrino_source->restoreFrom(context.state.sidecars));
+      m_neutrino_source_restored = true;
+    }
     gravity::TreePmProfileEvent tree_pm_profile;
     m_tree_pm_coordinator.solveActiveSetWithPmCadence(
         source_snapshot.pos_x_comoving,
@@ -2414,6 +2428,12 @@ class GravityRuntimeImpl final : public GravityRuntime {
         allow_heavy_reference_checks);
 
     if (decision.refresh_long_range_field) {
+      // N03: persist the response history produced by this PM solve so the
+      // next checkpoint carries it (restart equivalence).
+      if (m_neutrino_source != nullptr &&
+          m_config.extended.neutrinos.method == core::NeutrinoMethodConfig::kLinearResponse) {
+        m_neutrino_source->storeTo(context.state.sidecars);
+      }
       if (hierarchical) {
         m_hierarchical_pm_source_generation = context.state.gravitySourceGeneration();
         m_hierarchical_pm_field_version = decision.field_version;
@@ -4043,6 +4063,9 @@ class GravityRuntimeImpl final : public GravityRuntime {
   double m_gravitational_constant_code = 0.0;
   std::string m_pm_assignment_scheme = "unknown";
   std::string m_pm_backend = "unknown";
+  // CHUI-EXT-PHYS-REF-v1 N03 neutrino long-range source (null when disabled).
+  std::unique_ptr<neutrinos::NeutrinoSpectralSource> m_neutrino_source;
+  bool m_neutrino_source_restored = false;
   mutable gravity::TreePmCoordinator m_tree_pm_coordinator;
   gravity::TreePmOptions m_tree_pm_options;
   gravity::TreeSofteningSpeciesPolicy m_tree_pm_species_softening{};

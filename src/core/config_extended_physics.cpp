@@ -454,6 +454,23 @@ void validateNeutrinos(const SimulationConfig& config) {
               std::isfinite(nu.response_k_max_h_mpc) && nu.response_k_max_h_mpc > nu.response_k_min_h_mpc,
           "neutrinos.response_k_min_h_mpc and response_k_max_h_mpc must satisfy 0 < k_min < k_max (h/Mpc); the "
           "PM solve refuses wavenumbers outside this domain instead of extrapolating");
+  require(config.parallel.gpu_devices <= 0,
+          "neutrinos.method=" + neutrinoMethodConfigToString(nu.method) +
+              ": the PM spectral source hook exists only on the host periodic Poisson operator; CUDA PM "
+              "(parallel.gpu_devices > 0) is refused");
+  if (nu.method == NeutrinoMethodConfig::kLinearResponse) {
+    require(nu.table_format != BoltzmannTableFormatConfig::kCambTransfer,
+            "neutrinos.method=linear_response needs massive-neutrino velocity divergences for the initial "
+            "free-streaming term; CAMB transfer output has none (use chui_v1 or Newtonian-gauge class_tk)");
+    require(nu.table_gauge == BoltzmannGaugeConfig::kNewtonian,
+            "neutrinos.method=linear_response requires Newtonian-gauge tables (the response equation and its "
+            "initial theta are Newtonian-gauge quantities)");
+    for (const double m : species.ncdm_masses_ev) {
+      require(std::abs(m - species.ncdm_masses_ev.front()) <= 1.0e-12 * species.ncdm_masses_ev.front(),
+              "neutrinos.method=linear_response supports degenerate eigenstate masses only (one Fermi-Dirac "
+              "velocity scale); use transfer_ratio for non-degenerate hierarchies");
+    }
+  }
   require(buildModePolicy(config.mode).gravity_boundary == GravityBoundaryModel::kPeriodicPoisson,
           "neutrinos.method=" + neutrinoMethodConfigToString(nu.method) +
               " modifies the periodic PM Poisson operator; isolated/open gravity is not supported");

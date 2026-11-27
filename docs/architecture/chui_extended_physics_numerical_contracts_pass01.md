@@ -95,3 +95,71 @@ reason; `require()` throws). Observable kernels use it wherever a physics input 
 ### Frequency axis (`spectral/frequency_axis.hpp`)
 Explicit strictly increasing channel edges; per-channel Gauss–Legendre averaging with `subsamples` nodes
 (bandwidth averaging is explicit). Test EXT-RA05-T01: cubic averaged exactly by 4 nodes.
+
+---
+
+## N02–N06 — massive-neutrino perturbation methods (`cosmosim_neutrinos`)
+
+Models are distinct and separately admitted (`neutrinos.method`): `background_only` (S01 only),
+`transfer_ratio`, `linear_response` (both integrated, unqualified), `particles` / `delta_f` (reference
+kernels; admission FAIL_CLOSED). No model substitutes another.
+
+### PM coupling contract (`gravity/pm_spectral_hook.hpp`, `pm_solver.cpp::applyDerivedPoissonOperator`)
+`Ψ_k = −4πG W⁻² S_split M(|k|) δρ_cb,k / k²`, `M = 1 + (ρ̄_ν/ρ̄_cb) R(k)`, k ≠ 0 (k = 0 stays 0, so ρ̄_ν
+enters only H(a)). Deposited density is cold matter only (Ω_cb particles). M commutes with window
+deconvolution and the Gaussian long-range split; the short-range tree carries no neutrino force
+(declared scale limit; `shortRangeOmissionBound(k) = M(k) − 1`). Observation of the cold amplitude is a
+deterministic serial storage-order pass (`forEachLogicalSpectralModeSerial`), Hermitian multiplicity 1/2
+for the r2c half spectrum, then a collective `allreduceSumDoublesInPlace`. The mesh |k| domain is checked
+before any OpenMP loop (`requireWavenumberDomain`), so the noexcept multiplier never extrapolates. The
+hook identity is folded into the PM collective fingerprint. CUDA and isolated/open PM refuse the hook.
+
+### Transfer ratio (N03a)
+`R(k,a) = δ_ncdm/δ_cb` from `BoltzmannTransferSet` (ln k / ln a interpolation, no extrapolation). Prescribed
+linear-theory correlation with the current cold mode; does not respond to the simulated potential.
+
+### Linear response (N03b) — derivation (derived)
+Vlasov in comoving x, superconformal time `ds = dt/a²`, canonical velocity `u = dx/ds = q/m` (NR):
+`∂_s f + u·∇f − a²∇φ·∂_u f = 0`, with `∇²φ = 4πG a² δρ` (ρ physical). Linearize, Fourier (`e^{ik·x}`):
+`δf(s) = e^{−ik·uτ}δf_i + ∫ ds' e^{−ik·u(s−s')} a² i φ k·∂_u f̄`. Integrating over u with
+`∫ e^{−ik·uτ} ∂_u f̄ = ikτ n̄ F(kτ)` gives
+`δ_ν(s) = [δ_ν,i − θ_ν,i τ] F(k u₀τ) + ∫_{s_i}^{s} ds' (s−s') F(k u₀(s−s')) 4πG a⁴ (ρ̄_cb δ_cb + ρ̄_ν δ_ν)(s')`,
+`F(y) = ∫x²f(x) sinc(xy)dx / ∫x²f`, `u₀ = kT_ν,0/(mc)`, `θ_s = i k·dx/ds = a θ_conformal`
+(continuity `dδ/ds = −θ_s`). Cold limit F = 1 reproduces `d²δ/ds² = 4πGρ̄a⁴δ` (checked analytically and by
+test EXT-N03-T04). History closure: phase-coherent amplitude approximation `δ_cb(k,s') = δ_cb(k,s)
+A(k,s')/A(k,s)` with A the measured rms of the deposited cold density per |k| bin (**recalled lead**:
+Ali-Haïmoud & Bird 2013, MNRAS 428, 3375). Quadrature: trapezoid over the PM-solve history, explicit
+(weight (s − s') = 0 at s' = s). Bins without mesh modes interpolate ln A in ln k between observed bins.
+F: 5001-point table on y ∈ [0, 50] (oscillatory Gauss–Legendre quadrature, ≥ 16 nodes per period) plus
+the derived asymptotic series `∫x f sin(xy)dx = 1/(2y³)+1/(2y⁵)+3/(2y⁷)+…`.
+* **Validity (admission).** Degenerate eigenstates; Newtonian-gauge tables with θ columns (CLASS
+  Newtonian or chui_v1; CAMB refused); `<|p|>/(mc)` at a_begin below the user-declared
+  `response_max_mean_velocity_c` (no default bound); periodic host PM; table epochs bracket z_begin.
+* **State.** Bounded history (s, a, A_b, R_b) reserved through `MemoryGovernor`
+  (`kCanonicalPersistent`, `capacity × (2 + 2 n_bins) × 8 B`); persisted as whole-block module sidecar
+  `chui_neutrino_response_v1` (no restart schema bump; existing module-block persistence) after every
+  refreshing PM solve and restored on first execute; replicated on all ranks after the reduction;
+  deterministic replay truncates entries with a ≥ a_solve; a full history refuses.
+
+### Particles and δf (N04, reference kernels only)
+Lagrangian `L = −mca√((1+2Ψ)c² − (1−2Φ)v²)`, Φ = Ψ, first order: `dx/dt = q/(aε)`,
+`dq/dt = −(ε/a)(1+v²/c²)∇Ψ`, `εc² = √(q²c²+m²c⁴a²)` (derived; dΦ/dt term neglected). δf weight
+`w = 1 − f_ref(q)/f_i` with `f_i = f_ref(q_initial)` (**recalled lead**: Elbers et al. 2021, MNRAS 507,
+2614); gravitational estimator mass `w × m_rest γ`; signed masses refused on the tree path; no clipping.
+Thermal sampling by inverse CDF of `x²/(eˣ+1)`, counter-based SplitMix64 keyed by (seed, id, draw).
+**Missing edges (FAIL_CLOSED):** neutrino particle species in `core::ParticleSpecies`, IC displacement and
+bulk velocity from transfer tables (N02 IC adapter), signed PM deposition path, migration/restart lanes.
+
+### Species statistics (N05)
+CIC deposit against the BACKGROUND mean; `P_XY = V⟨Re δ_X δ_Y*⟩/N⁶`, optional `W⁻²` CIC deconvolution;
+`P_m = f_cb²P_cc + 2f_cb f_ν P_cν + f_ν² P_νν`; shot noise `VΣm²/(Σm)²`; δf noise `VΣ(wm)²/M_bg²`;
+response family `P_cν = R P_cc`, `P_νν = R² P_cc`. Reference serial radix-2 FFT (`spectral/reference_fft`).
+
+### Tests (`unit_neutrino_methods`, NOT_RUN)
+EXT-N03-T01 F(0)=1, small-y `1 − y²⟨x²⟩/6`, table vs quadrature 2e-7, asymptotic 1e-5; EXT-N03-T02 EdS
+superconformal time 1e-12; EXT-N03-T03 transfer-ratio multiplier and domain refusal; EXT-N03-T04 cold
+limit vs independent RK4 (|R−1| < 2e-3); EXT-N03-T05 sidecar round trip and replay; EXT-N03-T06 capacity
+refusal; EXT-N04-T01 δf weight sign, signed-mass refusal, NR drift 1e-9, FD sample mean (6σ);
+EXT-N05-T01 single-mode spectrum normalization, shot noise, ratio-family total. Missing (named for the
+execution campaign): PM-integrated neutrino DMO run vs CLASS P(k) suppression, MPI/rank equivalence of
+the reduction, restart equivalence through the real checkpoint writer.
