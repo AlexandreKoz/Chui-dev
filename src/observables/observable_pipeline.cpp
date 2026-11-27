@@ -14,6 +14,7 @@
 #include "core/internal/sha256.hpp"
 #include "cosmosim/core/constants.hpp"
 #include "cosmosim/core/simulation_mode.hpp"
+#include "cosmosim/instruments/interferometry.hpp"
 #include "cosmosim/lightcone/ray_geometry.hpp"
 #include "cosmosim/observables/cmb_secondaries.hpp"
 #include "cosmosim/observables/fits_writer.hpp"
@@ -24,6 +25,28 @@ namespace cosmosim::observables {
 namespace {
 
 namespace k = core::constants;
+
+[[nodiscard]] const spectral::AtomicLine& s21cm() { return spectral::hydrogen21cm(); }
+
+[[nodiscard]] std::vector<instruments::Station> loadStationLayout(const std::string& path, const std::string& sha) {
+  std::ifstream input(path, std::ios::binary);
+  if (!input) throw std::runtime_error("cannot open station layout '" + path + "'");
+  const std::string bytes((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+  if (core::internal::sha256Hex(bytes) != sha) throw std::runtime_error("station layout SHA-256 mismatch");
+  std::vector<instruments::Station> stations;
+  std::istringstream stream(bytes);
+  std::string line;
+  while (std::getline(stream, line)) {
+    if (line.empty() || line[0] == '#') continue;
+    std::istringstream row(line);
+    instruments::Station st;
+    row >> st.name >> st.enu_m[0] >> st.enu_m[1] >> st.enu_m[2];
+    if (row.fail()) throw std::runtime_error("malformed station layout row '" + line + "'");
+    stations.push_back(st);
+  }
+  if (stations.size() < 2U) throw std::runtime_error("station layout needs >= 2 stations");
+  return stations;
+}
 
 [[nodiscard]] std::string fileName(const core::SimulationConfig& config, const std::string& product, std::uint64_t step) {
   std::ostringstream name;
@@ -301,6 +324,73 @@ ObservablePipelineReport ObservablePipeline::execute(const core::SimulationState
     image.bunit = "m-2";
     image.history.push_back("RM not produced: no magnetic-field sample attached to the science accessor");
     write("dispersion_measure", std::move(image));
+  }
+  // O01/O02: observe the HI cube with the virtual interferometer (read-only sky).
+  const core::InstrumentsConfig& in = m_config.extended.instruments;
+  if (in.enabled && o.hi_cube) {
+    const double deg = k::k_pi / 180.0;
+    const double distance_m = cosmological ? m_background.transverseComovingDistanceSi(a)
+                                           : in.source_distance_mpc * k::k_megaparsec_si / a;
+    if (!(distance_m > 0.0)) throw std::runtime_error("instruments: zero distance to the cube (a = 1 snapshot?)");
+    // Transverse comoving (cosmological) or proper (isolated, a = 1) pixel size over the distance.
+    const double pixel_rad_x = extent[t1] / static_cast<double>(n) * length_m / distance_m;
+    const double pixel_rad_y = extent[t2] / static_cast<double>(n) * length_m / distance_m;
+    const double nu_rest = s21cm().rest_frequency_hz;
+    std::vector<double> edges(o.hi_channels + 1U);
+    for (std::size_t c = 0; c <= o.hi_channels; ++c) {
+      const double u_edge = hi_axis.u_min + hi_axis.width() * static_cast<double>(o.hi_channels - c);
+      edges[c] = nu_rest / (1.0 + (cosmological ? redshift : 0.0)) * (1.0 - u_edge / k::k_speed_of_light_si);
+    }
+    instruments::ObservationSettings obs;
+    obs.latitude_rad = in.latitude_deg * deg;
+    obs.phase_centre_dec_rad = in.phase_centre_dec_deg * deg;
+    obs.hour_angle_start_rad = in.hour_angle_start_deg * deg;
+    obs.integration_s = in.integration_s;
+    obs.time_steps = in.time_steps;
+    obs.time_subsamples = in.time_subsamples;
+    obs.frequencies = spectral::FrequencyAxis(edges, in.channel_subsamples);
+    obs.sefd_jy = in.sefd_jy;
+    obs.noise_seed = in.noise_seed;
+    obs.beam.model = static_cast<instruments::BeamModel>(in.beam);
+    obs.beam.fwhm_rad = in.beam_fwhm_deg * deg;
+    obs.beam.reference_hz = in.beam_reference_mhz * 1.0e6;
+    obs.beam.dish_diameter_m = in.dish_diameter_m;
+    std::vector<instruments::SkyComponent> sky;
+    for (std::size_t j = 0; j < n; ++j) {
+      for (std::size_t i = 0; i < n; ++i) {
+        instruments::SkyComponent comp;
+        comp.l = (static_cast<double>(i) + 0.5 - 0.5 * static_cast<double>(n)) * pixel_rad_x;
+        comp.m = (static_cast<double>(j) + 0.5 - 0.5 * static_cast<double>(n)) * pixel_rad_y;
+        comp.stokes_per_channel.resize(o.hi_channels);
+        bool any = false;
+        for (std::size_t c = 0; c < o.hi_channels; ++c) {
+          const std::size_t velocity_channel = o.hi_channels - 1U - c;  // ascending frequency order
+          const double nu = obs.frequencies.centerHz(c);
+          const double t_b = hi_cube[(velocity_channel * n + j) * n + i];
+          // Rayleigh-Jeans: S = 2 k T_b nu^2 Omega / c^2, in Jy.
+          const double s_jy = 2.0 * k::k_boltzmann_si * t_b * nu * nu * pixel_rad_x * pixel_rad_y /
+                              (k::k_speed_of_light_si * k::k_speed_of_light_si) * 1.0e26;
+          comp.stokes_per_channel[c] = {s_jy, 0.0, 0.0, 0.0};
+          any = any || s_jy != 0.0;
+        }
+        if (any) sky.push_back(std::move(comp));
+      }
+    }
+    const std::vector<instruments::Station> stations = loadStationLayout(in.station_layout_path, in.station_layout_sha256);
+    if (in.backend == core::InstrumentBackendConfig::kOskarExport) {
+      const std::string dir_oskar = (dir_out / (fileName(m_config, "oskar_inputs", step))).string();
+      instruments::exportOskarInputs(dir_oskar, stations, sky, in.phase_centre_ra_deg * deg, obs.phase_centre_dec_rad,
+                                     in.longitude_deg * deg, obs.latitude_rad, obs.frequencies.centerHz(0));
+      report.written_files.push_back(dir_oskar);
+    } else {
+      const std::string vis_path = (dir_out / (fileName(m_config, "visibilities", step) + ".chuivis")).string();
+      instruments::NativeVisibilityWriter writer(vis_path, stations, obs, provenance + ";sky=hi_cube_rayleigh_jeans");
+      const instruments::RimeReport rime = instruments::simulateVisibilitiesDirect(
+          stations, sky, obs, [&writer](const instruments::VisibilityBatch& batch) { writer.consume(batch); });
+      writer.finish();
+      static_cast<void>(rime);
+      report.written_files.push_back(vis_path);
+    }
   }
   // Text summary (statistics and provenance).
   std::ostringstream summary;

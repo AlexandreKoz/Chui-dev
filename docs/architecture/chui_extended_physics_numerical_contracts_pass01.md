@@ -373,3 +373,32 @@ crossing-beam M1 vs VET comparison, MPI/regrid RT, RT–MHD coupling.
   EXT-C02-T01 (Born vs multi-plane 2 %); EXT-C01-T01 (white-noise variance 5 %); EXT-RA03/RA04-T01
   (Kirchhoff, RM 0.812, Faraday screen 1e-12, singular K); EXT-RA03-T02 (∫F = 8π/9√3 2e-3, kernel vs closed
   form 2–3 %, Π 1 %); EXT-L02-T01 (sampler moments 5σ, photon budget); EXT-O01-T01 FITS blocking.
+
+---
+
+## O01–O05 — virtual interferometer (`cosmosim_instruments`, sky consumer only)
+
+* **Geometry (recalled lead: Thompson, Moran & Swenson eqs. 4.1, 4.15).** ENU → equatorial at latitude φ;
+  uvw from (H, δ); Earth rotation `H = H₀ + Ω_sid t`, `Ω_sid = 2π/86164.0905 s` (declared).
+* **RIME (direct reference).** `V_pq = A_p [Σ_s E(s,ν)² B_s e^{−2πi(ul+vm+w(n−1))}] A_q^H` with
+  `B = [[I+Q, U+iV],[U−iV, I−Q]]` (XX+YY = 2I), direction-independent `A = G(ν) D Ion(ν)` (gains, bandpass
+  delay, leakage, ionospheric phase `e²TEC/(4πε₀m_e cν)` and Faraday rotation `RM_ion λ²`), and a scalar
+  analytic voltage beam shared by all stations (none / Gaussian with power FWHM ∝ λ / Airy `2J₁(x)/x`,
+  J₁ by the periodic Bessel integral — no libc++-unavailable special functions). Exact w-term; point
+  components carry flux density (no 1/n). Time and bandwidth averaging by explicit sub-samples (Gauss–
+  Legendre per channel). Noise `σ_re = σ_im = SEFD/√(2Δντ)` (unit efficiency, declared), counter-based.
+  Flags skip evaluation. One batch per time step is streamed to a sink (`N_bl = N_a(N_a−1)/2`; storage per
+  batch ∝ N_bl × N_chan × 4 correlations; no resident cube).
+* **Products.** `chui_visibilities_v1` native binary (magic `CHUIVIS1`, text header with conventions,
+  frequencies, stations, provenance; per-batch records); OSKAR input export (sky model RA/Dec/IQUV/ref
+  frequency, telescope `layout.txt`/`position.txt`; **recalled lead** format, not executed).
+  **NOT_STARTED / FAIL_CLOSED:** UVH5 and Measurement Set adapters (need a validated HDF5/casacore writer
+  and reader round trip), accelerated GPU/NUFFT/antenna-matrix backends (admission refuses
+  `backend=accelerated`), measured/EM beams, complex-baseband receiver path, calibration solving.
+* **Pipeline.** HI cube (observables) → RJ flux densities `S = 2kT_bν²Ω/c²` per pixel → components at
+  `(l, m) = transverse offset / D` (S01 transverse comoving distance, or the declared distance for isolated
+  runs) with radio-convention channel frequencies → direct RIME → native file (or OSKAR export).
+* **Tests (`unit_instrument_rime`, NOT_RUN).** EXT-O05-T01 phase-centre coherency and polarization
+  normalization; T02 uvw and phase sign; T03 bandwidth smearing = |sinc(πΔντ)| (2e-3); T04 J_pBJ_q^H with
+  leakage/gain, Gaussian half power, Airy first null; T05 noise variance (5σ), determinism, flags,
+  baseline count; T06 polar-source uvw invariants.

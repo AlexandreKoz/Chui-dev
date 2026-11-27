@@ -77,6 +77,13 @@ inline constexpr std::array<SectionChoice<HiSpinModelConfig>, 2> k_hi_spin_model
 inline constexpr std::array<SectionChoice<HiTransferConfig>, 2> k_hi_transfer_names{{
     {"full_optical_depth", HiTransferConfig::kFullOpticalDepth}, {"optically_thin", HiTransferConfig::kOpticallyThin}}};
 
+inline constexpr std::array<SectionChoice<InstrumentBackendConfig>, 3> k_instrument_backend_names{{
+    {"direct_rime", InstrumentBackendConfig::kDirectRime},
+    {"oskar_export", InstrumentBackendConfig::kOskarExport},
+    {"accelerated", InstrumentBackendConfig::kAccelerated}}};
+inline constexpr std::array<SectionChoice<InstrumentBeamConfig>, 3> k_instrument_beam_names{{
+    {"none", InstrumentBeamConfig::kNone}, {"gaussian", InstrumentBeamConfig::kGaussian}, {"airy", InstrumentBeamConfig::kAiry}}};
+
 [[nodiscard]] bool parseSectionBool(const std::string& raw, const std::string& key) {
   const std::string v = lowerTrimmedValue(raw);
   if (v == "true") return true;
@@ -125,6 +132,13 @@ std::string hiTransferConfigToString(HiTransferConfig value) {
   return sectionChoiceToString(value, k_hi_transfer_names, "HiTransferConfig");
 }
 
+std::string instrumentBackendConfigToString(InstrumentBackendConfig value) {
+  return sectionChoiceToString(value, k_instrument_backend_names, "InstrumentBackendConfig");
+}
+std::string instrumentBeamConfigToString(InstrumentBeamConfig value) {
+  return sectionChoiceToString(value, k_instrument_beam_names, "InstrumentBeamConfig");
+}
+
 std::string cosmicRayModelConfigToString(CosmicRayModelConfig value) {
   return sectionChoiceToString(value, k_cosmic_ray_model_names, "CosmicRayModelConfig");
 }
@@ -152,6 +166,26 @@ const std::vector<ExtendedKeyDefault>& extendedPhysicsSectionKeyDefaults() {
       {"observables.hi_collision_table_sha256", ""},
       {"observables.sz_maps", "false"},
       {"observables.dispersion_map", "false"},
+      {"instruments.enabled", "false"},
+      {"instruments.backend", "direct_rime"},
+      {"instruments.station_layout_path", ""},
+      {"instruments.station_layout_sha256", ""},
+      {"instruments.latitude_deg", "0"},
+      {"instruments.longitude_deg", "0"},
+      {"instruments.phase_centre_ra_deg", "0"},
+      {"instruments.phase_centre_dec_deg", "0"},
+      {"instruments.hour_angle_start_deg", "0"},
+      {"instruments.integration_s", "0"},
+      {"instruments.time_steps", "0"},
+      {"instruments.time_subsamples", "1"},
+      {"instruments.channel_subsamples", "1"},
+      {"instruments.sefd_jy", "0"},
+      {"instruments.noise_seed", "1"},
+      {"instruments.beam", "none"},
+      {"instruments.beam_fwhm_deg", "0"},
+      {"instruments.beam_reference_mhz", "0"},
+      {"instruments.dish_diameter_m", "0"},
+      {"instruments.source_distance_mpc", "0"},
   };
   return keys;
 }
@@ -181,6 +215,28 @@ void parseExtendedPhysicsSectionsAfterNeutrinos(const ExtendedKeyLookup& lookup,
   o.hi_collision_table_sha256 = trimmedValue(lookup("observables.hi_collision_table_sha256"));
   o.sz_maps = parseSectionBool(lookup("observables.sz_maps"), "observables.sz_maps");
   o.dispersion_map = parseSectionBool(lookup("observables.dispersion_map"), "observables.dispersion_map");
+  InstrumentsConfig& in = config.extended.instruments;
+  const auto key = [](const char* name) { return std::string("instruments.") + name; };
+  in.enabled = parseSectionBool(lookup(key("enabled")), key("enabled"));
+  in.backend = parseSectionChoice(lookup(key("backend")), key("backend"), k_instrument_backend_names);
+  in.station_layout_path = trimmedValue(lookup(key("station_layout_path")));
+  in.station_layout_sha256 = trimmedValue(lookup(key("station_layout_sha256")));
+  in.latitude_deg = parseSectionDouble(lookup(key("latitude_deg")), key("latitude_deg"));
+  in.longitude_deg = parseSectionDouble(lookup(key("longitude_deg")), key("longitude_deg"));
+  in.phase_centre_ra_deg = parseSectionDouble(lookup(key("phase_centre_ra_deg")), key("phase_centre_ra_deg"));
+  in.phase_centre_dec_deg = parseSectionDouble(lookup(key("phase_centre_dec_deg")), key("phase_centre_dec_deg"));
+  in.hour_angle_start_deg = parseSectionDouble(lookup(key("hour_angle_start_deg")), key("hour_angle_start_deg"));
+  in.integration_s = parseSectionDouble(lookup(key("integration_s")), key("integration_s"));
+  in.time_steps = parseSectionUint(lookup(key("time_steps")), key("time_steps"));
+  in.time_subsamples = parseSectionUint(lookup(key("time_subsamples")), key("time_subsamples"));
+  in.channel_subsamples = parseSectionUint(lookup(key("channel_subsamples")), key("channel_subsamples"));
+  in.sefd_jy = parseSectionDouble(lookup(key("sefd_jy")), key("sefd_jy"));
+  in.noise_seed = parseSectionUint(lookup(key("noise_seed")), key("noise_seed"));
+  in.beam = parseSectionChoice(lookup(key("beam")), key("beam"), k_instrument_beam_names);
+  in.beam_fwhm_deg = parseSectionDouble(lookup(key("beam_fwhm_deg")), key("beam_fwhm_deg"));
+  in.beam_reference_mhz = parseSectionDouble(lookup(key("beam_reference_mhz")), key("beam_reference_mhz"));
+  in.dish_diameter_m = parseSectionDouble(lookup(key("dish_diameter_m")), key("dish_diameter_m"));
+  in.source_distance_mpc = parseSectionDouble(lookup(key("source_distance_mpc")), key("source_distance_mpc"));
 }
 
 void appendExtendedPhysicsSectionsAfterNeutrinos(std::ostream& stream, const ExtendedPhysicsConfig& extended) {
@@ -210,6 +266,29 @@ void appendExtendedPhysicsSectionsAfterNeutrinos(std::ostream& stream, const Ext
     stream << "sz_maps = " << (o.sz_maps ? "true" : "false") << '\n';
     stream << "dispersion_map = " << (o.dispersion_map ? "true" : "false") << '\n';
   }
+  const InstrumentsConfig& in = extended.instruments;
+  if (in.enabled) {
+    stream << "\n[instruments]\nenabled = true\n";
+    stream << "backend = " << instrumentBackendConfigToString(in.backend) << '\n';
+    stream << "station_layout_path = " << in.station_layout_path << '\n';
+    stream << "station_layout_sha256 = " << in.station_layout_sha256 << '\n';
+    stream << "latitude_deg = " << in.latitude_deg << '\n';
+    stream << "longitude_deg = " << in.longitude_deg << '\n';
+    stream << "phase_centre_ra_deg = " << in.phase_centre_ra_deg << '\n';
+    stream << "phase_centre_dec_deg = " << in.phase_centre_dec_deg << '\n';
+    stream << "hour_angle_start_deg = " << in.hour_angle_start_deg << '\n';
+    stream << "integration_s = " << in.integration_s << '\n';
+    stream << "time_steps = " << in.time_steps << '\n';
+    stream << "time_subsamples = " << in.time_subsamples << '\n';
+    stream << "channel_subsamples = " << in.channel_subsamples << '\n';
+    stream << "sefd_jy = " << in.sefd_jy << '\n';
+    stream << "noise_seed = " << in.noise_seed << '\n';
+    stream << "beam = " << instrumentBeamConfigToString(in.beam) << '\n';
+    stream << "beam_fwhm_deg = " << in.beam_fwhm_deg << '\n';
+    stream << "beam_reference_mhz = " << in.beam_reference_mhz << '\n';
+    stream << "dish_diameter_m = " << in.dish_diameter_m << '\n';
+    stream << "source_distance_mpc = " << in.source_distance_mpc << '\n';
+  }
 }
 
 void validateExtendedPhysicsSectionsAfterNeutrinos(const SimulationConfig& config) {
@@ -224,6 +303,36 @@ void validateExtendedPhysicsSectionsAfterNeutrinos(const SimulationConfig& confi
                        "MHD level stepper has no CR stage; CR state is not allocated on AMR patches, not carried "
                        "through halo/EMF exchange, regrid, migration or restart, and no SN/AGN feedback budget "
                        "debits CR energy (FAIL_CLOSED; see the extended-physics ledger, CR07)");
+  }
+  const InstrumentsConfig& in = config.extended.instruments;
+  if (!in.enabled) {
+    requireSection(in == InstrumentsConfig{},
+                   "instruments.enabled=false but other [instruments] keys differ from their defaults; those keys "
+                   "would have no effect. Remove them or set instruments.enabled=true");
+  } else {
+    requireSection(in.backend != InstrumentBackendConfig::kAccelerated,
+                   "instruments.backend=accelerated: no GPU direct-sum, NUFFT or antenna-matrix backend exists and no "
+                   "accuracy comparison against the direct reference has been made (FAIL_CLOSED; use direct_rime)");
+    requireSection(config.extended.observables.enabled && config.extended.observables.hi_cube,
+                   "instruments observe the observables.hi_cube product of the same step; enable it");
+    requireSection(!in.station_layout_path.empty() && in.station_layout_sha256.size() == 64U,
+                   "instruments require station_layout_path and a 64-hex station_layout_sha256 (no array is bundled)");
+    requireSection(std::abs(in.latitude_deg) <= 90.0 && std::abs(in.phase_centre_dec_deg) <= 90.0,
+                   "instruments latitude/declination must lie in [-90, 90] degrees");
+    requireSection(in.integration_s > 0.0 && in.time_steps >= 1U && in.time_subsamples >= 1U &&
+                       in.channel_subsamples >= 1U && in.channel_subsamples <= 64U,
+                   "instruments need integration_s > 0, time_steps >= 1 and subsamples in [1, 64]");
+    requireSection(in.sefd_jy >= 0.0, "instruments.sefd_jy must be >= 0 (0 = noiseless)");
+    if (in.beam == InstrumentBeamConfig::kGaussian) {
+      requireSection(in.beam_fwhm_deg > 0.0 && in.beam_reference_mhz > 0.0,
+                     "instruments.beam=gaussian requires beam_fwhm_deg and beam_reference_mhz > 0 (no default beam)");
+    } else if (in.beam == InstrumentBeamConfig::kAiry) {
+      requireSection(in.dish_diameter_m > 0.0, "instruments.beam=airy requires dish_diameter_m > 0");
+    }
+    const bool cosmological_run = buildModePolicy(config.mode).cosmological_comoving_frame;
+    requireSection(cosmological_run ? in.source_distance_mpc == 0.0 : in.source_distance_mpc > 0.0,
+                   "instruments.source_distance_mpc must be > 0 for isolated runs (angular scale of the cube) and 0 "
+                   "for cosmological runs (the S01 transverse comoving distance is used)");
   }
   const ObservablesConfig& o = config.extended.observables;
   if (!o.enabled) {

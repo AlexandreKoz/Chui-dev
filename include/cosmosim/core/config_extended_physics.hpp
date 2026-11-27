@@ -98,10 +98,45 @@ struct ObservablesConfig {
   bool operator==(const ObservablesConfig&) const = default;
 };
 
+// ------------------------------------------------------------- instruments
+enum class InstrumentBackendConfig : std::uint8_t {
+  kDirectRime = 0,    // O02 CPU reference (integrated)
+  kOskarExport = 1,   // O01 input export for an external OSKAR run (not executed)
+  kAccelerated = 2,   // O03 GPU/NUFFT/matrix backends: refused (FAIL_CLOSED)
+};
+enum class InstrumentBeamConfig : std::uint8_t { kNone = 0, kGaussian = 1, kAiry = 2 };
+
+// Virtual interferometer observing the observables.hi_cube product of the
+// same analysis step (instruments/interferometry.hpp).
+struct InstrumentsConfig {
+  bool enabled = false;
+  InstrumentBackendConfig backend = InstrumentBackendConfig::kDirectRime;
+  std::string station_layout_path;      // text: name E N U [m] per line
+  std::string station_layout_sha256;
+  double latitude_deg = 0.0;
+  double longitude_deg = 0.0;
+  double phase_centre_ra_deg = 0.0;
+  double phase_centre_dec_deg = 0.0;
+  double hour_angle_start_deg = 0.0;
+  double integration_s = 0.0;
+  std::uint32_t time_steps = 0U;
+  std::uint32_t time_subsamples = 1U;
+  std::uint32_t channel_subsamples = 1U;
+  double sefd_jy = 0.0;
+  std::uint64_t noise_seed = 1U;
+  InstrumentBeamConfig beam = InstrumentBeamConfig::kNone;
+  double beam_fwhm_deg = 0.0;
+  double beam_reference_mhz = 0.0;
+  double dish_diameter_m = 0.0;
+  double source_distance_mpc = 0.0;     // isolated runs only (angular scale of the cube)
+  bool operator==(const InstrumentsConfig&) const = default;
+};
+
 struct ExtendedPhysicsConfig {
   NeutrinoPerturbationConfig neutrinos;
   CosmicRayConfig cosmic_rays;
   ObservablesConfig observables;
+  InstrumentsConfig instruments;
   bool operator==(const ExtendedPhysicsConfig&) const = default;
 };
 
@@ -113,5 +148,7 @@ struct ExtendedPhysicsConfig {
 [[nodiscard]] std::string forestProfileConfigToString(ForestProfileConfig value);
 [[nodiscard]] std::string hiSpinModelConfigToString(HiSpinModelConfig value);
 [[nodiscard]] std::string hiTransferConfigToString(HiTransferConfig value);
+[[nodiscard]] std::string instrumentBackendConfigToString(InstrumentBackendConfig value);
+[[nodiscard]] std::string instrumentBeamConfigToString(InstrumentBeamConfig value);
 
 }  // namespace cosmosim::core
