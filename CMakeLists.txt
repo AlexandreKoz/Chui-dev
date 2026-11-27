@@ -1440,7 +1440,7 @@ if(COSMOSIM_ENABLE_TESTS)
 
   # CHUI-RT-BH-AGN-REF-v1 pass-01 verification sources (written, NOT RUN).
   # CHUI-EXT-PHYS-REF-v1 unit/reference test sources (NOT RUN in source-only pass 01).
-  foreach(cosmosim_ext_phys_unit IN ITEMS cosmological_background spectral_data neutrino_methods lightcone_geometry rhd_reference_backends cosmic_ray_transport observables_kernels instrument_rime)
+  foreach(cosmosim_ext_phys_unit IN ITEMS cosmological_background spectral_data neutrino_methods lightcone_geometry rhd_reference_backends cosmic_ray_transport observables_kernels instrument_rime extended_physics_config)
     add_executable(test_unit_${cosmosim_ext_phys_unit} tests/unit/test_${cosmosim_ext_phys_unit}.cpp)
     target_link_libraries(test_unit_${cosmosim_ext_phys_unit} PRIVATE cosmosim_all)
     target_compile_definitions(test_unit_${cosmosim_ext_phys_unit} PRIVATE COSMOSIM_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
@@ -3158,6 +3158,9 @@ if(COSMOSIM_ENABLE_BENCHMARKS)
   target_link_libraries(bench_black_hole_agn_sparse_update PRIVATE cosmosim_all)
   add_executable(bench_rt_transport_throughput bench/bench_rt_transport_throughput.cpp)
   target_link_libraries(bench_rt_transport_throughput PRIVATE cosmosim_all)
+  # CHUI-EXT-PHYS-REF-v1 I04 benchmark driver (source only; NOT RUN).
+  add_executable(bench_extended_physics_kernels bench/bench_extended_physics_kernels.cpp)
+  target_link_libraries(bench_extended_physics_kernels PRIVATE cosmosim_all)
   add_executable(bench_stellar_feedback_deposition bench/bench_stellar_feedback_deposition.cpp)
   target_link_libraries(bench_stellar_feedback_deposition PRIVATE cosmosim_all)
   add_executable(bench_tracer_update bench/bench_tracer_update.cpp)

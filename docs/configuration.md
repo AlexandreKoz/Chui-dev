@@ -1054,7 +1054,7 @@ live in `[physics]`. Full key table, units and refusal reasons:
   (`rt_transport != m1`, `bh_supply_model = resolved_flux`, `bh_spin_model`,
   `bh_accretion_state_model`, `agn_magnetic_injection`, `agn_nozzle`),
   `rt_opacity_model = photoionization` (reconciliation not wired),
-  `rt_stellar_sources` (no luminosity provider), `broad_uv_ir`/`agn_hard`
+  `rt_stellar_sources` (superseded 2026-11-27: now requires `rt_stellar_luminosity_table_*`, see the extended-physics section), `broad_uv_ir`/`agn_hard`
   profiles, RT with MPI > 1 / regrid / recursive subcycling / MHD, reduced c
   in cosmological modes, torque supply without an explicit `bh_torque_epsilon`,
   winds without disk-wind mass loading, velocities outside the declared
@@ -1062,3 +1062,70 @@ live in `[physics]`. Full key table, units and refusal reasons:
 * Example decks: `configs/rt_bh_agn/isolated_cluster_reference_bh_agn.param.txt`,
   `configs/rt_bh_agn/grey_rhd_reference_rt.param.txt` (uncalibrated; exercise
   code paths only).
+
+## CHUI-EXT-PHYS-REF-v1 extended-physics options (pass 01, source only, UNVALIDATED)
+
+All keys are typed, validated at load (`validateExtendedPhysicsConfig`,
+`src/core/config_extended_physics*.cpp`) and emitted in the normalized text
+ONLY when their model is enabled (disabled runs keep byte-identical text and
+config hash). Non-default values on a disabled model are rejected as inert.
+Nothing here was compiled or executed in pass 01.
+
+### `[cosmology]` relativistic background (S01/N01)
+
+| Key | Default | Meaning |
+|---|---|---|
+| `radiation_background` | `none` | `none` (legacy flat matter+Λ) or `photons_neutrinos` |
+| `t_cmb0_k` | `0` | present CMB temperature [K] (required > 0 when enabled) |
+| `n_ur` | `0` | massless effective species (N_eff convention) |
+| `ncdm_masses_ev` | empty | comma list, one massive eigenstate (g = 2) per entry |
+| `ncdm_temperature_ratio` | `0` | T_ncdm/T_cmb: `instantaneous_decoupling` = (4/11)^(1/3) or a number (CLASS default 0.71611) |
+
+With the background enabled `omega_matter` INCLUDES the present massive-neutrino density and the
+closure Ω_γ + Ω_ur + Ω_m + Ω_Λ = 1 is strict (1e-10; the error names the required `omega_lambda`).
+Requires a cosmological mode and `a_begin` after matter–radiation equality. Massive eigenstates require
+an explicit `[neutrinos] method`.
+
+### `[neutrinos]` (N02–N05)
+
+`method` = `none | background_only | transfer_ratio | linear_response | particles | delta_f`
+(`particles`/`delta_f` refused: no neutrino particle species). `table_format` = `chui_v1 | class_tk |
+camb_transfer`, `table_gauge` = `synchronous | newtonian`, `table_paths`, `table_sha256`,
+`table_redshifts` (strictly decreasing, ≥ 2 epochs; transfer ratio: bracket [z_end, z_begin]; linear
+response: bracket z_begin), `response_k_bins` [8, 4096], `response_history_capacity` [16, 1048576],
+`response_max_mean_velocity_c` (linear response; required in (0,1)), `response_k_min_h_mpc`,
+`response_k_max_h_mpc` (must cover the PM mesh). Linear response: Newtonian gauge, no CAMB, degenerate
+masses. Both PM models: periodic host PM only (`parallel.gpu_devices = 0`).
+
+### `[cosmic_rays]` (CR01–CR08)
+
+`model` = `none | grey | two_moment | spectral`; every non-`none` value is refused (kernels exist, no MHD
+CR stage / persistence lanes; see the extended-physics ledger).
+
+### `[observables]` (L/C/RA, inline read-only pipeline)
+
+`enabled`, `interval_steps` (≥ 1), `los_axis` (`x|y|z`), `sightlines_per_side` [1, 4096],
+`output_stem` (plain stem), products `lyman_alpha_forest` (cosmological; `forest_profile` =
+`voigt|doppler_only`, `forest_pixels` power of two ≥ 16, `forest_pdf_bins`), `hi_cube` (`hi_spin_model` =
+`saturated_kinetic|collisional_table`, `hi_transfer` = `full_optical_depth|optically_thin`, `hi_channels`,
+`hi_velocity_half_width_km_s`, `hi_collision_table_path`/`_sha256` for the table model; cosmological runs
+need the CMB background), `sz_maps`, `dispersion_map`. Requires a Part 2 thermochemistry backend (species
+lanes) and a single MPI rank.
+
+### `[instruments]` (O01–O05)
+
+`enabled`, `backend` = `direct_rime | oskar_export | accelerated` (accelerated refused),
+`station_layout_path`/`_sha256` (text `name E N U`), `latitude_deg`, `longitude_deg`,
+`phase_centre_ra_deg`, `phase_centre_dec_deg`, `hour_angle_start_deg`, `integration_s`, `time_steps`,
+`time_subsamples`, `channel_subsamples` [1, 64], `sefd_jy` (0 = noiseless), `noise_seed`, `beam` =
+`none|gaussian|airy` (+ `beam_fwhm_deg`, `beam_reference_mhz` / `dish_diameter_m`), `source_distance_mpc`
+(isolated runs only). Observes the `observables.hi_cube` product of the same step.
+
+### `[physics]` addition (F02)
+
+`rt_stellar_luminosity_table_path`, `rt_stellar_luminosity_table_sha256` (schema
+`chui_ssp_group_luminosity_v1`): required by `rt_stellar_sources = true`, which is now admitted in
+cosmological modes with the `ionizing3` profile (the previous FAIL_CLOSED refusal is replaced by these
+requirements). The keys appear in the normalized text only when set.
+
+Example decks: `configs/extended_physics/*.param.txt` (NOT RUN).
