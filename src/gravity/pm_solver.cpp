@@ -693,7 +693,10 @@ void validatePmCollectiveEntryConsensus(
       static_cast<std::uint64_t>(options.data_residency),
       static_cast<std::uint64_t>(options.decomposition_mode),
       static_cast<std::uint64_t>(options.boundary_condition),
-      std::bit_cast<std::uint64_t>(options.tree_pm_split_scale_comoving),
+      // The N03 spectral hook identity shares the split-scale lane so the
+      // fingerprint width stays fixed; any rank-divergent hook state differs.
+      std::bit_cast<std::uint64_t>(options.tree_pm_split_scale_comoving) ^
+          (options.spectral_source_hook == nullptr ? 0U : options.spectral_source_hook->fingerprint()),
       options.routing_exchange_batch_bytes,
       options.isolated_open_root_workspace_limit_bytes,
   };
@@ -1629,6 +1632,12 @@ void validateOptions(const PmGridShape& shape, const PmSolveOptions& options) {
     throw std::invalid_argument(
         "execution_policy=cuda currently supports only assignment_scheme=cic in this build");
   }
+  if (options.spectral_source_hook != nullptr &&
+      (options.execution_policy == core::ExecutionPolicy::kCuda ||
+       options.boundary_condition != PmBoundaryCondition::kPeriodic)) {
+    throw std::invalid_argument(
+        "PM spectral_source_hook (N03 neutrino source) is supported only by the periodic host Poisson operator");
+  }
   if (options.execution_policy == core::ExecutionPolicy::kCuda &&
       options.boundary_condition != PmBoundaryCondition::kPeriodic) {
     throw std::invalid_argument(
@@ -2503,6 +2512,48 @@ class PmSolver::Impl {
     }
   }
 
+  // Deterministic serial variant (N03 observation: storage-order sums).
+  template <typename Callback>
+  void forEachLogicalSpectralModeSerial(
+      const PlanResources& plan,
+      const PmGridShape& shape,
+      Callback&& callback) const {
+    const std::size_t nz_complex = shape.nz / 2U + 1U;
+    std::size_t visited = 0U;
+    if (plan.spectral_transposed) {
+      for (std::size_t local_iy = 0; local_iy < plan.transposed_local_ny; ++local_iy) {
+        const std::size_t iy = plan.transposed_begin_y + local_iy;
+        for (std::size_t ix = 0; ix < shape.nx; ++ix) {
+          for (std::size_t iz = 0; iz < nz_complex; ++iz) {
+            const std::size_t index = (local_iy * shape.nx + ix) * nz_complex + iz;
+            callback(
+                index, ix, iy, iz,
+                plan.kx_by_ix[ix], plan.ky_by_iy[iy], plan.kz_by_iz[iz]);
+            ++visited;
+          }
+        }
+      }
+    } else {
+      const std::size_t global_x_begin = plan.layout.owned_x.begin_x;
+      for (std::size_t local_ix = 0; local_ix < plan.layout.local_nx(); ++local_ix) {
+        const std::size_t ix = global_x_begin + local_ix;
+        for (std::size_t iy = 0; iy < shape.ny; ++iy) {
+          for (std::size_t iz = 0; iz < nz_complex; ++iz) {
+            const std::size_t index = (local_ix * shape.ny + iy) * nz_complex + iz;
+            callback(
+                index, ix, iy, iz,
+                plan.kx_by_ix[ix], plan.ky_by_iy[iy], plan.kz_by_iz[iz]);
+            ++visited;
+          }
+        }
+      }
+    }
+    if (visited != plan.logical_local_complex_cells) {
+      throw std::logic_error(
+          "PM logical spectral traversal disagrees with the plan's logical extent");
+    }
+  }
+
   [[nodiscard]] bool applyDerivedPoissonOperator(
       PlanResources& plan,
       const BoxLengths& lengths,
@@ -2516,6 +2567,49 @@ class PmSolver::Impl {
     }
 
     const double prefactor = -4.0 * k_pi * options.gravitational_constant_code;
+    // N03: optional isotropic source hook. Observation (binned mode power of
+    // the deposited cold density) precedes any modification of the modes; the
+    // collective finalize runs on every rank, including empty spectral slabs.
+    PmSpectralSourceHook* const hook = options.spectral_source_hook;
+    if (hook != nullptr) {
+      double k_axis_min = std::numeric_limits<double>::infinity();
+      double kx_max = 0.0;
+      double ky_max = 0.0;
+      double kz_max = 0.0;
+      const auto scan = [&k_axis_min](const auto& axis, double& axis_max) {
+        for (const double value : axis) {
+          const double magnitude = std::abs(value);
+          axis_max = std::max(axis_max, magnitude);
+          if (magnitude > 0.0) k_axis_min = std::min(k_axis_min, magnitude);
+        }
+      };
+      scan(plan.kx_by_ix, kx_max);
+      scan(plan.ky_by_iy, ky_max);
+      scan(plan.kz_by_iz, kz_max);
+      hook->requireWavenumberDomain(
+          k_axis_min, std::sqrt(kx_max * kx_max + ky_max * ky_max + kz_max * kz_max));
+      hook->beginSolve(options.scale_factor);
+      std::vector<double> bin_power;
+      std::vector<double> bin_modes;
+      if (hook->needsObservation()) {
+        bin_power.assign(hook->binCount(), 0.0);
+        bin_modes.assign(hook->binCount(), 0.0);
+        const std::size_t nz_complex = shape.nz / 2U + 1U;
+        const bool nz_even = (shape.nz % 2U) == 0U;
+        forEachLogicalSpectralModeSerial(
+            plan, shape,
+            [&](std::size_t index, std::size_t, std::size_t, std::size_t iz, double kx, double ky, double kz) {
+              const double k2 = kx * kx + ky * ky + kz * kz;
+              if (k2 == 0.0) return;
+              const std::size_t bin = hook->binIndex(std::sqrt(k2));
+              if (bin == PmSpectralSourceHook::k_no_bin) return;
+              const double multiplicity = (iz == 0U || (nz_even && iz == nz_complex - 1U)) ? 1.0 : 2.0;
+              bin_power[bin] += multiplicity * std::norm(fourier[index]);
+              bin_modes[bin] += multiplicity;
+            });
+      }
+      hook->finalizeObservation(bin_power, bin_modes);
+    }
     forEachLogicalSpectralMode(
         plan, shape,
         [&](std::size_t index,
@@ -2544,8 +2638,10 @@ class PmSolver::Impl {
             split_filter = treePmGaussianFourierLongRangeFilterUnchecked(
                 std::sqrt(k2), options.tree_pm_split_scale_comoving);
           }
+          const double source_multiplier =
+              hook == nullptr ? 1.0 : hook->multiplier(std::sqrt(k2));
           const double poisson_operator =
-              prefactor * window_correction * split_filter / k2;
+              prefactor * window_correction * split_filter * source_multiplier / k2;
           fourier[index] *= poisson_operator;
         });
 

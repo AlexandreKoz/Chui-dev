@@ -8,7 +8,9 @@
 #include <string>
 #include <vector>
 
+#include "cosmosim/core/config_extended_physics.hpp"
 #include "cosmosim/core/config_rt_bh_agn.hpp"
+#include "cosmosim/core/cosmology.hpp"
 #include "cosmosim/core/particle_species.hpp"
 
 namespace cosmosim::core {
@@ -666,6 +668,16 @@ struct CosmologyConfig {
   double box_size_z_mpc_comoving = 50.0;
   // Legacy scalar compatibility lane; canonical runtime geometry must use axis-aware fields above.
   double box_size_mpc_comoving = 50.0;
+  // CHUI-EXT-PHYS-REF-v1 S01/N01: relativistic background species derived
+  // from cosmology.radiation_background = photons_neutrinos, cosmology.t_cmb0_k,
+  // cosmology.n_ur, cosmology.ncdm_masses_ev, cosmology.ncdm_temperature_ratio.
+  // Disabled (default) keeps the legacy flat matter+Lambda background and the
+  // predecessor normalized text. See cosmosim/core/cosmology.hpp for the
+  // Omega_matter convention (includes massive neutrinos; Omega_cb derived).
+  RadiationSpeciesConfig radiation_species;
+  // True when cosmology.ncdm_temperature_ratio = instantaneous_decoupling
+  // ((4/11)^(1/3)); serialized as that token so the normalized text is exact.
+  bool ncdm_temperature_ratio_instantaneous_decoupling = false;
 };
 
 struct NumericsConfig {
@@ -1272,6 +1284,9 @@ struct SimulationConfig final {
   UnitsConfig units;
   ModeConfig mode;
   MhdConfig mhd;
+  // CHUI-EXT-PHYS-REF-v1 typed options ([neutrinos], [cosmic_rays],
+  // [observables], [instruments]); see config_extended_physics.hpp.
+  ExtendedPhysicsConfig extended;
   CompatibilityConfig compatibility;
 
  private:
@@ -1435,5 +1450,17 @@ void writeNormalizedConfigSnapshot(
 [[nodiscard]] std::string metalDiffusionTimeIntegratorToString(
     MetalDiffusionTimeIntegrator integrator);
 [[nodiscard]] std::string integratorTimeVariableToString(IntegratorTimeVariable variable);
+
+// CHUI-EXT-PHYS-REF-v1 S01: the single construction path from the frozen
+// configuration to the homogeneous-background authority. Every runtime and
+// validation site that builds a LambdaCdmBackground must use this function so
+// relativistic species can never be present in one consumer and absent in
+// another (implemented in src/core/config_extended_physics.cpp).
+[[nodiscard]] CosmologyBackgroundConfig cosmologyBackgroundConfigFromSimulation(const SimulationConfig& config);
+
+// CHUI-EXT-PHYS-REF-v1 I02 admission of the [neutrinos]/[cosmic_rays]/
+// [observables]/[instruments] options and of the [cosmology] radiation
+// background. Throws ConfigError with the exact missing contract or edge.
+void validateExtendedPhysicsConfig(const SimulationConfig& config);
 
 }  // namespace cosmosim::core

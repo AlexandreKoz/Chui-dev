@@ -83,6 +83,10 @@ struct RadiationTransportConfig {
   std::string stellar_sed_table_sha256;
   std::string agn_sed_table_path;       // schema chui_agn_sed_table_v1
   std::string agn_sed_table_sha256;
+  // CHUI-EXT-PHYS-REF-v1 F02: age/metallicity group luminosities per unit
+  // birth mass (schema chui_ssp_group_luminosity_v1, radiation_stellar_sources.hpp).
+  std::string stellar_luminosity_table_path;
+  std::string stellar_luminosity_table_sha256;
   double source_blackbody_temperature_k = 1.0e5;
   double source_power_law_index = 1.5;  // L_nu ~ nu^-index
   RtUvbPolicyConfig uvb_policy = RtUvbPolicyConfig::kRejectOverlap;

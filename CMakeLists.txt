@@ -489,6 +489,8 @@ add_library(cosmosim_core STATIC
   src/core/module_registry.cpp
   src/core/config.cpp
   src/core/config_rt_bh_agn.cpp
+  src/core/config_extended_physics.cpp
+  src/core/config_extended_physics_sections.cpp
   src/core/provenance.cpp
   src/core/cuda_runtime.cpp
   src/core/cosmology.cpp
@@ -689,7 +691,56 @@ add_library(cosmosim_radiation STATIC
   src/radiation/radiation_runtime.cpp
   src/radiation/radiation_amr.cpp
   src/radiation/radiation_sources.cpp
-  src/radiation/radiation_angular.cpp)
+  src/radiation/radiation_angular.cpp
+  src/radiation/radiation_stellar_sources.cpp
+  src/radiation/radiation_reference_transport.cpp
+  src/radiation/radiation_causal_transport.cpp)
+
+# CHUI-EXT-PHYS-REF-v1 S02 shared spectral/atomic/Boltzmann data services.
+# Depends on cosmosim_core only. Source-implemented, NOT compiled in pass 01
+# (docs/architecture/chui_extended_physics_implementation_pass01_status.md).
+add_library(cosmosim_spectral STATIC
+  src/spectral/atomic_data.cpp
+  src/spectral/boltzmann_tables.cpp
+  src/spectral/frequency_axis.cpp
+  src/spectral/reference_fft.cpp)
+
+# CHUI-EXT-PHYS-REF-v1 S03 read-only leaf ray and lightcone service
+# (depends on core only; observables consume it, it never mutates state).
+add_library(cosmosim_lightcone STATIC
+  src/lightcone/ray_geometry.cpp
+  src/lightcone/lightcone_plan.cpp)
+
+# CHUI-EXT-PHYS-REF-v1 CR01-CR07 cosmic-ray kernels (grey, two-moment,
+# spectral, losses/injection). Depends on mhd (RKL2 coefficients) and spectral.
+add_library(cosmosim_cosmic_rays STATIC
+  src/cosmic_rays/cosmic_ray_transport.cpp
+  src/cosmic_rays/cosmic_ray_spectrum.cpp
+  src/cosmic_rays/cosmic_ray_sources.cpp)
+
+# CHUI-EXT-PHYS-REF-v1 O01-O05 virtual interferometer (sky consumer only).
+add_library(cosmosim_instruments STATIC
+  src/instruments/interferometry.cpp)
+
+# CHUI-EXT-PHYS-REF-v1 L/C/RA observables (read-only consumers of state and
+# the lightcone geometry): line transfer, resonant Ly-a, CMB secondaries,
+# radio/Stokes transfer, FITS products, inline pipeline.
+add_library(cosmosim_observables STATIC
+  src/observables/gas_science_view.cpp
+  src/observables/line_transfer.cpp
+  src/observables/resonant_lyman_alpha.cpp
+  src/observables/cmb_secondaries.cpp
+  src/observables/radio_transfer.cpp
+  src/observables/fits_writer.cpp
+  src/observables/observable_pipeline.cpp)
+
+# CHUI-EXT-PHYS-REF-v1 N01-N05 massive-neutrino methods: PM spectral source
+# (transfer ratio / linear response), reference particle/delta-f kernels and
+# species statistics. Depends on spectral, gravity (hook interface), parallel.
+add_library(cosmosim_neutrinos STATIC
+  src/neutrinos/neutrino_linear_response.cpp
+  src/neutrinos/neutrino_particles.cpp
+  src/neutrinos/species_power_spectrum.cpp)
 
 add_library(cosmosim_workflows STATIC
   src/workflows/analysis_runtime.cpp
@@ -722,6 +773,12 @@ add_library(cosmosim_workflows STATIC
   src/workflows/reference_workflow.cpp)
 
 set(COSMOSIM_MODULE_LIBS
+  cosmosim_spectral
+  cosmosim_instruments
+  cosmosim_observables
+  cosmosim_cosmic_rays
+  cosmosim_lightcone
+  cosmosim_neutrinos
   cosmosim_mhd
   cosmosim_radiation
   cosmosim_gravity
@@ -759,10 +816,17 @@ if(COSMOSIM_STRICT_IO_WARNINGS)
   endif()
 endif()
 
-target_link_libraries(cosmosim_radiation PUBLIC cosmosim_physics)
+target_link_libraries(cosmosim_radiation PUBLIC cosmosim_physics cosmosim_lightcone)
+target_link_libraries(cosmosim_instruments PUBLIC cosmosim_spectral)
+target_link_libraries(cosmosim_observables PUBLIC cosmosim_spectral cosmosim_lightcone cosmosim_radiation cosmosim_instruments)
+target_link_libraries(cosmosim_cosmic_rays PUBLIC cosmosim_mhd cosmosim_spectral)
+target_link_libraries(cosmosim_neutrinos PUBLIC cosmosim_spectral cosmosim_gravity cosmosim_parallel)
 
 target_link_libraries(cosmosim_workflows
   PUBLIC
+    cosmosim_observables
+    cosmosim_neutrinos
+    cosmosim_spectral
     cosmosim_radiation
     cosmosim_mhd
     cosmosim_analysis
@@ -832,6 +896,12 @@ target_link_libraries(cosmosim_all
 set_target_properties(cosmosim_core PROPERTIES EXPORT_NAME core)
 set_target_properties(cosmosim_mhd PROPERTIES EXPORT_NAME mhd)
 set_target_properties(cosmosim_radiation PROPERTIES EXPORT_NAME radiation)
+set_target_properties(cosmosim_spectral PROPERTIES EXPORT_NAME spectral)
+set_target_properties(cosmosim_instruments PROPERTIES EXPORT_NAME instruments)
+set_target_properties(cosmosim_observables PROPERTIES EXPORT_NAME observables)
+set_target_properties(cosmosim_cosmic_rays PROPERTIES EXPORT_NAME cosmic_rays)
+set_target_properties(cosmosim_lightcone PROPERTIES EXPORT_NAME lightcone)
+set_target_properties(cosmosim_neutrinos PROPERTIES EXPORT_NAME neutrinos)
 set_target_properties(cosmosim_gravity PROPERTIES EXPORT_NAME gravity)
 set_target_properties(cosmosim_hydro PROPERTIES EXPORT_NAME hydro)
 set_target_properties(cosmosim_amr PROPERTIES EXPORT_NAME amr)
@@ -845,6 +915,12 @@ set_target_properties(cosmosim_all PROPERTIES EXPORT_NAME all)
 add_library(CosmoSim::core ALIAS cosmosim_core)
 add_library(CosmoSim::mhd ALIAS cosmosim_mhd)
 add_library(CosmoSim::radiation ALIAS cosmosim_radiation)
+add_library(CosmoSim::spectral ALIAS cosmosim_spectral)
+add_library(CosmoSim::instruments ALIAS cosmosim_instruments)
+add_library(CosmoSim::observables ALIAS cosmosim_observables)
+add_library(CosmoSim::cosmic_rays ALIAS cosmosim_cosmic_rays)
+add_library(CosmoSim::lightcone ALIAS cosmosim_lightcone)
+add_library(CosmoSim::neutrinos ALIAS cosmosim_neutrinos)
 add_library(CosmoSim::gravity ALIAS cosmosim_gravity)
 add_library(CosmoSim::hydro ALIAS cosmosim_hydro)
 add_library(CosmoSim::amr ALIAS cosmosim_amr)
@@ -862,6 +938,12 @@ target_link_libraries(cosmosim_harness PRIVATE cosmosim_all)
 set(COSMOSIM_INSTALL_CMAKEDIR "${CMAKE_INSTALL_LIBDIR}/cmake/CosmoSim")
 set(COSMOSIM_INSTALL_TARGETS
   cosmosim_core
+  cosmosim_spectral
+  cosmosim_instruments
+  cosmosim_observables
+  cosmosim_cosmic_rays
+  cosmosim_lightcone
+  cosmosim_neutrinos
   cosmosim_mhd
   cosmosim_radiation
   cosmosim_gravity
@@ -1357,6 +1439,15 @@ if(COSMOSIM_ENABLE_TESTS)
   add_test(NAME unit_black_hole_agn COMMAND test_unit_black_hole_agn)
 
   # CHUI-RT-BH-AGN-REF-v1 pass-01 verification sources (written, NOT RUN).
+  # CHUI-EXT-PHYS-REF-v1 unit/reference test sources (NOT RUN in source-only pass 01).
+  foreach(cosmosim_ext_phys_unit IN ITEMS cosmological_background spectral_data neutrino_methods lightcone_geometry rhd_reference_backends cosmic_ray_transport observables_kernels instrument_rime)
+    add_executable(test_unit_${cosmosim_ext_phys_unit} tests/unit/test_${cosmosim_ext_phys_unit}.cpp)
+    target_link_libraries(test_unit_${cosmosim_ext_phys_unit} PRIVATE cosmosim_all)
+    target_compile_definitions(test_unit_${cosmosim_ext_phys_unit} PRIVATE COSMOSIM_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
+    add_test(NAME unit_${cosmosim_ext_phys_unit} COMMAND test_unit_${cosmosim_ext_phys_unit})
+    cosmosim_append_test_labels(unit_${cosmosim_ext_phys_unit} ext_phys unit)
+  endforeach()
+
   foreach(cosmosim_rt_bh_agn_unit IN ITEMS rt_bh_agn_config source_transaction bh_agn_numerics radiation_core)
     add_executable(test_unit_${cosmosim_rt_bh_agn_unit} tests/unit/test_${cosmosim_rt_bh_agn_unit}.cpp)
     target_link_libraries(test_unit_${cosmosim_rt_bh_agn_unit} PRIVATE cosmosim_all)

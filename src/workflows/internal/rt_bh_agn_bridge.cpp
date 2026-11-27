@@ -183,6 +183,13 @@ RtBhAgnSourceBridge::RtBhAgnSourceBridge(const core::SimulationConfig& config, c
     const std::string profile = core::rtSpectralProfileConfigToString(p.rt.spectral_profile);
     rs.spectrum = radiation::buildRadiationSpectralDefinition(profile, p.rt.spectrum_upper_edge_ev, shape);
     m_agn_group_fractions = radiation::radiationGroupLuminosityFractions(rs.spectrum, shape);
+    if (p.rt.stellar_sources) {
+      // F02: versioned SSP group luminosities; edges must equal the RT groups.
+      m_stellar_table = std::make_unique<radiation::StellarLuminosityTable>(radiation::loadStellarLuminosityTable(
+          p.rt.stellar_luminosity_table_path, p.rt.stellar_luminosity_table_sha256));
+      radiation::requireMatchingGroupEdges(*m_stellar_table, rs.spectrum);
+      m_background = std::make_unique<core::LambdaCdmBackground>(core::cosmologyBackgroundConfigFromSimulation(config));
+    }
     const double c_code = core::constants::k_speed_of_light_si / units.velocity_si_per_code;
     rs.coupling.c_code = c_code;
     rs.coupling.c_hat_code = p.rt.c_fraction * c_code;
@@ -360,6 +367,16 @@ RtBhAgnEpochReport RtBhAgnSourceBridge::executeDiscreteEpoch(core::SimulationSta
     rin.frame_end = frame;
     if (m_config.physics.rt.agn_sources) {
       (void)radiation::buildAgnRadiationSources(state, m_agn_group_fractions, frame, m_box, dt_proper, rin.sources);
+    }
+    if (m_stellar_table != nullptr) {
+      radiation::StellarSourceInputs sin;
+      sin.background = m_background.get();
+      sin.units = m_units;
+      sin.scale_factor_begin = in.scale_factor_begin;
+      sin.scale_factor_end = in.scale_factor_end;
+      sin.dt_proper_code = dt_proper;
+      report.stellar_sources = radiation::buildStellarRadiationSources(
+          state, *m_stellar_table, m_radiation->settings().spectrum, sin, frame, m_box, rin.sources);
     }
     report.radiation = m_radiation->advanceInterval(state, rin);
     merge_rows(report.radiation.touched_gas_rows);

@@ -13,6 +13,7 @@
 #include "cosmosim/core/config.hpp"
 #include "cosmosim/core/memory_accounting.hpp"
 #include "cosmosim/gravity/gravity_communication_arena.hpp"
+#include "cosmosim/gravity/pm_spectral_hook.hpp"
 #include "cosmosim/core/execution_policy.hpp"
 #include "cosmosim/gravity/tree_index.hpp"
 #include "cosmosim/parallel/distributed_memory.hpp"
@@ -246,6 +247,10 @@ struct PmSolveOptions {
   // distributed isolated PM solver.
   std::uint64_t isolated_open_root_workspace_limit_bytes = 256ULL * 1024ULL * 1024ULL;
   PmForceGradientBackend force_gradient_backend = PmForceGradientBackend::kSpectral;
+  // CHUI-EXT-PHYS-REF-v1 N03: optional isotropic source multiplier M(|k|) of
+  // the periodic Poisson operator (pm_spectral_hook.hpp). Not owned. Null keeps
+  // the predecessor operator bit-for-bit. Refused by isolated/open and CUDA solves.
+  PmSpectralSourceHook* spectral_source_hook = nullptr;
 };
 
 struct PmProfileEvent {

@@ -1,4 +1,5 @@
 #include "cosmosim/core/config.hpp"
+#include "core/internal/config_extended_physics.hpp"
 #include "core/internal/config_rt_bh_agn_tables.hpp"
 #include "core/internal/config_rt_bh_agn_validation.hpp"
 
@@ -1606,7 +1607,8 @@ struct ConfigKeySpec {
 };
 
 [[nodiscard]] const std::vector<ConfigKeySpec>& configKeyRegistry() {
-  static const std::vector<ConfigKeySpec> keys = {
+  static const std::vector<ConfigKeySpec> keys = [] {
+  std::vector<ConfigKeySpec> registry = {
       {"schema_version", "1"},
       {"units.length_unit", "mpc"},
       {"units.mass_unit", "msun"},
@@ -1876,6 +1878,8 @@ struct ConfigKeySpec {
       {"physics.rt_stellar_sed_table_sha256", ""},
       {"physics.rt_agn_sed_table_path", ""},
       {"physics.rt_agn_sed_table_sha256", ""},
+      {"physics.rt_stellar_luminosity_table_path", ""},
+      {"physics.rt_stellar_luminosity_table_sha256", ""},
       {"physics.rt_source_blackbody_temperature_k", "1.0e5"},
       {"physics.rt_source_power_law_index", "1.5"},
       {"physics.rt_uvb_policy", "reject_overlap"},
@@ -2148,6 +2152,14 @@ struct ConfigKeySpec {
       {"mhd_performance.gpu_device_target_mib", "6144"},
       {"mhd_performance.allow_untracked_allocations", "false"},
   };
+  // CHUI-EXT-PHYS-REF-v1: [cosmology] radiation background, [neutrinos],
+  // [cosmic_rays], [observables], [instruments] (one default table owned by
+  // config_extended_physics.cpp).
+  for (const internal::ExtendedKeyDefault& entry : internal::extendedPhysicsKeyDefaults()) {
+    registry.push_back(ConfigKeySpec{entry.key, entry.default_value});
+  }
+  return registry;
+  }();
   return keys;
 }
 
@@ -3096,8 +3108,12 @@ void validateConfig(const SimulationConfig& config) {
   constexpr double k_cosmology_closure_tolerance = 1.0e-10;
   const double flat_density_sum =
       config.cosmology.omega_matter + config.cosmology.omega_lambda;
-  if (!std::isfinite(flat_density_sum) ||
-      std::abs(flat_density_sum - 1.0) > k_cosmology_closure_tolerance) {
+  // S01: with relativistic species the strict closure (including Omega_gamma
+  // and Omega_ur derived from T_cmb0) is enforced by validateExtendedPhysicsConfig
+  // through the same LambdaCdmBackground constructor the runtime uses.
+  if (!config.cosmology.radiation_species.enabled &&
+      (!std::isfinite(flat_density_sum) ||
+       std::abs(flat_density_sum - 1.0) > k_cosmology_closure_tolerance)) {
     throw ConfigError(
         "cosmology currently supports a flat radiation-free matter+Lambda background; "
         "omega_matter + omega_lambda must equal 1 within 1e-10 so H(a=1) == H0");
@@ -3265,6 +3281,7 @@ void validateConfig(const SimulationConfig& config) {
   }
   validatePart2BaryonicPhysics(config);
   internal::validateRtBhAgnConfig(config);
+  validateExtendedPhysicsConfig(config);
   validateMhdConfig(config.mhd);
   if (config.mhd.enabled) {
     // CHUI-MHD-REF-v1 cross-subsystem admission. These combinations have no
@@ -3837,6 +3854,8 @@ class NormalizedConfigStream {
   stream << "box_size_x = " << frozen.config.cosmology.box_size_x_mpc_comoving << " mpc\n";
   stream << "box_size_y = " << frozen.config.cosmology.box_size_y_mpc_comoving << " mpc\n";
   stream << "box_size_z = " << frozen.config.cosmology.box_size_z_mpc_comoving << " mpc\n";
+  // S01/N01: emitted only when enabled (disabled runs keep predecessor text/hash).
+  internal::appendCosmologyRadiationNormalizedText(stream, frozen.config.cosmology);
   stream << "\n[numerics]\n";
   stream << "a_begin = " << bridge_number(frozen.config.numerics.a_begin) << '\n';
   stream << "a_end = " << bridge_number(frozen.config.numerics.a_end) << '\n';
@@ -4135,6 +4154,12 @@ class NormalizedConfigStream {
     stream << "rt_stellar_sed_table_sha256 = " << frozen.config.physics.rt.stellar_sed_table_sha256 << '\n';
     stream << "rt_agn_sed_table_path = " << frozen.config.physics.rt.agn_sed_table_path << '\n';
     stream << "rt_agn_sed_table_sha256 = " << frozen.config.physics.rt.agn_sed_table_sha256 << '\n';
+    if (!frozen.config.physics.rt.stellar_luminosity_table_path.empty() ||
+        !frozen.config.physics.rt.stellar_luminosity_table_sha256.empty()) {
+      // F02 keys appear only when set (RT runs without stellar sources keep their text/hash).
+      stream << "rt_stellar_luminosity_table_path = " << frozen.config.physics.rt.stellar_luminosity_table_path << '\n';
+      stream << "rt_stellar_luminosity_table_sha256 = " << frozen.config.physics.rt.stellar_luminosity_table_sha256 << '\n';
+    }
     stream << "rt_source_blackbody_temperature_k = " << frozen.config.physics.rt.source_blackbody_temperature_k << '\n';
     stream << "rt_source_power_law_index = " << frozen.config.physics.rt.source_power_law_index << '\n';
     stream << "rt_uvb_policy = " << rtUvbPolicyConfigToString(frozen.config.physics.rt.uvb_policy) << '\n';
@@ -4563,6 +4588,8 @@ class NormalizedConfigStream {
          << (frozen.config.mhd.performance.allow_untracked_allocations ? "true" : "false")
          << '\n';
   }  // frozen.config.mhd.enabled
+  // CHUI-EXT-PHYS-REF-v1 sections, emitted only for enabled models.
+  internal::appendExtendedPhysicsNormalizedText(stream, frozen.config.extended);
   stream << "\n[compatibility]\n";
   stream << "allow_unknown_keys = "
          << (frozen.config.compatibility.allow_unknown_keys ? "true" : "false") << '\n';
@@ -4810,6 +4837,12 @@ class NormalizedConfigStream {
   frozen.config.cosmology.scalar_index_ns = parseFloating(
       requireString(entries, consumed, "cosmology.scalar_index_ns", "0.965"),
       "cosmology.scalar_index_ns");
+  // CHUI-EXT-PHYS-REF-v1 S01/N01 radiation background and the [neutrinos],
+  // [cosmic_rays], [observables], [instruments] sections. Every registered
+  // key is consumed here (defaults from the shared registry).
+  internal::parseExtendedPhysicsConfig(
+      [&](const std::string& key) { return requireString(entries, consumed, key, defaultFor(key)); },
+      frozen.config);
   const bool has_box_size_x = entries.contains("cosmology.box_size_x");
   const bool has_box_size_y = entries.contains("cosmology.box_size_y");
   const bool has_box_size_z = entries.contains("cosmology.box_size_z");
@@ -5715,6 +5748,8 @@ class NormalizedConfigStream {
   frozen.config.physics.rt.stellar_sed_table_sha256 = requireString(entries, consumed, "physics.rt_stellar_sed_table_sha256", defaultFor("physics.rt_stellar_sed_table_sha256"));
   frozen.config.physics.rt.agn_sed_table_path = requireString(entries, consumed, "physics.rt_agn_sed_table_path", defaultFor("physics.rt_agn_sed_table_path"));
   frozen.config.physics.rt.agn_sed_table_sha256 = requireString(entries, consumed, "physics.rt_agn_sed_table_sha256", defaultFor("physics.rt_agn_sed_table_sha256"));
+  frozen.config.physics.rt.stellar_luminosity_table_path = requireString(entries, consumed, "physics.rt_stellar_luminosity_table_path", defaultFor("physics.rt_stellar_luminosity_table_path"));
+  frozen.config.physics.rt.stellar_luminosity_table_sha256 = requireString(entries, consumed, "physics.rt_stellar_luminosity_table_sha256", defaultFor("physics.rt_stellar_luminosity_table_sha256"));
   frozen.config.physics.rt.source_blackbody_temperature_k = parseFloating(requireString(entries, consumed, "physics.rt_source_blackbody_temperature_k", defaultFor("physics.rt_source_blackbody_temperature_k")), "physics.rt_source_blackbody_temperature_k");
   frozen.config.physics.rt.source_power_law_index = parseFloating(requireString(entries, consumed, "physics.rt_source_power_law_index", defaultFor("physics.rt_source_power_law_index")), "physics.rt_source_power_law_index");
   frozen.config.physics.rt.uvb_policy = internal::parseRtBhAgnChoice(requireString(entries, consumed, "physics.rt_uvb_policy", defaultFor("physics.rt_uvb_policy")), "physics.rt_uvb_policy", internal::k_rt_uvb_policy_config_names);
@@ -6220,10 +6255,8 @@ class NormalizedConfigStream {
         "non-cosmological modes currently support only numerics.integrator_time_variable=code_time");
   }
   if (resolved_mode_policy.cosmological_comoving_frame) {
-    CosmologyBackgroundConfig background_config;
-    background_config.hubble_param = frozen.config.cosmology.hubble_param;
-    background_config.omega_matter = frozen.config.cosmology.omega_matter;
-    background_config.omega_lambda = frozen.config.cosmology.omega_lambda;
+    // S01: single construction path (relativistic species included when enabled).
+    const CosmologyBackgroundConfig background_config = cosmologyBackgroundConfigFromSimulation(frozen.config);
     const LambdaCdmBackground background = [&]() {
       try {
         return LambdaCdmBackground(background_config);
