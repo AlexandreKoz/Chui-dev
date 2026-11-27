@@ -725,3 +725,13 @@ drag-free gravity term (`first/second_source_kick_factor_code`).
 | Total energy in MHD mode `E_c = rho e + K + B_c^2/(2a)` | MHD stage `MhdGasStateSoa` during an interval; at rest the canonical gas rows hold `(rho, u, e)` and `B_c` comes from the faces | Rollback / stage-0 images inside `MhdLevelStepper` | `storeMhdGasToState` recovers `e` with the accepted faces and `a`; no floor |
 | Edge EMF (stage rate and interval integral) | `MhdStageWorkspace::emf` (scratch) / stepper-owned integral (when requested) | none | Owner-reconciled per stage; released at interval end; never checkpointed |
 | AMR EMF reflux register | `MhdEmfRegister` (pre-declared, interval-bound) | none | Rejected if incomplete/stale/duplicate; drained before any checkpoint |
+
+### MHD pass 04 additions (UNVALIDATED)
+
+| Fact | Single live authority | Mirrors / scratch | Refresh / invalidation |
+|---|---|---|---|
+| MHD wire hierarchy epoch | `MhdRuntimeBridge::m_hierarchy_epoch` = digest(global sorted directory) (+) collectively committed generation, agreed by allreduce | `MhdLevelStepperConfig::hierarchy_epoch` (copy per stepper); rank-local `topologyFingerprint` is a cache key only | Rebuilt with every directory rebuild; disagreement throws on every rank before any exchange |
+| Magnetic face authority access | `RuntimeResourceKey::kMagneticFaceState` (hydro view read-write; output/analysis read) | none | Seeded or bound once per segment at `HydroAmrRuntime::initializeMagneticState`; candidates never seed |
+| R-UCT face correction `D_n(B_t)` | none (stage scratch in `MhdFaceSignalPatch`) | none | Recomputed every ideal stage; never persisted |
+| Linear-response neutrino history | `NeutrinoSpectralSource` live history | module sidecar `chui_neutrino_response_v1`; bounded rollback journal (opening scalars/rows + popped accepted nodes) | Journal opened/committed/rolled back with the gravity cycle transaction; sidecar restored by the global-step state copy or re-published after a multirate rollback |
+| Accepted physical-boundary MHD budget | `MhdRuntimeTelemetry::boundary_*` (rank-global, cumulative) | stepper boundary-plane integrals (level-resident, admitted) | Produced only for domains with a non-periodic side; accepted intervals only |

@@ -788,6 +788,12 @@ bool maybeWriteOutputs(
     }
     io::RestartWritePayload restart_payload;
     restart_payload.persistent_state.simulation_state = &state;
+    // Pass 04 (M03-03): run-wide schema identity from the frozen configuration
+    // (identical on every rank, zero-gas ranks included), never from
+    // rank-local magnetic lanes.
+    restart_payload.magnetic_schema_selection = config.mhd.enabled
+        ? io::RestartMagneticSchemaSelection::kRunWideMagnetized
+        : io::RestartMagneticSchemaSelection::kRunWideNonMagnetic;
     restart_payload.integrator_state = &restart_integrator_state;
     restart_payload.scheduler = &scheduler;
     restart_payload.gas_cell_scheduler = &gas_cell_scheduler;
@@ -915,11 +921,15 @@ bool maybeWriteOutputs(
         .scale_factor = integrator_state.current_scale_factor,
         .message = "restart checkpoint written and streaming-verified",
         .payload = {{"path", report.restart_path.string()},
-                    {"restart_schema", state.magnetic_faces.empty() ? io::restartSchema().name
-                                                                    : io::mhdRestartSchema().name},
+                    // Pass 04 (M03-03): run-wide schema identity; RT v27 is
+                    // reported as written (never combined with v26).
+                    {"restart_schema", config.mhd.enabled ? io::mhdRestartSchema().name
+                                       : (!state.radiation.empty() ? io::radiationRestartSchema().name
+                                                                   : io::restartSchema().name)},
                     {"restart_schema_version",
-                     std::to_string(state.magnetic_faces.empty() ? io::restartSchema().version
-                                                                 : io::mhdRestartSchema().version)},
+                     std::to_string(config.mhd.enabled ? io::mhdRestartSchema().version
+                                    : (!state.radiation.empty() ? io::radiationRestartSchema().version
+                                                                : io::restartSchema().version))},
                     {"boundary_kind", std::string(core::stepBoundaryKindName(integrator_state.last_completed_boundary_kind))},
                     {"scheduler_current_tick", std::to_string(scheduler.currentTick())},
                     {"scheduler_max_bin", std::to_string(scheduler.maxBin())},
@@ -1042,6 +1052,27 @@ void validateRestartResumeTopologyOrThrowImpl(
   };
   require_scheduler(restart.scheduler_state, "particles");
   require_scheduler(restart.gas_cell_scheduler_state, "gas cells");
+  // Pass 04 (M03-03): run-wide restart schema admission. Every rank of a
+  // magnetized run must have read cosmosim_restart_v26 (an empty rank reads a
+  // valid empty /state/mhd group); a magnetized configuration resuming from a
+  // v25 rank file, or a nonmagnetic configuration resuming from v26, is
+  // refused on EVERY rank (collective verdict before any state is adopted).
+  {
+    const bool expected_v26 = config.mhd.enabled;
+    const bool read_v26 = restart.diagnostics.restart_schema_version == io::mhdRestartSchema().version;
+    const std::uint64_t local_mismatch = expected_v26 != read_v26 ? 1U : 0U;
+    const std::uint64_t mismatch = mpi_context.isEnabled() && mpi_context.worldSize() > 1
+        ? mpi_context.allreduceMaxUint64(local_mismatch)
+        : local_mismatch;
+    if (mismatch != 0U) {
+      throw std::runtime_error(
+          std::string("MHD_RESTART_SCHEMA_MISMATCH: ") +
+          (expected_v26 ? "mhd.enabled=true requires a cosmosim_restart_v26 file on every rank "
+                          "(a rank file without /state/mhd is corruption, not a legacy case)"
+                        : "a cosmosim_restart_v26 magnetized checkpoint cannot be resumed with "
+                          "mhd.enabled=false"));
+    }
+  }
   if (expected_max_bin > 0U) {
     if (restart.state.cells.size() != 0U || restart.integrator_state.inside_kdk_step ||
         !restart.integrator_state.last_completed_restart_safe ||
@@ -1362,6 +1393,7 @@ void OutputRestartRuntime::execute(OutputRestartStageView& view) {
        {RuntimeResourceKey::kMigrationOwnership, RuntimeResourceAccessMode::kRead},
        {RuntimeResourceKey::kSchedulerTruth, RuntimeResourceAccessMode::kRead},
        {RuntimeResourceKey::kIntegratorTruth, RuntimeResourceAccessMode::kRead},
+       {RuntimeResourceKey::kMagneticFaceState, RuntimeResourceAccessMode::kRead},
        {RuntimeResourceKey::kOutputRestartState, RuntimeResourceAccessMode::kReadWrite},
        {RuntimeResourceKey::kDiagnostics, RuntimeResourceAccessMode::kWrite}});
   if (context.stage != core::IntegrationStage::kOutputCheck) {

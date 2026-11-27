@@ -2679,3 +2679,16 @@ background authority with massive neutrinos, transfer-ratio/linear-response PM n
 spectral/lightcone services, RT reference backends and stellar sources, CR kernels (runtime
 refused), observables and instruments pipeline. Status ledger:
 `docs/architecture/chui_extended_physics_implementation_pass01_status.md`.
+
+## CHUI MHD corrective pass 04 (2026-11-27, source only)
+
+Corrective source pass over the 2026-11-27 compliance audit (M03-01..15,
+M04-01..05). Implemented (UNVALIDATED): global MHD wire epoch, run-wide v26
+schema with empty-rank groups, directory/row-map/seed/topology pre-admission,
+bounded deterministic exchange rounds, R-UCT face-consistent EMF,
+aspect-ratio-correct ratio-2 prolongation, composite additive seed integrals,
+legal magnetic initialization boundary and runtime resource key, neutrino
+response rollback journal, boundary budget telemetry, MHD test labels.
+Fail-closed: composition, observables/instruments, linear-response neutrinos,
+regrid/migration, `output_divergence_diagnostics=false`. Details and the
+continuation list: `docs/architecture/chui_mhd_implementation_pass04_status.md`.

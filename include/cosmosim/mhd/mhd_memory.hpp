@@ -21,7 +21,7 @@ namespace cosmosim::mhd {
 // (nx, ny, nz) cells, ghost g (2 PLM / 3 PPM), staggered tangential ghost 2:
 //   primitives      9 x (nx+2g)(ny+2g)(nz+2g)
 //   staggered       sum_a (n_a+1)(n_t1+4)(n_t2+4)
-//   face signals    2 x sum_a (n_a+1)(n_t1+2)(n_t2+2)
+//   face signals    4 x sum_a (n_a+1)(n_t1+2)(n_t2+2)  (fan +/- and two R-UCT corrections)
 //   stage EMF       N_e = nx(ny+1)(nz+1) + (nx+1)ny(nz+1) + (nx+1)(ny+1)nz
 //   boundary flux   6 x 2 x sum_a n_t1 n_t2
 //   rollback image  6 x N_c (gas) + N_f (faces)          [kPhaseResident]

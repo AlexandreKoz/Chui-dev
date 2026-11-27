@@ -46,6 +46,11 @@ enum class RuntimeResourceKey : std::uint8_t {
   kIntegratorTruth,
   kOutputRestartState,
   kDiagnostics,
+  // Pass 04 (M03-11): the authoritative oriented magnetic face flux
+  // (SimulationState::magnetic_faces). Only the kHydroUpdate hydro/MHD owner
+  // holds write access; output/restart reads it. Appended last so existing
+  // ordinals are unchanged.
+  kMagneticFaceState,
 };
 
 struct RuntimeResourceAccess {

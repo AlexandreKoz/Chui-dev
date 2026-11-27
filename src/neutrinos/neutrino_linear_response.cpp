@@ -7,6 +7,7 @@
 #include <array>
 #include <bit>
 #include <cmath>
+#include <cstddef>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
@@ -239,7 +240,12 @@ NeutrinoSpectralSource::NeutrinoSpectralSource(const core::LambdaCdmBackground& 
   if (m_settings.method == Method::kLinearResponse) {
     // Bounded authoritative history: reserved once (capacity x (s, a, A, R)).
     const std::uint64_t entry_bytes = (2U + 2U * bins) * sizeof(double);
-    const std::uint64_t bytes = entry_bytes * m_settings.history_capacity;
+    // Pass 04 (M04-01): the rollback journal (opening ratio/multiplier/initial
+    // rows + bounded saved entries) coexists with the live history and with
+    // the serialized sidecar copy; both journal parts are charged here.
+    const std::uint64_t journal_bytes = 5U * bins * sizeof(double) +
+        k_journal_max_saved_entries * (entry_bytes + sizeof(std::size_t));
+    const std::uint64_t bytes = entry_bytes * m_settings.history_capacity + journal_bytes;
     if (governor != nullptr) {
       m_reservation = governor->reserve(core::MemoryClass::kCanonicalPersistent, bytes, k_neutrino_response_module);
     }
@@ -247,8 +253,78 @@ NeutrinoSpectralSource::NeutrinoSpectralSource(const core::LambdaCdmBackground& 
     m_history_a.reserve(m_settings.history_capacity);
     m_history_amplitude.reserve(m_settings.history_capacity * bins);
     m_history_ratio.reserve(m_settings.history_capacity * bins);
+    m_journal_initial_delta_ratio.reserve(bins);
+    m_journal_initial_theta_ratio_s.reserve(bins);
+    m_journal_current_ratio.reserve(bins);
+    m_journal_current_multiplier.reserve(bins);
+    m_journal_saved_index.reserve(k_journal_max_saved_entries);
+    m_journal_saved_s.reserve(k_journal_max_saved_entries);
+    m_journal_saved_a.reserve(k_journal_max_saved_entries);
+    m_journal_saved_amplitude.reserve(k_journal_max_saved_entries * bins);
+    m_journal_saved_ratio.reserve(k_journal_max_saved_entries * bins);
     if (m_reservation.pending()) m_reservation.commit();
   }
+}
+
+void NeutrinoSpectralSource::beginTransaction() {
+  if (m_journal_open) throw std::logic_error("neutrino response transaction is already open");
+  if (m_solve_open) throw std::logic_error("neutrino response transaction opened inside a PM solve");
+  m_journal_size = m_history_s.size();
+  m_journal_min_size = m_journal_size;
+  m_journal_initial_scale_factor = m_initial_scale_factor;
+  // Capacities are reserved at construction for the linear-response method;
+  // the transfer-ratio method keeps bins-sized vectors only (assign never
+  // exceeds the existing size there either).
+  m_journal_initial_delta_ratio.assign(m_initial_delta_ratio.begin(), m_initial_delta_ratio.end());
+  m_journal_initial_theta_ratio_s.assign(m_initial_theta_ratio_s.begin(), m_initial_theta_ratio_s.end());
+  m_journal_current_ratio.assign(m_current_ratio.begin(), m_current_ratio.end());
+  m_journal_current_multiplier.assign(m_current_multiplier.begin(), m_current_multiplier.end());
+  m_journal_saved_index.clear();
+  m_journal_saved_s.clear();
+  m_journal_saved_a.clear();
+  m_journal_saved_amplitude.clear();
+  m_journal_saved_ratio.clear();
+  m_journal_open = true;
+}
+
+void NeutrinoSpectralSource::commitTransaction() noexcept {
+  m_journal_open = false;
+  m_journal_saved_index.clear();
+  m_journal_saved_s.clear();
+  m_journal_saved_a.clear();
+  m_journal_saved_amplitude.clear();
+  m_journal_saved_ratio.clear();
+}
+
+void NeutrinoSpectralSource::rollbackTransaction() noexcept {
+  if (!m_journal_open) return;
+  const std::size_t bins = m_bin_k_h_mpc.size();
+  // 1. Drop every node appended by the rejected attempt.
+  const std::size_t keep = m_journal_min_size;
+  m_history_s.resize(keep);
+  m_history_a.resize(keep);
+  m_history_amplitude.resize(keep * bins);
+  m_history_ratio.resize(keep * bins);
+  // 2. Re-append the accepted nodes a replay truncation popped, in index order
+  //    (saved in decreasing index order while popping). Capacity is reserved,
+  //    so no allocation occurs.
+  for (std::size_t n = m_journal_saved_index.size(); n-- > 0U;) {
+    m_history_s.push_back(m_journal_saved_s[n]);
+    m_history_a.push_back(m_journal_saved_a[n]);
+    for (std::size_t b = 0; b < bins; ++b) {
+      m_history_amplitude.push_back(m_journal_saved_amplitude[n * bins + b]);
+      m_history_ratio.push_back(m_journal_saved_ratio[n * bins + b]);
+    }
+  }
+  // 3. Opening scalars and rows (initial epoch included: an attempt that was
+  //    the first use restores the empty-history status exactly).
+  m_initial_scale_factor = m_journal_initial_scale_factor;
+  m_initial_delta_ratio.assign(m_journal_initial_delta_ratio.begin(), m_journal_initial_delta_ratio.end());
+  m_initial_theta_ratio_s.assign(m_journal_initial_theta_ratio_s.begin(), m_journal_initial_theta_ratio_s.end());
+  m_current_ratio.assign(m_journal_current_ratio.begin(), m_journal_current_ratio.end());
+  m_current_multiplier.assign(m_journal_current_multiplier.begin(), m_journal_current_multiplier.end());
+  m_solve_open = false;
+  commitTransaction();
 }
 
 std::unique_ptr<NeutrinoSpectralSource> NeutrinoSpectralSource::fromConfig(const core::SimulationConfig& config,
@@ -333,6 +409,27 @@ void NeutrinoSpectralSource::beginSolve(double scale_factor) {
   const std::size_t bins = m_bin_k_h_mpc.size();
   // Deterministic replay after a rejected step: entries at a >= current are discarded.
   while (!m_history_a.empty() && m_history_a.back() >= scale_factor) {
+    if (m_journal_open && m_history_a.size() <= m_journal_size &&
+        m_history_a.size() <= m_journal_min_size) {
+      // An ACCEPTED node (present at transaction opening) is about to be
+      // popped by replay: journal it so a rollback can restore it.
+      if (m_journal_saved_index.size() >= k_journal_max_saved_entries) {
+        throw std::runtime_error(
+            "neutrino linear-response replay would truncate more accepted history entries than the bounded "
+            "rollback journal holds (refused; entries are never dropped)");
+      }
+      const std::size_t index = m_history_a.size() - 1U;
+      m_journal_saved_index.push_back(index);
+      m_journal_saved_s.push_back(m_history_s.back());
+      m_journal_saved_a.push_back(m_history_a.back());
+      m_journal_saved_amplitude.insert(m_journal_saved_amplitude.end(),
+                                       m_history_amplitude.end() - static_cast<std::ptrdiff_t>(bins),
+                                       m_history_amplitude.end());
+      m_journal_saved_ratio.insert(m_journal_saved_ratio.end(),
+                                   m_history_ratio.end() - static_cast<std::ptrdiff_t>(bins),
+                                   m_history_ratio.end());
+      m_journal_min_size = index;
+    }
     m_history_a.pop_back();
     m_history_s.pop_back();
     m_history_amplitude.resize(m_history_amplitude.size() - bins);

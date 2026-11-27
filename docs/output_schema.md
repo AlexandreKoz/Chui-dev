@@ -565,13 +565,25 @@ Status: source-implemented in pass 02, UNVALIDATED (no build or run).
   lanes; the per-rank patch table is bounded (`2^24`) and the candidate lanes are
   admitted by the governor before allocation. `/state/mhd` in a pre-v26 file and
   a v26 file without it are both rejected.
+* Pass 04 (M03-03): the v26 decision is run-wide; a zero-leaf rank of a
+  magnetized run writes an empty but valid `/state/mhd` group marked
+  `empty_rank = 1` (see `docs/restart_checkpointing.md`). The restart event
+  payload reports the run-wide schema (v26 for MHD, v27 for radiation, else v25).
+* Pass 04 (M03-12/13): `mhd_io.output_divergence_diagnostics = false` is
+  refused (mandatory integrity record). The optional topology-resolved
+  `/MHD/FaceFlux` product has no requesting analysis contract in this source
+  tree and is NOT written; no configuration key requests it. The snapshot
+  field sampler indexes magnetic records once (sorted patch_id, O(P log P)) and
+  checks level and three-axis dimensions against every gas leaf.
 * `chui_science_snapshot_v6` is unchanged for MHD-off runs. Magnetized runs write
   `chui_science_snapshot_v7`: v6 plus `PartType0/MagneticField` (Nx3 float64,
   derived cell-centred `B_comov = a^2 B_phys` in normalized code units,
   attributes `Frame = Comoving`, `MagneticUnit = Code`, `Definition`),
   `PartType0/MagneticPressure` (`B_c^2/(2a)`), header provenance attributes
   `MhdSchemeVersion`, `MagneticUnits`, `MagneticFrame`, `InductionOperator`,
-  `EmfScheme`, `Reconstruction`, `NonidealIntegrator`, `CoefficientProvider`,
+  `EmfScheme` (pass 04: `uct_hll_r_uct_v1`, UCT-HLL with the face-consistency
+  correction R-UCT; pass-02 files read `uct_hll`), `Reconstruction`,
+  `NonidealIntegrator`, `CoefficientProvider`,
   `CoefficientTableSha256`, `DiffusivityConvention`, and `/MHD/Diagnostics`
   (`DiagnosticsScope` = `global` for a collective single file with rank-agreed
   values, `file_member` for sharded members; `DivergenceMaxNorm`,

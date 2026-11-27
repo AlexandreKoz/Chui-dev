@@ -40,6 +40,8 @@ struct RestartSchema {
 // non-empty MagneticFaceSoa; restartSchema() (v25) stays the nonmagnetic
 // current schema.
 [[nodiscard]] const RestartSchema& mhdRestartSchema();
+// CHUI-RT companion: cosmosim_restart_v27 (radiation moments; never combined with v26).
+[[nodiscard]] const RestartSchema& radiationRestartSchema();
 [[nodiscard]] bool isRestartSchemaCompatible(std::uint32_t file_schema_version);
 [[nodiscard]] const std::vector<std::string_view>& exactRestartCompletenessChecklist();
 
@@ -173,8 +175,21 @@ struct GravityForceCachePersistentState {
 [[nodiscard]] GravityForceCachePersistentView makeGravityForceCachePersistentView(
     const GravityForceCachePersistentState& cache) noexcept;
 
+// Pass 04 (M03-03): which checkpoint schema a rank writes must be a RUN-WIDE
+// decision. A rank that owns no magnetized patch in a magnetized run still
+// writes cosmosim_restart_v26 with a valid empty /state/mhd group; selecting
+// the schema from rank-local non-empty lanes (kFromLocalState) is retained
+// only for direct single-rank library callers and tests.
+enum class RestartMagneticSchemaSelection : std::uint8_t {
+  kFromLocalState = 0,
+  kRunWideNonMagnetic = 1,
+  kRunWideMagnetized = 2,
+};
+
 struct RestartWritePayload {
   RestartPersistentStateView persistent_state;
+  RestartMagneticSchemaSelection magnetic_schema_selection =
+      RestartMagneticSchemaSelection::kFromLocalState;
   const core::IntegratorState* integrator_state = nullptr;
   // Particle scheduler; particles.time_bin is a derived compatibility mirror.
   const core::HierarchicalTimeBinScheduler* scheduler = nullptr;
@@ -193,6 +208,10 @@ struct RestartWritePayload {
   OutputCadencePersistentState output_cadence_state;
   StochasticPersistentState stochastic_state;
 };
+
+// Pass 04 (M03-03): the magnetized (v26) schema decision of a write payload;
+// kRunWideNonMagnetic with a local magnetic state throws (schema mismatch).
+[[nodiscard]] bool restartPayloadIsMagnetized(const RestartWritePayload& payload);
 
 
 struct RestartDiagnosticsSummary {

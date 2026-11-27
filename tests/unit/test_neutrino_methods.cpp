@@ -218,6 +218,106 @@ void testHistoryCapacity() {
   CHUI_REQUIRE(threw && source.historySize() == 16U);
 }
 
+// Pass 04 (M04-01): transactional rollback of the live linear-response
+// history. A rejected interval containing PM refreshes must leave the live
+// history, current ratio/multiplier and fingerprint exactly equal to the
+// opening accepted state; the retried (shortened) trajectory must equal a
+// fresh direct run with the same accepted refresh epochs. Covers first use
+// (empty history), repeated retries, and the replay truncation of an accepted
+// node at the opening scale factor. NOT_RUN (source-only pass 04).
+void testLinearResponseTransactionRollback() {
+  const c::LambdaCdmBackground bg(neutrinoBackground(1.0));
+  nu::NeutrinoSourceSettings settings;
+  settings.method = c::NeutrinoMethodConfig::kLinearResponse;
+  settings.k_bins = 8;
+  settings.history_capacity = 64;
+  settings.k_min_h_mpc = 1.0e-4;
+  settings.k_max_h_mpc = 1.0e-3;
+  settings.hubble_param = 0.674;
+  settings.omega_baryon = 0.05;
+  const auto make = [&]() {
+    return nu::NeutrinoSpectralSource(bg, syntheticSet(bg, 49.0, 9.0, 1.0, 0.0), settings, nullptr, nullptr);
+  };
+  const std::vector<double> modes(8, 1.0);
+  const auto refresh = [&](nu::NeutrinoSpectralSource& source, double a, double amplitude) {
+    source.beginSolve(a);
+    const std::vector<double> power(8, amplitude * amplitude);
+    source.finalizeObservation(power, modes);
+  };
+  const auto same_state = [](const nu::NeutrinoSpectralSource& lhs, const nu::NeutrinoSpectralSource& rhs) {
+    CHUI_REQUIRE(lhs.historySize() == rhs.historySize());
+    CHUI_REQUIRE(lhs.fingerprint() == rhs.fingerprint());
+    const c::ModuleSidecarBlock left = lhs.serialize();
+    const c::ModuleSidecarBlock right = rhs.serialize();
+    CHUI_REQUIRE(left.payload == right.payload);  // bitwise: history, ratios, initial rows
+  };
+
+  // (1) First use inside a rejected attempt: rollback restores the empty
+  //     history (including the initial-epoch status).
+  {
+    nu::NeutrinoSpectralSource source = make();
+    const nu::NeutrinoSpectralSource pristine = make();
+    source.beginTransaction();
+    refresh(source, 0.020, 1.0);
+    refresh(source, 0.021, 1.05);
+    CHUI_REQUIRE(source.historySize() == 2U);
+    source.rollbackTransaction();
+    CHUI_REQUIRE(!source.transactionOpen());
+    same_state(source, pristine);
+  }
+  // (2) Rejected attempt with refreshes AFTER accepted history, retried twice
+  //     with shorter intervals; compare with a direct run of the accepted
+  //     epochs only.
+  {
+    nu::NeutrinoSpectralSource source = make();
+    nu::NeutrinoSpectralSource direct = make();
+    refresh(source, 0.020, 1.0);
+    refresh(direct, 0.020, 1.0);
+    for (int retry = 0; retry < 2; ++retry) {
+      source.beginTransaction();
+      refresh(source, 0.026 - 0.002 * retry, 1.3);  // rejected epochs beyond the retry
+      source.rollbackTransaction();
+    }
+    source.beginTransaction();
+    refresh(source, 0.022, 1.1);
+    source.commitTransaction();
+    refresh(direct, 0.022, 1.1);
+    same_state(source, direct);
+    // Subsequent accepted solves stay identical (no rejected node survived).
+    refresh(source, 0.025, 1.2);
+    refresh(direct, 0.025, 1.2);
+    same_state(source, direct);
+  }
+  // (3) A replay at the opening scale factor pops an ACCEPTED node; a rollback
+  //     must restore it exactly.
+  {
+    nu::NeutrinoSpectralSource source = make();
+    refresh(source, 0.020, 1.0);
+    refresh(source, 0.022, 1.1);
+    const c::ModuleSidecarBlock opening = source.serialize();
+    nu::NeutrinoSpectralSource reference = make();
+    reference.restore(opening);
+    source.beginTransaction();
+    refresh(source, 0.022, 1.4);  // truncates the accepted node at a = 0.022
+    refresh(source, 0.023, 1.5);
+    source.rollbackTransaction();
+    same_state(source, reference);
+  }
+  // (4) Commit keeps the attempt; a later rollback of a NEW transaction does
+  //     not touch committed nodes.
+  {
+    nu::NeutrinoSpectralSource source = make();
+    source.beginTransaction();
+    refresh(source, 0.020, 1.0);
+    source.commitTransaction();
+    const c::ModuleSidecarBlock committed = source.serialize();
+    source.beginTransaction();
+    refresh(source, 0.030, 2.0);
+    source.rollbackTransaction();
+    CHUI_REQUIRE(source.serialize().payload == committed.payload);
+  }
+}
+
 // EXT-N04-T01: delta-f weights, signed-mass refusal, NR drift, sampling moments.
 void testParticleKernels() {
   const nu::NeutrinoSpeciesScales scales{1.0, c::instantaneousDecouplingNeutrinoTemperatureRatio() * 2.7255};
@@ -290,6 +390,7 @@ int main() {
   testTransferRatio();
   testLinearResponseColdLimit();
   testHistoryCapacity();
+  testLinearResponseTransactionRollback();
   testParticleKernels();
   testSpeciesSpectra();
   return 0;

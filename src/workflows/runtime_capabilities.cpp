@@ -6,6 +6,7 @@
 #include "cosmosim/core/simulation_mode.hpp"
 #include "cosmosim/gravity/pm_solver.hpp"
 #include "cosmosim/io/ic_reader.hpp"
+#include "cosmosim/physics/baryonic_runtime_config.hpp"
 
 #include <fstream>
 #include <string>
@@ -449,6 +450,41 @@ std::string mhdProductionDispatchRefusal(const core::SimulationConfig& config,
   if (config.numerics.hydro_shadow_enabled) {
     return "numerics.hydro_shadow_enabled must be false: the hydro shadow reference compares "
            "nonmagnetic Godunov updates";
+  }
+  // Pass 04 (M03-02 / M04-02): the CHUI Part-2 composition sidecar (species,
+  // element and dust masses) is created by physics::ensureGasCompositionInitialized
+  // exactly when physics::part2ThermochemistrySelected() holds, and its only
+  // transport owner (CompositionFluxAccumulator on the legacy and AMR hydro
+  // paths) is bypassed by the magnetized kHydroUpdate branch. The MHD staging
+  // advects rho, momentum, total energy and the legacy metal-mass lane only.
+  // Until accepted SSPRK2 MHD mass fluxes drive composition transport, every
+  // configuration that creates or restores active composition lanes is
+  // refused. This also covers restarts: a checkpointed sidecar is restored
+  // only under a Part-2 backend, and a sidecar under legacy_cooling is
+  // already refused by ensureGasCompositionInitialized.
+  if (physics::part2ThermochemistrySelected(config.physics)) {
+    return "physics.thermochemistry_backend selects CHUI Part-2 composition (species/element/"
+           "dust lanes), but magnetized kHydroUpdate does not yet transport composition with the "
+           "accepted MHD mass flux (pass-04 M03-02); use thermochemistry_backend=legacy_cooling "
+           "with MHD";
+  }
+  // Pass 04 (M04-03): inline observables run inside AnalysisHooks while the
+  // global-step transaction may still be rejected, and their species-resolved
+  // inputs are not transported by MHD (M04-02); the virtual interferometer
+  // consumes the observables product of the same analysis step.
+  if (config.extended.observables.enabled || config.extended.instruments.enabled) {
+    return "observables/instruments with MHD are refused: products are published inside "
+           "AnalysisHooks before the global-step transaction is accepted and depend on species "
+           "composition that the magnetized update does not transport (pass-04 M04-02/M04-03)";
+  }
+  // Pass 04 (M04-01): MHD requires global-step retries; the time-dependent
+  // linear-response neutrino history is a live stateful PM hook whose
+  // rollback is verified only for the shared gravity cycle transaction added
+  // in pass 04 and remains unvalidated for the combined path.
+  if (config.extended.neutrinos.method == core::NeutrinoMethodConfig::kLinearResponse) {
+    return "extended.neutrinos.method=linear_response with MHD is refused: the combined "
+           "global-step retry of the spectral response history is not yet validated "
+           "(pass-04 M04-01); background_only and transfer_ratio are stateless and admitted";
   }
 #if !COSMOSIM_ENABLE_HDF5
   return "MHD requires an HDF5-enabled build: cosmosim_restart_v26 and snapshot v7 are the only "

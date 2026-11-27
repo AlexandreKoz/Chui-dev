@@ -433,13 +433,25 @@ MhdAmrSynchronizer::TransferResult MhdAmrSynchronizer::prolongFaceFluxes(
             slope_diff[d][t] = 0.5 * (s_plus - s_minus);
           }
         }
-        // Quadratic coefficients from the solenoidal constraints:
-        //   2 a_xx + b_xy + c_xz = 0 (and cyclic), with b_xy = slope_diff[y][x].
+        // Quadratic coefficients from the solenoidal constraints. With the
+        // normalized coordinates X_d = 2 x_d / Delta_d in [-1, 1] the
+        // X_d-linear part of div B in PHYSICAL coordinates is
+        //   (2/Delta_d)(2 a_dd) + (2/Delta_t1) b_{t1,d} + (2/Delta_t2) c_{t2,d},
+        // with b_{t1,d} = slope_diff[t1][d] (cross coefficient of component t1
+        // in X_t1 X_d). Pass 04 (M03-09): the aspect ratios are kept, so
+        //   a_dd = -(Delta_d / 2) (b_{t1,d} / Delta_t1 + c_{t2,d} / Delta_t2),
+        // which reduces to the cubic-cell form -(b + c)/2 when
+        // Delta_x = Delta_y = Delta_z. The pass-01/02 cubic form left an
+        // O(anisotropy x cross slope) divergence in rectangular cells (the
+        // transfer was then refused by the post-check below).
+        const std::array<double, 3> widths{parent_geometry.dx_comoving, parent_geometry.dy_comoving,
+                                           parent_geometry.dz_comoving};
         std::array<double, 3> quadratic{};
         for (std::size_t d = 0; d < 3U; ++d) {
           const std::size_t t1 = (d + 1U) % 3U;
           const std::size_t t2 = (d + 2U) % 3U;
-          quadratic[d] = -0.5 * (slope_diff[t1][d] + slope_diff[t2][d]);
+          quadratic[d] = -0.5 * widths[d] *
+              (slope_diff[t1][d] / widths[t1] + slope_diff[t2][d] / widths[t2]);
         }
         // Write fine faces of this parent cell.
         for (std::size_t d = 0; d < 3U; ++d) {

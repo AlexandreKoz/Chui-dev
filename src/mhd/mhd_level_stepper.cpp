@@ -345,12 +345,134 @@ void MhdLevelStepper::collective(std::string_view phase, Fn&& fn) {
   agree(failure, phase);
 }
 
+std::uint64_t MhdLevelStepper::exchangeRoundKey(std::uint64_t phase_id) noexcept {
+  // The read-only face comparison (42/43) exchanges the same lists as the
+  // face writes (40/41).
+  if (phase_id == 42U) {
+    return 40U;
+  }
+  if (phase_id == 43U) {
+    return 41U;
+  }
+  return phase_id;
+}
+
+void MhdLevelStepper::planExchangeRounds() {
+  m_exchange_rounds.clear();
+  const int world = m_transport->size();
+  const int me = m_transport->rank();
+  // Fixed, rank-invariant list order (edge fine slots are per global level).
+  std::vector<std::pair<std::uint64_t, const std::vector<Item>*>> lists{
+      {1U, &m_halo_items},          {10U, &m_edge_cross_items},  {20U, &m_record_cross_items},
+      {21U, &m_record_fine_items},  {30U, &m_energy_cross_items}, {31U, &m_energy_fine_items},
+      {40U, &m_face_cross_items},   {41U, &m_face_fine_items}};
+  for (std::size_t slot = 0; slot < m_edge_fine_items.size(); ++slot) {
+    lists.emplace_back(11U | (static_cast<std::uint64_t>(slot + 1U) << 8U), &m_edge_fine_items[slot]);
+  }
+  // Round payload capacity: the per-rank budget minus the per-peer wire
+  // headers of one round, so payload + headers never exceed the budget.
+  const std::uint64_t header_bytes =
+      static_cast<std::uint64_t>(world) * 2U * k_header_words * sizeof(std::uint64_t);
+  const std::uint64_t budget = std::max<std::uint64_t>(
+      m_config.comm_budget_bytes > header_bytes ? m_config.comm_budget_bytes - header_bytes : 0U,
+      1U);
+  std::vector<double> demand(m_topo.size(), 0.0);
+  std::vector<std::uint64_t> local_demand(m_topo.size(), 0U);
+  for (const auto& [key, list] : lists) {
+    ExchangeRounds rounds{};
+    std::fill(demand.begin(), demand.end(), 0.0);
+    std::fill(local_demand.begin(), local_demand.end(), 0U);
+    if (world > 1) {
+      for (const Item& item : *list) {
+        const bool src_local = m_topo[item.src].local != k_npos;
+        const bool dst_local = m_topo[item.dst].local != k_npos;
+        if (src_local == dst_local || (src_local && m_topo[item.dst].owner_rank == me)) {
+          continue;
+        }
+        // values + wire bytes on this rank's side of the transfer.
+        const std::uint64_t bytes = 2U * itemValueCount(item) * sizeof(double);
+        local_demand[item.dst] += bytes;
+        demand[item.dst] += static_cast<double>(bytes);
+      }
+      // Rank-invariant demand per destination (sum over ranks bounds every
+      // rank's share of that destination).
+      m_transport->allreduceSumDoubles(std::span<double>(demand.data(), demand.size()));
+    }
+    rounds.dst_begin.push_back(0U);
+    double round_sum = 0.0;
+    std::uint64_t round_local = 0U;
+    for (std::size_t d = 0; d < demand.size(); ++d) {
+      const double bytes = demand[d];
+      rounds.max_global_destination_bytes = std::max(
+          rounds.max_global_destination_bytes, static_cast<std::uint64_t>(std::ceil(bytes)));
+      if (round_sum > 0.0 && round_sum + bytes > static_cast<double>(budget)) {
+        rounds.dst_begin.push_back(static_cast<std::uint32_t>(d));
+        rounds.max_local_round_bytes = std::max(rounds.max_local_round_bytes, round_local);
+        round_sum = 0.0;
+        round_local = 0U;
+      }
+      round_sum += bytes;
+      round_local += local_demand[d];
+    }
+    rounds.max_local_round_bytes = std::max(rounds.max_local_round_bytes, round_local);
+    m_exchange_rounds.emplace_back(key, std::move(rounds));
+  }
+  m_exchange_rounds_ready = true;
+}
+
+const MhdLevelStepper::ExchangeRounds& MhdLevelStepper::roundsFor(std::uint64_t phase_id) {
+  if (!m_exchange_rounds_ready) {
+    planExchangeRounds();  // collective: every rank reaches its first exchange together
+  }
+  const std::uint64_t key = exchangeRoundKey(phase_id);
+  for (const auto& [list_key, rounds] : m_exchange_rounds) {
+    if (list_key == key) {
+      return rounds;
+    }
+  }
+  throw MhdError(MhdErrorCode::kMpiEpochMismatch,
+                 makeContext("mhd_level_exchange", "exchange phase has no planned round partition"));
+}
+
 template <class Packer, class Applier>
 void MhdLevelStepper::runItems(std::uint64_t phase_id, std::span<const Item> items, Packer&& pack,
                                Applier&& apply, bool remote_only) {
+  ++m_exchange_phases;
+  if (m_transport->size() <= 1) {
+    const std::uint64_t phase_word = (phase_id << 32U) ^ (m_phase_counter++ & 0xFFFFFFFFULL);
+    runItemsRound(phase_word, items, pack, apply, remote_only);
+    ++m_exchange_round_count;
+    return;
+  }
+  const ExchangeRounds& rounds = roundsFor(phase_id);
+  std::size_t begin = 0U;
+  for (std::size_t round = 0; round < rounds.dst_begin.size(); ++round) {
+    const std::uint32_t dst_end = round + 1U < rounds.dst_begin.size()
+        ? rounds.dst_begin[round + 1U]
+        : std::numeric_limits<std::uint32_t>::max();
+    std::size_t end = begin;
+    while (end < items.size() && items[end].dst < dst_end) {
+      ++end;
+    }
+    // Every rank executes the same round sequence (identical partition), so
+    // the phase word and the collective exchange count stay aligned.
+    const std::uint64_t phase_word = (phase_id << 32U) ^ (m_phase_counter++ & 0xFFFFFFFFULL);
+    runItemsRound(phase_word, items.subspan(begin, end - begin), pack, apply, remote_only);
+    ++m_exchange_round_count;
+    begin = end;
+  }
+  if (begin != items.size()) {
+    throw MhdError(MhdErrorCode::kMpiEpochMismatch,
+                   makeContext("mhd_level_exchange",
+                               "exchange items are not sorted by destination (round partition)"));
+  }
+}
+
+template <class Packer, class Applier>
+void MhdLevelStepper::runItemsRound(std::uint64_t phase_word, std::span<const Item> items,
+                                    Packer&& pack, Applier&& apply, bool remote_only) {
   const int world = m_transport->size();
   const int me = m_transport->rank();
-  const std::uint64_t phase_word = (phase_id << 32U) ^ (m_phase_counter++ & 0xFFFFFFFFULL);
   if (world > 1) {
     std::exception_ptr failure;
     try {
@@ -468,7 +590,6 @@ void MhdLevelStepper::runItems(std::uint64_t phase_id, std::span<const Item> ite
     failure = std::current_exception();
   }
   agree(failure, "exchange apply");
-  ++m_exchange_phases;
 }
 
 // Values of one item computed from its (local) source patch canonical or
@@ -925,7 +1046,7 @@ void MhdLevelStepper::reconcileEdges() {
   // Coarse <- fine, finest coarse level first (a coarse edge may itself be the
   // fine source of the next coarser override).
   for (std::size_t slot = m_edge_fine_items.size(); slot-- > 0U;) {
-    applyItemsWrite(m_edge_fine_items[slot], 11U);
+    applyItemsWrite(m_edge_fine_items[slot], 11U | (static_cast<std::uint64_t>(slot + 1U) << 8U));
   }
 }
 
@@ -1997,6 +2118,17 @@ MhdLevelMemoryPlan MhdLevelStepper::planMemory(const MhdLevelAdvanceOptions& mod
     max_phase = std::max(max_phase, phase_bytes(list, 1U));
   }
   const auto world = static_cast<std::uint64_t>(m_transport->size());
+  // Pass 04 (M03-05): with the collective round partition planned, the
+  // simultaneous application staging is the largest ROUND (never the whole
+  // phase); before planning, the conservative whole-phase bound is reported.
+  if (m_exchange_rounds_ready) {
+    std::uint64_t max_round = 0U;
+    for (const auto& [key, rounds] : m_exchange_rounds) {
+      (void)key;
+      max_round = std::max(max_round, rounds.max_local_round_bytes);
+    }
+    max_phase = std::min(max_phase, max_round);
+  }
   plan.communication_bytes =
       world > 1U ? max_phase + world * 2U * k_header_words * sizeof(std::uint64_t) : 0U;
   for (const PatchRuntime& patch : m_local) {
@@ -2008,6 +2140,27 @@ MhdLevelMemoryPlan MhdLevelStepper::planMemory(const MhdLevelAdvanceOptions& mod
 
 void MhdLevelStepper::admitMemory(core::MemoryGovernor& governor, const MhdLevelAdvanceOptions& mode,
                                   const MhdResourceLimits& limits) {
+  // Pass 04 (M03-05): COLLECTIVE round partition before any local refusal, so
+  // every rank reaches the same allreduce.
+  if (m_transport->size() > 1 && !m_exchange_rounds_ready) {
+    planExchangeRounds();
+  }
+  if (m_transport->size() > 1) {
+    const std::uint64_t comm_max = std::min(m_config.comm_budget_bytes, limits.comm_max_bytes_per_rank);
+    for (const auto& [key, rounds] : m_exchange_rounds) {
+      if (rounds.max_global_destination_bytes > comm_max) {
+        MhdFailureContext failure = makeContext(
+            "mhd_level_stepper",
+            "one destination patch's irreducible MHD exchange round exceeds the explicit "
+            "communication maximum (MP03); use smaller patches or the approved high-memory "
+            "communication profile");
+        failure.requested_bytes = rounds.max_global_destination_bytes;
+        failure.safe_limit_bytes = comm_max;
+        (void)key;
+        throw MhdError(MhdErrorCode::kMemoryBudgetExceeded, std::move(failure));
+      }
+    }
+  }
   const MhdLevelMemoryPlan plan = planMemory(mode, limits);
   if (plan.active_cells != 0U &&
       plan.bytesPerActiveCell() > static_cast<double>(limits.scratch_bytes_per_active_cell)) {
@@ -2035,13 +2188,23 @@ void MhdLevelStepper::admitMemory(core::MemoryGovernor& governor, const MhdLevel
   // Release a previous admission only after the new plan was validated.
   m_admission.release();
   m_comm_reservation.release();
-  m_topology_reservation.release();
+  // Pass 04 (M03-04): a topology reservation pre-admitted at construction
+  // (MhdLevelStepperConfig::topology_governor) is handed over instead of
+  // charging the already-built metadata a second time. It is released and
+  // re-reserved at the measured capacity only when it is from a different
+  // governor or no longer covers the plan; the transient never double-counts.
+  const bool keep_topology = m_topology_reservation.valid() &&
+      m_topology_reservation.committed() && m_config.topology_governor == &governor &&
+      m_topology_reservation.bytes() >= plan.topology_bytes;
+  if (!keep_topology) {
+    m_topology_reservation.release();
+  }
   MhdPatchMemoryEstimate aggregate{};
   aggregate.rollback_image_bytes = plan.level_resident_bytes;
   aggregate.primitive_cache_bytes = plan.batch_scratch_bytes;
   m_admission = MhdMemoryAdmission(governor, aggregate, 1U, false, "mhd_level_stepper");
   try {
-    if (plan.topology_bytes != 0U) {
+    if (plan.topology_bytes != 0U && !keep_topology) {
       m_topology_reservation = governor.reserve(core::MemoryClass::kPhaseResident,
                                                 plan.topology_bytes, "mhd_level_stepper.topology");
       // Topology metadata already exists (built at construction).
@@ -2104,6 +2267,7 @@ MhdLevelAdvanceResult MhdLevelStepper::advance(const MhdStageContext& interval,
   const std::uint64_t bytes_sent_before = m_bytes_sent;
   const std::uint64_t bytes_received_before = m_bytes_received;
   const std::uint64_t phases_before = m_exchange_phases;
+  const std::uint64_t rounds_before = m_exchange_round_count;
   // (1) Read-only validation BEFORE anything is written; (2) the rollback
   // image is the exact caller state; (3) normalization happens inside the
   // transaction.
@@ -2172,6 +2336,7 @@ MhdLevelAdvanceResult MhdLevelStepper::advance(const MhdStageContext& interval,
       result.mpi_bytes_sent = m_bytes_sent - bytes_sent_before;
       result.mpi_bytes_received = m_bytes_received - bytes_received_before;
       result.exchange_phases = m_exchange_phases - phases_before;
+      result.exchange_rounds = m_exchange_round_count - rounds_before;
       return result;
     } catch (const MhdError& error) {
       failure = std::current_exception();
@@ -2209,6 +2374,7 @@ MhdLevelAdvanceResult MhdLevelStepper::advance(const MhdStageContext& interval,
       result.mpi_bytes_sent = m_bytes_sent - bytes_sent_before;
       result.mpi_bytes_received = m_bytes_received - bytes_received_before;
       result.exchange_phases = m_exchange_phases - phases_before;
+      result.exchange_rounds = m_exchange_round_count - rounds_before;
       return result;
     }
     attempt.dt_code = shorter;

@@ -243,8 +243,14 @@ void writeMhdRestartGroup(std::int64_t hdf5_file, const core::MagneticFaceSoa& f
   (void)metadata;
   fail("MHD restart group requires COSMOSIM_ENABLE_HDF5=ON");
 #else
-  if (!faces.isConsistent() || faces.patches.empty()) {
-    fail("refusing to write an empty or inconsistent magnetic face state");
+  if (!faces.isConsistent()) {
+    fail("refusing to write an inconsistent magnetic face state");
+  }
+  const bool empty_rank = faces.patches.empty();
+  if (empty_rank && (!metadata.allow_empty_rank || !faces.face_flux_x_comoving.empty() ||
+                     !faces.face_flux_y_comoving.empty() || !faces.face_flux_z_comoving.empty())) {
+    fail("refusing to write an empty magnetic face state outside a run-wide magnetized "
+         "checkpoint (or with orphan flux values)");
   }
   const auto finite = [](const auto& lane) {
     return std::all_of(lane.begin(), lane.end(), [](double v) { return std::isfinite(v); });
@@ -308,6 +314,9 @@ void writeMhdRestartGroup(std::int64_t hdf5_file, const core::MagneticFaceSoa& f
   writeStringAttribute(group.get(), "face_flux_contract", faces.contract);
   writeScalarAttribute<double>(group.get(), "divergence_max_norm", metadata.divergence_max_norm);
   writeScalarAttribute<double>(group.get(), "scale_factor", metadata.scale_factor);
+  if (empty_rank) {
+    writeScalarAttribute<std::uint32_t>(group.get(), "empty_rank", 1U);
+  }
   writeDataset(group.get(), "patch_id", ids.data(), count, 1U);
   writeDataset(group.get(), "geometry_generation", generations.data(), count, 1U);
   writeDataset(group.get(), "refinement_level", levels.data(), count, 1U);
@@ -379,8 +388,17 @@ core::MagneticFaceSoa readMhdRestartGroup(std::int64_t hdf5_file,
     H5Sget_simple_extent_dims(space.get(), &dims, nullptr);
     count = dims;
   }
-  if (count == 0U) {
-    fail("magnetized checkpoint carries no patches");
+  const bool empty_rank_marker = H5Aexists(group.get(), "empty_rank") > 0 &&
+      readScalarAttribute<std::uint32_t>(group.get(), "empty_rank") == 1U;
+  if (H5Aexists(group.get(), "empty_rank") > 0 && !empty_rank_marker) {
+    fail("invalid empty_rank marker value");
+  }
+  if (count == 0U && !empty_rank_marker) {
+    fail("magnetized checkpoint carries no patches and no empty_rank marker (truncated or "
+         "corrupt group)");
+  }
+  if (count != 0U && empty_rank_marker) {
+    fail("empty_rank marker on a non-empty patch table (corrupt group)");
   }
   // Bound the patch table before allocating it (malicious/corrupt extents).
   if (count > k_mhd_restart_max_patches_per_rank) {

@@ -11,10 +11,13 @@
 #include <limits>
 #include <sstream>
 #include <stdexcept>
+#include <tuple>
 
+#include "cosmosim/core/memory_accounting.hpp"
 #include "cosmosim/core/stage_transaction.hpp"
 #include "cosmosim/hydro/gas_thermodynamic_refresh.hpp"
 #include "cosmosim/mhd/mhd_initial_conditions.hpp"
+#include "cosmosim/workflows/hydro_amr_runtime.hpp"
 
 namespace cosmosim::workflows::internal {
 namespace {
@@ -33,6 +36,14 @@ void mix(std::uint64_t& hash, std::uint64_t word) noexcept {
 
 [[noreturn]] void fail(std::string_view phase, const std::string& detail) {
   throw std::runtime_error("MHD_RUNTIME (" + std::string(phase) + "): " + detail);
+}
+
+[[nodiscard]] std::uint64_t checkedBytesMultiply(std::uint64_t lhs, std::uint64_t rhs,
+                                                 std::string_view context) {
+  if (rhs != 0U && lhs > std::numeric_limits<std::uint64_t>::max() / rhs) {
+    fail("admission", std::string(context) + " overflows 64-bit byte arithmetic");
+  }
+  return lhs * rhs;
 }
 
 [[nodiscard]] std::int64_t roundToLattice(double value, std::string_view what) {
@@ -120,6 +131,13 @@ MhdRuntimeBridge::MhdRuntimeBridge(const core::SimulationConfig& config,
   if (!config.mhd.enabled) {
     throw std::logic_error("MhdRuntimeBridge constructed for an MHD-disabled run");
   }
+  // Pass 04: direct construction must obey the same precise admission as the
+  // capability report and the HydroAmrRuntime factory (composition, observables,
+  // linear-response neutrinos, regrid, rebalance, ...).
+  if (const std::string refusal = mhdProductionDispatchRefusal(config, core::ModePolicy{});
+      !refusal.empty()) {
+    throw std::invalid_argument("MHD_UNSUPPORTED_PHYSICS: " + refusal);
+  }
   m_policy = mhd::mhdNumericsPolicyFromConfig(config.mhd);
   if (config.mhd.nonideal.enabled) {
     m_provider = mhd::makeConfiguredCoefficientProvider(config.mhd);
@@ -152,7 +170,18 @@ mhd::MhdLevelAdvanceOptions MhdRuntimeBridge::advanceOptions() const {
   // stage: no pending register, so neither edge nor boundary-flux integrals
   // are required by the production path (both remain available for audits).
   options.produce_edge_integrals = false;
-  options.produce_boundary_flux_integrals = false;
+  // Pass 04 (M03-12): accepted open/wall boundary gas and non-ideal Poynting
+  // work enter the conservation budget. The integrals live in the stepper's
+  // admitted level-resident boundary planes (O(patch surface)); they are
+  // requested only when the global domain has a non-periodic side, so a fully
+  // periodic run keeps its pass-02 memory plan.
+  bool physical_boundary = false;
+  for (std::size_t axis = 0; axis < 3U; ++axis) {
+    physical_boundary = physical_boundary ||
+        m_level_domain.lower[axis] != mhd::MhdBoundaryKind::kPeriodic ||
+        m_level_domain.upper[axis] != mhd::MhdBoundaryKind::kPeriodic;
+  }
+  options.produce_boundary_flux_integrals = physical_boundary;
   return options;
 }
 
@@ -235,8 +264,52 @@ void MhdRuntimeBridge::buildDirectory(const core::SimulationState& state,
     failure = std::current_exception();
   }
   m_mpi.rethrowCollectivePreparationFailure(failure, "MHD leaf directory preparation");
+  // Pass 04 (M03-04): admit the gathered directory, the decoded descriptor
+  // table and the replacement row maps BEFORE they are allocated. Counts are
+  // agreed collectively (zero-patch ranks contribute zero), so every rank
+  // admits from the same global descriptor count. The previous row maps stay
+  // charged until the replacement is built (old + new coexistence).
+  std::uint64_t local_cells = 0U;
+  for (const Descriptor& d : local) {
+    local_cells += static_cast<std::uint64_t>(d.cells[0] * d.cells[1] * d.cells[2]);
+  }
+  const std::uint64_t global_descriptors =
+      m_transport.size() > 1 ? m_mpi.allreduceSumUint64(local.size()) : local.size();
+  core::MemoryReservation directory_reservation{};
+  core::MemoryReservation row_map_reservation{};
+  failure = nullptr;
+  try {
+    if (m_governor != nullptr) {
+      const std::uint64_t per_descriptor = k_descriptor_words * sizeof(std::uint64_t) +
+          sizeof(Descriptor) + sizeof(mhd::MhdRemotePatchDescriptor) +
+          6U * sizeof(std::uint64_t) /* canonical epoch tuple */;
+      const std::uint64_t directory_bytes = core::checkedMemoryBytesAdd(
+          checkedBytesMultiply(global_descriptors, per_descriptor,
+                                           "MHD directory bytes"),
+          local_bytes.capacity(), "MHD directory bytes");
+      directory_reservation = m_governor->reserve(core::MemoryClass::kCommunication,
+                                                  directory_bytes, "mhd_runtime.directory");
+      const std::uint64_t row_bytes = core::checkedMemoryBytesAdd(
+          checkedBytesMultiply(local_cells, sizeof(std::uint32_t),
+                                           "MHD row-map bytes"),
+          checkedBytesMultiply(local.size(), sizeof(LocalPatch), "MHD row-map bytes"),
+          "MHD row-map bytes");
+      row_map_reservation = m_governor->reserve(core::MemoryClass::kPersistentCache, row_bytes,
+                                                "mhd_runtime.row_maps");
+    }
+  } catch (...) {
+    failure = std::current_exception();
+  }
+  m_mpi.rethrowCollectivePreparationFailure(failure, "MHD directory and row-map admission");
+  if (directory_reservation.pending()) {
+    directory_reservation.commit();
+  }
+  if (row_map_reservation.pending()) {
+    row_map_reservation.commit();
+  }
   const std::vector<std::uint8_t> gathered =
       m_transport.size() > 1 ? m_mpi.allgatherBytesBounded(local_bytes) : local_bytes;
+  std::uint64_t directory_digest = 0U;
   failure = nullptr;
   try {
     if (gathered.size() % (k_descriptor_words * sizeof(std::uint64_t)) != 0U) {
@@ -298,6 +371,18 @@ void MhdRuntimeBridge::buildDirectory(const core::SimulationState& state,
     m_level_domain.upper = boundary.upper;
     m_patches.clear();
     m_remote.clear();
+    // Pass 04 (M03-01): canonical GLOBAL directory digest. Integer tuples
+    // (level, patch_id, lattice origin, cells, owner) sorted by
+    // (level, patch_id); the allgather order and any floating bits are
+    // irrelevant, so every rank computes the same value.
+    std::vector<std::array<std::int64_t, 9>> canonical;
+    canonical.reserve(all.size());
+    std::int32_t finest_level = base_level;
+    for (const Descriptor& d : all) {
+      finest_level = std::max(finest_level, d.level);
+    }
+    m_finest_level = finest_level;
+    m_base_spacing = base_spacing;
     for (const Descriptor& d : all) {
       const double factor = std::ldexp(1.0, -(d.level - base_level));
       std::array<double, 3> spacing{};
@@ -318,6 +403,10 @@ void MhdRuntimeBridge::buildDirectory(const core::SimulationState& state,
         mix(generation, static_cast<std::uint64_t>(d.cells[axis]));
       }
       generation |= 1U;
+      canonical.push_back({static_cast<std::int64_t>(d.level),
+                           static_cast<std::int64_t>(d.patch_id), origin_cell[0], origin_cell[1],
+                           origin_cell[2], d.cells[0], d.cells[1], d.cells[2],
+                           static_cast<std::int64_t>(d.owner_rank)});
       if (d.owner_rank != my_rank) {
         mhd::MhdRemotePatchDescriptor remote{};
         remote.patch_id = d.patch_id;
@@ -389,15 +478,71 @@ void MhdRuntimeBridge::buildDirectory(const core::SimulationState& state,
       }
       m_patches.push_back(std::move(patch));
     }
+    std::sort(canonical.begin(), canonical.end(),
+              [](const auto& lhs, const auto& rhs) {
+                return std::tie(lhs[0], lhs[1]) < std::tie(rhs[0], rhs[1]);
+              });
+    for (std::size_t r = 1; r < canonical.size(); ++r) {
+      if (canonical[r][1] == canonical[r - 1][1]) {
+        fail("directory", "duplicate patch_id across ranks in the global leaf directory");
+      }
+    }
+    std::uint64_t digest = k_fnv_offset;
+    mix(digest, canonical.size());
+    mix(digest, static_cast<std::uint64_t>(static_cast<std::int64_t>(base_level)));
+    for (std::size_t axis = 0; axis < 3U; ++axis) {
+      mix(digest, static_cast<std::uint64_t>(m_level_domain.cells[axis]));
+    }
+    for (const auto& tuple : canonical) {
+      for (const std::int64_t word : tuple) {
+        mix(digest, static_cast<std::uint64_t>(word));
+      }
+    }
+    directory_digest = digest;
   } catch (...) {
     failure = std::current_exception();
   }
   m_mpi.rethrowCollectivePreparationFailure(failure, "MHD leaf directory and lattice");
+  // The gathered bytes and decode tables are released on return; only the
+  // retained row maps stay charged (old maps were already cleared above).
+  m_row_map_reservation = std::move(row_map_reservation);
+  directory_reservation.release();
+  // Collectively committed generation: buildDirectory is entered by every
+  // rank the same number of times (rebuild decisions are reduced), so the
+  // counter is rank-invariant. The wire epoch distinguishes successive
+  // hierarchies even when their descriptors coincide.
+  ++m_hierarchy_generation;
+  agreeHierarchyValue(directory_digest, "global leaf directory digest");
+  m_directory_digest = directory_digest;
+  std::uint64_t epoch = directory_digest;
+  mix(epoch, m_hierarchy_generation);
+  m_hierarchy_epoch = epoch | 1U;
+  agreeHierarchyValue(m_hierarchy_epoch, "hierarchy wire epoch");
+}
+
+void MhdRuntimeBridge::agreeHierarchyValue(std::uint64_t value, std::string_view what) {
+  if (m_transport.size() <= 1) {
+    return;
+  }
+  const std::uint64_t high = m_mpi.allreduceMaxUint64(value);
+  const std::uint64_t high_complement = m_mpi.allreduceMaxUint64(~value);
+  const std::uint64_t local_disagree = (high != value || high_complement != ~value) ? 1U : 0U;
+  // Every rank learns the same verdict before anyone throws (no partial
+  // mutation, no rank left waiting in a later collective).
+  if (m_mpi.allreduceMaxUint64(local_disagree) != 0U) {
+    fail("epoch", "ranks disagree on the " + std::string(what) +
+                      "; the hierarchy is not globally consistent (stale or corrupt directory)");
+  }
 }
 
 void MhdRuntimeBridge::seedFreshField(core::SimulationState& state, const MhdDomainSpec& domain,
                                       double scale_factor) {
   const core::MhdConfig::Io& io = m_config.mhd.io;
+  core::MagneticFaceSoa storage{};
+  core::MemoryReservation layout_reservation{};
+  core::MemoryReservation seed_scratch_reservation{};
+  std::uint64_t process_baseline_before = 0U;
+  std::uint64_t old_owned = 0U;
   std::exception_ptr failure;
   try {
     if (io.initial_field_seed == core::MhdInitialFieldSeedConfigMode::kNone) {
@@ -406,12 +551,55 @@ void MhdRuntimeBridge::seedFreshField(core::SimulationState& state, const MhdDom
            "field_loop, circular_alfven, stochastic) or restart from a cosmosim_restart_v26 "
            "checkpoint; cell-centred fields are never projected into face flux");
     }
+    // Pass 04 (M03-04): checked upper bound of the authoritative layout (three
+    // flux lanes + records + alignment slack) and of the per-patch seed edge
+    // scratch, admitted BEFORE any allocation. The layout is canonical
+    // persistent state; the edge scratch is a scratch arena held only while
+    // seeding.
+    std::uint64_t face_values = 0U;
+    std::uint64_t max_edge_values = 0U;
+    for (const LocalPatch& patch : m_patches) {
+      const mhd::MhdPatchGeometry& g = patch.geometry;
+      face_values = core::checkedMemoryBytesAdd(
+          face_values, g.faceCountX() + g.faceCountY() + g.faceCountZ(), "MHD seed layout");
+      const std::uint64_t edges = static_cast<std::uint64_t>(g.nx) * (g.ny + 1U) * (g.nz + 1U) +
+          static_cast<std::uint64_t>(g.nx + 1U) * g.ny * (g.nz + 1U) +
+          static_cast<std::uint64_t>(g.nx + 1U) * (g.ny + 1U) * g.nz;
+      max_edge_values = std::max(max_edge_values, edges);
+    }
+    constexpr std::uint64_t k_lane_alignment_slack = 3U * 256U;
+    const std::uint64_t layout_bytes = core::checkedMemoryBytesAdd(
+        core::checkedMemoryBytesAdd(
+            checkedBytesMultiply(face_values, sizeof(double), "MHD seed layout"),
+            checkedBytesMultiply(m_patches.size(), sizeof(core::MagneticFacePatchRecord),
+                                 "MHD seed layout"),
+            "MHD seed layout"),
+        k_lane_alignment_slack + 128U, "MHD seed layout");
+    const std::uint64_t scratch_bytes = core::checkedMemoryBytesAdd(
+        checkedBytesMultiply(max_edge_values, sizeof(double), "MHD seed scratch"),
+        k_lane_alignment_slack, "MHD seed scratch");
+    if (m_governor != nullptr) {
+      process_baseline_before = m_governor->snapshot().baseline_owned_bytes;
+      old_owned = core::memoryReportBaselineOwnedBytes(core::collectSimulationMemoryReport(state));
+      if (process_baseline_before < old_owned) {
+        // The process baseline has not been measured yet (very first
+        // allocation of the run): the replacement is then charged relative to
+        // the state it replaces only.
+        process_baseline_before = old_owned;
+      }
+      layout_reservation = m_governor->reserve(core::MemoryClass::kCanonicalPersistent,
+                                               layout_bytes, "mhd_runtime.seed_layout");
+      seed_scratch_reservation = m_governor->reserve(core::MemoryClass::kScratchArena,
+                                                     scratch_bytes, "mhd_runtime.seed_scratch");
+      layout_reservation.commit();
+      seed_scratch_reservation.commit();
+    }
     std::vector<mhd::MhdAdapterPatchBinding> bindings;
     bindings.reserve(m_patches.size());
     for (const LocalPatch& patch : m_patches) {
       bindings.push_back({patch.patch_id, patch.geometry_generation, patch.level, patch.geometry});
     }
-    core::MagneticFaceSoa storage = mhd::buildMagneticFaceLayout(
+    storage = mhd::buildMagneticFaceLayout(
         bindings, m_provider ? m_provider->tableSha256().value_or(std::string()) : std::string());
     const std::array<double, 3> uniform{io.initial_field_uniform_b_x_comoving,
                                         io.initial_field_uniform_b_y_comoving,
@@ -437,6 +625,20 @@ void MhdRuntimeBridge::seedFreshField(core::SimulationState& state, const MhdDom
             io.initial_field_spectral_index, io.initial_field_random_seed);
         break;
     }
+    // Pass 04 (M03-10): one common geometric edge authority on the composite
+    // hierarchy. Every edge line integral is evaluated as the pairwise
+    // (binary-tree) sum of the integrals over its unit sub-edges of the
+    // FINEST lattice present anywhere in the global hierarchy, with sub-edge
+    // start points computed from integer finest-lattice coordinates. A coarse
+    // edge therefore equals the floating-point sum of its two fine halves with
+    // the identical association, so the coarse interface face flux C(A)
+    // equals the sum of its four fine faces to roundoff and the strict entry
+    // consistency check holds for non-polynomial potentials as well.
+    if (potential) {
+      potential = mhd::compositeEdgePotential(std::move(potential), domain.origin_comoving,
+                                              m_base_spacing,
+                                              m_finest_level - m_level_domain.base_level);
+    }
     double divergence = 0.0;
     for (std::size_t index = 0; index < m_patches.size(); ++index) {
       const LocalPatch& patch = m_patches[index];
@@ -453,11 +655,41 @@ void MhdRuntimeBridge::seedFreshField(core::SimulationState& state, const MhdDom
     }
     storage.divergence_max_normalized = divergence;
     (void)scale_factor;  // Seeds are B_c (comoving); B_phys = B_c / a_initial^2.
-    state.magnetic_faces = std::move(storage);
+    if (m_governor != nullptr) {
+      const std::uint64_t owned = static_cast<std::uint64_t>(
+          (storage.face_flux_x_comoving.capacity() + storage.face_flux_y_comoving.capacity() +
+           storage.face_flux_z_comoving.capacity()) * sizeof(double) +
+          storage.patches.capacity() * sizeof(core::MagneticFacePatchRecord));
+      if (owned > layout_reservation.bytes()) {
+        fail("admission", "seeded magnetic layout capacity exceeds its pre-admitted bound");
+      }
+    }
   } catch (...) {
     failure = std::current_exception();
   }
+  seed_scratch_reservation.release();
+  // Collective success precedes mutation of the authoritative state: a seed
+  // failure on any rank leaves every rank's (empty) magnetic state intact.
   m_mpi.rethrowCollectivePreparationFailure(failure, "MHD fresh-start magnetic seed");
+  const std::uint64_t new_owned = static_cast<std::uint64_t>(
+      (storage.face_flux_x_comoving.capacity() + storage.face_flux_y_comoving.capacity() +
+       storage.face_flux_z_comoving.capacity()) * sizeof(double) +
+      storage.patches.capacity() * sizeof(core::MagneticFacePatchRecord));
+  const std::uint64_t replaced = static_cast<std::uint64_t>(
+      (state.magnetic_faces.face_flux_x_comoving.capacity() +
+       state.magnetic_faces.face_flux_y_comoving.capacity() +
+       state.magnetic_faces.face_flux_z_comoving.capacity()) * sizeof(double) +
+      state.magnetic_faces.patches.capacity() * sizeof(core::MagneticFacePatchRecord));
+  state.magnetic_faces = std::move(storage);  // nothrow move of the vectors
+  if (layout_reservation.valid() && layout_reservation.committed()) {
+    // Hand the admitted bytes to the process baseline without a transient
+    // double count (the old, empty state is retired in the same step).
+    const std::uint64_t base = process_baseline_before >= replaced
+        ? process_baseline_before - replaced
+        : 0U;
+    layout_reservation.reconcileBaselineOwnedAndRelease(base + new_owned);
+  }
+  (void)old_owned;
 }
 
 void MhdRuntimeBridge::bindFaces(core::SimulationState& state) {
@@ -482,13 +714,29 @@ void MhdRuntimeBridge::bindFaces(core::SimulationState& state) {
                        " at its current geometry generation (stale magnetic topology)");
     }
     const core::MagneticFacePatchRecord& r = state.magnetic_faces.patches[record];
-    if (r.level != patch.level || r.nx != patch.geometry.nx || r.ny != patch.geometry.ny ||
-        r.nz != patch.geometry.nz ||
-        std::abs(r.cell_width_x_comoving - patch.geometry.dx_comoving) >
-            1.0e-12 * patch.geometry.dx_comoving ||
-        std::abs(r.origin_x_comoving - patch.geometry.origin_x_comoving) >
-            1.0e-9 * std::max(patch.geometry.dx_comoving, std::abs(patch.geometry.origin_x_comoving))) {
-      fail("bind", "magnetic face record geometry disagrees with the leaf patch");
+    // Pass 04 (M03-13): full three-axis geometry (dimensions, widths and
+    // origins) - the geometry generation alone is a lattice digest and does
+    // not cover the comoving widths/origins recorded in the restart record.
+    const std::array<double, 3> record_width{r.cell_width_x_comoving, r.cell_width_y_comoving,
+                                             r.cell_width_z_comoving};
+    const std::array<double, 3> record_origin{r.origin_x_comoving, r.origin_y_comoving,
+                                              r.origin_z_comoving};
+    const std::array<double, 3> width{patch.geometry.dx_comoving, patch.geometry.dy_comoving,
+                                      patch.geometry.dz_comoving};
+    const std::array<double, 3> origin{patch.geometry.origin_x_comoving,
+                                       patch.geometry.origin_y_comoving,
+                                       patch.geometry.origin_z_comoving};
+    bool geometry_matches = r.level == patch.level && r.nx == patch.geometry.nx &&
+        r.ny == patch.geometry.ny && r.nz == patch.geometry.nz;
+    for (std::size_t axis = 0; axis < 3U && geometry_matches; ++axis) {
+      geometry_matches = std::isfinite(record_width[axis]) && std::isfinite(record_origin[axis]) &&
+          std::abs(record_width[axis] - width[axis]) <= 1.0e-12 * width[axis] &&
+          std::abs(record_origin[axis] - origin[axis]) <=
+              1.0e-9 * std::max(width[axis], std::abs(origin[axis]));
+    }
+    if (!geometry_matches) {
+      fail("bind", "magnetic face record geometry (level, dims, x/y/z widths or origins) "
+                   "disagrees with leaf patch " + std::to_string(patch.patch_id));
     }
     patch.face_record = record;
   }
@@ -496,7 +744,7 @@ void MhdRuntimeBridge::bindFaces(core::SimulationState& state) {
 
 void MhdRuntimeBridge::ensureMagneticState(core::SimulationState& state,
                                            const core::IntegratorState& integrator,
-                                           const MhdDomainSpec& domain) {
+                                           const MhdDomainSpec& domain, bool allow_seed) {
   const bool has_leaves = [&]() {
     for (std::size_t p = 0; p < state.patches.size(); ++p) {
       if (state.patches.cell_count[p] != 0U) {
@@ -515,6 +763,12 @@ void MhdRuntimeBridge::ensureMagneticState(core::SimulationState& state,
     fail("admission", "some ranks hold a magnetic state and others do not");
   }
   if (ranks_empty != 0U) {
+    if (!allow_seed) {
+      fail("admission",
+           "the magnetic state was not initialized at the legal pre-step boundary "
+           "(HydroAmrRuntime::initializeMagneticState); a timestep candidate or kHydroUpdate "
+           "never seeds the authoritative field");
+    }
     if (integrator.step_index != 0U) {
       fail("admission",
            "magnetized run past step 0 without an authoritative magnetic state (restart from a "
@@ -592,7 +846,9 @@ void MhdRuntimeBridge::bind(core::SimulationState& state, const MhdDomainSpec& d
     stepper_config.retry_mode = mhd::MhdRetryMode::kExternal;
     stepper_config.transport = &m_transport;
     stepper_config.require_memory_admission = m_governor != nullptr;
-    stepper_config.hierarchy_epoch = fingerprint;
+    // Pass 04 (M03-01): globally agreed epoch, never the local fingerprint.
+    stepper_config.hierarchy_epoch = m_hierarchy_epoch;
+    stepper_config.topology_governor = m_governor;
     stepper_config.comm_budget_bytes = m_config.mhd.performance.mhd_comm_budget_mib_per_rank * k_mib;
     m_stepper = std::make_unique<mhd::MhdLevelStepper>(m_policy, m_level_domain, std::move(bindings),
                                                        m_remote, stepper_config);
@@ -600,6 +856,9 @@ void MhdRuntimeBridge::bind(core::SimulationState& state, const MhdDomainSpec& d
     failure = std::current_exception();
   }
   m_mpi.rethrowCollectivePreparationFailure(failure, "MHD hierarchy topology");
+  // The stepper's own digest of its global directory must agree on every rank
+  // (it includes the owner ranks the bridge assigned).
+  agreeHierarchyValue(m_stepper->directoryDigest(), "stepper directory digest");
   failure = nullptr;
   try {
     if (m_governor != nullptr) {
@@ -684,6 +943,7 @@ void MhdRuntimeBridge::advance(core::StepContext& context, const MhdDomainSpec& 
     interval.apply_expansion_source = false;
   }
   loadGas(state, interval.scale_factor);
+  ++m_telemetry.attempted_intervals;
   try {
     m_last = m_stepper->advance(interval, advanceOptions());
   } catch (const mhd::MhdError& error) {
@@ -694,12 +954,66 @@ void MhdRuntimeBridge::advance(core::StepContext& context, const MhdDomainSpec& 
   m_telemetry.ideal_stage_evaluations_attempted += m_last.ideal_stage_evaluations_attempted;
   m_telemetry.mpi_bytes_sent += m_last.mpi_bytes_sent;
   m_telemetry.mpi_bytes_received += m_last.mpi_bytes_received;
+  m_telemetry.exchange_rounds += m_last.exchange_rounds;
+  m_telemetry.exchange_phases += m_last.exchange_phases;
   if (!m_last.accepted) {
     ++m_telemetry.rejected_intervals;
     std::ostringstream stream;
     stream << "MHD interval rejected (retryable, nothing committed): " << m_last.last_rejection
            << "; suggested dt " << m_last.dt_suggested_code;
     throw core::StageTransactionRejected(core::StageRejectionKind::kNumericalRetry, stream.str());
+  }
+  // Pass 04 (M03-12): accepted physical-boundary budget of this interval.
+  // Lane 0 is mass, lane 4 the ideal TOTAL (gas + magnetic) energy flux of
+  // the HLLD/HLLE face solver. Gas: the record integral I = sum_stage w F / a updates a cell by
+  // -/+ I / dx, so the comoving amount leaving through a face is +/- I * A
+  // (upper side positive outward, lower side negative). Non-ideal Poynting
+  // energy uses the same convention with the energy-record integral.
+  // Rank-local sums are reduced collectively (zero-patch ranks contribute 0).
+  {
+    std::array<double, 3> boundary{0.0, 0.0, 0.0};  // mass, gas energy, Poynting energy out
+    const mhd::MhdLevelAdvanceOptions options = advanceOptions();
+    if (options.produce_boundary_flux_integrals) {
+      for (std::size_t index = 0; index < m_patches.size(); ++index) {
+        const mhd::MhdPatchBoundary& sides = m_stepper->patchBoundary(index);
+        const mhd::MhdBoundaryFaceFluxes& gas = m_stepper->boundaryGasFluxIntegral(index);
+        const mhd::MhdBoundaryFaceEnergyFluxes& energy =
+            m_stepper->boundaryEnergyFluxIntegral(index);
+        const mhd::MhdPatchGeometry& g = m_patches[index].geometry;
+        const std::array<std::size_t, 3> n{g.nx, g.ny, g.nz};
+        const std::array<double, 3> area{g.faceAreaX(), g.faceAreaY(), g.faceAreaZ()};
+        for (std::size_t axis = 0; axis < 3U; ++axis) {
+          const std::size_t t1 = (axis + 1U) % 3U;
+          const std::size_t t2 = (axis + 2U) % 3U;
+          for (std::size_t side = 0; side < 2U; ++side) {
+            const mhd::MhdBoundaryKind kind = side == 0U ? sides.lower[axis] : sides.upper[axis];
+            if (kind != mhd::MhdBoundaryKind::kOpen &&
+                kind != mhd::MhdBoundaryKind::kReflectingConductingWall) {
+              continue;
+            }
+            const double outward = side == 0U ? -1.0 : 1.0;
+            for (std::size_t b = 0; b < n[t2]; ++b) {
+              for (std::size_t a = 0; a < n[t1]; ++a) {
+                const double* record = gas.at(axis, side, a, b);
+                boundary[0] += outward * record[0] * area[axis];
+                boundary[1] += outward * record[4] * area[axis];
+                if (m_rate != nullptr) {
+                  boundary[2] += outward * energy.at(axis, side, a, b) * area[axis];
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    if (m_transport.size() > 1) {
+      m_transport.allreduceSumDoubles(std::span<double>(boundary.data(), boundary.size()));
+    }
+    m_telemetry.boundary_mass_out_comoving += boundary[0];
+    m_telemetry.boundary_gas_energy_out_comoving += boundary[1];
+    m_telemetry.boundary_poynting_energy_out_comoving += boundary[2];
+    m_telemetry.last_boundary_mass_out_comoving = boundary[0];
+    m_telemetry.last_boundary_energy_out_comoving = boundary[1] + boundary[2];
   }
   std::exception_ptr failure;
   try {

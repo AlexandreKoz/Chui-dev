@@ -127,6 +127,68 @@ double seedFaceFlux(const MhdPatchGeometry& geometry,
   return maxNormalizedFaceDivergence(geometry, phi_x, phi_y, phi_z, normalizer);
 }
 
+MhdEdgePotential compositeEdgePotential(MhdEdgePotential inner,
+                                        std::array<double, 3> origin_comoving,
+                                        std::array<double, 3> base_spacing_comoving,
+                                        std::int32_t finest_depth) {
+  if (!inner || finest_depth < 0 || finest_depth > 20) {
+    throw MhdError(MhdErrorCode::kInvalidField,
+                   MhdFailureContext{.owner = "mhd_initial_conditions",
+                                     .detail = "invalid composite edge potential request"});
+  }
+  std::array<double, 3> fine{};
+  for (std::size_t axis = 0; axis < 3U; ++axis) {
+    if (!(base_spacing_comoving[axis] > 0.0) || !std::isfinite(origin_comoving[axis])) {
+      throw MhdError(MhdErrorCode::kInvalidField,
+                     MhdFailureContext{.owner = "mhd_initial_conditions",
+                                       .detail = "invalid composite lattice"});
+    }
+    fine[axis] = std::ldexp(base_spacing_comoving[axis], -finest_depth);
+  }
+  return [inner = std::move(inner), origin_comoving, fine](
+             MhdAxis axis, std::array<double, 3> start, double length) {
+    const auto to_lattice = [](double value) {
+      const double rounded = std::nearbyint(value);
+      if (!std::isfinite(value) || std::abs(value - rounded) > 1.0e-6) {
+        throw MhdError(MhdErrorCode::kInvalidField,
+                       MhdFailureContext{.owner = "mhd_initial_conditions",
+                                         .detail = "edge is not on the finest composite lattice"});
+      }
+      return static_cast<std::int64_t>(rounded);
+    };
+    std::array<std::int64_t, 3> n{};
+    for (std::size_t d = 0; d < 3U; ++d) {
+      n[d] = to_lattice((start[d] - origin_comoving[d]) / fine[d]);
+    }
+    const std::size_t direction = mhdAxisIndex(axis);
+    const std::int64_t m = to_lattice(length / fine[direction]);
+    if (m < 1 || (m & (m - 1)) != 0) {
+      throw MhdError(MhdErrorCode::kInvalidField,
+                     MhdFailureContext{.owner = "mhd_initial_conditions",
+                                       .detail = "edge length is not a power-of-two multiple of "
+                                                 "the finest spacing"});
+    }
+    const auto point = [&](std::int64_t along) {
+      std::array<double, 3> p{};
+      for (std::size_t d = 0; d < 3U; ++d) {
+        const std::int64_t index = d == direction ? along : n[d];
+        p[d] = origin_comoving[d] + static_cast<double>(index) * fine[d];
+      }
+      return p;
+    };
+    // Explicit-stack pairwise sum over [n_dir, n_dir + m) (identical tree for
+    // any aligned sub-range of the same size).
+    const auto pairwise = [&](auto&& self, std::int64_t begin, std::int64_t count) -> double {
+      if (count == 1) {
+        return inner(axis, point(begin), fine[direction]);
+      }
+      const std::int64_t half = count / 2;
+      return self(self, begin, half) + self(self, begin + half, half);
+    };
+    return pairwise(pairwise, n[direction], m);
+  };
+}
+
 MhdEdgePotential fieldLoopPotential(double amplitude, double radius, std::array<double, 3> center) {
   if (!(radius > 0.0) || !std::isfinite(amplitude)) {
     throw MhdError(MhdErrorCode::kInvalidField,
