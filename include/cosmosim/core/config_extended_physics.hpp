@@ -52,13 +52,28 @@ struct NeutrinoPerturbationConfig {
   bool operator==(const NeutrinoPerturbationConfig&) const = default;
 };
 
+// ------------------------------------------------------------- cosmic rays
+enum class CosmicRayModelConfig : std::uint8_t {
+  kNone = 0,
+  kGrey = 1,        // CR01/CR02 kernels exist; runtime stage missing (refused)
+  kTwoMoment = 2,   // CR03 kernels exist; runtime stage missing (refused)
+  kSpectral = 3,    // CR04-CR06 kernels exist; runtime stage missing (refused)
+};
+
+struct CosmicRayConfig {
+  CosmicRayModelConfig model = CosmicRayModelConfig::kNone;
+  bool operator==(const CosmicRayConfig&) const = default;
+};
+
 struct ExtendedPhysicsConfig {
   NeutrinoPerturbationConfig neutrinos;
+  CosmicRayConfig cosmic_rays;
   bool operator==(const ExtendedPhysicsConfig&) const = default;
 };
 
 [[nodiscard]] std::string neutrinoMethodConfigToString(NeutrinoMethodConfig value);
 [[nodiscard]] std::string boltzmannTableFormatConfigToString(BoltzmannTableFormatConfig value);
 [[nodiscard]] std::string boltzmannGaugeConfigToString(BoltzmannGaugeConfig value);
+[[nodiscard]] std::string cosmicRayModelConfigToString(CosmicRayModelConfig value);
 
 }  // namespace cosmosim::core

@@ -262,3 +262,59 @@ closure 1e-14, restart, queue refusal; EXT-R05-T01 ⟨μ⟩ = g, cube escape vs 
 energy closure; EXT-F02-T01 table parse, exact age integral 1e-12, log-Z interpolation, domain refusals,
 F01 formula. Missing (named): Strömgren sphere with stellar sources through RadiationRuntime, shadow and
 crossing-beam M1 vs VET comparison, MPI/regrid RT, RT–MHD coupling.
+
+---
+
+## CR01–CR08 — cosmic rays (`cosmosim_cosmic_rays`, kernels on a uniform patch)
+
+* **CR01 grey (recalled lead: Pfrommer et al. 2017 energy equation).**
+  `∂e/∂t + ∇·(eu) = −P∇·u − ∇·F_diff − ∇·F_st + v_st·∇P + Q − Λ`, `P = (γ_cr − 1)e` (declared γ_cr; 4/3 only
+  for the ultrarelativistic grey approximation). Gas: momentum `−∇P`, energy `−u·∇P` and `H_st = −v_st·∇P ≥ 0`.
+  Donor-cell advection with face velocity `(u_L+u_R)/2`; central `∇·u`, `∇P` (the CR/gas pair is conservative
+  only to truncation error for non-uniform u; the ledger reports the residual). No CR allocation unless a
+  kernel object is created (lazy).
+* **CR02 anisotropic diffusion (recalled lead: Sharma & Hammett 2007 limited scheme).**
+  `F = −κ_∥ b(b·∇e) − κ_⊥(∇e − b(b·∇e))`; face normal gradient from the two cells, transverse gradients by a
+  4-argument monotonized-central limiter of the one-sided differences of both cells; face b = normalized
+  average; weak field `|B| < threshold` → declared isotropic κ (never an undefined direction). Explicit bound
+  `Δt ≤ cfl/(2κ_max Σ Δx⁻²)`; RKL2 super-steps reuse `mhd::makeRkl2Coefficients` (Meyer, Balsara & Aslam
+  2014, as already cited in the MHD module). Coefficients are inputs (no universal constants).
+* **Streaming (recalled lead: Sharma, Colella & Martin 2010 regularization).**
+  `v_st = −v_s b tanh(l_reg b·∇e / e)`, `F_st = (e + P)v_st`; heating `H = v_s tanh(·)(γ−1)b·∇e ≥ 0` removed
+  from the CR and added to the gas in the same step (exact balance; no double counting); explicit bound
+  `Δt ≤ cfl Δx/v_s · min(1, Δx/l_reg)`.
+* **CR03 two-moment (derived).** `∂F/∂t = −(F − F_target)/τ`, `F_target = (e+P)(u+v_st) − K∇e`,
+  `τ = 3K/c_r²` — algebraically identical to `∂F/∂t + (c_r²/3)∇e = −(c_r²/3)K⁻¹(F − F_eq)`. Staggered
+  face-normal fluxes, exact exponential relaxation per face with the normal diffusivity
+  `κ_n = b_a²κ_∥ + (1−b_a²)κ_⊥` (approximation for oblique fields: the full tensor coupling of the face
+  normal and transverse flux components is reduced to κ_n; recorded), donor-cell enthalpy flux, CR02 limited
+  diffusive flux; gas impulse = time integral of `f_gas = (1/3)K⁻¹(F − F_eq)` using the exact exponential
+  average of F, energy `(u+v_st)·impulse` split between adjacent cells. Stiff limit = CR02 stencil
+  (spatially asymptotic preserving); `Δt ≤ cfl/Σ c_r/Δx`. Periodic/reflecting only; positivity refusal.
+  Not a copy of photon M1 (isotropic CR pressure, no M1 closure). Leads for later comparison: Jiang & Oh
+  2018, Thomas & Pfrommer 2019 (**recalled leads**, formulations not transcribed).
+* **CR04 spectra (recalled leads: Girichidis et al. 2020; Miniati 2001).** p̃ = p/(mc) bins; fixed-bin
+  reference (number only, f constant per bin) and piecewise power law (number + energy conserved,
+  slope by bisection on the monotone ⟨T⟩(q), bound slopes counted). Momentum-space fluxes
+  `Φ_N = 4πp̃²f_up A`, `Φ_E = TΦ_N`, in-bin work `W = 4π∫p̃²f T' A dp̃` (24-node GL in ln p̃), outer-edge
+  losses ledgered, zero inflow from outside, explicit with positivity refusal; pressure from the spectrum.
+  Spectral two-moment (number/energy fluxes per bin): **NOT_STARTED** (no verified discrete contract).
+* **CR05 sources.** Injection normalizes the declared p^{−α} shape to the caller's (already debited)
+  energy exactly (fixed bins: normalized to the represented energy). Electron synchrotron + IC (Thomson,
+  derived): `dp̃/dt = −C p̃ γ`, `C = (4/3)σ_T(U_B + U_rad)/(m_e c)`, `U_rad` = u_cmb(a) of S01 (caller passes
+  it). Proton Coulomb/hadronic coefficients and thermalized hadronic fraction only from a versioned
+  `chui_cr_loss_rates_v1` table with a mandatory reference line; missing → unavailable → refusal. Secondary
+  e±, γ-ray emissivity, CR ionization: providers report UNAVAILABLE.
+* **CR06/CR07.** Eulerian electron spectra = CR04 + CR05 radiative losses (tracer spectra NOT_STARTED).
+  Memory: `CrSpectralState::bytesFor = lanes·bins·cells·8` reserved as `kCanonicalPersistent` before
+  allocation (lanes 2 for piecewise power law, 1 for fixed bins); e.g. 2 species × 16 bins × 2 lanes at
+  256³ = 8 GiB (matches master §12); the full 8-scalar two-moment variant would be 32 GiB at 256³ (not
+  implemented). Groups are never dropped under pressure (reservation fails instead).
+* **Runtime (I01/I02).** `cosmic_rays.model ≠ none` is refused at admission with the exact edge: no MHD
+  level-stepper CR stage, no AMR/halo/regrid/migration/restart lanes, no feedback budget debit.
+* **Tests (`unit_cosmic_ray_transport`, NOT_RUN).** EXT-CR01-T01 advection conservation/ledger; CR02-T01
+  field-aligned rows and variance `σ₀² + 2κt`; CR02-T02 oblique-field monotonicity (property claimed by the
+  recalled lead; to verify); CR02-T03 RKL2 vs explicit; CR02-T04 streaming balance; CR03-T01 diffusive
+  limit vs one-moment (3 %); CR04-T01 slope recovery; CR04-T02 momentum-space adiabatic work
+  `E₀e^{At}`, number conservation; CR06-T01 synchrotron cooling to p₀/2 after one cooling time (10 %);
+  CR05-T01 loss refusal and gas/escape split.
