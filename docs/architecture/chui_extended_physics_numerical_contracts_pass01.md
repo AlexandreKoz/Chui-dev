@@ -193,3 +193,72 @@ the reduction, restart equivalence through the real checkpoint writer.
   closure and midpoint containment, tie determinism; T03 AMR leaves via PatchSoa with metadata parent,
   open face, hole and capacity refusals; T04 rank merge and overlap refusal; T05 EdS χ(a) 1e-8, inverse,
   contiguous shells, replication count, temporal weights.
+
+---
+
+## F01 / F02 / R01–R06 — radiation foundations and reference backends
+
+### F01 governed RT workspaces (`radiation_runtime`)
+Live allocation formula (source estimate, not RSS): `radiationIntervalWorkspaceBytes = 8·(6·4+1)·n_values
++ coupled·3·n_cells·(4 + 6·8)` bytes, i.e. ≈ 6.25× the canonical 4-lane radiation state plus three gas
+work copies (the prior ledger's "≈5×" undercounted the source lane and the stage copies). Reserved as
+`kPhaseResident` through the run's `MemoryGovernor` (forwarded from `RuntimeServices` by
+`SourceRuntimeImpl` → `RtBhAgnSourceBridge::setMemoryGovernor` → `RadiationRuntime`) BEFORE the work
+copies are allocated and committed after; released at interval end (RAII). **Not done (ledger):** level
+solver topology/ghost buffers are not in the formula; RT topology construction remains O(P²); MPI
+owned-face halo exchange, regrid transfer and synchronized reflux across ranks remain refused (A14).
+
+### F02 stellar luminosity provider (`radiation_stellar_sources`)
+`E_g = M_* ∫_{τ0}^{τ1} L_g(τ, Z) dτ`, L_g from the external table `chui_ssp_group_luminosity_v1`
+(group luminosity per unit BIRTH mass vs age and metallicity; source/IMF declared; edges must equal the RT
+group edges to 1e-9); piecewise-linear in age (the trapezoid over the union of nodes is the exact
+integral of the interpolant), linear in log₁₀Z; no extrapolation in age or Z (the age grid must start at 0).
+Ages from `formation_scale_factor` via the S01 background → admitted only in cosmological modes.
+Deposition into the containing radiation record cell (bucket-indexed locator; no O(P) scan per star),
+isotropic, comoving a⁴ storage like the AGN sources; emission is a pure function of age, so disjoint
+accepted intervals emit exactly once (no pending state, nothing to checkpoint). Photon number is not
+inferred: the report keeps the table Q integral and the transported photon equivalent E_g/⟨hν⟩_g of the RT
+reference shape (auditable mismatch; group cross sections stay those of the declared reference shape —
+a named multigroup approximation). Admission now requires the table (refusal replaced by explicit
+requirements); RT's existing single-rank/no-regrid/no-MHD restrictions still apply.
+
+### R01 / R02 (existing, unchanged)
+Multigroup M1 + PD-ARS IMEX, explicit comparator, HLL/GLF, realizability and the ionizing3 threshold
+edges (13.598434 / 24.587389 / 54.417765 eV with explicit terminal edge) are EXISTING_UNQUALIFIED; no
+change in this pass. Cosmological reduced-c remains refused. Photoionization reconciliation with the
+thermochemistry operator remains refused (FAIL_CLOSED) — not closed in this pass.
+
+### R03 reference backends on a uniform patch (`radiation_reference_transport`)
+* **Discrete ordinates (derived).** Step (first-order upwind) discretization
+  `I_c = (η + χ_s J + Σ_a |n_a| I_up,a/Δx_a)/(χ_t + Σ_a |n_a|/Δx_a)` per Fibonacci direction (equal
+  weights 4π/N), upwind sweep order, source iteration for isotropic scattering, periodic inflow iteration,
+  vacuum inflow at open faces; exact for uniform periodic media (I = η/χ). Reflecting boundaries refused.
+* **VET.** `f_ij = Σ w I n_i n_j / Σ w I` (convex combination of projectors: PSD, trace 1); moment system
+  `∂E/∂t + ∇·F = cχ_a(aT⁴ − E)`, `∂F/∂t + c²∇·(fE) = −cχ_t F`; LLF fluxes at speed c (eigenvalues of f
+  along an axis in [0, 1] ⇒ stable for `Σ_a cΔt/Δx_a ≤ cfl`), backward-Euler local sources, closure from a
+  steady formal solution of the current emissivity every `closure_cadence` steps (time-independent VET
+  closure, declared), realizability projection |F| ≤ cE counted. Distinct backend; never routed through
+  the M1 Riemann solver. Leads: VETTAM (Menon et al. 2022), Davis, Stone & Jiang 2012 (**recalled leads**).
+* **FLD comparator.** `D = cλ(R)/χ_t`, Levermore–Pomraning `λ = (2+R)/(6+3R+R²)` (**recalled lead**:
+  Levermore & Pomraning 1981; limits 1/3 and 1/R verified in test), backward Euler, harmonic face D,
+  Jacobi-preconditioned CG (refuses non-convergence), periodic/reflecting/vacuum boundaries.
+
+### R04 causal rays / R05 HG Monte Carlo (`radiation_causal_transport`)
+* Causal packets at `x_e + c(t − t_e)n`, exact exponential attenuation per leaf segment, escape at open
+  faces, explicit `unresolved` ledger below an energy floor, exactly-once closure
+  `emitted = absorbed + escaped + unresolved + in_flight`, bounded queue refusing over-capacity emission
+  before mutation, serialize/restore of packet state. Steady-state `traceDirectRays` keeps its
+  infinite-speed label. Direct/diffuse hand-off into M1 is NOT implemented (no hybrid).
+* Analog MC with Henyey–Greenstein sampling `μ = (1+g² − ((1−g²)/(1−g+2gξ))²)/(2g)` (**recalled lead**,
+  property ⟨μ⟩ = g verified in test), counter-based RNG (`radiationCounterRandom`), batch standard errors,
+  truncation ledger. Asymptotic-preserving/implicit MC (R05 P1) FAIL_CLOSED: no published discrete
+  contract selected.
+
+### Tests (`unit_rhd_reference_backends`, NOT_RUN)
+EXT-R03-T01 FLD limits, Gaussian thick diffusion amplitude 1/√2 (±0.02), conservation 1e-10, LTE
+relaxation; T02 DO exact uniform solution, isotropic f (±0.02), scattering J = η/χ_a; T03 VET budget
+closure 1e-10, relaxation `1 − e^{−cχ_a t}` (±0.02); EXT-R04-T01 light travel, attenuation, ledger
+closure 1e-14, restart, queue refusal; EXT-R05-T01 ⟨μ⟩ = g, cube escape vs exact angular average (5σ),
+energy closure; EXT-F02-T01 table parse, exact age integral 1e-12, log-Z interpolation, domain refusals,
+F01 formula. Missing (named): Strömgren sphere with stellar sources through RadiationRuntime, shadow and
+crossing-beam M1 vs VET comparison, MPI/regrid RT, RT–MHD coupling.

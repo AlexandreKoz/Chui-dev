@@ -30,6 +30,7 @@
 #include <vector>
 
 #include "cosmosim/core/config_rt_bh_agn.hpp"
+#include "cosmosim/core/memory_governor.hpp"
 #include "cosmosim/core/simulation_state.hpp"
 #include "cosmosim/physics/rt_bh_agn_frame.hpp"
 #include "cosmosim/radiation/radiation_matter_coupling.hpp"
@@ -46,7 +47,20 @@ struct RadiationRuntimeSettings {
   RadiationTransportSettings transport{};
   RadiationCouplingConstants coupling{};
   RadiationCouplingModel coupling_model = RadiationCouplingModel::kNone;
+  // CHUI-EXT-PHYS-REF-v1 F01: optional governor; when set, the interval work
+  // copies are reserved (kPhaseResident) BEFORE allocation and released at
+  // the end of advanceInterval (radiationIntervalWorkspaceBytes). Not owned.
+  core::MemoryGovernor* governor = nullptr;
 };
+
+// F01 live allocation formula of RadiationRuntime::advanceInterval (source
+// estimate, not RSS): six RadiationWorkState copies of four lanes (u, t0, t1,
+// tmp, ustar, unew), one source lane, and when matter coupling is active
+// three GasWork copies (gas, gas_saved, gas_stage) of one 32-bit row lane and
+// six double lanes per record cell. Topology/ghost buffers of the level
+// solver are excluded (they scale with face count and are bounded by the
+// same record set). nvalues = group_count x record cells.
+[[nodiscard]] std::uint64_t radiationIntervalWorkspaceBytes(std::size_t nvalues, std::size_t ncells, bool coupled);
 
 // Time-integrated source deposit: comoving energy-density rate added to one
 // record cell and group over the whole interval (isotropic: no net flux).
@@ -98,6 +112,7 @@ class RadiationRuntime {
   [[nodiscard]] const RadiationRuntimeSettings& settings() const noexcept { return m_settings; }
   [[nodiscard]] RadiationIntervalReport advanceInterval(core::SimulationState& state,
                                                         const RadiationIntervalInputs& inputs) const;
+  void setMemoryGovernor(core::MemoryGovernor* governor) noexcept { m_settings.governor = governor; }
 
  private:
   RadiationRuntimeSettings m_settings;

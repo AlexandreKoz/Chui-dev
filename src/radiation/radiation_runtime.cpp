@@ -139,6 +139,18 @@ RadiationIntervalReport RadiationRuntime::advanceInterval(core::SimulationState&
   const std::size_t nvalues = rad.energy_density_comoving.size();
   const RadiationTopology topology(rad, m_settings.transport);
   const RadiationLevelSolver solver(rad, topology, m_settings.transport);
+  // F01: reserve the interval work copies before allocating them.
+  core::MemoryReservation workspace_reservation;
+  if (m_settings.governor != nullptr) {
+    std::size_t record_cells = 0;
+    for (const core::RadiationPatchRecord& record : rad.patches) {
+      record_cells += static_cast<std::size_t>(record.nx) * record.ny * record.nz;
+    }
+    workspace_reservation = m_settings.governor->reserve(
+        core::MemoryClass::kPhaseResident,
+        radiationIntervalWorkspaceBytes(nvalues, record_cells, m_settings.coupling_model != RadiationCouplingModel::kNone),
+        "radiation_interval_workspace");
+  }
 
   // Working state (E, G = F c_hat/c), comoving.
   RadiationWorkState u;
@@ -311,6 +323,7 @@ RadiationIntervalReport RadiationRuntime::advanceInterval(core::SimulationState&
   tmp.resize(nvalues);
   ustar.resize(nvalues);
   unew.resize(nvalues);
+  if (workspace_reservation.pending()) workspace_reservation.commit();
   while (t < total * (1.0 - 1.0e-14)) {
     if (report.substeps >= m_settings.config.max_subcycles) {
       throw std::runtime_error("RadiationRuntime: physics.rt_max_subcycles exhausted before the interval end");
@@ -502,6 +515,13 @@ RadiationIntervalReport RadiationRuntime::advanceInterval(core::SimulationState&
   rad.scale_factor = in.scale_factor_end;
   if (batch.size() > 0U) report.touched_gas_rows = batch.commit(state);
   return report;
+}
+
+std::uint64_t radiationIntervalWorkspaceBytes(std::size_t nvalues, std::size_t ncells, bool coupled) {
+  const std::uint64_t work = (6U * 4U + 1U) * static_cast<std::uint64_t>(nvalues) * sizeof(double);
+  const std::uint64_t gas = coupled ? 3U * static_cast<std::uint64_t>(ncells) * (sizeof(std::uint32_t) + 6U * sizeof(double))
+                                    : 0U;
+  return work + gas;
 }
 
 }  // namespace cosmosim::radiation

@@ -33,6 +33,7 @@
 #include "cosmosim/physics/black_hole/bh_neighborhood.hpp"
 #include "cosmosim/radiation/radiation_runtime.hpp"
 #include "cosmosim/radiation/radiation_spectrum.hpp"
+#include "cosmosim/radiation/radiation_stellar_sources.hpp"
 
 namespace cosmosim::core {
 class HierarchicalTimeBinScheduler;
@@ -91,6 +92,7 @@ struct RtBhAgnEpochReport {
   physics::BhEngineIntervalReport engine{};
   physics::AgnInjectionReport agn{};
   radiation::RadiationIntervalReport radiation{};
+  radiation::StellarRadiationSourceReport stellar_sources{};  // F02 emission ledger
   std::uint64_t seeded = 0U;
 };
 
@@ -100,6 +102,10 @@ class RtBhAgnSourceBridge {
                       const parallel::MpiContext& mpi, std::array<double, 3> box_extent_comoving, bool periodic);
   [[nodiscard]] bool engineEnabled() const noexcept { return m_engine.has_value(); }
   [[nodiscard]] bool radiationEnabled() const noexcept { return m_radiation.has_value(); }
+  // F01: forwards the run's MemoryGovernor to the RT interval workspaces.
+  void setMemoryGovernor(core::MemoryGovernor* governor) noexcept {
+    if (m_radiation.has_value()) m_radiation->setMemoryGovernor(governor);
+  }
   [[nodiscard]] RtBhAgnEpochReport executeDiscreteEpoch(core::SimulationState& state, const RtBhAgnEpochInputs& in);
 
  private:
@@ -114,6 +120,9 @@ class RtBhAgnSourceBridge {
   std::optional<radiation::RadiationRuntime> m_radiation;
   std::unique_ptr<radiation::TabulatedSpectrum> m_agn_sed;
   std::vector<double> m_agn_group_fractions;
+  // CHUI-EXT-PHYS-REF-v1 F02 stellar luminosity provider (null when disabled).
+  std::unique_ptr<radiation::StellarLuminosityTable> m_stellar_table;
+  std::unique_ptr<core::LambdaCdmBackground> m_background;
 };
 
 }  // namespace cosmosim::workflows::internal

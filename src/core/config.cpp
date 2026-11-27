@@ -1878,6 +1878,8 @@ struct ConfigKeySpec {
       {"physics.rt_stellar_sed_table_sha256", ""},
       {"physics.rt_agn_sed_table_path", ""},
       {"physics.rt_agn_sed_table_sha256", ""},
+      {"physics.rt_stellar_luminosity_table_path", ""},
+      {"physics.rt_stellar_luminosity_table_sha256", ""},
       {"physics.rt_source_blackbody_temperature_k", "1.0e5"},
       {"physics.rt_source_power_law_index", "1.5"},
       {"physics.rt_uvb_policy", "reject_overlap"},
@@ -4152,6 +4154,12 @@ class NormalizedConfigStream {
     stream << "rt_stellar_sed_table_sha256 = " << frozen.config.physics.rt.stellar_sed_table_sha256 << '\n';
     stream << "rt_agn_sed_table_path = " << frozen.config.physics.rt.agn_sed_table_path << '\n';
     stream << "rt_agn_sed_table_sha256 = " << frozen.config.physics.rt.agn_sed_table_sha256 << '\n';
+    if (!frozen.config.physics.rt.stellar_luminosity_table_path.empty() ||
+        !frozen.config.physics.rt.stellar_luminosity_table_sha256.empty()) {
+      // F02 keys appear only when set (RT runs without stellar sources keep their text/hash).
+      stream << "rt_stellar_luminosity_table_path = " << frozen.config.physics.rt.stellar_luminosity_table_path << '\n';
+      stream << "rt_stellar_luminosity_table_sha256 = " << frozen.config.physics.rt.stellar_luminosity_table_sha256 << '\n';
+    }
     stream << "rt_source_blackbody_temperature_k = " << frozen.config.physics.rt.source_blackbody_temperature_k << '\n';
     stream << "rt_source_power_law_index = " << frozen.config.physics.rt.source_power_law_index << '\n';
     stream << "rt_uvb_policy = " << rtUvbPolicyConfigToString(frozen.config.physics.rt.uvb_policy) << '\n';
@@ -5740,6 +5748,8 @@ class NormalizedConfigStream {
   frozen.config.physics.rt.stellar_sed_table_sha256 = requireString(entries, consumed, "physics.rt_stellar_sed_table_sha256", defaultFor("physics.rt_stellar_sed_table_sha256"));
   frozen.config.physics.rt.agn_sed_table_path = requireString(entries, consumed, "physics.rt_agn_sed_table_path", defaultFor("physics.rt_agn_sed_table_path"));
   frozen.config.physics.rt.agn_sed_table_sha256 = requireString(entries, consumed, "physics.rt_agn_sed_table_sha256", defaultFor("physics.rt_agn_sed_table_sha256"));
+  frozen.config.physics.rt.stellar_luminosity_table_path = requireString(entries, consumed, "physics.rt_stellar_luminosity_table_path", defaultFor("physics.rt_stellar_luminosity_table_path"));
+  frozen.config.physics.rt.stellar_luminosity_table_sha256 = requireString(entries, consumed, "physics.rt_stellar_luminosity_table_sha256", defaultFor("physics.rt_stellar_luminosity_table_sha256"));
   frozen.config.physics.rt.source_blackbody_temperature_k = parseFloating(requireString(entries, consumed, "physics.rt_source_blackbody_temperature_k", defaultFor("physics.rt_source_blackbody_temperature_k")), "physics.rt_source_blackbody_temperature_k");
   frozen.config.physics.rt.source_power_law_index = parseFloating(requireString(entries, consumed, "physics.rt_source_power_law_index", defaultFor("physics.rt_source_power_law_index")), "physics.rt_source_power_law_index");
   frozen.config.physics.rt.uvb_policy = internal::parseRtBhAgnChoice(requireString(entries, consumed, "physics.rt_uvb_policy", defaultFor("physics.rt_uvb_policy")), "physics.rt_uvb_policy", internal::k_rt_uvb_policy_config_names);

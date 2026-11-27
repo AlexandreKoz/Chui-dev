@@ -691,7 +691,10 @@ add_library(cosmosim_radiation STATIC
   src/radiation/radiation_runtime.cpp
   src/radiation/radiation_amr.cpp
   src/radiation/radiation_sources.cpp
-  src/radiation/radiation_angular.cpp)
+  src/radiation/radiation_angular.cpp
+  src/radiation/radiation_stellar_sources.cpp
+  src/radiation/radiation_reference_transport.cpp
+  src/radiation/radiation_causal_transport.cpp)
 
 # CHUI-EXT-PHYS-REF-v1 S02 shared spectral/atomic/Boltzmann data services.
 # Depends on cosmosim_core only. Source-implemented, NOT compiled in pass 01
@@ -787,7 +790,7 @@ if(COSMOSIM_STRICT_IO_WARNINGS)
   endif()
 endif()
 
-target_link_libraries(cosmosim_radiation PUBLIC cosmosim_physics)
+target_link_libraries(cosmosim_radiation PUBLIC cosmosim_physics cosmosim_lightcone)
 target_link_libraries(cosmosim_neutrinos PUBLIC cosmosim_spectral cosmosim_gravity cosmosim_parallel)
 
 target_link_libraries(cosmosim_workflows
@@ -1398,7 +1401,7 @@ if(COSMOSIM_ENABLE_TESTS)
 
   # CHUI-RT-BH-AGN-REF-v1 pass-01 verification sources (written, NOT RUN).
   # CHUI-EXT-PHYS-REF-v1 unit/reference test sources (NOT RUN in source-only pass 01).
-  foreach(cosmosim_ext_phys_unit IN ITEMS cosmological_background spectral_data neutrino_methods lightcone_geometry)
+  foreach(cosmosim_ext_phys_unit IN ITEMS cosmological_background spectral_data neutrino_methods lightcone_geometry rhd_reference_backends)
     add_executable(test_unit_${cosmosim_ext_phys_unit} tests/unit/test_${cosmosim_ext_phys_unit}.cpp)
     target_link_libraries(test_unit_${cosmosim_ext_phys_unit} PRIVATE cosmosim_all)
     target_compile_definitions(test_unit_${cosmosim_ext_phys_unit} PRIVATE COSMOSIM_SOURCE_DIR="${PROJECT_SOURCE_DIR}")

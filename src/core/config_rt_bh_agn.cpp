@@ -185,9 +185,19 @@ void validateRadiation(const SimulationConfig& config) {
             "physics.rt_source_blackbody_temperature_k must be > 0 and physics.rt_source_power_law_index finite");
   }
   if (rt.stellar_sources) {
-    require(false,
-            "physics.rt_stellar_sources: no age/metallicity-dependent stellar ionizing-luminosity provider exists in "
-            "the stellar-population authority (the SED-table schema carries a spectral shape only); FAIL_CLOSED");
+    // CHUI-EXT-PHYS-REF-v1 F02: the age/metallicity provider exists
+    // (radiation_stellar_sources.hpp) and is wired in the RT bridge; it needs
+    // an external versioned table and the formation-time authority.
+    require(!rt.stellar_luminosity_table_path.empty() && rt.stellar_luminosity_table_sha256.size() == 64U,
+            "physics.rt_stellar_sources requires physics.rt_stellar_luminosity_table_path and a 64-hex "
+            "physics.rt_stellar_luminosity_table_sha256 (schema chui_ssp_group_luminosity_v1: group luminosities "
+            "per unit birth mass versus age and metallicity; no stellar spectrum is bundled or invented)");
+    require(isCosmological(config),
+            "physics.rt_stellar_sources needs stellar ages from StarParticleSidecar::formation_scale_factor, which is "
+            "a formation-time authority only in cosmological comoving modes (FAIL_CLOSED for isolated modes)");
+    require(rt.spectral_profile == RtSpectralProfileConfig::kIonizing3,
+            "physics.rt_stellar_sources is defined for the ionizing3 group profile (table edges must equal the RT "
+            "group edges)");
     require(config.physics.enable_star_formation, "physics.rt_stellar_sources requires star formation");
     if (rt.source_shape == RtSourceShapeConfig::kSedTable) {
       require(!rt.stellar_sed_table_path.empty() && rt.stellar_sed_table_sha256.size() == 64U,
@@ -195,6 +205,10 @@ void validateRadiation(const SimulationConfig& config) {
               "and a 64-hex physics.rt_stellar_sed_table_sha256 (schema chui_ssp_sed_table_v1); no stellar SED is "
               "bundled");
     }
+  }
+  if (!rt.stellar_sources) {
+    require(rt.stellar_luminosity_table_path.empty() && rt.stellar_luminosity_table_sha256.empty(),
+            "physics.rt_stellar_luminosity_table_* is set but physics.rt_stellar_sources=false (inert keys)");
   }
   if (rt.agn_sources) {
     require(config.physics.agn.radiation_coupling == AgnRadiationCouplingConfig::kRtTransport,

@@ -1144,6 +1144,7 @@ class SourceRuntimeImpl final : public SourceRuntime {
       m_rt_bh_agn = std::make_unique<internal::RtBhAgnSourceBridge>(
           config, units, mpi_context, boxExtentForRtBhAgnBridge(config),
           mode_policy.hydro_boundary == core::BoundaryCondition::kPeriodic);
+      if (runtime_services != nullptr) m_rt_bh_agn->setMemoryGovernor(runtime_services->memory_governor);
     }
 
     const double hubble_si = config.cosmology.hubble_param *
