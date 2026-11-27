@@ -65,9 +65,43 @@ struct CosmicRayConfig {
   bool operator==(const CosmicRayConfig&) const = default;
 };
 
+// ------------------------------------------------------------- observables
+enum class LosAxisConfig : std::uint8_t { kX = 0, kY = 1, kZ = 2 };
+enum class ForestProfileConfig : std::uint8_t { kVoigt = 0, kDopplerOnly = 1 };
+enum class HiSpinModelConfig : std::uint8_t {
+  kSaturatedKinetic = 0,   // named shortcut T_s = T_K
+  kCollisionalTable = 1,   // x_c from chui_21cm_collision_rates_v1 (+ T_cmb from S01)
+};
+enum class HiTransferConfig : std::uint8_t { kFullOpticalDepth = 0, kOpticallyThin = 1 };
+
+// Inline (analysis-cadence) read-only observables over axis-aligned parallel
+// sightlines of the current state (observables/observable_pipeline.hpp).
+struct ObservablesConfig {
+  bool enabled = false;
+  std::uint32_t interval_steps = 0U;
+  LosAxisConfig los_axis = LosAxisConfig::kZ;
+  std::uint32_t sightlines_per_side = 0U;
+  std::string output_stem = "observables";
+  bool lyman_alpha_forest = false;
+  ForestProfileConfig forest_profile = ForestProfileConfig::kVoigt;
+  std::uint32_t forest_pixels = 0U;
+  std::uint32_t forest_pdf_bins = 20U;
+  bool hi_cube = false;
+  HiSpinModelConfig hi_spin_model = HiSpinModelConfig::kSaturatedKinetic;
+  HiTransferConfig hi_transfer = HiTransferConfig::kFullOpticalDepth;
+  std::uint32_t hi_channels = 0U;
+  double hi_velocity_half_width_km_s = 0.0;
+  std::string hi_collision_table_path;
+  std::string hi_collision_table_sha256;
+  bool sz_maps = false;
+  bool dispersion_map = false;
+  bool operator==(const ObservablesConfig&) const = default;
+};
+
 struct ExtendedPhysicsConfig {
   NeutrinoPerturbationConfig neutrinos;
   CosmicRayConfig cosmic_rays;
+  ObservablesConfig observables;
   bool operator==(const ExtendedPhysicsConfig&) const = default;
 };
 
@@ -75,5 +109,9 @@ struct ExtendedPhysicsConfig {
 [[nodiscard]] std::string boltzmannTableFormatConfigToString(BoltzmannTableFormatConfig value);
 [[nodiscard]] std::string boltzmannGaugeConfigToString(BoltzmannGaugeConfig value);
 [[nodiscard]] std::string cosmicRayModelConfigToString(CosmicRayModelConfig value);
+[[nodiscard]] std::string losAxisConfigToString(LosAxisConfig value);
+[[nodiscard]] std::string forestProfileConfigToString(ForestProfileConfig value);
+[[nodiscard]] std::string hiSpinModelConfigToString(HiSpinModelConfig value);
+[[nodiscard]] std::string hiTransferConfigToString(HiTransferConfig value);
 
 }  // namespace cosmosim::core

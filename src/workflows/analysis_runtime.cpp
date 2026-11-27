@@ -17,6 +17,7 @@
 #include "cosmosim/core/profiling.hpp"
 #include "cosmosim/core/simulation_mode.hpp"
 #include "cosmosim/core/simulation_state.hpp"
+#include "cosmosim/observables/observable_pipeline.hpp"
 #include "cosmosim/parallel/distributed_memory.hpp"
 #include "cosmosim/workflows/runtime_services.hpp"
 #include "workflows/internal/runtime_stage_resource_access.hpp"
@@ -34,7 +35,13 @@ class AnalysisRuntimeImpl final : public AnalysisRuntime {
       : m_config(config),
         m_stage_sequence(&stage_sequence),
         m_services(services),
-        m_diagnostics(config, services.memory_governor) {}
+        m_diagnostics(config, services.memory_governor) {
+    // CHUI-EXT-PHYS-REF-v1 I05: read-only inline observables (admission in
+    // validateExtendedPhysicsConfig: single rank, species lanes, products).
+    if (config.extended.observables.enabled) {
+      m_observables = std::make_unique<observables::ObservablePipeline>(config);
+    }
+  }
 
   [[nodiscard]] std::uint64_t estimateRequiredIncrementalBytes(
       const core::SimulationState& state, std::uint64_t completed_step) const override {
@@ -165,6 +172,14 @@ class AnalysisRuntimeImpl final : public AnalysisRuntime {
          {RuntimeResourceKey::kDiagnostics, RuntimeResourceAccessMode::kWrite}});
     if (context.stage != core::IntegrationStage::kAnalysisHooks) {
       throw std::logic_error("analysis diagnostics handler received an unregistered stage");
+    }
+    if (m_observables != nullptr && context.integrator_state.step_index !=
+                                        std::numeric_limits<std::uint64_t>::max()) {
+      // Same completed-state labelling as the diagnostics below.
+      const std::uint64_t observed_step = context.integrator_state.step_index + 1U;
+      if (m_observables->due(observed_step)) {
+        static_cast<void>(m_observables->execute(context.state, observed_step, context.timeline_step.scale_factor_end));
+      }
     }
     if (!m_config.analysis.enable_diagnostics) {
       return;
@@ -415,6 +430,7 @@ class AnalysisRuntimeImpl final : public AnalysisRuntime {
   analysis::DiagnosticsEngine m_diagnostics;
   internal::OptionalDiagnosticCadence m_science_light_pending;
   internal::OptionalDiagnosticCadence m_science_heavy_pending;
+  std::unique_ptr<observables::ObservablePipeline> m_observables;
 };
 
 }  // namespace

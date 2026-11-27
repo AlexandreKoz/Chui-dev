@@ -318,3 +318,58 @@ crossing-beam M1 vs VET comparison, MPI/regrid RT, RT–MHD coupling.
   limit vs one-moment (3 %); CR04-T01 slope recovery; CR04-T02 momentum-space adiabatic work
   `E₀e^{At}`, number conservation; CR06-T01 synchrotron cooling to p₀/2 after one cooling time (10 %);
   CR05-T01 loss refusal and gas/escape split.
+
+---
+
+## L01–L04, C01–C04, RA01–RA06 — observables (`cosmosim_observables`, read-only)
+
+* **Science accessor.** One authority per quantity from `SimulationState`: n_X from composition species lanes
+  (persistent `ChemicalSpecies` slot order) over the proper leaf-cell volume; n_e by charge neutrality of
+  H/He ions (metal electrons excluded, stated); T from the kelvin cache; v peculiar; B only when a CT
+  sample is attached. Missing inputs → `kUnavailable` → `require()` throws (no zero substitution).
+* **L01 forest.** Velocity axis = proper Hubble velocity `u = aHs + v·n` (periodic `aHL`) for snapshot
+  sightlines; segment-averaged Voigt/Doppler profile (3-point GL per b/4) preserves ∫τ du = Nσλ₀ for any
+  Hubble spread; `τ = Σ n ℓ σ_int λ₀ ⟨φ_v⟩`, `φ_v = H(a,Δv/b)/(√πb)`, `a = Aλ₀/(4πb)` (derived from S02).
+  Statistics: mean flux, flux PDF, 1-D `P_F(k) = L_v|δ̃_k|²/N²` (k in s/m), observed-frame EW, column.
+  Doppler-only = named comparator. **NOT_STARTED:** FGPA comparator (needs a recombination-rate provider),
+  3-D flux statistics, lightcone forest driver (the kernel supports log-λ velocity coordinates; no driver).
+* **L02/L03 resonant MC (reference, unaccelerated).** Exact parallel-velocity sampler (derived two-component
+  envelope: Gaussian on u < x − d accepted with d²/((x−u)²+a²); truncated Cauchy on u ≥ x − d accepted with
+  e^{−u²}/max e^{−u²}; d = max(1,|x|/2)); coherent atom-frame redistribution `x' = x − u·k + u·k'`, optional
+  recoil `g = hν₀/(c√(2kTm_H))` (derived, equal to Field's hΔν_D/2kT), isotropic or dipole phase functions
+  only (no unverified mixtures), dust absorption, optional uniform Hubble flow, separate estimators (escape
+  spectrum, escape/dust/truncation fractions, scattering rate, momentum deposition). Core skipping,
+  diffusion hybrids, dynamical/WF coupling: **FAIL_CLOSED/NOT_STARTED**.
+* **RA01 HI 21 cm.** `α = 3c³A₁₀h n_HI φ_v/(32πν₀²kT_s)` (Einstein relations, derived); ordered formal solution
+  from the far end; background T_cmb(z) (S01) or 0; observer-frame δT_b = (T_b − T_γ)/(1+z); thin and
+  saturated-spin shortcuts separately named. Spin temperature (Field 1958, **recalled lead**), x_c from a
+  versioned κ₁₀ table only, x_α = 4P_αT_*/(27A₁₀T_γ) (**recalled lead**) available as a function but the
+  pipeline passes x_α = 0 (no admitted P_α provider). **RA02 cosmic dawn / semi-numerical:** NOT_STARTED.
+* **C01.** `chui_cmb_cl_v1` tables (units μK², dl or cl normalization, provenance); flat-sky Gaussian
+  realization `⟨|a_k|²⟩ = A C_ℓ`, Hermitian symmetry, counter-based draws. Primary TE/EE realizations and
+  lensing-potential inputs: parsed, not realized (TT only).
+* **C02.** Plane Poisson `∇²_⊥ψ = (3H₀²Ω_m/c²)Σ`, deflection by spectral gradient, multi-plane recursion
+  with lens-lens coupling, bilinear periodic interpolation, κ from the finite-difference Jacobian; Born
+  comparator. Single plane: multi-plane ≡ Born analytically (test). Lightcone plane construction from
+  the simulation (projected δ/a per shell) has NO driver yet (kernel only).
+* **C03.** y, τ_e, kSZ (receding ⇒ decrement), nonrelativistic tSZ factor `x coth(x/2) − 4` (Kompaneets,
+  derived); ISW/RS `ΔT/T = (2/c²)∫Φ̇ dt`, Φ̇ from two bracketing potential snapshots linear in a.
+  Relativistic tSZ: **FAIL_CLOSED** (no verified kernel).
+* **RA03–RA05 radio.** Free-free RL 5.14 with Draine 2011 Gaunt (**recalled leads**), Kirchhoff absorption;
+  synchrotron single-particle kernel F, G by the derived single-integral representations
+  (`F(x) = x∫cosh(5t/3)e^{−x cosh t}/cosh t dt`, `G(x) = x∫e^{−x cosh t}cosh(2t/3)dt`), emission/absorption by
+  integration over an arbitrary electron spectrum (time-dependent CR04 spectra can feed it), RL power-law
+  closed forms kept as an independent comparator (test asserts agreement); Faraday rotation
+  `ρ_V = e³λ²n_eB_∥/(4π²ε₀m_e²c³)`; exact constant-coefficient Stokes step by the 5×5 augmented matrix
+  exponential (Padé(6,6), scaling-squaring; valid for singular K); DM/RM with (1+z)⁻¹, (1+z)⁻² weights.
+  Named omissions: circular emission, Faraday conversion, polarized absorption, DELO, recombination and
+  molecular lines, FRB populations.
+* **I05 pipeline.** `[observables]` → `ObservablePipeline` in `AnalysisRuntime::executeDiagnostics`
+  (completed-step label, cadence) → leaf geometry + accessor → kernels → FITS (`.partial` + rename) and a
+  `chui_observables_summary_v1` text summary. Single rank, Part 2 thermochemistry required.
+* **Tests (`unit_observables_kernels`, NOT_RUN).** EXT-L01-T03 (Doppler core 2e-3, thin EW 1 %, damping
+  wing 1 %, velocity-integral conservation 1e-3); EXT-RA01-T02 (1.823e18 column relation 1 %, two-layer
+  ordered solution 1e-12, spin limits); EXT-C03-T01 (slab y 1e-14, kSZ sign, tSZ null 217.5 ± 1.5 GHz, ISW);
+  EXT-C02-T01 (Born vs multi-plane 2 %); EXT-C01-T01 (white-noise variance 5 %); EXT-RA03/RA04-T01
+  (Kirchhoff, RM 0.812, Faraday screen 1e-12, singular K); EXT-RA03-T02 (∫F = 8π/9√3 2e-3, kernel vs closed
+  form 2–3 %, Π 1 %); EXT-L02-T01 (sampler moments 5σ, photon budget); EXT-O01-T01 FITS blocking.
