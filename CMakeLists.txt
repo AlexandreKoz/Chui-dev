@@ -693,6 +693,14 @@ add_library(cosmosim_radiation STATIC
   src/radiation/radiation_sources.cpp
   src/radiation/radiation_angular.cpp)
 
+# CHUI-EXT-PHYS-REF-v1 S02 shared spectral/atomic/Boltzmann data services.
+# Depends on cosmosim_core only. Source-implemented, NOT compiled in pass 01
+# (docs/architecture/chui_extended_physics_implementation_pass01_status.md).
+add_library(cosmosim_spectral STATIC
+  src/spectral/atomic_data.cpp
+  src/spectral/boltzmann_tables.cpp
+  src/spectral/frequency_axis.cpp)
+
 add_library(cosmosim_workflows STATIC
   src/workflows/analysis_runtime.cpp
   src/workflows/gravity_runtime.cpp
@@ -724,6 +732,7 @@ add_library(cosmosim_workflows STATIC
   src/workflows/reference_workflow.cpp)
 
 set(COSMOSIM_MODULE_LIBS
+  cosmosim_spectral
   cosmosim_mhd
   cosmosim_radiation
   cosmosim_gravity
@@ -834,6 +843,7 @@ target_link_libraries(cosmosim_all
 set_target_properties(cosmosim_core PROPERTIES EXPORT_NAME core)
 set_target_properties(cosmosim_mhd PROPERTIES EXPORT_NAME mhd)
 set_target_properties(cosmosim_radiation PROPERTIES EXPORT_NAME radiation)
+set_target_properties(cosmosim_spectral PROPERTIES EXPORT_NAME spectral)
 set_target_properties(cosmosim_gravity PROPERTIES EXPORT_NAME gravity)
 set_target_properties(cosmosim_hydro PROPERTIES EXPORT_NAME hydro)
 set_target_properties(cosmosim_amr PROPERTIES EXPORT_NAME amr)
@@ -847,6 +857,7 @@ set_target_properties(cosmosim_all PROPERTIES EXPORT_NAME all)
 add_library(CosmoSim::core ALIAS cosmosim_core)
 add_library(CosmoSim::mhd ALIAS cosmosim_mhd)
 add_library(CosmoSim::radiation ALIAS cosmosim_radiation)
+add_library(CosmoSim::spectral ALIAS cosmosim_spectral)
 add_library(CosmoSim::gravity ALIAS cosmosim_gravity)
 add_library(CosmoSim::hydro ALIAS cosmosim_hydro)
 add_library(CosmoSim::amr ALIAS cosmosim_amr)
@@ -864,6 +875,7 @@ target_link_libraries(cosmosim_harness PRIVATE cosmosim_all)
 set(COSMOSIM_INSTALL_CMAKEDIR "${CMAKE_INSTALL_LIBDIR}/cmake/CosmoSim")
 set(COSMOSIM_INSTALL_TARGETS
   cosmosim_core
+  cosmosim_spectral
   cosmosim_mhd
   cosmosim_radiation
   cosmosim_gravity
@@ -1360,7 +1372,7 @@ if(COSMOSIM_ENABLE_TESTS)
 
   # CHUI-RT-BH-AGN-REF-v1 pass-01 verification sources (written, NOT RUN).
   # CHUI-EXT-PHYS-REF-v1 unit/reference test sources (NOT RUN in source-only pass 01).
-  foreach(cosmosim_ext_phys_unit IN ITEMS cosmological_background)
+  foreach(cosmosim_ext_phys_unit IN ITEMS cosmological_background spectral_data)
     add_executable(test_unit_${cosmosim_ext_phys_unit} tests/unit/test_${cosmosim_ext_phys_unit}.cpp)
     target_link_libraries(test_unit_${cosmosim_ext_phys_unit} PRIVATE cosmosim_all)
     target_compile_definitions(test_unit_${cosmosim_ext_phys_unit} PRIVATE COSMOSIM_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
