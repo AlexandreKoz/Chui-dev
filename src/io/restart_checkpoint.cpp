@@ -2886,6 +2886,25 @@ const RestartSchema& radiationRestartSchema() {
   return schema;
 }
 
+bool restartPayloadIsMagnetized(const RestartWritePayload& payload) {
+  const core::SimulationState* state = payload.persistent_state.simulation_state;
+  const bool local_magnetized = state != nullptr && !state->magnetic_faces.empty();
+  switch (payload.magnetic_schema_selection) {
+    case RestartMagneticSchemaSelection::kFromLocalState:
+      return local_magnetized;
+    case RestartMagneticSchemaSelection::kRunWideNonMagnetic:
+      if (local_magnetized) {
+        throw std::invalid_argument(
+            "MHD_RESTART_SCHEMA_MISMATCH: the run-wide schema is nonmagnetic but this rank holds a "
+            "magnetic face state");
+      }
+      return false;
+    case RestartMagneticSchemaSelection::kRunWideMagnetized:
+      return true;
+  }
+  throw std::invalid_argument("unknown restart magnetic schema selection");
+}
+
 const RestartSchema& mhdRestartSchema() {
   static const RestartSchema schema{std::string(k_restart_schema_name_v26), k_restart_schema_v26};
   return schema;
@@ -4028,7 +4047,10 @@ void writeRestartCheckpointHdf5(
   // synchronization boundaries: the synchronized MHD path never leaves pending
   // flux registers, temporal histories or partial stages between steps, so a
   // magnetized state carrying any of them is refused (no partial authority).
-  const bool magnetized = !payload.persistent_state.simulation_state->magnetic_faces.empty();
+  // Pass 04 (M03-03): run-wide schema identity. Production passes the frozen
+  // configuration's decision (identical on every rank); an empty rank of a
+  // magnetized run writes v26 with a valid empty /state/mhd group.
+  const bool magnetized = restartPayloadIsMagnetized(payload);
   const bool radiated = !payload.persistent_state.simulation_state->radiation.empty();
   if (magnetized && radiated) {
     throw std::invalid_argument(
@@ -4164,6 +4186,8 @@ void writeRestartCheckpointHdf5(
     mhd_metadata.divergence_max_norm =
         payload.persistent_state.simulation_state->magnetic_faces.divergence_max_normalized;
     mhd_metadata.scale_factor = payload.integrator_state->current_scale_factor;
+    mhd_metadata.allow_empty_rank = payload.magnetic_schema_selection ==
+        RestartMagneticSchemaSelection::kRunWideMagnetized;
     writeMhdRestartGroup(static_cast<std::int64_t>(file.get()),
                          payload.persistent_state.simulation_state->magnetic_faces, mhd_metadata);
   }
@@ -4609,7 +4633,7 @@ RestartVerificationResult verifyRestartCheckpointHdf5(
     result.schema_name = readScalarStringAttribute(file.get(), "restart_schema_name");
     result.schema_version = readScalarU32Attribute(file.get(), "restart_schema_version");
     const bool expected_magnetized = expected.persistent_state.simulation_state != nullptr &&
-        !expected.persistent_state.simulation_state->magnetic_faces.empty();
+        restartPayloadIsMagnetized(expected);
     const bool expected_radiated = expected.persistent_state.simulation_state != nullptr &&
         !expected.persistent_state.simulation_state->radiation.empty();
     const RestartSchema& expected_schema = expected_radiated

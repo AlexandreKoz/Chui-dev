@@ -163,6 +163,15 @@ class GravityRuntime : public GravityAccelerationProvider,
       const core::SimulationState& restored_state,
       std::uint64_t layout_certificate) = 0;
   [[nodiscard]] virtual bool cycleTransactionOpen() const noexcept = 0;
+  // Pass 04 (M04-01): after a rollback whose caller restored only part of the
+  // state (the multirate PM-cycle rollback restores particle lanes, not the
+  // module sidecar registry), re-publish runtime-owned module sidecars from
+  // the journal-restored live owners so sidecar and live state agree. The
+  // global-step rollback restores the whole SimulationState copy and needs no
+  // call. Default: no runtime-owned module sidecar.
+  virtual void synchronizeModuleSidecarsAfterRollback(core::SimulationState& state) {
+    static_cast<void>(state);
+  }
   // Execution-cost totals of rejected attempts (not part of the trajectory).
   [[nodiscard]] virtual std::uint64_t rejectedLongRangeRefreshCount() const noexcept = 0;
   [[nodiscard]] virtual std::uint64_t rejectedLongRangeReuseCount() const noexcept = 0;

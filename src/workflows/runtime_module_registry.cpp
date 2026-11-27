@@ -98,6 +98,9 @@ namespace {
         case Key::kHydroPrimitiveState: return Mode::kReadWrite;
         case Key::kAmrPatchState: return Mode::kReadWrite;
         case Key::kEffectiveIsmThermodynamics: return Mode::kReadWrite;
+        // Pass 04 (M03-11): the hydro/MHD kHydroUpdate owner is the only
+        // writer of the magnetic face authority.
+        case Key::kMagneticFaceState: return Mode::kReadWrite;
         case Key::kGravityAcceleration: return Mode::kRead;
         case Key::kMigrationOwnership: return Mode::kRead;
         case Key::kIntegratorTruth: return Mode::kRead;
@@ -127,6 +130,7 @@ namespace {
         case Key::kSourceMutationState:
         case Key::kMigrationOwnership:
         case Key::kIntegratorTruth:
+        case Key::kMagneticFaceState:  // read-only consumers (diagnostics)
           return Mode::kRead;
         case Key::kDiagnostics:
           return Mode::kWrite;
@@ -142,6 +146,7 @@ namespace {
         case Key::kMigrationOwnership:
         case Key::kSchedulerTruth:
         case Key::kIntegratorTruth:
+        case Key::kMagneticFaceState:  // v26 restart / v7 snapshot writer
           return Mode::kRead;
         case Key::kOutputRestartState:
           return Mode::kReadWrite;
@@ -462,6 +467,7 @@ std::string_view runtimeResourceKeyName(RuntimeResourceKey resource) noexcept {
     case RuntimeResourceKey::kIntegratorTruth: return "integrator_truth";
     case RuntimeResourceKey::kOutputRestartState: return "output_restart_state";
     case RuntimeResourceKey::kDiagnostics: return "diagnostics";
+    case RuntimeResourceKey::kMagneticFaceState: return "magnetic_face_state";
   }
   return "unknown";
 }

@@ -1139,6 +1139,19 @@ void TimeCoordinator::runRungZeroSegment(
   // validates freshness (generation equality) and the existing conservative
   // coverage check before routing.
   install_authoritative_domain_geometry();
+  // Pass 04 (M03-11): the single legal initialization boundary of the
+  // magnetic face authority (fresh seed or restart bind), before the first
+  // global-step retry capture, timestep candidate or output of this segment.
+  {
+    std::exception_ptr magnetic_failure;
+    try {
+      m_hydro_amr.initializeMagneticState(state, integrator_state);
+    } catch (...) {
+      magnetic_failure = std::current_exception();
+    }
+    FailureCoordinator(m_services).rethrowCollectiveFailure(
+        magnetic_failure, "MHD magnetic-state initialization");
+  }
 
   const std::uint64_t run_start_step_index = integrator_state.step_index;
   const std::uint64_t configured_segment_steps = options.max_steps_override > 0
@@ -2254,6 +2267,10 @@ void TimeCoordinator::runHierarchicalSegment(
       pending = store.pending;
       while (state.gravitySourceGeneration() <= generation_reached) state.bumpGravitySourceGeneration();
       m_gravity.rollbackCycleTransaction(store.force_endpoint, state, layout_certificate);
+      // Pass 04 (M04-01): this rollback restores particle lanes only; the
+      // journal-restored live neutrino history is re-published so the module
+      // sidecar cannot keep the rejected attempt's response history.
+      m_gravity.synchronizeModuleSidecarsAfterRollback(state);
       integrator.pm_source_generation = state.gravitySourceGeneration();
       syncTimeBinsFromSchedulers(particles, cells, state);
       report.multirate_rejected_blocks += pm_cycle.completed_blocks;

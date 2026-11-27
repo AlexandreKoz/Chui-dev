@@ -115,8 +115,26 @@ class NeutrinoSpectralSource final : public gravity::PmSpectralSourceHook {
   [[nodiscard]] core::ModuleSidecarBlock serialize() const;
   void restore(const core::ModuleSidecarBlock& block);
   void storeTo(core::ModuleSidecarRegistry& registry) const { registry.upsert(serialize()); }
-  // Restores when the sidecar exists; returns whether it did.
+  // Restores when the sidecar exists; returns whether it did. An absent
+  // sidecar leaves the live state untouched (fresh-run first use).
   bool restoreFrom(const core::ModuleSidecarRegistry& registry);
+
+  // Pass 04 (M04-01): bounded rollback journal driven by the gravity cycle
+  // transaction owner (GravityRuntime begin/commit/rollbackCycleTransaction).
+  // beginTransaction() records the opening accepted state: history length,
+  // current ratio/multiplier, the first-use initial-epoch fields (including
+  // the empty-history status) and any accepted history entries a replay
+  // truncation pops during the transaction (bounded by
+  // k_journal_max_saved_entries; exceeding it refuses the solve, never drops
+  // data). rollbackTransaction() restores exactly that state without
+  // allocation (history vectors keep their reserved capacity), so no rejected
+  // node survives and no accepted node is counted twice. Outside a
+  // transaction the source behaves as before.
+  static constexpr std::size_t k_journal_max_saved_entries = 8U;
+  void beginTransaction();
+  void commitTransaction() noexcept;
+  void rollbackTransaction() noexcept;
+  [[nodiscard]] bool transactionOpen() const noexcept { return m_journal_open; }
 
   // Pure evaluation of the linear-response ratio for one bin given an
   // explicit history (exposed for analytic tests): s nodes ascending,
@@ -152,6 +170,22 @@ class NeutrinoSpectralSource final : public gravity::PmSpectralSourceHook {
   std::vector<double> m_current_multiplier;
   double m_solve_scale_factor = 0.0;
   bool m_solve_open = false;
+  // Rollback journal (pass 04, M04-01). Capacities reserved at construction.
+  bool m_journal_open = false;
+  std::size_t m_journal_size = 0U;       // opening history length
+  std::size_t m_journal_min_size = 0U;   // smallest length reached while open
+  double m_journal_initial_scale_factor = 0.0;
+  std::vector<double> m_journal_initial_delta_ratio;
+  std::vector<double> m_journal_initial_theta_ratio_s;
+  std::vector<double> m_journal_current_ratio;
+  std::vector<double> m_journal_current_multiplier;
+  // Accepted entries popped by a replay truncation, in increasing index order
+  // after rollback sorting: (s, a) and bins-sized amplitude/ratio rows.
+  std::vector<std::size_t> m_journal_saved_index;
+  std::vector<double> m_journal_saved_s;
+  std::vector<double> m_journal_saved_a;
+  std::vector<double> m_journal_saved_amplitude;
+  std::vector<double> m_journal_saved_ratio;
 };
 
 }  // namespace cosmosim::neutrinos

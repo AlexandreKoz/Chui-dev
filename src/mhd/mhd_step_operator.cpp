@@ -822,6 +822,44 @@ void MhdStepOperator::evaluateIdealStage(const MhdPatchGeometry& geometry,
                               static_cast<std::size_t>(c[2]));
   };
 
+  // Pass 04 (M03-08, R-UCT): HLL transverse induction flux on the exact PLM-MC
+  // states UCT-HLL uses in its one-dimensional reduction at this face
+  // (cell-centred v and B_eff extrapolated half a cell along the normal with
+  // MC slopes, shared normal field bn, the face's signed fan).
+  const auto plmInductionHll = [&](std::size_t axis, const MhdIndex3& left_cell,
+                                   const MhdIndex3& right_cell, std::size_t transverse, double bn,
+                                   double speed_plus_value, double speed_minus_value) {
+    const auto extrapolate = [&](const MhdDoubleArray& lane, const MhdIndex3& cell,
+                                 double direction) {
+      MhdIndex3 minus = cell;
+      MhdIndex3 plus = cell;
+      minus[axis] -= 1;
+      plus[axis] += 1;
+      const double center = lane[primitives.index(cell)];
+      return center + direction * 0.5 *
+          mcLimitedSlope(lane[primitives.index(minus)], center, lane[primitives.index(plus)]);
+    };
+    const MhdDoubleArray& vn = primitives.velocity(static_cast<MhdAxis>(axis));
+    const MhdDoubleArray& vt = primitives.velocity(static_cast<MhdAxis>(transverse));
+    const MhdDoubleArray& bt = primitives.field(static_cast<MhdAxis>(transverse));
+    const double vn_l = extrapolate(vn, left_cell, +1.0);
+    const double vn_r = extrapolate(vn, right_cell, -1.0);
+    const double vt_l = extrapolate(vt, left_cell, +1.0);
+    const double vt_r = extrapolate(vt, right_cell, -1.0);
+    const double bt_l = extrapolate(bt, left_cell, +1.0);
+    const double bt_r = extrapolate(bt, right_cell, -1.0);
+    const double flux_l = vn_l * bt_l - vt_l * bn;
+    const double flux_r = vn_r * bt_r - vt_r * bn;
+    const double denominator = speed_plus_value + speed_minus_value;
+    if (!(denominator > 0.0) || !std::isfinite(denominator)) {
+      throw MhdError(MhdErrorCode::kInvalidField,
+                     makeContext("mhd_ideal", "degenerate signal fan in the UCT face correction"));
+    }
+    return (speed_plus_value * flux_l + speed_minus_value * flux_r) / denominator -
+        speed_plus_value * speed_minus_value / denominator * (bt_r - bt_l);
+  };
+  workspace.signals.induction_correction_valid = true;
+
   for (std::size_t axis = 0; axis < 3U; ++axis) {
     const MhdAxis normal = static_cast<MhdAxis>(axis);
     const std::size_t t1 = (axis + 1U) % 3U;
@@ -829,6 +867,8 @@ void MhdStepOperator::evaluateIdealStage(const MhdPatchGeometry& geometry,
     const double weight_per_length = flux_weight / (a_stage * spacingAlong(geometry, axis));
     std::span<double> speed_plus = workspace.signals.speed_plus[axis].span();
     std::span<double> speed_minus = workspace.signals.speed_minus[axis].span();
+    std::span<double> correction_t1 = workspace.signals.induction_correction[axis][0].span();
+    std::span<double> correction_t2 = workspace.signals.induction_correction[axis][1].span();
     for (std::ptrdiff_t b = -1; b <= n[t2]; ++b) {
       for (std::ptrdiff_t a = -1; a <= n[t1]; ++a) {
         const bool interior_line = a >= 0 && a < n[t1] && b >= 0 && b < n[t2];
@@ -856,16 +896,34 @@ void MhdStepOperator::evaluateIdealStage(const MhdPatchGeometry& geometry,
           const std::size_t signal_index = workspace.signals.index(normal, face);
           const MhdPrimitiveState& left = previous.upper;
           const MhdPrimitiveState& right = current.lower;
+          MhdIndex3 left_cell = cell;
+          left_cell[axis] = f - 1;
           if (!interior_line) {
-            // Ghost-row face: only the signed fan is needed for UCT-HLL.
-            const MhdSignalBounds bounds =
-                MhdRiemann::signalBounds(normal, left, right, bn, gamma);
-            if (!bounds.valid) {
-              throw MhdError(MhdErrorCode::kNonPositiveState,
-                             makeContext("mhd_ideal", "invalid signal fan on a ghost-row face"));
+            // Ghost-row face. Pass 04 (R-UCT): the edge correction needs the
+            // flux of the SAME solver path used on interior faces, and the
+            // fan must come from that solve so that, in a 1-D solution, the
+            // two adjacent a-faces of a boundary edge carry identical bounds.
+            // Nothing here touches the gas update or the fallback counters.
+            MhdRiemann::Result ghost_solved =
+                MhdRiemann::solve(normal, left, right, bn, gamma, m_policy.riemann);
+            if (!ghost_solved.valid) {
+              ghost_solved = firstOrderPositivityFlux(normal, primitives.load(left_cell),
+                                                      primitives.load(cell), bn, gamma);
             }
-            speed_plus[signal_index] = std::max(0.0, bounds.speed_right);
-            speed_minus[signal_index] = std::max(0.0, -bounds.speed_left);
+            if (!ghost_solved.valid) {
+              throw MhdError(MhdErrorCode::kNonPositiveState,
+                             makeContext("mhd_ideal", "invalid flux on a ghost-row face"));
+            }
+            speed_plus[signal_index] = std::max(0.0, ghost_solved.flux.fastest_signal_speed);
+            speed_minus[signal_index] = std::max(0.0, -ghost_solved.flux.slowest_signal_speed);
+            correction_t1[signal_index] =
+                ghost_solved.flux.magnetic_flux[t1] -
+                plmInductionHll(axis, left_cell, cell, t1, bn, speed_plus[signal_index],
+                                speed_minus[signal_index]);
+            correction_t2[signal_index] =
+                ghost_solved.flux.magnetic_flux[t2] -
+                plmInductionHll(axis, left_cell, cell, t2, bn, speed_plus[signal_index],
+                                speed_minus[signal_index]);
             previous = current;
             continue;
           }
@@ -873,8 +931,6 @@ void MhdStepOperator::evaluateIdealStage(const MhdPatchGeometry& geometry,
               MhdRiemann::solve(normal, left, right, bn, gamma, m_policy.riemann);
           double metal_upwind = 0.0;
           if (!solved.valid) {
-            MhdIndex3 left_cell = cell;
-            left_cell[axis] = f - 1;
             const MhdPrimitiveState left_average = primitives.load(left_cell);
             const MhdPrimitiveState right_average = primitives.load(cell);
             solved = firstOrderPositivityFlux(normal, left_average, right_average, bn, gamma);
@@ -901,6 +957,15 @@ void MhdStepOperator::evaluateIdealStage(const MhdPatchGeometry& geometry,
           const MhdRiemannFlux& flux = solved.flux;
           speed_plus[signal_index] = std::max(0.0, flux.fastest_signal_speed);
           speed_minus[signal_index] = std::max(0.0, -flux.slowest_signal_speed);
+          // R-UCT: correction relative to the HLL flux on the UCT's PLM states.
+          correction_t1[signal_index] =
+              flux.magnetic_flux[t1] - plmInductionHll(axis, left_cell, cell, t1, bn,
+                                                       speed_plus[signal_index],
+                                                       speed_minus[signal_index]);
+          correction_t2[signal_index] =
+              flux.magnetic_flux[t2] - plmInductionHll(axis, left_cell, cell, t2, bn,
+                                                       speed_plus[signal_index],
+                                                       speed_minus[signal_index]);
           const std::array<double, MhdGasStateSoa::k_lane_count> values{
               flux.mass_flux, flux.momentum_flux[0], flux.momentum_flux[1],
               flux.momentum_flux[2], flux.energy_flux, flux.mass_flux * metal_upwind};

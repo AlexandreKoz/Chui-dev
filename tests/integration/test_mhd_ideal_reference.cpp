@@ -10,6 +10,8 @@
 #include <vector>
 
 #include "../unit/mhd/mhd_test_fixtures.hpp"
+#include "cosmosim/core/constants.hpp"
+#include "cosmosim/core/cosmology.hpp"
 #include "cosmosim/mhd/mhd_initial_conditions.hpp"
 #include "cosmosim/mhd/mhd_level_stepper.hpp"
 
@@ -311,6 +313,84 @@ void testExpansionOnly() {
   CHUI_REQUIRE(std::abs(budget.momentum[0]) <= 1e-15);
 }
 
+// Pass 04 (I09 / M04-05): the same homogeneous check driven by the SINGLE
+// configured cosmological background (core::LambdaCdmBackground built from a
+// CosmologyBackgroundConfig with photons and a background-only massive
+// neutrino eigenstate, the S01 construction path the workflow uses). Interval
+// endpoints (a, H) come from that background, dt from int da / (a H). B_c
+// must stay invariant to roundoff, M_c ~ 1/a and p_c ~ a^{3 - 3 gamma}
+// independently of the H(a) shape (adiabatic exponent, no double Hubble
+// term). A legacy pure-LambdaCDM background gives the same invariants.
+// NOT_RUN (pass 04).
+void testExpansionWithRelativisticBackground() {
+  for (const bool radiation : {true, false}) {
+    cosmosim::core::CosmologyBackgroundConfig config{};
+    config.hubble_param = 0.674;
+    config.omega_matter = 0.3;
+    if (radiation) {
+      config.radiation_species.enabled = true;
+      config.radiation_species.t_cmb0_k = 2.7255;
+      config.radiation_species.n_ur = 0.0;
+      config.radiation_species.ncdm_masses_ev = {0.06};
+      config.radiation_species.ncdm_temperature_ratio =
+          cosmosim::core::instantaneousDecouplingNeutrinoTemperatureRatio();
+    }
+    // Flatness closes with Lambda (same closure as the neutrino-method tests;
+    // the nonrelativistic ncdm density is part of omega_matter).
+    namespace k = cosmosim::core::constants;
+    const double h0_si = config.hubble_param * k::k_hubble_100_km_s_mpc_si;
+    const double rho_crit0 = 3.0 * h0_si * h0_si / (8.0 * k::k_pi * k::k_newton_g_si);
+    const double omega_gamma = radiation
+        ? k::k_radiation_constant_si * std::pow(2.7255, 4) /
+              (k::k_speed_of_light_si * k::k_speed_of_light_si * rho_crit0)
+        : 0.0;
+    config.omega_lambda = 1.0 - config.omega_matter - omega_gamma;
+    const cosmosim::core::LambdaCdmBackground background(config);
+    TestLevel level({4, 4, 4}, {4, 4, 4}, {0.25, 0.25, 0.25}, cosmosim::mhd::test::periodicDomain());
+    const double b0 = 0.7;
+    const double a_begin = 0.02;
+    level.initialize([](std::array<double, 3>) { return GasPrimitive{}; }, {b0, 0.2, 0.0}, {},
+                     a_begin, k_gamma);
+    MhdLevelStepper stepper = level.makeStepper(MhdNumericsPolicy{});
+    const std::vector<double> phi0(level.faces(0).fluxX().begin(), level.faces(0).fluxX().end());
+    const double h0 = background.hubbleSi(1.0);
+    double a = a_begin;
+    double time = 0.0;  // code time in units of 1/H0
+    const double growth = 1.0005;
+    const MhdConservationBudget start = stepper.levelBudget(a);
+    for (int step = 0; step < 400; ++step) {
+      const double a_end = a * growth;
+      double dt = 0.0;  // int da / (a H) in units of 1/H0, 64-point midpoint
+      for (int q = 0; q < 64; ++q) {
+        const double aq = a + (a_end - a) * (static_cast<double>(q) + 0.5) / 64.0;
+        dt += (a_end - a) / 64.0 / (aq * background.hubbleSi(aq) / h0);
+      }
+      MhdStageContext interval{};
+      interval.time_code = time;
+      interval.dt_code = dt;
+      interval.comoving_coordinates = true;
+      interval.scale_factor = a;
+      interval.scale_factor_end = a_end;
+      interval.hubble_rate_code = background.hubbleSi(a) / h0;
+      interval.hubble_rate_end_code = background.hubbleSi(a_end) / h0;
+      CHUI_REQUIRE(stepper.advance(interval, {}).accepted);
+      time += dt;
+      a = a_end;
+    }
+    for (std::size_t index = 0; index < phi0.size(); ++index) {
+      CHUI_REQUIRE(std::abs(level.faces(0).fluxX()[index] - phi0[index]) <=
+                   1e-12 * std::abs(phi0[index]));
+    }
+    const MhdConservationBudget budget = stepper.levelBudget(a);
+    CHUI_REQUIRE(std::abs(budget.energy_magnetic * a - start.energy_magnetic * a_begin) <=
+                 1e-12 * start.energy_magnetic * a_begin);
+    const double thermal_expected =
+        start.energy_thermal * std::pow(a / a_begin, 3.0 - 3.0 * k_gamma);
+    CHUI_REQUIRE(std::abs(budget.energy_thermal - thermal_expected) <= 1e-5 * thermal_expected);
+    CHUI_REQUIRE(std::abs(budget.momentum[0]) <= 1e-15);
+  }
+}
+
 // I03: Brio-Wu along x with open boundaries: positivity, no NaN, CT kept.
 void testBrioWu() {
   TestLevel level({128, 3, 3}, {128, 3, 3}, {1.0 / 128, 1.0 / 128, 1.0 / 128},
@@ -429,6 +509,7 @@ int main() {
   testMultiPatchEquivalence();
   testFieldLoopConservation();
   testExpansionOnly();
+  testExpansionWithRelativisticBackground();
   testBrioWu();
   testConductingWallBox();
   testRetryAndRollback();

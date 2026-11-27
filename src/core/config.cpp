@@ -2567,6 +2567,15 @@ void validateMhdConfig(const MhdConfig& mhd) {
         "mhd_amr.checkpoint_sync_only must be true: MHD checkpoints are written only "
         "at globally agreed safe synchronization boundaries");
   }
+  // Pass 04 (M03-12): the flux-based /MHD/Diagnostics divergence and
+  // magnetic-energy record of snapshot v7 is a mandatory integrity record
+  // (REF 13.1 provenance); it cannot be disabled, and no optional per-cell
+  // divergence product exists yet, so `false` would be a silent no-op.
+  if (!mhd.io.output_divergence_diagnostics) {
+    throw ConfigError(
+        "mhd_io.output_divergence_diagnostics=false is refused: the flux-based divergence "
+        "diagnostics of chui_science_snapshot_v7 are mandatory integrity records");
+  }
   if (!mhd.io.checkpoint_face_flux) {
     throw ConfigError(
         "mhd_io.checkpoint_face_flux must be true for exact MHD restart authority");

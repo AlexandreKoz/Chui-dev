@@ -71,6 +71,14 @@ class HydroAmrRuntime {
     return std::numeric_limits<double>::infinity();
   }
   [[nodiscard]] virtual std::uint64_t magnetizedOwnedCapacityBytes() const noexcept { return 0U; }
+  // Pass 04 (M03-11): COLLECTIVE legal initialization boundary of the
+  // authoritative magnetic face state. Called once per segment by the
+  // TimeCoordinator before the first retry capture, scheduler candidate and
+  // output: a fresh start seeds Phi = Phi_uniform + C(A) on the real leaf
+  // topology; a restart validates and binds the restored v26 state. No-op for
+  // MHD-disabled runs.
+  virtual void initializeMagneticState(core::SimulationState& /*state*/,
+                                       const core::IntegratorState& /*integrator*/) {}
 };
 
 // Empty when every MHD admission predicate of the synchronized CPU reference

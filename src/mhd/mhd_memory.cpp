@@ -86,7 +86,8 @@ MhdPatchMemoryEstimate estimatePatchMemory(const MhdMemoryRequest& request) {
     const std::uint64_t t1 = n[(axis + 1U) % 3U];
     const std::uint64_t t2 = n[(axis + 2U) % 3U];
     estimate.staggered_cache_bytes += lane(checkedProduct({n[axis] + 1U, t1 + 2U * gt, t2 + 2U * gt}));
-    estimate.face_signal_bytes += 2U * lane(checkedProduct({n[axis] + 1U, t1 + 2U, t2 + 2U}));
+    // speed+/speed- plus the two pass-04 R-UCT induction-correction lanes.
+    estimate.face_signal_bytes += 4U * lane(checkedProduct({n[axis] + 1U, t1 + 2U, t2 + 2U}));
     estimate.boundary_flux_bytes += 2U * lane(checkedProduct({MhdBoundaryFaceFluxes::k_values_per_face, t1, t2}));
   }
   estimate.stage_emf_bytes = edge_storage();

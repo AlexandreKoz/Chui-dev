@@ -549,3 +549,26 @@ no speedup or capacity claim is made.
 traversal, Voigt evaluation, one CR anisotropic diffusion step and the direct RIME, and prints
 the governed memory formulas (`radiationIntervalWorkspaceBytes`, `CrSpectralState::bytesFor`,
 ray-index bytes) beside wall times. No measurement exists for this pass.
+
+## CHUI-MHD corrective pass 04 counters (source only; NOT RUN, no measurements)
+
+Added to `counters.json` by the magnetized `kHydroUpdate` branch
+(`HydroAmrRuntimeImpl::execute`) on every accepted interval, in addition to the
+pass-02 `mhd_*` counters:
+
+| Counter | Kind | Meaning |
+|---|---|---|
+| `mhd_intervals_attempted_total` | set | Every `MhdRuntimeBridge::advance` entry, accepted or rejected |
+| `mhd_intervals_accepted_total` / `mhd_intervals_rejected_total` | set | Accepted / rejected (retryable or refused) intervals |
+| `mhd_exchange_phases` / `mhd_exchange_rounds` | add | Logical exchange phases and the bounded destination rounds that executed them (rounds > phases when the per-rank communication budget splits a phase, MP03) |
+| `mhd_ideal_faces_attempted` / `mhd_hlle_fallback_faces_attempted` | add | Face solves and HLLE fallbacks over all attempts of the accepted interval (cost accounting) |
+| `mhd_hierarchy_generation` | set | Collectively committed directory rebuild generation (wire-epoch input) |
+
+`MhdRuntimeTelemetry` also accumulates the accepted physical-boundary budget
+(`boundary_mass_out_comoving`, `boundary_gas_energy_out_comoving` = ideal total
+energy, `boundary_poynting_energy_out_comoving`) for domains with open or wall
+sides. Process RSS/PSS stays the responsibility of the time coordinator's
+`observeProcessMemory` report; per-class high-water marks come from the
+governor snapshot. Per-peer MPI wait time, OpenMP thread-count determinism
+tests and the 100-interval plateau (MP05) are NOT implemented in this pass;
+nothing here is a measured throughput, roofline or frontier.

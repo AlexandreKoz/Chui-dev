@@ -49,6 +49,13 @@ struct MhdRestartGroupMetadata {
   std::string coefficient_table_sha256;
   double divergence_max_norm = 0.0;
   double scale_factor = 1.0;
+  // Pass 04 (M03-03): a rank of a magnetized run that owns no leaf patch
+  // writes a VALID empty group (zero patch rows, offset tables {0}, empty
+  // flux lanes, identical contract/provider/units attributes) marked with the
+  // attribute empty_rank = 1. Only the run-wide writer sets this; an empty
+  // face state is refused otherwise. Readers accept zero rows only with the
+  // marker and reject the marker on a non-empty table (corruption).
+  bool allow_empty_rank = false;
 };
 
 // What a reader requires before admitting the magnetic state.

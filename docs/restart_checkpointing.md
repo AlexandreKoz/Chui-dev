@@ -784,6 +784,42 @@ streaming verifier expects v26 for magnetized payloads.
   the `[mhd*]` normalized text (including the pass-02 `initial_field_*` keys)
   is part of the hash for magnetized runs.
 
+### Pass 04 corrections (UNVALIDATED, NOT_RUN)
+
+* **Run-wide schema selection (M03-03).** `RestartWritePayload::
+  magnetic_schema_selection` carries the frozen-configuration decision
+  (`kRunWideMagnetized` iff `mhd.enabled`; the production output runtime always
+  sets it). A rank that owns no leaf patch in a magnetized run writes v26 with a
+  VALID empty `/state/mhd` group: zero patch rows, offset tables `{0}`, empty
+  flux lanes, identical contract/provider/units attributes, plus the group
+  attribute `empty_rank = 1`. Readers accept zero rows only with that marker
+  and reject the marker on a non-empty table; a v26 file without `/state/mhd`
+  is corruption (never a legacy case). `kRunWideNonMagnetic` with a local
+  magnetic state is refused. `kFromLocalState` (rank-local choice) remains only
+  for single-rank direct library callers/tests. Compatibility: older v26 files
+  never contain empty tables (the pass-02 writer refused them), so the marker
+  rule is additive; a pass-02 reader refuses a pass-04 empty-rank file
+  (fail-closed).
+* **Resume admission.** `validateRestartResumeTopologyOrThrowImpl` collectively
+  requires every rank file to be v26 when `mhd.enabled = true` and none to be
+  v26 when it is false, before any state is adopted.
+* **Neutrino response sidecar under retries (M04-01).** The live
+  `NeutrinoSpectralSource` history is journalled by the gravity cycle
+  transaction (`beginTransaction/commitTransaction/rollbackTransaction`): a
+  rejected interval restores history length, accepted nodes popped by replay,
+  current ratio/multiplier and the first-use initial epoch (empty history
+  included) without allocation; the global-step rollback restores the module
+  sidecar from its state copy and the multirate PM-cycle rollback re-publishes
+  it from the restored live owner. MHD + `linear_response` stays refused until
+  the combined path is validated.
+* **Initialization boundary (M03-11).** Fresh-start seeding and restart binding
+  of the magnetic authority happen once per segment in
+  `HydroAmrRuntime::initializeMagneticState`, before the first retry capture.
+* Reproducibility: MHD-off checkpoints are unchanged (v25 byte layout); v26
+  content for nonempty ranks is unchanged; R-UCT and the anisotropic AMR
+  prolongation fix change magnetized trajectories (bug fixes, documented in
+  `docs/architecture/decision_log.md`).
+
 ## CHUI-RT-BH-AGN-REF-v1 (pass 01, UNVALIDATED)
 
 * Radiation-enabled states write `cosmosim_restart_v27` (see

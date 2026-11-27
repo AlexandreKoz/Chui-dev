@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <stdexcept>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -470,6 +471,47 @@ void testConfigAndCapabilityAdmission() {
     shadow_refused = true;  // rejected even earlier by typed config validation
   }
   CHUI_REQUIRE(shadow_refused);
+  // Pass 04 (M03-02/M04-01/M04-02/M04-03): precise refusals for combinations
+  // whose MHD integration is incomplete (typed config mutated directly so the
+  // refusal under test is the MHD predicate, not an unrelated table check).
+  {
+    cosmosim::core::SimulationConfig composition = supported.config;
+    composition.physics.thermochemistry_backend =
+        cosmosim::core::ThermochemistryBackendMode::kFixedHybrid;
+    CHUI_REQUIRE(cosmosim::workflows::mhdProductionDispatchRefusal(
+                     composition, cosmosim::core::ModePolicy{})
+                     .find("thermochemistry_backend") != std::string::npos);
+    cosmosim::core::SimulationConfig observables = supported.config;
+    observables.extended.observables.enabled = true;
+    CHUI_REQUIRE(cosmosim::workflows::mhdProductionDispatchRefusal(
+                     observables, cosmosim::core::ModePolicy{})
+                     .find("observables") != std::string::npos);
+    cosmosim::core::SimulationConfig neutrinos = supported.config;
+    neutrinos.extended.neutrinos.method = cosmosim::core::NeutrinoMethodConfig::kLinearResponse;
+    CHUI_REQUIRE(cosmosim::workflows::mhdProductionDispatchRefusal(
+                     neutrinos, cosmosim::core::ModePolicy{})
+                     .find("linear_response") != std::string::npos);
+    // Stateless background-only neutrinos are NOT refused by the MHD predicate.
+    cosmosim::core::SimulationConfig background = supported.config;
+    background.extended.neutrinos.method = cosmosim::core::NeutrinoMethodConfig::kBackgroundOnly;
+    CHUI_REQUIRE(cosmosim::workflows::mhdProductionDispatchRefusal(
+                     background, cosmosim::core::ModePolicy{}) == supported_refusal);
+  }
+  // Pass 04 (M03-12): the mandatory divergence integrity record cannot be
+  // disabled.
+  {
+    bool divergence_refused = false;
+    try {
+      (void)cosmosim::core::loadFrozenConfigFromString(
+          supported_text + "
+[mhd_io]
+output_divergence_diagnostics = false
+", "mhd_no_div");
+    } catch (const std::exception&) {
+      divergence_refused = true;
+    }
+    CHUI_REQUIRE(divergence_refused);
+  }
   const auto off_report = cosmosim::workflows::buildRuntimeCapabilityReport(off.config);
   CHUI_REQUIRE(!off_report.require("mhd_production_dispatch").requested);
   CHUI_REQUIRE(off_report.require("mhd_production_dispatch").runtime_available);
@@ -477,9 +519,102 @@ void testConfigAndCapabilityAdmission() {
 
 }  // namespace
 
+// Pass 04 (M03-09): on ANISOTROPIC rectangular cells (dx != dy != dz) a
+// linear solenoidal field with nonzero curl,
+//   B = (0.2 + 0.3 y, 0.1 + 0.4 z, -0.2 + 0.5 x),
+// is reproduced EXACTLY on the fine faces of every parent cell whose
+// transverse slopes are unlimited interior differences (MC of linear data is
+// the central difference), the fine-cell divergence is zero, and restriction
+// returns the parent. The pass-01/02 cubic-cell quadratic coefficient would
+// break the divergence of nonlinear data on these cells (see
+// testNonuniformTransferIdentity, which uses the same anisotropic parent).
+void testAnisotropicLinearFieldExactness() {
+  const MhdPatchGeometry parent = parentGeometry();
+  MhdFaceFluxStorage faces(parent);
+  const auto bx = [](double, double y, double) { return 0.2 + 0.3 * y; };
+  const auto by = [](double, double, double z) { return 0.1 + 0.4 * z; };
+  const auto bz = [](double x, double, double) { return -0.2 + 0.5 * x; };
+  const auto fill = [](const MhdPatchGeometry& g, std::span<double> px, std::span<double> py,
+                       std::span<double> pz, auto fx, auto fy, auto fz) {
+    const double ox = g.origin_x_comoving;
+    const double oy = g.origin_y_comoving;
+    const double oz = g.origin_z_comoving;
+    for (std::size_t k = 0; k < g.nz; ++k) {
+      for (std::size_t j = 0; j < g.ny; ++j) {
+        for (std::size_t i = 0; i <= g.nx; ++i) {
+          px[i + (g.nx + 1U) * (j + g.ny * k)] =
+              fx(ox + i * g.dx_comoving, oy + (j + 0.5) * g.dy_comoving,
+                 oz + (k + 0.5) * g.dz_comoving) * g.faceAreaX();
+        }
+      }
+    }
+    for (std::size_t k = 0; k < g.nz; ++k) {
+      for (std::size_t j = 0; j <= g.ny; ++j) {
+        for (std::size_t i = 0; i < g.nx; ++i) {
+          py[i + g.nx * (j + (g.ny + 1U) * k)] =
+              fy(ox + (i + 0.5) * g.dx_comoving, oy + j * g.dy_comoving,
+                 oz + (k + 0.5) * g.dz_comoving) * g.faceAreaY();
+        }
+      }
+    }
+    for (std::size_t k = 0; k <= g.nz; ++k) {
+      for (std::size_t j = 0; j < g.ny; ++j) {
+        for (std::size_t i = 0; i < g.nx; ++i) {
+          pz[i + g.nx * (j + g.ny * k)] =
+              fz(ox + (i + 0.5) * g.dx_comoving, oy + (j + 0.5) * g.dy_comoving,
+                 oz + k * g.dz_comoving) * g.faceAreaZ();
+        }
+      }
+    }
+  };
+  fill(parent, faces.fluxX(), faces.fluxY(), faces.fluxZ(), bx, by, bz);
+  CHUI_REQUIRE(maxDivergence(faces) <= 1e-14);
+  std::array<MhdFaceFluxStorage, 8> children{};
+  const auto result = MhdAmrSynchronizer::prolongFaceFluxes(parent, faces.fluxX(), faces.fluxY(),
+                                                            faces.fluxZ(), children);
+  CHUI_REQUIRE(result.ok && result.max_cell_divergence_residual <= 1e-13);
+  for (std::int32_t block = 0; block < 8; ++block) {
+    const MhdFaceFluxStorage& child = children[static_cast<std::size_t>(block)];
+    const MhdPatchGeometry& g = child.geometry();
+    CHUI_REQUIRE(maxDivergence(child) <= 1e-13);
+    MhdFaceFluxStorage exact(g);
+    fill(g, exact.fluxX(), exact.fluxY(), exact.fluxZ(), bx, by, bz);
+    // Compare only fine faces inside parent cells at least one parent cell
+    // away from the parent patch boundary (where MC slopes are interior).
+    const auto interior = [&](double coordinate, double origin, double width, std::size_t n) {
+      const double parent_index = (coordinate - origin) / width;
+      return parent_index > 1.0 + 1e-9 && parent_index < static_cast<double>(n) - 1.0 - 1e-9;
+    };
+    for (std::size_t k = 0; k < g.nz; ++k) {
+      for (std::size_t j = 0; j < g.ny; ++j) {
+        for (std::size_t i = 0; i < g.nx; ++i) {
+          const double xc = g.origin_x_comoving + (i + 0.5) * g.dx_comoving;
+          const double yc = g.origin_y_comoving + (j + 0.5) * g.dy_comoving;
+          const double zc = g.origin_z_comoving + (k + 0.5) * g.dz_comoving;
+          if (!interior(xc, parent.origin_x_comoving, parent.dx_comoving, parent.nx) ||
+              !interior(yc, parent.origin_y_comoving, parent.dy_comoving, parent.ny) ||
+              !interior(zc, parent.origin_z_comoving, parent.dz_comoving, parent.nz)) {
+            continue;
+          }
+          CHUI_REQUIRE(std::abs(child.faceFluxX(i, j, k) - exact.faceFluxX(i, j, k)) <= 1e-14);
+          CHUI_REQUIRE(std::abs(child.faceFluxY(i, j, k) - exact.faceFluxY(i, j, k)) <= 1e-14);
+          CHUI_REQUIRE(std::abs(child.faceFluxZ(i, j, k) - exact.faceFluxZ(i, j, k)) <= 1e-14);
+        }
+      }
+    }
+  }
+  MhdFaceFluxStorage restored(parent);
+  MhdAmrSynchronizer::restrictFaceFluxes(parent, restored.fluxX(), restored.fluxY(),
+                                         restored.fluxZ(), children);
+  for (std::size_t index = 0; index < faces.fluxY().size(); ++index) {
+    CHUI_REQUIRE(std::abs(restored.fluxY()[index] - faces.fluxY()[index]) <= 1e-14);
+  }
+}
+
 int main() {
   testUniformProlongation();
   testNonuniformTransferIdentity();
+  testAnisotropicLinearFieldExactness();
   testGasTransferTransaction();
   testEmfRegisterCoverage();
   testFaceLayoutLifecycle();

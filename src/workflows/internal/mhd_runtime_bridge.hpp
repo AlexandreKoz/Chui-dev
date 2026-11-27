@@ -21,6 +21,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "cosmosim/core/config.hpp"
@@ -79,6 +80,18 @@ struct MhdRuntimeTelemetry {
   double last_dt_accepted_code = 0.0;
   double last_magnetic_energy = 0.0;
   double last_total_energy = 0.0;
+  // Pass 04 (M03-12/14): accepted physical (open/wall) boundary budget,
+  // rank-global, comoving code units; cumulative over accepted intervals and
+  // the last interval. Zero for fully periodic domains.
+  double boundary_mass_out_comoving = 0.0;
+  double boundary_gas_energy_out_comoving = 0.0;
+  double boundary_poynting_energy_out_comoving = 0.0;
+  double last_boundary_mass_out_comoving = 0.0;
+  double last_boundary_energy_out_comoving = 0.0;
+  // Attempt accounting (MP12): every advance() entry, including rejections.
+  std::uint64_t attempted_intervals = 0U;
+  std::uint64_t exchange_rounds = 0U;
+  std::uint64_t exchange_phases = 0U;
 };
 
 class MhdRuntimeBridge {
@@ -94,8 +107,14 @@ class MhdRuntimeBridge {
   // face layout from the real patch topology and seed it with the configured
   // Phi = Phi_uniform + C(A). Restart / later steps: validate only (never
   // reseed); an empty or stale magnetic state fails closed.
+  //
+  // Pass 04 (M03-11): seeding is permitted ONLY when allow_seed is true, i.e.
+  // from HydroAmrRuntime::initializeMagneticState at the legal pre-step
+  // boundary (TimeCoordinator, before the first retry capture, scheduler
+  // candidate or output). The timestep candidate and kHydroUpdate call it with
+  // allow_seed = false and refuse an uninitialized magnetic state.
   void ensureMagneticState(core::SimulationState& state, const core::IntegratorState& integrator,
-                           const MhdDomainSpec& domain);
+                           const MhdDomainSpec& domain, bool allow_seed = false);
 
   // COLLECTIVE scheduler candidate (rank-global): fast-magnetosonic CFL and
   // non-ideal cost-bound candidates at the current state; +infinity on an
@@ -113,6 +132,10 @@ class MhdRuntimeBridge {
   [[nodiscard]] const MhdRuntimeTelemetry& telemetry() const noexcept { return m_telemetry; }
   [[nodiscard]] const mhd::MhdLevelAdvanceResult& lastResult() const noexcept { return m_last; }
   [[nodiscard]] std::uint64_t ownedCapacityBytes() const noexcept;
+  // Pass 04 (M03-01): globally agreed wire epoch of the bound hierarchy
+  // (identical on every rank, zero-patch ranks included); 0 before bind.
+  [[nodiscard]] std::uint64_t hierarchyEpoch() const noexcept { return m_hierarchy_epoch; }
+  [[nodiscard]] std::uint64_t hierarchyGeneration() const noexcept { return m_hierarchy_generation; }
 
  private:
   struct LocalPatch {
@@ -133,7 +156,10 @@ class MhdRuntimeBridge {
   void bindFaces(core::SimulationState& state);
   void loadGas(const core::SimulationState& state, double scale_factor);
   [[nodiscard]] mhd::MhdLevelAdvanceOptions advanceOptions() const;
+  // Rank-LOCAL cache key only (stepper reuse); never sent on the wire.
   [[nodiscard]] std::uint64_t topologyFingerprint(const core::SimulationState& state) const;
+  // COLLECTIVE: every rank must hold the same value or all ranks throw.
+  void agreeHierarchyValue(std::uint64_t value, std::string_view what);
 
   const core::SimulationConfig& m_config;
   const parallel::MpiContext& m_mpi;
@@ -148,6 +174,16 @@ class MhdRuntimeBridge {
   std::vector<mhd::MhdRemotePatchDescriptor> m_remote;
   std::unique_ptr<mhd::MhdLevelStepper> m_stepper;
   std::uint64_t m_fingerprint = 0U;
+  // Global wire epoch = digest(canonical global directory) (+) collectively
+  // committed rebuild generation (pass 04, M03-01).
+  std::uint64_t m_hierarchy_epoch = 0U;
+  std::uint64_t m_hierarchy_generation = 0U;
+  std::uint64_t m_directory_digest = 0U;
+  std::int32_t m_finest_level = 0;
+  std::array<double, 3> m_base_spacing{};
+  // Pass 04 (M03-04): directory / row-map metadata admitted before allocation.
+  core::MemoryReservation m_directory_reservation{};
+  core::MemoryReservation m_row_map_reservation{};
   const double* m_bound_face_data = nullptr;
   std::uint64_t m_bound_identity_generation = 0U;
   core::MemoryReservation m_staging_reservation{};

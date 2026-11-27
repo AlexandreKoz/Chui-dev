@@ -123,9 +123,25 @@ struct MhdLevelStepperConfig {
   // Production: advance()/estimateStableTimeStep() refuse to allocate before
   // admitMemory() succeeded.
   bool require_memory_admission = false;
-  // Hierarchy epoch written into every exchange payload header and checked by
-  // the receiver (MHD_MPI_EPOCH_MISMATCH on disagreement).
+  // GLOBAL hierarchy epoch written into every exchange payload header and
+  // checked by the receiver (MHD_MPI_EPOCH_MISMATCH on disagreement). Pass 04
+  // (M03-01): the value MUST be identical on every rank of the hierarchy - a
+  // deterministic digest of the canonical globally sorted descriptor
+  // directory (integer lattice boxes, levels, patch ids, owners) mixed with a
+  // collectively committed rebuild generation - and never a rank-local cache
+  // key (local cell count / local patch hash). The per-exchange stage/attempt
+  // sequence is carried separately in the phase word. When
+  // verify_hierarchy_epoch is true the constructor's caller has collectively
+  // verified agreement; the stepper additionally recomputes its own digest
+  // of the global directory (MhdLevelStepper::directoryDigest) and the
+  // bridge compares both before admission.
   std::uint64_t hierarchy_epoch = 0U;
+  // Pass 04 (M03-04): optional governor used to pre-admit the item-list /
+  // halo-plan metadata BEFORE it is allocated in the constructor. The bound
+  // is derived from the exact neighbour hits of every local patch (see
+  // topologyItemBytesBound); the actual capacity is checked against it after
+  // planning and the reservation is handed over to admitMemory().
+  core::MemoryGovernor* topology_governor = nullptr;
   // Communication budget for one exchange phase (send + receive payloads),
   // PERF section 8.1 (64 MiB default, 128 MiB explicit maximum).
   std::uint64_t comm_budget_bytes = k_mhd_default_comm_budget_bytes_per_rank;
@@ -174,6 +190,9 @@ struct MhdLevelAdvanceResult {
   std::uint64_t mpi_bytes_sent = 0U;
   std::uint64_t mpi_bytes_received = 0U;
   std::uint64_t exchange_phases = 0U;
+  // Pass 04 (M03-05/MP12): bounded exchange rounds executed (>= phases when
+  // the per-rank communication budget splits a phase).
+  std::uint64_t exchange_rounds = 0U;
 };
 
 // Honest resource plan of a stepper (PERF sections 4-9). Level-resident bytes
@@ -284,6 +303,12 @@ class MhdLevelStepper {
   // COLLECTIVE (rank-global sums; divergence is the rank-global maximum).
   [[nodiscard]] MhdConservationBudget levelBudget(double scale_factor);
   [[nodiscard]] std::uint64_t ownedCapacityBytes() const noexcept;
+  // Pass 04 (M03-01): deterministic digest of the GLOBAL sorted directory
+  // (level, patch_id, integer lattice box, owner rank) - identical on every
+  // rank that was given the same global hierarchy; zero-patch ranks
+  // included. Integer words only (no struct padding, no floating bits).
+  [[nodiscard]] std::uint64_t directoryDigest() const noexcept { return m_directory_digest; }
+  [[nodiscard]] std::uint64_t hierarchyEpoch() const noexcept { return m_config.hierarchy_epoch; }
 
   [[nodiscard]] MhdLevelMemoryPlan planMemory(const MhdLevelAdvanceOptions& mode,
                                               const MhdResourceLimits& limits = {}) const;
@@ -458,6 +483,26 @@ class MhdLevelStepper {
   template <class Packer, class Applier>
   void runItems(std::uint64_t phase_id, std::span<const Item> items, Packer&& pack,
                 Applier&& apply, bool remote_only);
+  template <class Packer, class Applier>
+  void runItemsRound(std::uint64_t phase_word, std::span<const Item> items, Packer&& pack,
+                     Applier&& apply, bool remote_only);
+  // Pass 04 (M03-05): bounded application staging. Every exchanged item list
+  // is split into deterministic rounds of contiguous DESTINATION topology
+  // index ranges. The per-destination byte demand (send + receive, values and
+  // wire bytes) is summed over all ranks (rank-invariant), and a round closes
+  // before its sum would exceed MhdLevelStepperConfig::comm_budget_bytes; a
+  // single destination larger than the budget is an irreducible round
+  // (admitMemory refuses it beyond the explicit maximum). Because rounds are
+  // contiguous in the (dst-sorted) list order, application order - and hence
+  // every result bit - equals the unsplit exchange. COLLECTIVE.
+  struct ExchangeRounds {
+    std::vector<std::uint32_t> dst_begin;  // round r covers [dst_begin[r], dst_begin[r+1])
+    std::uint64_t max_local_round_bytes = 0U;
+    std::uint64_t max_global_destination_bytes = 0U;
+  };
+  void planExchangeRounds();
+  [[nodiscard]] static std::uint64_t exchangeRoundKey(std::uint64_t phase_id) noexcept;
+  [[nodiscard]] const ExchangeRounds& roundsFor(std::uint64_t phase_id);
   void agree(const std::exception_ptr& local_failure, std::string_view phase);
   template <class Fn>
   void collective(std::string_view phase, Fn&& fn);
@@ -552,6 +597,9 @@ class MhdLevelStepper {
   std::vector<std::vector<std::uint8_t>> m_send_bytes;
   std::vector<std::vector<double>> m_recv_values;
   std::uint64_t m_phase_counter = 0U;
+  std::vector<std::pair<std::uint64_t, ExchangeRounds>> m_exchange_rounds;  // by list key
+  bool m_exchange_rounds_ready = false;
+  std::uint64_t m_exchange_round_count = 0U;  // telemetry: rounds executed
   std::uint64_t m_bytes_sent = 0U;
   std::uint64_t m_bytes_received = 0U;
   std::uint64_t m_exchange_phases = 0U;
@@ -572,6 +620,7 @@ class MhdLevelStepper {
   MhdMemoryAdmission m_admission{};
   core::MemoryReservation m_comm_reservation{};
   core::MemoryReservation m_topology_reservation{};
+  std::uint64_t m_directory_digest = 0U;
   MhdLevelAdvanceOptions m_admitted_mode{};
   bool m_admitted_nonideal = false;
   bool m_admitted_super = false;

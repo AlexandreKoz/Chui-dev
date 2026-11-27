@@ -973,21 +973,40 @@ class MhdSnapshotFieldSampler {
     if (!state.magnetic_faces.isConsistent()) {
       throw std::runtime_error("MHD_INVALID_FIELD: inconsistent magnetic face state at output");
     }
+    // Pass 04 (M03-13): index the magnetic records once (sorted patch_id ->
+    // record, O(P log P)) instead of scanning all records per patch (O(P^2)).
+    // Metadata-scale (one pair per local record); duplicates are corruption.
+    std::vector<std::pair<std::uint64_t, std::size_t>> index;
+    index.reserve(state.magnetic_faces.patches.size());
+    for (std::size_t r = 0; r < state.magnetic_faces.patches.size(); ++r) {
+      index.emplace_back(state.magnetic_faces.patches[r].patch_id, r);
+    }
+    std::sort(index.begin(), index.end());
+    for (std::size_t r = 1; r < index.size(); ++r) {
+      if (index[r].first == index[r - 1U].first) {
+        throw std::runtime_error("MHD_INVALID_FIELD: duplicate magnetic patch record at output");
+      }
+    }
     m_record_by_patch_row.assign(state.patches.size(), k_none);
     for (std::size_t p = 0; p < state.patches.size(); ++p) {
       if (state.patches.cell_count[p] == 0U) {
         continue;
       }
-      for (std::size_t r = 0; r < state.magnetic_faces.patches.size(); ++r) {
-        if (state.magnetic_faces.patches[r].patch_id == state.patches.patch_id[p]) {
-          m_record_by_patch_row[p] = r;
-          break;
-        }
-      }
-      if (m_record_by_patch_row[p] == k_none) {
+      const std::uint64_t id = state.patches.patch_id[p];
+      const auto found = std::lower_bound(
+          index.begin(), index.end(), std::pair<std::uint64_t, std::size_t>{id, 0U});
+      if (found == index.end() || found->first != id) {
         throw std::runtime_error(
             "MHD_STALE_GEOMETRY: gas leaf patch without a magnetic face record at output");
       }
+      const core::MagneticFacePatchRecord& record = state.magnetic_faces.patches[found->second];
+      // Full three-axis dimensions must agree with the gas leaf.
+      if (record.nx != state.patches.cell_dim_x[p] || record.ny != state.patches.cell_dim_y[p] ||
+          record.nz != state.patches.cell_dim_z[p] || record.level != state.patches.level[p]) {
+        throw std::runtime_error(
+            "MHD_STALE_GEOMETRY: magnetic record level/dimensions disagree with its gas leaf");
+      }
+      m_record_by_patch_row[p] = found->second;
     }
   }
 
@@ -1312,7 +1331,8 @@ void writeScienceSnapshotHdf5(
     writeScalarStringAttribute(header_group.get(), "MagneticUnits", "code_comoving_lorentz_heaviside");
     writeScalarStringAttribute(header_group.get(), "MagneticFrame", "Comoving");
     writeScalarStringAttribute(header_group.get(), "InductionOperator", "face_flux_ct");
-    writeScalarStringAttribute(header_group.get(), "EmfScheme", "uct_hll");
+    // Pass 04 (M03-08): UCT-HLL plus the face-consistency correction R-UCT.
+    writeScalarStringAttribute(header_group.get(), "EmfScheme", "uct_hll_r_uct_v1");
     writeScalarStringAttribute(
         header_group.get(), "Reconstruction",
         mhd.reconstruction == core::MhdReconstructionConfigMode::kPlmMc ? "plm_mc" : "ppm");

@@ -1237,3 +1237,26 @@ vs. workflow ownership ledger not audited.
 The individual, severity-ranked gap list of the extended-physics campaign is maintained in
 `docs/architecture/chui_extended_physics_implementation_pass01_status.md` §6 (nothing was
 compiled or run; every new test is NOT_RUN).
+
+## CHUI MHD corrective pass 04 (2026-11-27) — open blockers
+
+Ledger: `docs/architecture/chui_mhd_implementation_pass04_status.md` (all NOT_RUN).
+
+* P0 — No configure/build/test evidence for pass-02/03/04 MHD source.
+* P0 (guarded) — MHD composition transport with accepted SSPRK2 mass fluxes
+  (M03-02) is NOT implemented; Part-2 thermochemistry, observables,
+  instruments and restored composition sidecars are refused with MHD.
+* P1 (guarded) — Dynamic magnetic regrid/migration (M03-07) not wired; regrid
+  and multi-rank rebalance stay refused.
+* P1 — Real `mpiexec` production-bridge tests (G06) not written/registered;
+  in-process two-rank stepper tests only (incl. new stale-epoch and bounded-round
+  cases).
+* P1 — Magnetized-shock preset and certified imported face-flux HDF5 ICs
+  (REF section 10) not implemented; Tóth–Roe equivalence of the (now
+  aspect-ratio-correct) Balsara prolongation not derived.
+* P1 — Optional `/MHD/FaceFlux` topology output not implemented (no requesting
+  analysis contract); v7 readback test missing.
+* P1 — Peak-coexistence accounting of global retry copy + stepper rollback +
+  bridge staging (M03-06), MP05 plateau, MP12 per-peer waits/RSS deltas open.
+* P1 (guarded) — MHD + `linear_response` neutrinos refused until the new
+  journal is validated in a combined retry run.

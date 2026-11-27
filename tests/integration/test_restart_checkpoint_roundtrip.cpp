@@ -1411,10 +1411,115 @@ void testMagnetizedRestartV26() {
 #endif
 }
 
+// Pass 04 (M03-03): a rank of a magnetized run that owns no gas/leaf writes
+// cosmosim_restart_v26 with a VALID empty /state/mhd group (run-wide schema
+// selection), reads it back as an empty magnetic state with identical
+// contract/provider metadata, and the corrupt variants are refused: an empty
+// table without the empty_rank marker, the marker on a non-empty table, a
+// missing group in a v26 file, and a local magnetic state under a run-wide
+// nonmagnetic selection. The v25 path is unchanged. NOT_RUN (pass 04).
+void testMagnetizedEmptyRankRestartV26() {
+#if COSMOSIM_ENABLE_HDF5
+  cosmosim::core::SimulationState state;
+  state.resizeParticles(0);
+  state.resizeCells(0);
+  state.resizePatches(0);
+  state.rebuildSpeciesIndex();
+  state.magnetic_faces.coefficient_table_sha256 = "";
+  CHUI_REQUIRE(state.magnetic_faces.empty());
+  CHUI_REQUIRE(state.validateOwnershipInvariants());
+  cosmosim::core::IntegratorState integrator_state;
+  integrator_state.current_scale_factor = 0.5;
+  integrator_state.current_boundary_kind = cosmosim::core::StepBoundaryKind::kCheckpointPoint;
+  integrator_state.last_completed_boundary_kind = cosmosim::core::StepBoundaryKind::kCheckpointPoint;
+  integrator_state.last_completed_restart_safe = true;
+  integrator_state.step_index = 11;
+  cosmosim::core::HierarchicalTimeBinScheduler scheduler(0);
+  scheduler.reset(0, 0, 0);
+  auto gas_scheduler = makePayloadGasCellScheduler(state, scheduler);
+  cosmosim::io::RestartWritePayload payload;
+  fillRestartPayload(payload, state, integrator_state, scheduler, &gas_scheduler);
+  payload.magnetic_schema_selection = cosmosim::io::RestartMagneticSchemaSelection::kRunWideMagnetized;
+  const std::filesystem::path path = cosmosim::test_support::TestTempWorkspace::uniqueProcessLocalPath(
+      "cosmosim_restart_v26_empty_rank.hdf5");
+  cosmosim::io::writeRestartCheckpointHdf5(path, payload);
+  {
+    const auto restored = cosmosim::io::readRestartCheckpointHdf5(path);
+    CHUI_REQUIRE(restored.diagnostics.restart_schema_version == 26U);
+    CHUI_REQUIRE(restored.payload_integrity_verified);
+    CHUI_REQUIRE(restored.state.magnetic_faces.empty());
+    CHUI_REQUIRE(restored.state.magnetic_faces.contract == state.magnetic_faces.contract);
+  }
+  const auto expect_refusal = [&](const std::filesystem::path& file_path) {
+    bool threw = false;
+    try {
+      (void)cosmosim::io::readRestartCheckpointHdf5(file_path);
+    } catch (const std::exception&) {
+      threw = true;
+    }
+    CHUI_REQUIRE(threw);
+  };
+  // Empty table without its marker: truncated/corrupt, not a legacy case.
+  {
+    hid_t file = H5Fopen(path.string().c_str(), H5F_ACC_RDWR, H5P_DEFAULT);
+    CHUI_REQUIRE(file >= 0);
+    hid_t group = H5Gopen2(file, "/state/mhd", H5P_DEFAULT);
+    CHUI_REQUIRE(group >= 0 && H5Adelete(group, "empty_rank") >= 0);
+    H5Gclose(group);
+    H5Fclose(file);
+    expect_refusal(path);
+  }
+  // Missing /state/mhd group in a v26 file.
+  {
+    cosmosim::io::writeRestartCheckpointHdf5(path, payload);
+    hid_t file = H5Fopen(path.string().c_str(), H5F_ACC_RDWR, H5P_DEFAULT);
+    CHUI_REQUIRE(file >= 0);
+    CHUI_REQUIRE(H5Ldelete(file, "/state/mhd", H5P_DEFAULT) >= 0);
+    H5Fclose(file);
+    expect_refusal(path);
+  }
+  // Run-wide nonmagnetic selection keeps the v25 schema for the empty rank.
+  {
+    cosmosim::io::RestartWritePayload plain_payload;
+    fillRestartPayload(plain_payload, state, integrator_state, scheduler, &gas_scheduler);
+    plain_payload.magnetic_schema_selection =
+        cosmosim::io::RestartMagneticSchemaSelection::kRunWideNonMagnetic;
+    cosmosim::io::writeRestartCheckpointHdf5(path, plain_payload);
+    const auto restored = cosmosim::io::readRestartCheckpointHdf5(path);
+    CHUI_REQUIRE(restored.diagnostics.restart_schema_version == cosmosim::io::restartSchema().version);
+  }
+  // A local magnetic state under a run-wide nonmagnetic decision is refused.
+  {
+    cosmosim::core::SimulationState magnetized = state;
+    cosmosim::core::MagneticFacePatchRecord record{};
+    record.patch_id = 1;
+    record.nx = record.ny = record.nz = 1;
+    record.cell_width_x_comoving = record.cell_width_y_comoving = record.cell_width_z_comoving = 1.0;
+    magnetized.magnetic_faces.patches = {record};
+    magnetized.magnetic_faces.face_flux_x_comoving.assign(2U, 0.0);
+    magnetized.magnetic_faces.face_flux_y_comoving.assign(2U, 0.0);
+    magnetized.magnetic_faces.face_flux_z_comoving.assign(2U, 0.0);
+    cosmosim::io::RestartWritePayload bad_payload;
+    fillRestartPayload(bad_payload, magnetized, integrator_state, scheduler, &gas_scheduler);
+    bad_payload.magnetic_schema_selection =
+        cosmosim::io::RestartMagneticSchemaSelection::kRunWideNonMagnetic;
+    bool threw = false;
+    try {
+      cosmosim::io::writeRestartCheckpointHdf5(path, bad_payload);
+    } catch (const std::exception&) {
+      threw = true;
+    }
+    CHUI_REQUIRE(threw);
+  }
+  std::filesystem::remove(path);
+#endif
+}
+
 int main() {
   testRestartRoundtrip();
   testRestartAfterReorderAndMigration();
   testParentlessGasCellRestartRoundtrip();
   testMagnetizedRestartV26();
+  testMagnetizedEmptyRankRestartV26();
   return 0;
 }

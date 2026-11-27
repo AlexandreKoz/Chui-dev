@@ -48,6 +48,25 @@ double seedFaceFlux(const MhdPatchGeometry& geometry,
                     std::span<double> phi_y,
                     std::span<double> phi_z);
 
+// Pass 04 (M03-10): composite-hierarchy edge authority. Wraps `inner` so that
+// the line integral of any lattice edge (start on the lattice of a level l,
+// length 2^(finest_depth - (l - base)) finest cells) is the PAIRWISE sum of
+// `inner` evaluated on unit sub-edges of the finest lattice, whose start
+// points are recomputed from integer finest-lattice coordinates
+// origin + n * (base_spacing / 2^finest_depth). Consequently
+//   I(coarse edge) == I(left fine half) + I(right fine half)
+// with identical floating-point association, i.e. coarse and fine curl seeds
+// are additive on the composite complex. `finest_depth` is the number of
+// refinement levels below the base level present anywhere in the GLOBAL
+// hierarchy (0 for a single level). Edges whose start/length are not on the
+// finest lattice or whose length is not a power-of-two multiple of the finest
+// spacing throw MHD_INVALID_FIELD (never silently resampled). Cost per edge
+// is 2^(finest_depth - depth(edge)) inner evaluations; depth is limited to 20.
+[[nodiscard]] MhdEdgePotential compositeEdgePotential(MhdEdgePotential inner,
+                                                      std::array<double, 3> origin_comoving,
+                                                      std::array<double, 3> base_spacing_comoving,
+                                                      std::int32_t finest_depth);
+
 // Gauss-quadrature (3-point) edge integral of an analytic potential A(x).
 [[nodiscard]] double integrateEdgePotential(
     const std::function<std::array<double, 3>(std::array<double, 3>)>& vector_potential,

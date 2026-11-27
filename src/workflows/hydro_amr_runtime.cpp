@@ -1073,6 +1073,7 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime, public HydroShadowChro
          {RuntimeResourceKey::kHydroPrimitiveState, RuntimeResourceAccessMode::kReadWrite},
          {RuntimeResourceKey::kAmrPatchState, RuntimeResourceAccessMode::kReadWrite},
          {RuntimeResourceKey::kEffectiveIsmThermodynamics, RuntimeResourceAccessMode::kReadWrite},
+         {RuntimeResourceKey::kMagneticFaceState, RuntimeResourceAccessMode::kReadWrite},
          {RuntimeResourceKey::kMigrationOwnership, RuntimeResourceAccessMode::kRead},
          {RuntimeResourceKey::kIntegratorTruth, RuntimeResourceAccessMode::kRead}});
     if (context.stage != core::IntegrationStage::kHydroUpdate) {
@@ -1119,6 +1120,18 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime, public HydroShadowChro
       if (context.state.cells.size() != 0U) {
         context.state.requireGasCellIdentityMapCoversDenseRows("MHD hydro callback");
       }
+      // Pass 04 (M03-02): defense in depth for direct/factory construction and
+      // restored state - active composition lanes have no MHD transport owner.
+      // Collective verdict before any rank mutates gas or face state.
+      {
+        const std::uint64_t local_composition = context.state.gas_composition.enabled() ? 1U : 0U;
+        if (m_mpi_context.allreduceMaxUint64(local_composition) != 0U) {
+          throw std::runtime_error(
+              "MHD_UNSUPPORTED_PHYSICS: an active gas composition sidecar exists, but the "
+              "magnetized kHydroUpdate does not transport composition with the accepted MHD mass "
+              "flux (pass-04 M03-02); nothing was advanced");
+        }
+      }
       m_mhd->advance(context, magnetizedDomain(context.state), m_temperature_k_per_internal_energy_code);
       // PERF section 13 telemetry into the existing counters.json registry
       // (actual counts of the accepted interval; never estimates).
@@ -1141,6 +1154,20 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime, public HydroShadowChro
                           last.ghost_prolongation_slope_fallbacks);
         counters.setCount("mhd_phase_scratch_capacity_bytes", last.scratch_capacity_bytes);
         counters.setCount("mhd_owned_capacity_bytes", m_mhd->ownedCapacityBytes());
+        // Pass 04 (M03-14, MP12): attempt/accept/reject separation, bounded
+        // exchange rounds and rank-global wire epoch identity. Counts only;
+        // measured process memory is attached by the time coordinator's
+        // memory report (observeProcessMemory), never synthesized here.
+        const internal::MhdRuntimeTelemetry& telemetry = m_mhd->telemetry();
+        counters.setCount("mhd_intervals_attempted_total", telemetry.attempted_intervals);
+        counters.setCount("mhd_intervals_accepted_total", telemetry.accepted_intervals);
+        counters.setCount("mhd_intervals_rejected_total", telemetry.rejected_intervals);
+        counters.addCount("mhd_exchange_rounds", last.exchange_rounds);
+        counters.addCount("mhd_exchange_phases", last.exchange_phases);
+        counters.addCount("mhd_ideal_faces_attempted", last.ideal_attempted.faces_solved);
+        counters.addCount("mhd_hlle_fallback_faces_attempted",
+                          last.ideal_attempted.hlle_fallback_faces);
+        counters.setCount("mhd_hierarchy_generation", m_mhd->hierarchyGeneration());
       }
       // Same compatibility-mirror contract as the production AMR hydro path.
       internal::synchronizeParentParticleCompatibilityMirrors(
@@ -4077,6 +4104,20 @@ class HydroAmrRuntimeImpl final : public HydroAmrRuntime, public HydroShadowChro
 
   [[nodiscard]] std::uint64_t magnetizedOwnedCapacityBytes() const noexcept override {
     return m_mhd != nullptr ? m_mhd->ownedCapacityBytes() : 0U;
+  }
+
+  void initializeMagneticState(core::SimulationState& state,
+                               const core::IntegratorState& integrator) override {
+    if (m_mhd == nullptr) {
+      return;
+    }
+    const std::uint64_t local_has_production_amr =
+        amr::hasProductionAmrHydroCoverage(state) ? 1ULL : 0ULL;
+    if (m_mpi_context.allreduceSumUint64(local_has_production_amr) == 0U) {
+      throw std::runtime_error(
+          "MHD_UNSUPPORTED_PHYSICS: magnetized runs require production AMR leaf coverage");
+    }
+    m_mhd->ensureMagneticState(state, integrator, magnetizedDomain(state), /*allow_seed=*/true);
   }
 
  private:

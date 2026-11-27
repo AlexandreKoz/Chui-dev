@@ -1260,6 +1260,20 @@ if(COSMOSIM_ENABLE_TESTS)
   target_link_libraries(test_integration_mhd_hierarchy_runtime PRIVATE cosmosim_mhd Threads::Threads)
   add_test(NAME integration_mhd_hierarchy_runtime COMMAND test_integration_mhd_hierarchy_runtime)
   set_tests_properties(integration_mhd_hierarchy_runtime PROPERTIES LABELS "mhd;integration")
+
+  # Pass 04 (NOT_RUN): R-UCT face-consistent edge EMF (M03-08).
+  add_executable(test_unit_mhd_uct_face_consistency tests/unit/mhd/test_mhd_uct_face_consistency.cpp)
+  target_link_libraries(test_unit_mhd_uct_face_consistency PRIVATE cosmosim_mhd)
+  add_test(NAME unit_mhd_uct_face_consistency COMMAND test_unit_mhd_uct_face_consistency)
+
+  # Pass 04 (M03-15): every MHD-specific test carries the `mhd` label so that
+  # `ctest -L mhd` selects the complete MHD suite (plus unit/integration).
+  foreach(cosmosim_mhd_test IN ITEMS
+      unit_mhd_discrete_complex unit_mhd_riemann_reconstruction unit_mhd_memory_governance
+      unit_mhd_uct_face_consistency integration_mhd_ideal_reference
+      integration_mhd_nonideal_reference integration_mhd_amr_mpi_restarts)
+    cosmosim_append_test_labels(${cosmosim_mhd_test} mhd)
+  endforeach()
   add_executable(test_unit_retained_capacity_transaction tests/unit/test_retained_capacity_transaction.cpp)
   target_link_libraries(test_unit_retained_capacity_transaction PRIVATE cosmosim_core)
   add_test(NAME unit_retained_capacity_transaction COMMAND test_unit_retained_capacity_transaction)
@@ -2418,6 +2432,8 @@ if(COSMOSIM_ENABLE_TESTS)
   target_link_libraries(test_integration_restart_checkpoint_roundtrip PRIVATE cosmosim_all)
   add_test(NAME integration_restart_checkpoint_roundtrip COMMAND test_integration_restart_checkpoint_roundtrip)
   cosmosim_mark_runtime_truth_test(integration_restart_checkpoint_roundtrip restart provenance gas sidecar scheduler)
+  # Pass 04 (M03-15): carries the v26 MHD restart cases (incl. empty-rank v26).
+  cosmosim_append_test_labels(integration_restart_checkpoint_roundtrip mhd)
 
   add_executable(test_integration_restart_equivalence_harness tests/integration/test_restart_equivalence_harness.cpp)
   target_link_libraries(test_integration_restart_equivalence_harness PRIVATE cosmosim_all)

@@ -981,6 +981,10 @@ reason. Required/refused combinations:
 | `numerics.hydro_shadow_enabled` | `false` |
 | `mhd_performance.optional_gpu_backend` | `false` |
 | `mhd_nonideal.coefficient_provider` | `constant` or `table` (`chemistry` refused) |
+| `physics.thermochemistry_backend` | `legacy_cooling` (pass 04, M03-02/M04-02: Part-2 composition lanes are not transported with the accepted MHD mass flux yet; restarts carrying a composition sidecar are refused as well) |
+| `observables.enabled`, `instruments.enabled` | `false` (pass 04, M04-02/M04-03: species-dependent products and publication inside `AnalysisHooks` before the global-step transaction commits) |
+| `neutrinos.method` | not `linear_response` (pass 04, M04-01: combined retry of the spectral history unvalidated; `background_only` and `transfer_ratio` are admitted) |
+| `mhd_io.output_divergence_diagnostics` | `true` (pass 04, M03-12: the flux-based `/MHD/Diagnostics` record is mandatory integrity output; `false` is refused at parse time) |
 | Build | `COSMOSIM_ENABLE_HDF5=ON` (v26/v7 are the only magnetic IO authorities) |
 
 The run also requires production AMR leaf coverage with explicit patch geometry
@@ -1002,7 +1006,28 @@ Fresh-start magnetic seed (`[mhd_io]`, normalized only when `mhd.enabled`):
 
 Every seed is `Phi = Phi_uniform + C(A_edge)` on the real leaf topology
 (divergence-free by construction, checked against `mhd` strict-CT tolerance);
-a restored v26 field is never reseeded. Cell-centred IC fields are never
+a restored v26 field is never reseeded. Pass 04 (M03-10): every edge line
+integral is the pairwise sum of the integrals over unit sub-edges of the
+finest lattice present in the global hierarchy (integer-lattice start
+points), so coarse and fine edge integrals are additive and coarse/fine
+interface faces agree to roundoff for non-polynomial potentials. The
+`field_loop` potential is a left-point line rule on that finest lattice. The
+`stochastic` spectral index applies to the vector-potential mode amplitudes
+(`|A_k| ~ |k|^index`, hence `|B_k| ~ |k|^(index+1)`); modes are drawn on the
+Hermitian half space and projected perpendicular to `k`. Seeding happens once,
+at the legal pre-step boundary `HydroAmrRuntime::initializeMagneticState`
+(TimeCoordinator, before the first retry capture/timestep candidate/output);
+the timestep candidate and `kHydroUpdate` refuse an uninitialized field
+(pass 04, M03-11). `magnetized_shock` and imported face-flux HDF5 initial
+conditions (REF section 10) are NOT implemented in this source pass.
+
+`mhd.emf_scheme = uct_hll` (pass 04, M03-08, reconciliation R-UCT): the edge
+EMF is UCT-HLL plus a face-consistency correction built from the actual
+HLLD/HLLE/first-order face induction flux and the HLL flux on the UCT's own
+PLM states, so aligned one-dimensional solutions reduce exactly to the face
+flux used for the gas update (also for PPM). This is a numerical bug fix of
+the pass-01/02 operator and changes magnetized trajectories (not MHD-off
+runs); the snapshot v7 `EmfScheme` attribute reads `uct_hll_r_uct_v1`. Cell-centred IC fields are never
 projected into face flux (`mhd_io.input_projection = reject`).
 
 Compatibility rules:

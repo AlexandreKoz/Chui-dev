@@ -274,6 +274,33 @@ void MhdLevelStepper::buildTopology(std::vector<MhdRemotePatchDescriptor> remote
   }
   m_level_count = m_max_level - m_domain.base_level + 1;
   m_topo = std::move(directory);
+  {
+    // Pass 04 (M03-01): global directory digest over integer words of the
+    // canonical (level, patch_id)-sorted directory. Every rank holds the full
+    // directory (local + remote descriptors), so the value is rank-invariant.
+    std::uint64_t digest = 1469598103934665603ULL;
+    const auto mix_word = [&digest](std::uint64_t word) noexcept {
+      for (int byte = 0; byte < 8; ++byte) {
+        digest ^= (word >> (8 * byte)) & 0xFFULL;
+        digest *= 1099511628211ULL;
+      }
+    };
+    mix_word(static_cast<std::uint64_t>(m_topo.size()));
+    mix_word(static_cast<std::uint64_t>(static_cast<std::int64_t>(m_domain.base_level)));
+    for (std::size_t axis = 0; axis < 3U; ++axis) {
+      mix_word(static_cast<std::uint64_t>(m_domain.cells[axis]));
+    }
+    for (const TopoPatch& entry : m_topo) {
+      mix_word(entry.patch_id);
+      mix_word(static_cast<std::uint64_t>(static_cast<std::int64_t>(entry.level)));
+      mix_word(static_cast<std::uint64_t>(static_cast<std::int64_t>(entry.owner_rank)));
+      for (std::size_t axis = 0; axis < 3U; ++axis) {
+        mix_word(static_cast<std::uint64_t>(entry.box.lo[axis]));
+        mix_word(static_cast<std::uint64_t>(entry.box.hi[axis]));
+      }
+    }
+    m_directory_digest = digest;
+  }
   for (std::size_t index = 0; index < m_topo.size(); ++index) {
     if (m_topo[index].local != k_npos) {
       m_local[m_topo[index].local].topo = static_cast<std::uint32_t>(index);
@@ -328,6 +355,7 @@ void MhdLevelStepper::buildTopology(std::vector<MhdRemotePatchDescriptor> remote
   // destination is remote are collected for exchange packing.
   m_halo_items.clear();
   std::vector<std::uint8_t> plan_needed(m_topo.size(), 0U);
+  std::size_t neighbour_hits = 0U;
   for (const PatchRuntime& runtime : m_local) {
     const TopoPatch& patch = m_topo[runtime.topo];
     // Any patch within ghost reach of a local patch, at levels L-1..L+1, may
@@ -350,10 +378,55 @@ void MhdLevelStepper::buildTopology(std::vector<MhdRemotePatchDescriptor> remote
         query.hi[axis] = hi + reach;
       }
       queryLevel(level, query, hits);
+      neighbour_hits += hits.size();
       for (const auto& [other, shift] : hits) {
         (void)shift;
         plan_needed[other] = 1U;
       }
+    }
+  }
+  // Pass 04 (M03-04): pre-admit the item-list and halo-plan metadata before
+  // any of it is allocated. Every planned Item is attached to one (source,
+  // destination, periodic shift) neighbour pair within ghost reach; local
+  // destinations see exactly the pairs counted in neighbour_hits, remote
+  // plans with a local source see the mirror pairs (factor 2). A pair yields
+  // at most k_items_per_pair items per list family (7 halo kinds + 8
+  // reconciliation kinds on <= 3 axes, rounded up), an item is held in at
+  // most k_list_multiplicity lists (patch plan + exchange list, or a
+  // reconciliation list + its energy variant + growth slack), and vector
+  // growth may double capacity. Prolongation entries are bounded by the
+  // ghost shell of each local patch.
+  if (m_config.topology_governor != nullptr) {
+    constexpr std::uint64_t k_items_per_pair = 48U;
+    constexpr std::uint64_t k_list_multiplicity = 3U;
+    constexpr std::uint64_t k_growth = 2U;
+    std::uint64_t bound = 0U;
+    const auto add = [&bound](std::uint64_t a, std::uint64_t b) {
+      if (b != 0U && a > std::numeric_limits<std::uint64_t>::max() / b) {
+        throwTopology(MhdErrorCode::kMemoryBudgetExceeded, "topology metadata bound overflows");
+      }
+      const std::uint64_t product = a * b;
+      if (bound > std::numeric_limits<std::uint64_t>::max() - product) {
+        throwTopology(MhdErrorCode::kMemoryBudgetExceeded, "topology metadata bound overflows");
+      }
+      bound += product;
+    };
+    add(2U * static_cast<std::uint64_t>(neighbour_hits),
+        k_items_per_pair * k_list_multiplicity * k_growth * sizeof(Item));
+    for (const PatchRuntime& runtime : m_local) {
+      const MhdPatchGeometry& g = runtime.binding.geometry;
+      const std::uint64_t outer = (g.nx + 2U * ghost) * (g.ny + 2U * ghost) * (g.nz + 2U * ghost);
+      const std::uint64_t shell = outer - static_cast<std::uint64_t>(g.cellCount());
+      add(shell * k_growth, sizeof(ProlongCell) + 3U * sizeof(ProlongFace));
+    }
+    add(1U, topologyCapacityBytes());
+    try {
+      m_topology_reservation = m_config.topology_governor->reserve(
+          core::MemoryClass::kPhaseResident, bound, "mhd_level_stepper.topology");
+      m_topology_reservation.commit();
+    } catch (const core::MemoryAdmissionError& error) {
+      throwTopology(MhdErrorCode::kMemoryBudgetExceeded,
+                    std::string("topology metadata pre-admission refused: ") + error.what());
     }
   }
   for (PatchRuntime& runtime : m_local) {
@@ -383,6 +456,13 @@ void MhdLevelStepper::buildTopology(std::vector<MhdRemotePatchDescriptor> remote
   planReconciliation();
   planCrossLevel();
   finalizeItemLists();
+  if (m_topology_reservation.valid() && topologyCapacityBytes() > m_topology_reservation.bytes()) {
+    std::ostringstream stream;
+    stream << "planned topology metadata (" << topologyCapacityBytes()
+           << " B) exceeds its pre-admitted structural bound (" << m_topology_reservation.bytes()
+           << " B)";
+    throwTopology(MhdErrorCode::kMemoryBudgetExceeded, stream.str());
+  }
 }
 
 // ---------------------------------------------------------------------------

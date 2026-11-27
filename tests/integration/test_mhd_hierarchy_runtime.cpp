@@ -21,6 +21,7 @@
 #include <memory>
 #include <mutex>
 #include <stdexcept>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -563,7 +564,9 @@ class InProcessTransport final : public cosmosim::mhd::MhdHaloTransport {
   int m_rank;
 };
 
-void runTwoRanks(Hierarchy& h, double dt, int steps) {
+void runTwoRanks(Hierarchy& h, double dt, int steps, std::uint64_t comm_budget_bytes = 0U,
+                 std::array<std::uint64_t, 2>* rounds_out = nullptr,
+                 std::array<std::uint64_t, 2>* phases_out = nullptr) {
   InProcessHub hub(2);
   std::array<std::exception_ptr, 2> failures{};
   std::array<std::thread, 2> threads;
@@ -573,13 +576,28 @@ void runTwoRanks(Hierarchy& h, double dt, int steps) {
         InProcessTransport transport(hub, rank);
         MhdLevelStepperConfig config{};
         config.transport = &transport;
+        // Pass 04 (M03-01): every rank receives the same (global) epoch.
+        config.hierarchy_epoch = 0x5eedULL;
+        if (comm_budget_bytes != 0U) {
+          config.comm_budget_bytes = comm_budget_bytes;
+        }
         MhdLevelStepper stepper(MhdNumericsPolicy{}, h.domain(), h.bindings(rank), h.remote(rank),
                                 config);
         double t = 0.0;
+        std::uint64_t rounds = 0U;
+        std::uint64_t phases = 0U;
         for (int step = 0; step < steps; ++step) {
           const MhdLevelAdvanceResult result = stepper.advance(isolated(t, dt), {});
           CHUI_REQUIRE(result.accepted);
+          rounds += result.exchange_rounds;
+          phases += result.exchange_phases;
           t += dt;
+        }
+        if (rounds_out != nullptr) {
+          (*rounds_out)[static_cast<std::size_t>(rank)] = rounds;
+        }
+        if (phases_out != nullptr) {
+          (*phases_out)[static_cast<std::size_t>(rank)] = phases;
         }
       } catch (...) {
         failures[static_cast<std::size_t>(rank)] = std::current_exception();
@@ -614,6 +632,70 @@ void testTwoRankEquivalence() {
   CHUI_REQUIRE(maxDifference(serial.snapshot(), idle.snapshot()) <= 1.0e-13);
 }
 
+// Pass 04 (M03-05, MP03): an artificially small per-rank communication
+// budget forces every exchange phase into several deterministic destination
+// rounds. The result must be BITWISE equal to the default-budget (single
+// round) run, both ranks must execute the same round count, and the split
+// run must use strictly more rounds. NOT_RUN.
+void testBoundedExchangeRoundsMatchUnsplit() {
+  Hierarchy unsplit = makeTwoLevel(/*fine_rank=*/1, /*coarse_rank=*/0);
+  Hierarchy chunked = makeTwoLevel(/*fine_rank=*/1, /*coarse_rank=*/0);
+  for (Hierarchy* h : {&unsplit, &chunked}) {
+    h->initialize(smoothProfile, {0.1, 0.05, 0.02}, {});
+  }
+  Hierarchy serial = makeTwoLevel();
+  serial.initialize(smoothProfile, {0.1, 0.05, 0.02}, {});
+  MhdLevelStepper probe(MhdNumericsPolicy{}, serial.domain(), serial.bindings(0));
+  const double dt = 0.25 * probe.estimateStableTimeStep(isolated(0.0, 1.0), {});
+  std::array<std::uint64_t, 2> unsplit_rounds{};
+  std::array<std::uint64_t, 2> chunked_rounds{};
+  std::array<std::uint64_t, 2> chunked_phases{};
+  runTwoRanks(unsplit, dt, 2, 0U, &unsplit_rounds);
+  runTwoRanks(chunked, dt, 2, /*comm_budget_bytes=*/4096U, &chunked_rounds, &chunked_phases);
+  CHUI_REQUIRE(maxDifference(unsplit.snapshot(), chunked.snapshot()) == 0.0);
+  CHUI_REQUIRE(chunked_rounds[0] == chunked_rounds[1]);
+  CHUI_REQUIRE(unsplit_rounds[0] == unsplit_rounds[1]);
+  CHUI_REQUIRE(chunked_rounds[0] > unsplit_rounds[0]);
+  CHUI_REQUIRE(chunked_rounds[0] > chunked_phases[0]);
+}
+
+// Pass 04 (M03-01): a payload whose header carries a stale hierarchy epoch
+// (the two ranks were configured with different epochs, as a rank-local
+// fingerprint would produce) is rejected coherently on BOTH ranks before the
+// interval commits anything. NOT_RUN.
+void testStaleEpochRejectedCollectively() {
+  Hierarchy split = makeTwoLevel(/*fine_rank=*/1, /*coarse_rank=*/0);
+  split.initialize(smoothProfile, {0.1, 0.05, 0.02}, {});
+  const auto before = split.snapshot();
+  InProcessHub hub(2);
+  std::array<bool, 2> rejected{false, false};
+  std::array<std::thread, 2> threads;
+  for (int rank = 0; rank < 2; ++rank) {
+    threads[static_cast<std::size_t>(rank)] = std::thread([&, rank]() {
+      InProcessTransport transport(hub, rank);
+      MhdLevelStepperConfig config{};
+      config.transport = &transport;
+      config.hierarchy_epoch = rank == 0 ? 0x1111ULL : 0x2222ULL;  // deliberately stale peer
+      MhdLevelStepper stepper(MhdNumericsPolicy{}, split.domain(), split.bindings(rank),
+                              split.remote(rank), config);
+      try {
+        (void)stepper.advance(isolated(0.0, 1.0e-4), {});
+      } catch (const MhdError& error) {
+        rejected[static_cast<std::size_t>(rank)] =
+            error.code() == MhdErrorCode::kMpiEpochMismatch ||
+            std::string(error.what()).find("collective failure") != std::string::npos;
+      } catch (...) {
+        rejected[static_cast<std::size_t>(rank)] = true;
+      }
+    });
+  }
+  for (std::thread& thread : threads) {
+    thread.join();
+  }
+  CHUI_REQUIRE(rejected[0] && rejected[1]);
+  CHUI_REQUIRE(maxDifference(before, split.snapshot()) == 0.0);  // nothing committed
+}
+
 }  // namespace
 
 int main() {
@@ -625,5 +707,7 @@ int main() {
   testForeignLateFailureRollsBack();
   testMemoryRefusalBeforeAllocation();
   testTwoRankEquivalence();
+  testBoundedExchangeRoundsMatchUnsplit();
+  testStaleEpochRejectedCollectively();
   return 0;
 }

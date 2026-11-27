@@ -971,6 +971,25 @@ corruption, `_comov` spelling refusal, v25 unchanged, unsafe-boundary refusal).
 admission (positive supported predicates, negative retry-owner and shadow cases)
 instead of a universal refusal. Ledger: `docs/architecture/chui_mhd_implementation_pass02_status.md`.
 
+Pass 04 additions (NOT_RUN; every MHD test now carries the `mhd` label, so
+`ctest -L mhd` selects unit, integration and the v26 restart roundtrip suite):
+`tests/unit/mhd/test_mhd_uct_face_consistency.cpp` (CTest
+`unit_mhd_uct_face_consistency`; R-UCT exact 1-D reduction on all axes for
+HLLD/HLLE x PPM/PLM on anisotropic cells across a contact/pressure jump, and
+oblique-wave divergence after CT, tolerance 1e-12 relative / 1e-13 normalized),
+`test_mhd_amr_mpi_restarts.cpp::testAnisotropicLinearFieldExactness` (G07/M03-09)
+and new admission cases (composition, observables, linear-response, divergence
+option), `test_mhd_hierarchy_runtime.cpp::testBoundedExchangeRoundsMatchUnsplit`
+(MP03: bitwise equality with a 4 KiB budget, rank-identical round counts) and
+`testStaleEpochRejectedCollectively` (G06/M03-01 header rejection on both ranks,
+nothing committed), `test_mhd_ideal_reference.cpp::testExpansionWithRelativisticBackground`
+(I09/M04-05 with photons + background-only massive neutrinos and legacy
+LambdaCDM), `test_restart_checkpoint_roundtrip.cpp::testMagnetizedEmptyRankRestartV26`
+(G08/M03-03), `test_neutrino_methods.cpp::testLinearResponseTransactionRollback`
+(M04-01: first use, repeated retries, popped accepted node, commit). Still NOT
+written: real `mpiexec` production-bridge test, I02/I06/I07/I08/I10, N02/N06/N08,
+G03 1000-step dynamic AMR/MPI, MP04/MP05/MP12 measurement harnesses, v7 readback.
+
 ## CHUI-RT-BH-AGN-REF-v1 gates V01–V09 (pass 01: sources written, NOT RUN)
 
 Test sources (registered, label `rt_bh_agn`): `unit_rt_bh_agn_config`,

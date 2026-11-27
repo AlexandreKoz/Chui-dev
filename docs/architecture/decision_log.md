@@ -1268,3 +1268,48 @@ Source only; NOT configured, compiled or run. Ledger:
 * Observables run inside `AnalysisRuntime::executeDiagnostics` (read-only, cadence-gated).
 * Reproducibility impact: disabled runs unchanged (text, hash, schemas); N03 deterministic per
   rank topology.
+
+## 2026-11-27 — CHUI MHD corrective pass 04 (source only, unvalidated)
+
+Ledger: `docs/architecture/chui_mhd_implementation_pass04_status.md`; audit:
+`docs/architecture/chui_mhd_specification_compliance_audit_20261127.md`.
+
+* **R-UCT (M03-08), numerical bug fix.** `mhd.emf_scheme = uct_hll` now adds a
+  face-consistency correction `D_n(B_t) = F_face(B_t) - F_HLL^PLM(B_t)` to the
+  UCT-HLL edge EMF, upwind-weighted with UCT's signed fan weights; ghost-row
+  faces are solved with the same solver path. Aligned 1-D solutions reduce
+  exactly to the face flux of the gas update for HLLD/HLLE x PPM/PLM and the
+  first-order fallback. Labelled R-UCT (not the Mignone & Del Zanna HLLD-
+  coefficient UCT); snapshot v7 `EmfScheme = uct_hll_r_uct_v1`. Changes
+  magnetized trajectories only; batch scratch +2 face lanes per axis.
+* **Anisotropic ratio-2 prolongation (M03-09), bug fix.** The solenoidal
+  quadratic coefficient keeps the cell aspect ratios
+  (`a_dd = -(Delta_d/2)(b_{t1,d}/Delta_t1 + c_{t2,d}/Delta_t2)`); the pass-01/02
+  cubic-cell form left a divergence on rectangular cells. Tóth–Roe equivalence
+  of the Balsara construction is still NOT claimed; regrid remains refused.
+* **Global wire epoch (M03-01).** The exchange header epoch is a digest of the
+  canonical globally sorted integer directory mixed with a collectively
+  committed rebuild generation, agreed by allreduce before use; the rank-local
+  topology fingerprint is only a cache key.
+* **Bounded exchange rounds (M03-05).** Every MHD exchange phase is split into
+  deterministic contiguous destination ranges under the per-rank budget
+  (rank-invariant summed demand); results are bitwise those of the unsplit
+  exchange; an irreducible destination above the budget is refused at
+  admission.
+* **Run-wide restart schema (M03-03).** Payload field `magnetic_schema_selection`;
+  empty-rank v26 groups marked `empty_rank = 1`; collective resume admission.
+* **New runtime resource key** `RuntimeResourceKey::kMagneticFaceState`
+  (appended): hydro view read-write, output/analysis views read-only (M03-11).
+  Seeding moved to `HydroAmrRuntime::initializeMagneticState` (new virtual with
+  no-op default) called by the TimeCoordinator once per segment.
+* **Gravity transaction seam (M04-01).** `NeutrinoSpectralSource` gained a
+  bounded rollback journal driven by `GravityRuntime` cycle transactions; new
+  virtual `GravityRuntime::synchronizeModuleSidecarsAfterRollback` (no-op
+  default) used by the multirate rollback. This also fixes the non-MHD
+  linear-response retry divergence; MHD + linear_response stays refused.
+* **Admission (M03-02/M04-02/M04-03).** MHD refuses Part-2 thermochemistry
+  (composition lanes), observables/instruments and linear-response neutrinos;
+  `mhd_io.output_divergence_diagnostics = false` refused.
+* No dependency-direction exception; `cosmosim_workflows` already links
+  `cosmosim_physics`. Reproducibility: MHD-off text/hash/schemas unchanged;
+  magnetized runs change through R-UCT and the prolongation fix only.

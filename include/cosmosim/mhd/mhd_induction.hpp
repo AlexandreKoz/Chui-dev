@@ -122,6 +122,16 @@ struct MhdFaceSignalPatch {
   std::size_t nz = 0;
   std::array<MhdDoubleArray, 3> speed_plus{};
   std::array<MhdDoubleArray, 3> speed_minus{};
+  // Pass 04 (M03-08, reconciliation R-UCT): face-consistency correction of
+  // the transverse induction flux, same index space as the speeds.
+  //   induction_correction[n][s] = F_face(B_t) - F_HLL^PLM(B_t),  t = (n+1+s)%3,
+  // where F_face is the flux of the ACTUAL face solver used for the gas update
+  // (HLLD, its HLLE fallback or the first-order positivity flux, on the
+  // primary PLM/PPM states) and F_HLL^PLM is the HLL flux on exactly the
+  // PLM-MC states and signed fan bounds that UCT-HLL uses at that face in its
+  // one-dimensional reduction. Valid only when `induction_correction_valid`.
+  std::array<std::array<MhdDoubleArray, 2>, 3> induction_correction{};
+  bool induction_correction_valid = false;
 
   void resize(const MhdPatchGeometry& patch_geometry);
   [[nodiscard]] std::array<std::size_t, 3> extents(MhdAxis normal) const noexcept;
@@ -158,6 +168,27 @@ void fillStaggeredGhosts(const MhdPatchBoundary& boundary, MhdStaggeredFieldPatc
 // to the edge) and B_a(sb) (from the a-face on side sb, reconstructed along b).
 // Corner velocities are v_cell + sa*0.5*slope_a + sb*0.5*slope_b with MC
 // slopes, and staggered fields use MC slopes along the transverse direction.
+//
+// Pass 04 face-consistent correction (reconciliation R-UCT, M03-08). The
+// primary REF profile solves HLLD on PPM (or PLM) states, so plain UCT-HLL on
+// PLM-MC corner states does NOT reduce to the face flux actually used for the
+// gas update. When MhdFaceSignalPatch::induction_correction_valid, the edge
+// EMF is
+//   E_c = E_UCT-HLL
+//         - [a_b+ D_a(B_b)|_(b-) + a_b- D_a(B_b)|_(b+)] / (a_b+ + a_b-)
+//         + [a_a+ D_b(B_a)|_(a-) + a_a- D_b(B_a)|_(a+)] / (a_a+ + a_a-),
+// D_n(B_t) = F_face(B_t) - F_HLL^PLM(B_t) on the two adjacent faces of each
+// family, upwind-weighted with the same signed fan weights UCT-HLL applies to
+// the corresponding states. Derivation of the 1-D reduction: with no
+// variation along b, both a-faces carry the same D_a and the same fan, the
+// b-face L/R states coincide so D_b = F(U) - F(U) = 0, and E_UCT-HLL =
+// -F_HLL^PLM(B_b); hence E_c = -F_HLL^PLM - D_a = -F_face(B_b) exactly (to
+// roundoff) for HLLD+PPM, HLLD+PLM and every fallback flux. Symmetrically
+// E_c = +F_face(B_a) for variation along b only. The
+// correction is an edge-local function of face data, so D*C = 0 (divergence)
+// is untouched; wall and periodic edge rules are applied afterwards as
+// before. This is UCT-HLL plus a face-consistency correction, NOT the
+// Mignone & Del Zanna HLLD-coefficient UCT; it is labelled R-UCT.
 //
 // One-dimensional reduction: with no variation along b the expression reduces
 // exactly to -F_HLL(B_b) on the a-face (and with no variation along a, to

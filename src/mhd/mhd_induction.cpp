@@ -194,6 +194,11 @@ void MhdFaceSignalPatch::resize(const MhdPatchGeometry& patch_geometry) {
       speed_plus[axis].resize(count, 0.0);
       speed_minus[axis].resize(count, 0.0);
     }
+    for (MhdDoubleArray& correction : induction_correction[axis]) {
+      if (correction.size() != count) {
+        correction.resize(count, 0.0);
+      }
+    }
   }
 }
 
@@ -233,6 +238,9 @@ std::uint64_t MhdFaceSignalPatch::ownedCapacityBytes() const noexcept {
   std::uint64_t bytes = 0U;
   for (std::size_t axis = 0; axis < 3U; ++axis) {
     bytes += speed_plus[axis].ownedCapacityBytes() + speed_minus[axis].ownedCapacityBytes();
+    for (const MhdDoubleArray& correction : induction_correction[axis]) {
+      bytes += correction.ownedCapacityBytes();
+    }
   }
   return bytes;
 }
@@ -449,7 +457,18 @@ void MhdEmfBuilder::buildUctHll(const MhdPatchGeometry& geometry,
               (denom_a * denom_b);
           const double dissipation_a = ap_a * am_a / denom_a * (field_b_upper - field_b_lower);
           const double dissipation_b = ap_b * am_b / denom_b * (field_a_upper - field_a_lower);
-          const double electric_eff = upwinded + dissipation_a - dissipation_b;
+          double electric_eff = upwinded + dissipation_a - dissipation_b;
+          if (signals.induction_correction_valid) {
+            // a-faces: transverse component B_b is slot (b - a - 1) % 3 == 0;
+            // b-faces: B_a is slot (a - b - 1) % 3 == 1 (cyclic a = c+1, b = c+2).
+            const MhdDoubleArray& correction_a = signals.induction_correction[a][0];
+            const MhdDoubleArray& correction_b = signals.induction_correction[b][1];
+            const double face_a_correction =
+                (ap_b * correction_a[sa_lo] + am_b * correction_a[sa_hi]) / denom_b;
+            const double face_b_correction =
+                (ap_a * correction_b[sb_lo] + am_a * correction_b[sb_hi]) / denom_a;
+            electric_eff += -face_a_correction + face_b_correction;
+          }
           if (!std::isfinite(electric_eff)) {
             throwInvalid("UCT-HLL produced a non-finite edge electric field");
           }

@@ -651,9 +651,19 @@ class GravityRuntimeImpl final : public GravityRuntime {
     m_pending_long_range_reuses = 0U;
     m_pending_cadence_records.clear();
     m_pending_cadence_records_dropped = 0U;
+    // Pass 04 (M04-01): the live spectral neutrino history is mutable PM-hook
+    // state; journal its opening accepted state (and the first-use restore
+    // status) with the same transaction that owns forces and cadence.
+    m_neutrino_restored_at_open = m_neutrino_source_restored;
+    if (m_neutrino_source != nullptr) {
+      m_neutrino_source->beginTransaction();
+    }
   }
   void commitCycleTransaction() noexcept override {
     if (!m_cycle_transaction_open) return;
+    if (m_neutrino_source != nullptr) {
+      m_neutrino_source->commitTransaction();
+    }
     // Publish the journal in order through the same bounded window the
     // non-transactional path uses (oldest accepted records are evicted only
     // by newer accepted records).
@@ -687,6 +697,16 @@ class GravityRuntimeImpl final : public GravityRuntime {
     m_pending_long_range_reuses = 0U;
     m_pending_cadence_records_dropped = 0U;
     m_cycle_transaction_open = false;
+    // 2b. Pass 04 (M04-01): live neutrino response history back to the
+    //     opening accepted state (no-allocation journal). The caller restores
+    //     the canonical module sidecar from its opening state copy, so live
+    //     history and sidecar agree again. If the rejected attempt performed
+    //     the first-use restart restore, that status is reverted too, so the
+    //     next attempt restores from the (restored) sidecar again.
+    if (m_neutrino_source != nullptr) {
+      m_neutrino_source->rollbackTransaction();
+    }
+    m_neutrino_source_restored = m_neutrino_restored_at_open;
     // 3. Derived state. Tree build/refit candidates and topology maps depend
     //    on the positions the rejected attempt visited: force a full build.
     m_tree_pm_coordinator.invalidateSourceHistoryForRollback();
@@ -703,6 +723,19 @@ class GravityRuntimeImpl final : public GravityRuntime {
     m_source_predicted_inactive_count = 0U;
   }
   [[nodiscard]] bool cycleTransactionOpen() const noexcept override { return m_cycle_transaction_open; }
+  void synchronizeModuleSidecarsAfterRollback(core::SimulationState& state) override {
+    if (m_neutrino_source == nullptr ||
+        m_config.extended.neutrinos.method != core::NeutrinoMethodConfig::kLinearResponse) {
+      return;
+    }
+    // A sidecar exists only once a refresh stored it (or a restart loaded
+    // it); an absent sidecar with an empty live history stays absent.
+    if (state.sidecars.find(neutrinos::k_neutrino_response_module) == nullptr &&
+        m_neutrino_source->historySize() == 0U) {
+      return;
+    }
+    m_neutrino_source->storeTo(state.sidecars);
+  }
   [[nodiscard]] std::uint64_t rejectedCadenceRecordCount() const noexcept override {
     return m_rejected_cadence_record_count;
   }
@@ -4066,6 +4099,7 @@ class GravityRuntimeImpl final : public GravityRuntime {
   // CHUI-EXT-PHYS-REF-v1 N03 neutrino long-range source (null when disabled).
   std::unique_ptr<neutrinos::NeutrinoSpectralSource> m_neutrino_source;
   bool m_neutrino_source_restored = false;
+  bool m_neutrino_restored_at_open = false;
   mutable gravity::TreePmCoordinator m_tree_pm_coordinator;
   gravity::TreePmOptions m_tree_pm_options;
   gravity::TreeSofteningSpeciesPolicy m_tree_pm_species_softening{};
