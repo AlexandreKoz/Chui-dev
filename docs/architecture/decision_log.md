@@ -1244,3 +1244,27 @@ Source only; NOT configured, compiled or run. Ledger:
 * Full decision list: `docs/architecture/chui_rt_bh_agn_compatibility_amendment_v01.md`.
 * Reproducibility impact: disabled runs byte-identical config text/hash and
   unchanged schemas; enabled runs deterministic by stable-ID ordering.
+
+## 2026-11-27 — CHUI-EXT-PHYS-REF-v1 pass 01 (source only, unvalidated)
+
+* Branch `feature/extended_physics_bulk_pass01` from `main` @ `ada3564`. Ledger:
+  `docs/architecture/chui_extended_physics_implementation_pass01_status.md`; contracts:
+  `chui_extended_physics_numerical_contracts_pass01.md`.
+* S01: the relativistic background lives in `core::LambdaCdmBackground` (the existing single
+  H(a) authority) instead of a new module; `cosmologyBackgroundConfigFromSimulation` is the only
+  config→background path (three construction sites switched). `omega_matter` keeps its GADGET
+  `Omega0` meaning and includes massive neutrinos when the background is enabled.
+* New libraries (none included by core): `cosmosim_spectral` (core), `cosmosim_lightcone`
+  (core), `cosmosim_neutrinos` (spectral, gravity, parallel), `cosmosim_cosmic_rays` (mhd,
+  spectral), `cosmosim_instruments` (spectral), `cosmosim_observables` (spectral, lightcone,
+  radiation, instruments); `cosmosim_radiation` additionally links `cosmosim_lightcone`;
+  `cosmosim_workflows` links neutrinos/observables.
+* Gravity: optional `PmSpectralSourceHook` in `PmSolveOptions` (null = predecessor operator);
+  the hook identity is folded into the existing split-scale fingerprint lane (width fixed).
+* Persistence: N03 history in the existing whole-block module sidecar mechanism; no restart
+  schema bump.
+* RT admission change: `rt_stellar_sources` admitted with an external SSP group-luminosity
+  table in cosmological ionizing3 runs (previous refusal replaced by explicit requirements).
+* Observables run inside `AnalysisRuntime::executeDiagnostics` (read-only, cadence-gated).
+* Reproducibility impact: disabled runs unchanged (text, hash, schemas); N03 deterministic per
+  rank topology.

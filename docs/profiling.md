@@ -542,3 +542,10 @@ Canonical RT bytes follow `4 G 8 N` (`radiationCanonicalBytes`); the moment
 lanes appear in the memory report as `rt.*` (absent when disabled).
 `bench/bench_rt_transport_throughput.cpp` prints cell-group updates per second;
 no speedup or capacity claim is made.
+
+## CHUI-EXT-PHYS-REF-v1 benchmark driver (source only; NOT RUN)
+
+`bench_extended_physics_kernels [grid_n] [sightlines] [stations] [components]` times leaf-ray
+traversal, Voigt evaluation, one CR anisotropic diffusion step and the direct RIME, and prints
+the governed memory formulas (`radiationIntervalWorkspaceBytes`, `CrSpectralState::bytesFor`,
+ray-index bytes) beside wall times. No measurement exists for this pass.

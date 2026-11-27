@@ -1,5 +1,21 @@
 # Current repository status
 
+## Extended physics bulk implementation, pass 01 — 2026-11-27
+
+**SOURCE ONLY — NOT BUILT, NOT TESTED, NOT BENCHMARKED, NOT QUALIFIED.**
+
+Added in source (branch `feature/extended_physics_bulk_pass01`, CHUI-EXT-PHYS-REF-v1):
+
+* S01/N01 relativistic background in `LambdaCdmBackground` (photons, massless N_eff, Fermi-Dirac massive neutrinos, distances) behind `cosmology.radiation_background`;
+* N03 PM neutrino source (`neutrinos.method = transfer_ratio | linear_response`) through a PM spectral hook, response history in a module sidecar;
+* S02 Boltzmann/atomic data adapters, S03 leaf-ray and lightcone services;
+* F02 stellar RT sources from an SSP group-luminosity table; R03-R05 reference RT backends (not runtime-dispatched);
+* CR01-CR07 cosmic-ray kernels (runtime refused at admission);
+* inline observables (Ly-a forest, HI cube, SZ, DM; FITS) and a direct full-polarization RIME instrument with native/OSKAR export.
+
+Defaults are unchanged (every new section disabled, config hash unchanged).
+See the [pass-01 ledger](docs/architecture/chui_extended_physics_implementation_pass01_status.md).
+
 ## RT / BH / AGN bulk implementation, pass 01 — 2026-11-26
 
 **SOURCE ONLY — NOT BUILT, NOT TESTED, NOT VALIDATED.**

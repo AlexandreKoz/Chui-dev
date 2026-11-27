@@ -597,3 +597,25 @@ Status: source-implemented in pass 02, UNVALIDATED (no build or run).
   with the other module blocks; no outer schema bump.
 * Science snapshots: no new datasets in pass 01 (radiation fields and engine
   lanes are not exported yet; gap). Canonical GADGET/AREPO names unchanged.
+
+## CHUI-EXT-PHYS-REF-v1 observable and instrument products (pass 01, source only, NOT RUN)
+
+No science-snapshot or restart schema version changed in this pass. New
+products are separate, self-describing files written by the inline
+observable pipeline (`observables.enabled`), never into snapshots:
+
+* FITS primary HDUs (`<output_directory>/<stem>_<product>_step<N>.fits`; BITPIX −64,
+  big-endian, linear WCS, `HISTORY` provenance incl. accessor provenance, scale factor,
+  LOS axis, sightline count, `NOT_QUALIFIED` flag): `lya_flux` [pixel (VELO m/s), sightline],
+  `hi_cube` [x, y (code length), VRAD m/s] in K (observer-frame δT_b for cosmological runs),
+  `compton_y`, `tau_e`, `ksz_dt_over_t`, `dispersion_measure` (m⁻²).
+* `chui_observables_summary_v1` text (`key = value`): step, scale factor, provenance,
+  Ly-a mean flux, flux PDF, 1-D flux power.
+* `chui_visibilities_v1` binary (`*.chuivis`, magic `CHUIVIS1`, u64 header length, text header
+  with correlation order XX,XY,YX,YY, Jy, Fourier sign, frequency edges, stations, settings,
+  provenance; per-time records: u64 time index, f64 hour angle, u64 baselines, (u32 p, u32 q,
+  3 f64 uvw m) per baseline, then 8 f64 + u8 flag per baseline × channel; native byte order).
+* OSKAR input export directory (`sky_model.osm`, `telescope/layout.txt`, `telescope/position.txt`).
+
+All files are written to `*.partial` and renamed on success. UVH5 / Measurement Set are not
+written (adapter not implemented).

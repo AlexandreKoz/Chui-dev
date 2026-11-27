@@ -801,3 +801,19 @@ streaming verifier expects v26 for magnetized payloads.
   (records must match the leaf tiling).
 * Reproducibility: disabled runs unchanged; reference-engine runs depend on
   deterministic ordering by stable IDs (sorted plans, rank-ordered replies).
+
+## CHUI-EXT-PHYS-REF-v1 additions (pass 01, source only, NOT RUN)
+
+* No restart schema version change. The only new evolved authoritative state admitted at
+  runtime is the N03 linear-response history, persisted as the whole-block (non particle
+  indexed) module sidecar `chui_neutrino_response_v1` (schema 1) in
+  `SimulationState::sidecars`, i.e. through the existing module-block checkpoint path. It is
+  stored after every refreshing PM solve and restored on the first gravity execute after a
+  restart; a sidecar written with a different method or k binning, or larger than the
+  configured capacity, refuses the restart. The transfer-ratio model is stateless.
+* F02 stellar RT sources carry no pending state (emission is a pure function of stellar age).
+* Kernels with serializable state that are NOT runtime-admitted (causal rays
+  `CausalRayTransport::serialize`, CR spectral state) have no checkpoint lane yet (ledger).
+* Reproducibility: disabled extended physics leaves config text/hash, schemas and outputs
+  unchanged; enabled N03 is deterministic for a fixed rank count (serial storage-order bin
+  sums, then a collective reduction).
