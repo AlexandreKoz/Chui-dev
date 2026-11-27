@@ -163,3 +163,33 @@ refusal; EXT-N04-T01 δf weight sign, signed-mass refusal, NR drift 1e-9, FD sam
 EXT-N05-T01 single-mode spectrum normalization, shot noise, ratio-family total. Missing (named for the
 execution campaign): PM-integrated neutrino DMO run vs CLASS P(k) suppression, MPI/rank equivalence of
 the reduction, restart equivalence through the real checkpoint writer.
+
+---
+
+## S03 — read-only leaf ray and lightcone service (`cosmosim_lightcone`)
+
+* **Geometry (derived).** Leaves = populated patches (`cell_count > 0`); parents carry no cells, so covered
+  parents are excluded by construction. Cell row = `first_cell + i + nx(j + ny k)` (canonical
+  `amr::linearPatchCellIndex`). Point location: CSR uniform bucket index (≤ 256³ buckets, each leaf in
+  every bucket it overlaps): O(1) expected, replacing linear patch scans. Half-open leaf boxes.
+* **Traversal.** Comoving length s; at each crossing the next cell is found at `p + 10⁻⁶ Δx_min d`
+  (ties on faces/edges/corners resolve toward the direction of travel); exit distance = nearest face of
+  that cell measured in the probe image frame (periodic images handled by an explicit shift). Segments
+  strictly increasing in s; Σ lengths = requested length. Periodic: unbounded unwrapped position with
+  wrapped probes (box replicas). Open: stop at the face. A tiling hole throws; `max_segments` capacity
+  throws (no silent truncation). Proper path length for a snapshot ray at fixed a: `dℓ = a ds`.
+* **MPI.** Rank-local leaves; additive LOS integrals reduce per ray; ordered transfer needs
+  `mergeRankSegments` (sorted by s then global patch id, overlap refused). The exchange of segment
+  records between ranks is NOT implemented in pass 01 (single-rank ordered transfer only; ledger gap).
+* **Lightcone.** `χ(a)` table on ln a (cumulative adaptive conformal-time integrals of the S01 authority,
+  cubic Hermite interpolation, bisection inverse). Shell i owns χ between midpoints to its neighbours;
+  replicas `⌈χ_max/L⌉`, missing modes k < 2π/L and repeated-structure flag recorded. Temporal weights linear
+  in a between bracketing snapshots (no extrapolation). Observer frame `1+z_obs = (1+z)(1+v_los/c)` (first
+  order, declared); snapshot Hubble velocity `v = aH dx`.
+* **Not implemented (ledger):** HEALPix pixelization, distributed streaming/tiled lightcone accumulation
+  with shell checksums during the run, gravitationally deflected rays (multi-plane lensing in C02 handles
+  deflection on planes separately).
+* **Tests (`unit_lightcone_geometry`, NOT_RUN).** EXT-S03-T01 axis ray segment lengths/rows; T02 oblique ray
+  closure and midpoint containment, tie determinism; T03 AMR leaves via PatchSoa with metadata parent,
+  open face, hole and capacity refusals; T04 rank merge and overlap refusal; T05 EdS χ(a) 1e-8, inverse,
+  contiguous shells, replication count, temporal weights.
